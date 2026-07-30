@@ -128,12 +128,11 @@ const FINAL_LOGO = [
 	"3:1", "3:4",
 	"4:1", "4:4",
 	"5:1", "5:4",
-	"6:1", "6:4", "6:5",
-	"7:1", "7:4", "7:5",
-	"8:1",
+	"6:1", "6:3", "6:4", "6:5",
+	"7:1", "7:3", "7:4", "7:5",
 ];
 
-const FINAL_LOGO_BOUNDS = { minX: 1, maxX: 6, minY: 1, maxY: 8 } as const;
+const FINAL_LOGO_BOUNDS = { minX: 1, maxX: 6, minY: 1, maxY: 7 } as const;
 
 function toCellKey(y: number, x: number) {
 	return `${y}:${x}`;
