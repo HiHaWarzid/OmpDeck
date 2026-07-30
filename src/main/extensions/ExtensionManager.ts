@@ -8,13 +8,8 @@ import { toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 type SettingsProvider = () => AppSettings;
 
-/** PiDeck 内置扩展列表，用于在扫描不到时仍展示在扩展管理页中。 */
-export const BUILT_IN_EXTENSIONS = [
-	"pi-deck-ask-question.ts",
-	"pi-deck-nul-redirect-fix.ts",
-	"pi-deck-plan-mode.ts",
-	"pi-deck-todo.ts",
-] as const;
+/** OmpDeck 内置扩展列表（已全部移除，omp 提供原生能力替代） */
+export const BUILT_IN_EXTENSIONS = [] as const;
 
 /**
  * 通过 pi CLI 管理已安装扩展，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
@@ -160,32 +155,8 @@ export class ExtensionManager {
 		// 变化导致结果被丢弃后反复重入。
 		const conflicts: { builtIn: string; thirdParty: string }[] = [];
 		let removedChanged = false;
-		for (const [builtInName, keyword] of BUILT_IN_CONFLICT_KEYWORDS) {
-			if (removedBuiltIn.has(builtInName)) continue; // 已移除的不重复检测
-			const conflicting = merged.find(
-				(ext) =>
-					!ext.builtIn &&
-					ext.enabled !== false &&
-					extensionNameMatches(ext.source, keyword),
-			);
-			if (conflicting) {
-				removedBuiltIn.add(builtInName);
-				removedChanged = true;
-				// 必须删掉磁盘文件：pi 会加载 ~/.pi/agent/extensions 下全部 .ts，
-				// 仅写 removedBuiltInExtensions 无法阻止 Tool 同名冲突导致 RPC 启动失败。
-				await this.removeBuiltInFile(builtInName).catch(() => undefined);
-				conflicts.push({
-					builtIn: builtInName,
-					thirdParty: conflicting.source,
-				});
-				// 同步更新 enabled 状态
-				for (const ext of merged) {
-					if (ext.builtIn && ext.source === builtInName) {
-						ext.enabled = false;
-					}
-				}
-			}
-		}
+		// BUILT_IN_CONFLICT_KEYWORDS 已清空（omp 内置能力替代）
+
 		if (removedChanged) {
 			await this.saveRemovedBuiltIn([...removedBuiltIn]);
 		}
@@ -573,11 +544,7 @@ export class ExtensionManager {
  * 当前参与冲突检测的内置扩展与关键词。
  * todo / plan / ask：三方包名含关键词即视为功能冲突；其它内置扩展暂不自动互斥。
  */
-export const BUILT_IN_CONFLICT_KEYWORDS = [
-	["pi-deck-todo.ts", "todo"],
-	["pi-deck-plan-mode.ts", "plan"],
-	["pi-deck-ask-question.ts", "ask"],
-] as const;
+export const BUILT_IN_CONFLICT_KEYWORDS = [] as const;
 
 /**
  * 固定关键词冲突匹配：清理协议/作用域后，包名是否包含指定关键词。
