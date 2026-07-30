@@ -368,12 +368,11 @@ export class ExtensionManager {
 	async checkPiUpdate(): Promise<PiUpdateCheckResult> {
 		try {
 			const status = await this.locator.check(this.getSettings().customPiPath);
-			if (!status.installed) return { hasUpdate: false, error: status.error ?? "pi 未安装" };
-			const latestVersion = await this.npmViewVersion("@earendil-works/pi-coding-agent");
+			if (!status.installed) return { hasUpdate: false, error: status.error ?? "omp 未安装" };
+			// omp 自身版本检查通过 update --check，不通过 npm
 			return {
 				currentVersion: status.version,
-				latestVersion,
-				hasUpdate: this.compareVersions(latestVersion, status.version ?? "0.0.0") > 0,
+				hasUpdate: false,
 			};
 		} catch (error) {
 			return { hasUpdate: false, error: error instanceof Error ? error.message : String(error) };
@@ -381,23 +380,23 @@ export class ExtensionManager {
 	}
 
 	async updatePi(): Promise<PiCliUpdateResult> {
-		const check = await this.checkPiUpdate();
-		if (!check.hasUpdate) {
+		try {
+			const output = await this.runPi(["update"], 120_000, { offline: false });
+			return this.toUpdateResult("omp update", output, true);
+		} catch (error) {
 			return {
-				command: "pi update pi",
-				output: check.error ?? `当前版本 ${check.currentVersion ?? "unknown"}，最新版本 ${check.latestVersion ?? "unknown"}，无需更新。`,
+				command: "omp update",
+				output: error instanceof Error ? error.message : String(error),
 				updated: false,
 			};
 		}
-		const output = await this.runPi(["update", "pi"], 120_000, { offline: false });
-		return this.toUpdateResult("pi update pi", output, true);
 	}
 
 	async updateExtensions(): Promise<PiCliUpdateResult> {
-		const output = await this.runPi(["update", "--extensions"], 120_000, { offline: false });
+		const output = await this.runPi(["update", "--plugins"], 120_000, { offline: false });
 		// 更新后版本信息变化，强制下次 list 重新获取。
 		this.invalidateListCache();
-		return this.toUpdateResult("pi update --extensions", output, true);
+		return this.toUpdateResult("omp update --plugins", output, true);
 	}
 
 	private async enrichExtensionVersion(extension: PiExtensionSummary): Promise<PiExtensionSummary> {
@@ -505,11 +504,7 @@ export class ExtensionManager {
 	}
 
 	private async runPi(args: string[], timeout: number, options: { offline?: boolean } = {}): Promise<string> {
-		// --no-approve 在 pi 0.79+ 才支持，老版本需要跳过以避免 unknown option 错误。
 		const finalArgs = [...args];
-		if (await this.noApproveSupported()) {
-			finalArgs.push("--no-approve");
-		}
 		const settings = this.getSettings();
 		const command = this.locator.resolveCommand(settings.customPiPath, settings.wslEnabled, settings.wslDistro, settings.wslUser);
 		const invocation = this.locator.createInvocation(command, finalArgs);
