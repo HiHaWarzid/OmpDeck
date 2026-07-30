@@ -90,10 +90,10 @@ export class WorktreeService {
 			return false;
 		}
 
-		// 删除 PiDeck 创建的分支：旧版本使用 pideck/{slug}，新版本使用与目录名一致的 {slug}。
-		// 对外部 worktree 尽量保守，只在“分支名等于目录名”时认为是 PiDeck 创建的同名工作区。
+		// 删除 OmpDeck 创建的分支：旧版本使用 pideck/{slug}，新版本使用 ompdeck/{slug}。
+		// 对外部 worktree 尽量保守，只在“分支名等于目录名”时认为是 OmpDeck 创建的同名工作区。
 		const worktreeDirName = basename(worktreePath);
-		if (branch?.startsWith("pideck/") || branch === worktreeDirName) {
+		if (branch?.startsWith("ompdeck/") || branch?.startsWith("pideck/") || branch === worktreeDirName) {
 			await execFileAsync("git", ["branch", "-D", branch], { cwd: projectPath }).catch(() => undefined);
 		}
 

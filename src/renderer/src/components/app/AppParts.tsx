@@ -1662,7 +1662,7 @@ export { PiLogoCanvas } from "./PiLogoCanvas";
  */
 export function BrandLockup(props: { replayToken?: number } = {}) {
 	return (
-		<div className="brand-lockup" aria-label="PiDeck">
+		<div className="brand-lockup" aria-label="OmpDeck">
 			{/* 34px：比字标略大，仍保持侧栏紧凑 */}
 			<PiLogoCanvas
 				size={34}
@@ -1671,7 +1671,7 @@ export function BrandLockup(props: { replayToken?: number } = {}) {
 				replayToken={props.replayToken}
 			/>
 			<span className="brand-wordmark" aria-hidden="true">
-				PiDeck
+				OmpDeck
 			</span>
 		</div>
 	);

@@ -275,9 +275,9 @@ function applyNativeThemeSource(settings: AppSettings) {
 	nativeTheme.themeSource = settings.theme === "system" ? "system" : settings.theme;
 }
 
-const RELEASES_URL = "https://github.com/ayuayue/pi-desktop/releases";
+const RELEASES_URL = "https://github.com/HiHaWarzid/OmpDeck/releases";
 const LATEST_RELEASE_API =
-	"https://api.github.com/repos/ayuayue/pi-desktop/releases/latest";
+	"https://api.github.com/repos/HiHaWarzid/OmpDeck/releases/latest";
 const POSTHOG_PROJECT_KEY =
 	process.env.POSTHOG_PROJECT_KEY ??
 	"phc_xgJ8gFUMgExZEEPzZ7VRa7698ENcaDRquWZVGYb2dCFK";
@@ -489,7 +489,7 @@ async function checkForAppUpdate(
 	const response = await fetch(LATEST_RELEASE_API, {
 		headers: {
 			Accept: "application/vnd.github+json",
-			"User-Agent": `pi-desktop/${currentVersion}`,
+			"User-Agent": `OmpDeck/${currentVersion}`,
 		},
 	});
 	if (!response.ok) {
@@ -544,7 +544,7 @@ async function downloadUpdateAsset(asset: AppUpdateAsset): Promise<AppUpdateDown
 	return new Promise((resolve, reject) => {
 			void appLogger.info("update", "Download update asset started", { assetName: asset.name, url: asset.url });
 		const request = net.request({ method: "GET", url: asset.url });
-		request.setHeader("User-Agent", `pi-desktop/${app.getVersion()}`);
+		request.setHeader("User-Agent", `OmpDeck/${app.getVersion()}`);
 		request.on("redirect", (_statusCode, _method, redirectUrl) => {
 			// GitHub browser_download_url 通常会 302 到对象存储,必须显式跟随重定向。
 			request.followRedirect();

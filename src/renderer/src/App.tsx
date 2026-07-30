@@ -564,7 +564,7 @@ export function App() {
             <path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
           </svg>
         </div>
-        <strong>PiDeck</strong>
+        <strong>OmpDeck</strong>
         <span>{t("app.preloadMissing")}</span>
       </div>
     );
@@ -1362,7 +1362,7 @@ export function App() {
   const [webServiceChanging, setWebServiceChanging] = useState(false);
   const [appInfo, setAppInfo] = useState<AppInfo>({
     version: "-",
-    releasesUrl: "https://github.com/ayuayue/pi-desktop/releases",
+    releasesUrl: "https://github.com/HiHaWarzid/OmpDeck/releases",
     platform: "win32",
     homeDir: "",
   });
@@ -7094,9 +7094,9 @@ export function App() {
                       }) : null;
                       const wtChildren = wtDisplay?.visibleChildren ?? [];
                       const hiddenSessionCount = (wtDisplay?.hiddenChildCount ?? 0);
-                      // PiDeck 创建的 worktree 分支使用 pideck/{slug} 命名；侧栏只展示 slug。
+                      // OmpDeck 创建的 worktree 分支使用 ompdeck/{slug} 命名；侧栏只展示 slug。
                       // 完整路径放 title，不再行内显示目录名——分支与目录名不一致时会参差不齐。
-                      const displayBranchName = wt.branch.replace(/^pideck\//, "");
+                      const displayBranchName = wt.branch.replace(/^ompdeck\//, "");
                       const wtKey = `wt:${wt.path}`;
                       const isChildActive =
                         !!childProject && activeProjectId === childProject.id;
@@ -7356,7 +7356,7 @@ export function App() {
               <button
                 className="icon-button homepage-icon"
                 title={t("app.homepage")}
-                onClick={() => api.app.openExternal("https://ayuayue.github.io/PiDeck/")}
+                onClick={() => api.app.openExternal("https://github.com/HiHaWarzid/OmpDeck/")}
               >
                 <Globe size={17} />
               </button>
@@ -7386,13 +7386,13 @@ export function App() {
           <div className="chat-title-block">
             <div className="chat-title-row">
               <strong
-                title={activeAgent?.title ?? activeProject?.name ?? "PiDeck"}
+                title={activeAgent?.title ?? activeProject?.name ?? "OmpDeck"}
               >
                 {activeAgent?.title ??
                   (isChatProject(activeProject)
                     ? t("app.chatProject")
                     : activeProject?.name) ??
-                  "PiDeck"}
+                  "OmpDeck"}
               </strong>
               {activeAgent?.noSession && (
                 <span
@@ -10207,7 +10207,7 @@ function FeedbackModal({
   const issueTitle = descriptionSummary
     ? `${t("feedback.issueTitle")}${descriptionSummary}`
     : t("feedback.issueTitle") + t("feedback.issueTitleEmpty");
-  const issueUrl = `https://github.com/ayuayue/pi-desktop/issues/new?title=${encodeURIComponent(issueTitle)}&body=${encodeURIComponent(report)}`;
+  const issueUrl = `https://github.com/HiHaWarzid/OmpDeck/issues/new?title=${encodeURIComponent(issueTitle)}&body=${encodeURIComponent(report)}`;
   const authorUrl = "https://github.com/ayuayue";
 
   async function copyReport() {

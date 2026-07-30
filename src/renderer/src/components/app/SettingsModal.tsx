@@ -1212,7 +1212,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 									{/* 版本与更新 */}
 									<div className="setting-row">
 										<div>
-											<strong>PiDeck</strong>
+											<strong>OmpDeck</strong>
 											<span style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
 												v{props.appInfo.version}
 											</span>

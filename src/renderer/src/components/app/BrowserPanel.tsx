@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { t } from "../../i18n";
 
-const DEFAULT_HOME = "https://ayuayue.github.io/PiDeck/";
+const DEFAULT_HOME = "https://github.com/HiHaWarzid/OmpDeck";
 
 type DeviceType = "pc" | "mobile" | "tablet";
 
@@ -65,7 +65,7 @@ export const moduleState: { tabs: TabEntry[]; activeTabId: string | null; device
 function ensureInitialTab() {
 	if (moduleState.tabs.length > 0) return;
 	const id = genTabId();
-	moduleState.tabs = [{ id, title: "PiDeck", url: DEFAULT_HOME }];
+	moduleState.tabs = [{ id, title: "OmpDeck", url: DEFAULT_HOME }];
 	moduleState.activeTabId = id;
 }
 

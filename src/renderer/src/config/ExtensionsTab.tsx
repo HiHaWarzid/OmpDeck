@@ -21,13 +21,8 @@ function getExtensionsApi(): ExtensionsApi {
 	return api;
 }
 
-/** PiDeck 内置扩展名 → source 文件名映射 */
-const PIDEK_BUILTIN_SOURCE: Record<string, string> = {
-	"pi-deck-todo": "pi-deck-todo.ts",
-	"pi-deck-plan-mode": "pi-deck-plan-mode.ts",
-	"pi-deck-ask-question": "pi-deck-ask-question.ts",
-	"pi-deck-nul-redirect-fix": "pi-deck-nul-redirect-fix.ts",
-};
+/** OmpDeck 已移除内置扩展（omp 提供原生能力替代） */
+const PIDEK_BUILTIN_SOURCE: Record<string, string> = {};
 
 /** 预设推荐扩展包 */
 const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
