@@ -164,7 +164,7 @@ when appropriate. If unsure whether a skill is needed, follow the rule:
 ];
 
 /**
- * 管理 pi 全局 Prompt Templates 目录 (~/.pi/agent/prompts/)。
+ * 管理 omp 全局 Prompt Templates 目录 (~/.pi/agent/prompts/)。
  * 
  * Prompt Templates 是 markdown 文件，用户可在 pi 中输入 /<name> 快速展开。
  * frontmatter 支持 description、argument-hint 等元数据。

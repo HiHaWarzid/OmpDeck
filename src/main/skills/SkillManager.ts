@@ -23,7 +23,7 @@ import type { WslEnvironment } from "../wsl/WslPaths";
 const SKILL_FILE = "SKILL.md";
 
 /**
- * 管理 pi 全局 Skill 目录。
+ * 管理 omp 全局 Skill 目录。
  * 第一版仅操作全局目录，不触碰项目级 .pi/.agents skills，避免误删项目资产或绕过 trusted project 规则。
  */
 export class SkillManager {

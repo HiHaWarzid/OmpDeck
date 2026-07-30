@@ -1,5 +1,5 @@
 /**
- * 启动页官方 pi 风格 logo 动画（与侧栏 PiLogoCanvas 同源逻辑）。
+ * 启动页 omp 风格 logo 动画（与侧栏 PiLogoCanvas 同源逻辑）。
  * 在 React 挂载前由 index.html 引入；覆盖层移除前循环播放，尊重 prefers-reduced-motion。
  */
 

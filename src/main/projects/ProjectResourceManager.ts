@@ -15,7 +15,7 @@ const SKILL_FILE = "SKILL.md";
 type ProjectProvider = (projectId: string) => Project | undefined;
 
 /**
- * 管理单个项目目录内的 pi 资源。
+ * 管理单个项目目录内的 omp 资源。
  * 仅扫描/删除项目目录下的 .pi/.agents 资源，避免把全局 skill/extension 混入项目级弹框。
  */
 export class ProjectResourceManager {

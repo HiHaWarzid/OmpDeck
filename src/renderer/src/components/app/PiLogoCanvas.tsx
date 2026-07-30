@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 /**
- * 官方 pi.dev 风格的 canvas 像素 logo。
- * 逻辑参考 pi 官网 home-inline.js 的 createHeroLogoController：
+ * omp 风格的 canvas 像素 logo。
  * - 8×9 棋盘上的 FINAL_LOGO 点阵
  * - 彩色方块带 bevel 立体边
  * - 四块 tetromino 下落拼装 → 消行闪烁 → 定格为单色 logo

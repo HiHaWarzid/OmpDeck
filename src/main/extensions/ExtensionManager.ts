@@ -12,7 +12,7 @@ type SettingsProvider = () => AppSettings;
 export const BUILT_IN_EXTENSIONS = [] as const;
 
 /**
- * 通过 pi CLI 管理已安装扩展，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
+ * 通过 omp CLI 管理已安装插件，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
  * 自动检测 pi 版本，条件性添加 --no-approve（仅 pi >= 0.79.0 支持），
  * 兼容老版本避免 unknown option 错误。
  */
@@ -52,14 +52,7 @@ export class ExtensionManager {
 		return this.wslEnvironment?.windowsHome ?? homedir();
 	}
 
-	/** 缓存的 pi 版本号，用于条件性传递 --no-approve。 */
-	private piVersion: string | null = null;
-	private piVersionPromise: Promise<string | null> | null = null;
-
-	/**
-	 * 安装/卸载/开关后主动清缓存。
-	 * 同时递增 generation 并断开 inflight 复用，避免旧请求完成后把已删除/已变更的列表写回。
-	 */
+	/** 缓存过期后主动清空。 */
 	invalidateListCache() {
 		this.listCache = null;
 		this.listCacheHasVersionInfo = false;
@@ -116,8 +109,8 @@ export class ExtensionManager {
 			? await Promise.all(parsed.map((extension) => this.enrichExtensionVersion(extension)))
 			: parsed;
 
-		// 扫描本地自动发现的扩展（~/.pi/agent/extensions/ 下的 .ts 文件和目录），
-		// pi list 只列出通过 pi install 安装的包，不包含本地文件扩展。
+		// 扫描本地自动发现的扩展，
+		// omp plugin list 只列出通过 omp plugin install 安装的包，不包含本地文件扩展。
 		const localExtensions = await this.scanLocalExtensions();
 
 		// 合并，已通过 pi 安装的优先保留原条目
@@ -436,40 +429,6 @@ export class ExtensionManager {
 			if (diff !== 0) return diff;
 		}
 		return 0;
-	}
-
-	/**
-	 * --no-approve 标志在 pi 0.79.0 引入。检测本地安装的 pi 版本是否支持。
-	 */
-	private async noApproveSupported(): Promise<boolean> {
-		const version = await this.getPiVersion();
-		if (!version) return false;
-		const match = version.match(/^(\d+)\.(\d+)/);
-		if (!match) return false;
-		const major = parseInt(match[1], 10);
-		const minor = parseInt(match[2], 10);
-		// pi >= 0.79.0 或 1.x+ 都支持 --no-approve
-		return major > 0 || minor >= 79;
-	}
-
-	private async getPiVersion(): Promise<string | null> {
-		if (this.piVersion) return this.piVersion;
-		if (this.piVersionPromise) return this.piVersionPromise;
-		this.piVersionPromise = this.detectPiVersion();
-		return this.piVersionPromise;
-	}
-
-	private async detectPiVersion(): Promise<string | null> {
-		try {
-			const status = await this.locator.check(this.getSettings().customPiPath);
-			if (status.installed && status.version) {
-				this.piVersion = status.version;
-				return status.version;
-			}
-		} catch {
-			// 版本检测失败时静默处理，后续调用方会 fallback 为不支持 --no-approve
-		}
-		return null;
 	}
 
 	private async runPi(args: string[], timeout: number): Promise<string> {

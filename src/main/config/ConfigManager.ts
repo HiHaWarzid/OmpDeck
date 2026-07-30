@@ -78,7 +78,7 @@ type TestRequest = {
 };
 
 /**
- * 管理 pi 全局配置文件（~/.pi/agent/ 下的 models.json、auth.json、settings.json）。
+ * 管理 omp 全局配置文件（~/.pi/agent/ 下的 models.json、auth.json、settings.json）。
  * 按照 pi 实际文件格式解析：models.json 是嵌套 providers 结构，auth.json 是对象映射。
  */
 export class ConfigManager {

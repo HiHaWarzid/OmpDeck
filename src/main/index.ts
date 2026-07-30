@@ -3867,7 +3867,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	// 启动后异步校准内置扩展：对比 resources 与用户目录全文，不一致则覆盖。
 	// 用户手动移除的记在 removedBuiltInExtensions，跳过自动部署。
 	const deployExtensionsTo = async (homeDir: string) => {
-		// 迁移旧的 pi disabledExtensions 配置到 PiDeck 自有设置
+		// 迁移旧的配置到自有设置
 		try {
 			const piSettingsPath = join(homeDir, ".pi", "agent", "settings.json");
 			const piRaw = await readFile(piSettingsPath, "utf-8").catch(() => "");
@@ -4085,7 +4085,7 @@ type PiDeckExtensionSyncResult =
 	| "missing-source";
 
 /**
- * 将 PiDeck 内置的扩展部署到用户扩展目录。
+ * 将内置扩展部署到用户扩展目录。
  * 启动时异步对比 resources 源文件与 ~/.omp/agent/extensions 目标：
  * - 目标不存在 → 安装
  * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
