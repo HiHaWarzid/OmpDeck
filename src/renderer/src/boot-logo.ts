@@ -28,20 +28,20 @@ const LOGO_FPS = 36;
 const CLEAR_ROW = 6;
 
 const COLORS: Record<ColorKey, string> = {
-	cyan: "#4B607C",
-	red: "#8F4632",
-	green: "#A3A473",
-	orange: "#D4904E",
-	flash: "#fff5b4",
+	cyan: "#1a7a55",
+	red: "#1a9e6e",
+	green: "#14b87e",
+	orange: "#4ad9a0",
+	flash: "#a8ffe0",
 	white: "#ffffff",
 	ink: "#09090B",
 };
 
 const BORDER_COLORS: Partial<Record<ColorKey, string>> = {
-	cyan: "#2D3D55",
-	red: "#4F271C",
-	green: "#5A5A3F",
-	orange: "#754F2B",
+	cyan: "#0f5e3f",
+	red: "#0f7a52",
+	green: "#0e8f5e",
+	orange: "#28b07a",
 	ink: "#000000",
 	white: "#9ca3af",
 };
@@ -121,20 +121,17 @@ const LOGO_TIMING = {
 	loopGapMs: 120,
 };
 
+/** 定格后的分子 O 几何（y:x）— omp 品牌标识 */
 const FINAL_LOGO = [
-	"3:2",
-	"3:3",
-	"3:4",
-	"4:2",
-	"4:4",
-	"5:2",
-	"5:3",
-	"5:5",
-	"6:2",
-	"6:5",
+	"1:2", "1:3", "1:4", "1:5",
+	"2:1", "2:6",
+	"3:1", "3:3", "3:4", "3:5",
+	"4:1", "4:3", "4:4", "4:5",
+	"5:1", "5:6",
+	"6:2", "6:3", "6:4", "6:5",
 ];
 
-const FINAL_LOGO_BOUNDS = { minX: 2, maxX: 5, minY: 3, maxY: 6 } as const;
+const FINAL_LOGO_BOUNDS = { minX: 1, maxX: 6, minY: 1, maxY: 6 } as const;
 
 function toCellKey(y: number, x: number) {
 	return `${y}:${x}`;
