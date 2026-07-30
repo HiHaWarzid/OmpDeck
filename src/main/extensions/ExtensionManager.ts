@@ -114,7 +114,7 @@ export class ExtensionManager {
 	}
 
 	private async loadList(includeVersionInfo: boolean): Promise<PiExtensionListResult> {
-		const raw = await this.runPi(["list"], 20_000);
+		const raw = await this.runPi(["plugin", "list"], 20_000);
 		const parsed = this.parseListOutput(raw);
 		// npm view 是扩展页变慢的主因；默认列表先跳过，只有手动刷新时再查更新。
 		const piInstalled = includeVersionInfo
@@ -204,7 +204,7 @@ export class ExtensionManager {
 	 * 单文件扩展（.ts 文件）和目录扩展（含 index.ts）都会被识别。
 	 */
 	private async scanLocalExtensions(): Promise<PiExtensionSummary[]> {
-		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
+		const extensionsDir = join(this.homeDir, ".omp", "agent", "extensions");
 		const result: PiExtensionSummary[] = [];
 
 		let entries: string[];
@@ -263,7 +263,7 @@ export class ExtensionManager {
 	 * 只允许删除 extensions 目录下的单层 basename，防止路径穿越。
 	 */
 	private async removeLocalExtension(source: string): Promise<void> {
-		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
+		const extensionsDir = join(this.homeDir, ".omp", "agent", "extensions");
 		const trimmed = source.trim();
 		const name = basename(trimmed);
 		// source 必须等于 basename（如 orca-agent-status.ts），拒绝 ../ 或绝对路径穿越。
@@ -285,10 +285,8 @@ export class ExtensionManager {
 		if (this.isLocalFileExtension(normalized)) {
 			await this.removeLocalExtension(normalized);
 		} else {
-			await this.runPi([
-				"remove",
-				normalized,
-				...(scope === "project" ? ["-l"] : []),
+			await this.runPi(["plugin", "uninstall", normalized,
+				...(scope === "project" ? ["--local"] : []),
 			], 30_000);
 		}
 		this.invalidateListCache();
@@ -344,7 +342,7 @@ export class ExtensionManager {
 	 * force: 文件本就不存在时静默成功（幂等，适合启动残留清理）。
 	 */
 	async removeBuiltInFile(source: string): Promise<void> {
-		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
+		const extensionsDir = join(this.homeDir, ".omp", "agent", "extensions");
 		const trimmed = source.trim();
 		const name = basename(trimmed);
 		if (!name || name !== trimmed || !name.startsWith("pi-deck-") || name === "." || name === "..") {
@@ -360,7 +358,7 @@ export class ExtensionManager {
 	async install(source: string): Promise<string> {
 		const normalized = source.trim();
 		if (!normalized) throw new Error("扩展名称不能为空");
-		const result = await this.runPi(["install", normalized], 60_000);
+		const result = await this.runPi(["plugin", "install", normalized], 60_000);
 		this.invalidateListCache();
 		return result;
 	}
@@ -381,7 +379,7 @@ export class ExtensionManager {
 
 	async updatePi(): Promise<PiCliUpdateResult> {
 		try {
-			const output = await this.runPi(["update"], 120_000, { offline: false });
+			const output = await this.runPi(["update"], 120_000);
 			return this.toUpdateResult("omp update", output, true);
 		} catch (error) {
 			return {
@@ -393,7 +391,7 @@ export class ExtensionManager {
 	}
 
 	async updateExtensions(): Promise<PiCliUpdateResult> {
-		const output = await this.runPi(["update", "--plugins"], 120_000, { offline: false });
+		const output = await this.runPi(["update", "--plugins"], 120_000);
 		// 更新后版本信息变化，强制下次 list 重新获取。
 		this.invalidateListCache();
 		return this.toUpdateResult("omp update --plugins", output, true);
@@ -503,15 +501,12 @@ export class ExtensionManager {
 		return null;
 	}
 
-	private async runPi(args: string[], timeout: number, options: { offline?: boolean } = {}): Promise<string> {
+	private async runPi(args: string[], timeout: number): Promise<string> {
 		const finalArgs = [...args];
 		const settings = this.getSettings();
 		const command = this.locator.resolveCommand(settings.customPiPath, settings.wslEnabled, settings.wslDistro, settings.wslUser);
 		const invocation = this.locator.createInvocation(command, finalArgs);
 		const env = this.locator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl);
-		// list/remove/install 使用离线模式避免配置页被网络和包管理器输出拖慢；update 必须允许联网，
-		// 否则 pi 只会返回简化的 Updated packages，无法真正走 npm 更新流程。
-		if (options.offline !== false) env.PI_OFFLINE = "1";
 		return new Promise<string>((resolve, reject) => {
 			execFile(
 				invocation.command,
