@@ -121,17 +121,19 @@ const LOGO_TIMING = {
 	loopGapMs: 120,
 };
 
-/** 定格后的分子 O 几何（y:x）— omp 品牌标识 */
+/** 定格后的 π+插头（y:x）— omp 品牌标识 */
 const FINAL_LOGO = [
-	"1:2", "1:3", "1:4", "1:5",
-	"2:1", "2:6",
-	"3:1", "3:3", "3:4", "3:5",
-	"4:1", "4:3", "4:4", "4:5",
-	"5:1", "5:6",
-	"6:2", "6:3", "6:4", "6:5",
+	"1:1", "1:2", "1:3", "1:4", "1:5", "1:6",
+	"2:1", "2:4",
+	"3:1", "3:4",
+	"4:1", "4:4",
+	"5:1", "5:4",
+	"6:1", "6:4", "6:5",
+	"7:1", "7:4", "7:5",
+	"8:1",
 ];
 
-const FINAL_LOGO_BOUNDS = { minX: 1, maxX: 6, minY: 1, maxY: 6 } as const;
+const FINAL_LOGO_BOUNDS = { minX: 1, maxX: 6, minY: 1, maxY: 8 } as const;
 
 function toCellKey(y: number, x: number) {
 	return `${y}:${x}`;
