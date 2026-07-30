@@ -12,7 +12,7 @@ import {
 import type { WslEnvironment } from "../wsl/WslPaths";
 
 /** pi 全局配置目录：~/.pi/agent/ */
-const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+const PI_AGENT_DIR = join(homedir(), ".omp", "agent");
 
 // ── models.json 结构 ──────────────────────────────────
 // { providers: { [providerName]: { baseUrl, api, apiKey, models: [...] } } }

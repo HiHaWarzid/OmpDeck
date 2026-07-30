@@ -87,7 +87,7 @@
   },
   "build": {
     "appId": "com.ayuayue.pi-desktop",
-    "productName": "PiDeck",
+    "productName": "OmpDeck",
     "asar": true,
     "compression": "maximum",
     "afterPack": "./scripts/after-pack-cleanup.js",

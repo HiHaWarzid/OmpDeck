@@ -42,8 +42,8 @@ export class SkillManager {
 		return [
 			{
 				id: "pi-global",
-				label: "~/.pi/agent/skills",
-				path: join(home, ".pi", "agent", "skills"),
+				label: "~/.omp/agent/skills",
+				path: join(home, ".omp", "agent", "skills"),
 				rootMarkdownEnabled: true,
 			},
 			{

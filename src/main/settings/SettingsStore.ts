@@ -11,7 +11,7 @@ function desktopSettingsPath() {
 
 /** pi agent 的 settings.json 路径（~/.pi/agent/settings.json） */
 function piAgentSettingsPath() {
-	return join(app.getPath("home"), ".pi", "agent", "settings.json");
+	return join(app.getPath("home"), ".omp", "agent", "settings.json");
 }
 
 /** 同步读取桌面 settings.json（app.ready 前可用）。文件缺失时返回空对象。 */

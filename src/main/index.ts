@@ -3036,7 +3036,7 @@ function registerIpc() {
 		return { converted, argumentHint, varCount: varMap.size };
 	}
 
-	/** 从 prompts.chat 导入 prompt 到本地 ~/.pi/agent/prompts/ */
+	/** 从 prompts.chat 导入 prompt 到本地 ~/.omp/agent/prompts/ */
 	ipcMain.handle(ipcChannels.promptStoreImport, async (_event, {
 		title,
 		description,
@@ -3783,7 +3783,7 @@ app.whenReady().then(async () => {
 	rpcLogger = new RpcLogger();
 	gitService = new GitService();
 	worktreeService = new WorktreeService();
-	piLocator = new PiLocator();
+	piLocator = new PiLocator("omp");
 	configManager = new ConfigManager();
 	promptManager = new PromptManager();
 	xuePromptManager = new XuePromptManager();
@@ -4085,8 +4085,8 @@ type PiDeckExtensionSyncResult =
 	| "missing-source";
 
 /**
- * 将 PiDeck 内置的 pi 扩展部署到用户扩展目录，使 pi 自动加载。
- * 启动时异步对比 resources 源文件与 ~/.pi/agent/extensions 目标：
+ * 将 PiDeck 内置的扩展部署到用户扩展目录。
+ * 启动时异步对比 resources 源文件与 ~/.omp/agent/extensions 目标：
  * - 目标不存在 → 安装
  * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
  * - 内容一致 → 跳过写盘

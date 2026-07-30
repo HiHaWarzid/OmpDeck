@@ -20,7 +20,7 @@ type ParsedCodexSession = {
 
 export class CodexSessionImporter {
 	private readonly codexRoot = join(app.getPath("home"), ".codex", "sessions");
-	private readonly piRoot = join(app.getPath("home"), ".pi", "agent", "sessions");
+	private readonly piRoot = join(app.getPath("home"), ".omp", "agent", "sessions");
 
 	async scan(projectPath: string): Promise<CodexSessionSummary[]> {
 		const files = await this.collectJsonl(this.codexRoot).catch(() => []);
@@ -204,7 +204,7 @@ export class CodexSessionImporter {
 			parentId,
 			timestamp,
 			provider: String(session.meta.model_provider ?? "codex"),
-			modelId: String(session.meta.model ?? "codex"),
+			model: `${String(session.meta.model_provider ?? "codex")}/${String(session.meta.model ?? "codex")}`,
 		});
 		parentId = modelChangeId;
 

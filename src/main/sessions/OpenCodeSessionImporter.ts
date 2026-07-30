@@ -38,7 +38,7 @@ type ParsedOpenCodeSession = {
 
 export class OpenCodeSessionImporter {
 	private readonly openCodeDb = join(app.getPath("home"), ".local", "share", "opencode", "opencode.db");
-	private readonly piRoot = join(app.getPath("home"), ".pi", "agent", "sessions");
+	private readonly piRoot = join(app.getPath("home"), ".omp", "agent", "sessions");
 
 	async scan(projectPath: string): Promise<OpenCodeSessionSummary[]> {
 		if (!existsSync(this.openCodeDb)) return [];
@@ -168,7 +168,7 @@ export class OpenCodeSessionImporter {
 			parentId,
 			timestamp,
 			provider: model.providerID || "opencode",
-			modelId: model.id || model.modelID || "opencode",
+			model: `${model.providerID || "opencode"}/${model.id || model.modelID || "opencode"}`,
 		});
 		parentId = modelChangeId;
 

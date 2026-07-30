@@ -67,7 +67,7 @@ export class PiProcess extends EventEmitter {
    */
   static warmVersionCache(
     settings?: PiProcessSettings,
-    locator: PiProcessLocator = new PiLocator(),
+    locator: PiProcessLocator = new PiLocator("omp"),
   ): Promise<boolean> {
     const command = locator.resolveCommand(
       settings?.customPiPath,
@@ -97,7 +97,7 @@ export class PiProcess extends EventEmitter {
   constructor(
     private readonly cwd: string,
     private readonly settings?: PiProcessSettings,
-    private readonly locator: PiProcessLocator = new PiLocator(),
+    private readonly locator: PiProcessLocator = new PiLocator("omp"),
     private readonly options: PiProcessOptions = {},
   ) {
     super();
@@ -137,8 +137,8 @@ export class PiProcess extends EventEmitter {
     if (this.settings?.piRpcNoExtensions) return [];
     const home = this.options.agentHomeDir?.trim() || homedir();
     const dirs = [
-      join(home, ".pi", "agent", "extensions"),
-      join(this.cwd, ".pi", "extensions"),
+      join(home, ".omp", "agent", "extensions"),
+      join(this.cwd, ".omp", "extensions"),
     ];
     const parked: ParkedExtension[] = [];
     for (const dir of dirs) {
@@ -159,14 +159,9 @@ export class PiProcess extends EventEmitter {
   async start(sessionPath?: string, trustOverride?: "approve" | "no-approve", noSession?: boolean) {
     if (this.proc) return this.rpc!;
 
-    // 信任确认由桌面端 AgentManager.ensureProjectTrust 在启动 pi 前完成，不再静默 --approve。
-    // pi 在 RPC 模式下 project_trust 事件 hasUI 恒为 false，故信任弹窗由桌面端自行处理。
+    // 信任确认由桌面端 AgentManager.ensureProjectTrust 在启动 agent 前完成。
+    // omp 在 RPC 模式下无 TUI，不需要主题/模型列表网络刷新。
     const args = ["--mode", "rpc"];
-    // RPC 无 TUI，不需要主题发现/加载；跳过可少扫用户/项目/package themes，加快冷启动。
-    // 内置 dark/light 仍可被扩展渲染路径按需使用，只是不扫盘加载自定义主题。
-    args.push("--no-themes");
-    // 桌面端模型列表来自本地 models.json；默认 --offline 跳过 pi 启动期模型目录网络刷新。
-    if (this.settings?.piRpcOffline !== false) args.push("--offline");
     // 诊断开关：坏扩展/技能有时会拖垮 RPC 初始化；用户可在开发设置临时关闭后重试。
     if (this.settings?.piRpcNoExtensions) args.push("--no-extensions");
     if (this.settings?.piRpcNoSkills) args.push("--no-skills");
@@ -182,23 +177,15 @@ export class PiProcess extends EventEmitter {
     }
 
     if (noSession) args.push("--no-session");
-    if (sessionPath) args.push("--session", sessionPath);
+    if (sessionPath) args.push("--resume", sessionPath);
 
     // 用户手动指定的 pi 路径优先于自动检测，解决 npm global、nvm 等路径未在 PATH 中的问题
     const command = this.locator.resolveCommand(this.settings?.customPiPath, this.settings?.wslEnabled, this.settings?.wslDistro, this.settings?.wslUser);
 
-    // 信任覆盖：用 --approve/--no-approve 覆盖 pi 的 trustStore 决策（本次生效，不落盘）。
-    // trust-session 用 --approve 让 pi 本次加载项目资源；deny 用 --no-approve 以不信任模式启动。
-    // --approve/--no-approve 从 pi 0.79.0 开始支持。对老版本 pi 不传递这些参数，
-    // 避免 "unknown option" 错误导致 RPC 进程启动失败。
-    if (trustOverride) {
-      await this.ensureVersionCheck(command);
-      const cached = PiProcess.versionCache.get(command);
-      if (cached?.status === "done" && PiProcess.versionSupportsTrustFlags(cached.minorVersion)) {
-        if (trustOverride === "approve") args.push("--approve");
-        else if (trustOverride === "no-approve") args.push("--no-approve");
-      }
-      // 版本不支持信任标志时静默跳过：老版本 pi 无 trust 系统，自动加载所有资源。
+    // omp 使用自身 trust/approval 系统，桌面端信任确认由 AgentManager 自行完成。
+    // omp RPC 模式下信任由 omp 自身管理，无需传递 trust 参数。
+    if (trustOverride === "approve") {
+      args.push("--auto-approve");
     }
 
     let spawnCwd = this.cwd;

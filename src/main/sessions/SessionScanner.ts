@@ -11,7 +11,7 @@ import { toWslLinuxPath, type WslEnvironment } from "../wsl/WslPaths";
 import { SessionSummaryCache, type SessionFileVersion } from "./sessionSummaryCache";
 
 export class SessionScanner {
-  private readonly root = join(app.getPath("home"), ".pi", "agent", "sessions");
+  private readonly root = join(app.getPath("home"), ".omp", "agent", "sessions");
   private readonly codexRoot = join(app.getPath("home"), ".codex", "sessions");
   /** WSL 配置由主进程统一解析；内部保留 home 字段以维持扫描代码的单一 Linux 路径语义。 */
   private wslConfig: { distro: string; user: string; home: string } | null = null;
@@ -21,7 +21,7 @@ export class SessionScanner {
   private summaryCacheFileSetKey = "";
   /**
    * 最近一次 list() 解析出的会话扫描根目录。
-   * 默认 ~/.pi/agent/sessions，加上 settings 中的 sessionDir（如项目 .pi/sessions）。
+   * 默认 ~/.omp/agent/sessions，加上 settings 中的 sessionDir（如项目 .pi/sessions）。
    * 供子会话父路径推断作为边界。
    */
   private activeScanRoots: string[] = [];
@@ -67,7 +67,7 @@ export class SessionScanner {
 
   /** WSL 中 pi 默认 session 目录（基于动态获取的 home） */
   private get wslSessionsDir(): string {
-    return `${this.wslConfig!.home}/.pi/agent/sessions`;
+    return `${this.wslConfig!.home}/.omp/agent/sessions`;
   }
 
   /** 当前环境下的默认会话根目录（全局 encoded-cwd 布局） */
@@ -236,7 +236,7 @@ export class SessionScanner {
       await this.summaryCache.ensureLoaded();
 
       // 扫描根 = 默认全局 sessions + 项目/全局 sessionDir（如 <project>/.pi/sessions）。
-      // pi 配置 sessionDir 后不再写 encoded-cwd 子目录，必须额外扫该路径。
+      // pi/omp 配置 sessionDir 后不再写 encoded-cwd 子目录，必须额外扫该路径。
       const scanRoots = await this.resolveScanRoots(projectPath, normalizedProjectPath);
       this.activeScanRoots = scanRoots;
 
@@ -315,8 +315,8 @@ export class SessionScanner {
     const projectRaw = await this.readSessionDirSettingLocal(projectSettingsPath);
 
     const globalRaw = this.wslConfig
-      ? await this.readSessionDirSettingWsl(`${this.wslConfig.home}/.pi/agent/settings.json`)
-      : await this.readSessionDirSettingLocal(join(app.getPath("home"), ".pi", "agent", "settings.json"));
+      ? await this.readSessionDirSettingWsl(`${this.wslConfig.home}/.omp/agent/settings.json`)
+      : await this.readSessionDirSettingLocal(join(app.getPath("home"), ".omp", "agent", "settings.json"));
 
     const raw = projectRaw ?? globalRaw;
     if (!raw) return undefined;
@@ -1156,8 +1156,8 @@ export class SessionScanner {
 
   private inferProjectPathFromFile(filePath: string) {
     const normalized = filePath.replace(/\\/g, "/");
-    // 默认布局：~/.pi/agent/sessions/<encoded-cwd>/...
-    const marker = "/.pi/agent/sessions/";
+    // 默认布局：~/.omp/agent/sessions/<encoded-cwd>/...
+    const marker = "/.omp/agent/sessions/";
     const index = normalized.toLowerCase().indexOf(marker);
     if (index !== -1) {
       const encoded = normalized.slice(index + marker.length).split("/")[0];

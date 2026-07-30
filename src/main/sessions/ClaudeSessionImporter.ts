@@ -24,7 +24,7 @@ type ParsedClaudeSession = {
 
 export class ClaudeSessionImporter {
 	private readonly claudeRoot = join(app.getPath("home"), ".claude", "projects");
-	private readonly piRoot = join(app.getPath("home"), ".pi", "agent", "sessions");
+	private readonly piRoot = join(app.getPath("home"), ".omp", "agent", "sessions");
 
 	async scan(projectPath: string): Promise<ClaudeSessionSummary[]> {
 		const projectDir = this.getClaudeProjectDir(projectPath);
@@ -187,7 +187,7 @@ export class ClaudeSessionImporter {
 			parentId,
 			timestamp,
 			provider: "anthropic",
-			modelId: "claude-sonnet-4",
+			model: "anthropic/claude-sonnet-4",
 		});
 		parentId = modelChangeId;
 

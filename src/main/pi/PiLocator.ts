@@ -32,6 +32,8 @@ export type PiCommandInvocation = {
 
 /** Resolves the pi CLI across packaged Electron environments where shell PATH is often incomplete. */
 export class PiLocator {
+  constructor(private readonly binaryName = "pi") {}
+
   /**
    * Resolves the pi CLI across packaged Electron environments where shell PATH is often incomplete.
    * When `customPath` is provided, it takes priority over auto-detection —
@@ -53,7 +55,7 @@ export class PiLocator {
     const candidates = this.getCandidates();
     const found = candidates.find(candidate => existsSync(candidate));
     if (found) return found;
-    return "pi";
+    return this.binaryName;
   }
 
   getSearchDirs() {
@@ -495,8 +497,10 @@ export class PiLocator {
   }
 
   private getCandidates() {
-    // Windows 不再自动检测 pi.ps1：PowerShell shim 与 .cmd 指向同一入口，但执行策略/编码/引号规则更复杂。
-    const names = process.platform === "win32" ? ["pi.cmd", "pi.exe", "pi"] : ["pi"];
+    // Windows 不再自动检测 pi.ps1/pio.ps1：PowerShell shim 与 .cmd 指向同一入口，但执行策略/编码/引号规则更复杂。
+    const names = process.platform === "win32"
+      ? [`${this.binaryName}.cmd`, `${this.binaryName}.exe`, this.binaryName]
+      : [this.binaryName];
     return this.getSearchDirs().flatMap(dir => names.map(name => join(dir, name)));
   }
 

@@ -173,12 +173,12 @@ export class PromptManager {
 	private promptsDir: string;
 
 	constructor(home?: string) {
-		this.promptsDir = join(home ?? homedir(), ".pi", "agent", "prompts");
+		this.promptsDir = join(home ?? homedir(), ".omp", "agent", "prompts");
 	}
 
 	/** 将 prompt 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
 	configureWsl(environment: WslEnvironment | null) {
-		this.promptsDir = join(environment?.windowsHome ?? homedir(), ".pi", "agent", "prompts");
+		this.promptsDir = join(environment?.windowsHome ?? homedir(), ".omp", "agent", "prompts");
 	}
 
 	getDir(): string {
