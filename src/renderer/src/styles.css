@@ -19993,6 +19993,7 @@ html[data-theme="dark"] .scratch-pad-md mark {
   margin: 0;
   flex-shrink: 0;
   align-items: center;
+  justify-content: center;
 }
 
 .chat-list-pane.v3-braun .sidebar-body .app-badge {
