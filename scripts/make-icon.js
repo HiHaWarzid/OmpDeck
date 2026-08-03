@@ -9,7 +9,7 @@ const svg = fs.readFileSync(path.join(__dirname, '..', 'build', 'icon.svg'), 'ut
 
 const out = path.join(__dirname, '..', 'build');
 const iconsDir = path.join(out, 'icons');
-const iconContentRatio = 0.875;
+const iconContentRatio = 0.92;
 const pngSizes = [16, 24, 32, 48, 64, 128, 256, 512, 1024];
 const icnsSources = [
   [16, 'icp4'],

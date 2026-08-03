@@ -555,13 +555,13 @@ export function App() {
       <div className="boot-screen root-loading">
         {/* 与 EmptyState / index.html 启动标同一 path，避免 LogoMark 再套一层不同底色 */}
         <div className="boot-logo root-loading-logo" aria-hidden="true">
-          <svg viewBox="140 140 520 520" width="48" height="48">
-            <path
-              fill="#fff"
-              fillRule="evenodd"
-              d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-            />
-            <path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
+          <svg viewBox="0 0 120 120" width="48" height="48">
+            <rect x="22" y="30" width="76" height="12" rx="2" fill="#000"/>
+            <rect x="34" y="42" width="12" height="52" rx="2" fill="#000"/>
+            <rect x="74" y="42" width="12" height="32" rx="2" fill="#000"/>
+            <rect x="64" y="68" width="28" height="22" rx="4" fill="#ff8c00"/>
+            <rect x="69" y="74" width="4" height="10" rx="1" fill="#fff"/>
+            <rect x="83" y="74" width="4" height="10" rx="1" fill="#fff"/>
           </svg>
         </div>
         <strong>OmpDeck</strong>
@@ -1362,7 +1362,7 @@ export function App() {
   const [webServiceChanging, setWebServiceChanging] = useState(false);
   const [appInfo, setAppInfo] = useState<AppInfo>({
     version: "-",
-    releasesUrl: "https://github.com/HiHaWarzid/OmpDeck/releases",
+    releasesUrl: "https://github.com/HiHaWarzid/OmpDeck",
     platform: "win32",
     homeDir: "",
   });

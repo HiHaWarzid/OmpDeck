@@ -30,6 +30,8 @@ import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
 import iconPath from "../../build/icon.png?asset";
+// 托盘图标使用预渲染的小尺寸 PNG，避免从 512x512 下采样导致模糊
+import trayIconPath from "../../build/icons/32x32.png?asset";
 
 applyLinuxDisplayBackendWorkaround();
 
@@ -275,9 +277,12 @@ function applyNativeThemeSource(settings: AppSettings) {
 	nativeTheme.themeSource = settings.theme === "system" ? "system" : settings.theme;
 }
 
-const RELEASES_URL = "https://github.com/HiHaWarzid/OmpDeck/releases";
+const RELEASES_URL = "https://github.com/HiHaWarzid/OmpDeck";
 const LATEST_RELEASE_API =
 	"https://api.github.com/repos/HiHaWarzid/OmpDeck/releases/latest";
+// GitHub API 认证：设置 GITHUB_TOKEN 环境变量可提升请求限额（5000次/小时→5000次/小时），
+// 避免国内网络下因限频（403）导致检查更新失败。
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.PI_DECK_GITHUB_TOKEN ?? "";
 const POSTHOG_PROJECT_KEY =
 	process.env.POSTHOG_PROJECT_KEY ??
 	"phc_xgJ8gFUMgExZEEPzZ7VRa7698ENcaDRquWZVGYb2dCFK";
@@ -486,12 +491,14 @@ async function checkForAppUpdate(
 ): Promise<AppUpdateInfo> {
 	const currentVersion = app.getVersion();
 	void appLogger.info("update", "Check for app update", { currentVersion, installationType });
-	const response = await fetch(LATEST_RELEASE_API, {
-		headers: {
-			Accept: "application/vnd.github+json",
-			"User-Agent": `OmpDeck/${currentVersion}`,
-		},
-	});
+	const headers: Record<string, string> = {
+		Accept: "application/vnd.github+json",
+		"User-Agent": `OmpDeck/${currentVersion}`,
+	};
+	if (GITHUB_TOKEN) {
+		headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+	}
+	const response = await fetch(LATEST_RELEASE_API, { headers });
 	if (!response.ok) {
 		throw new Error(`GitHub Release 检查失败：HTTP ${response.status}`);
 	}
@@ -645,10 +652,9 @@ function handleVersionFocusRequest() {
 focusExistingWindow = handleVersionFocusRequest;
 
 function setupTray() {
-	// iconPath 由 electron-vite 的 ?asset 后缀自动解析，打包后也能正确定位
-	const icon = nativeImage.createFromPath(iconPath);
-	tray = new Tray(icon.resize({ width: 16, height: 16 }));
-	tray.setToolTip("PiDeck");
+	// 托盘图标：直接使用预渲染 32x32 PNG，高 DPI 下清晰；不额外 resize 以免模糊
+	tray = new Tray(nativeImage.createFromPath(trayIconPath));
+	tray.setToolTip("OmpDeck");
 
 	// 双击托盘图标恢复窗口（Windows 常见交互）
 	tray.on("double-click", () => {

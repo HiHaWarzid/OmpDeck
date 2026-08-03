@@ -20,7 +20,6 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
-import { PiLogoCanvas } from "./PiLogoCanvas";
 import {
 	summarizeMessage,
 	type ToolGroupItem,
@@ -1613,11 +1612,6 @@ function formatCompact(value?: number | null) {
 	return String(value);
 }
 
-/** PiDeck 品牌几何路径（与 boot / Agent 头像共用，勿随意改形） */
-const PI_LOGO_PATH_MAIN =
-	"M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z";
-const PI_LOGO_PATH_CORNER = "M517.36 400H634.72V634.72H517.36Z";
-
 /**
  * 侧栏 Agent 状态圆点（对齐最近会话列表风格）：
  * idle=实心蓝点；starting=灰色转圈；running=实心黄点；error=实心红点；closed=灰色静默点。
@@ -1641,35 +1635,35 @@ export function AgentStatusIndicator(props: { status: string }) {
 export function LogoMark() {
 	return (
 		<div className="logo-mark" aria-label={t("app.logoLabel")}>
-			<svg viewBox="140 140 520 520" width="22" height="22" aria-hidden="true">
-				<path
-					fill="#fff"
-					fillRule="evenodd"
-					d={PI_LOGO_PATH_MAIN}
-				/>
-				<path fill="#fff" d={PI_LOGO_PATH_CORNER} />
+			<svg viewBox="0 0 120 120" width="24" height="24" aria-hidden="true">
+				<rect x="22" y="30" width="76" height="12" rx="2" fill="#000"/>
+				<rect x="34" y="42" width="12" height="52" rx="2" fill="#000"/>
+				<rect x="74" y="42" width="12" height="32" rx="2" fill="#000"/>
+				<rect x="64" y="68" width="28" height="22" rx="4" fill="#ff8c00"/>
+				<rect x="69" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
+				<rect x="83" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
 			</svg>
 		</div>
 	);
 }
 
-// 官方 pi 风格 canvas logo（侧栏可点击重播）
-export { PiLogoCanvas } from "./PiLogoCanvas";
 
 /**
  * 侧栏品牌 lockup：π 标 + PiDeck 字标，垂直居中平齐。
  * replayToken 由 App 在 agent 启动/关闭时递增，驱动 logo 重播拼装动画。
  */
-export function BrandLockup(props: { replayToken?: number } = {}) {
+export function BrandLockup(_props: { replayToken?: number } = {}) {
 	return (
 		<div className="brand-lockup" aria-label="OmpDeck">
-			{/* 34px：比字标略大，仍保持侧栏紧凑 */}
-			<PiLogoCanvas
-				size={34}
-				autoPlay
-				playOnClick
-				replayToken={props.replayToken}
-			/>
+			{/* 44px SVG π — 细版匹配托盘图标 */}
+			<svg viewBox="0 0 120 120" width="45" height="45" aria-hidden="true">
+				<rect x="22" y="30" width="76" height="12" rx="2" fill="#000"/>
+				<rect x="34" y="42" width="12" height="52" rx="2" fill="#000"/>
+				<rect x="74" y="42" width="12" height="32" rx="2" fill="#000"/>
+				<rect x="64" y="68" width="28" height="22" rx="4" fill="#ff8c00"/>
+				<rect x="69" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
+				<rect x="83" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
+			</svg>
 			<span className="brand-wordmark" aria-hidden="true">
 				OmpDeck
 			</span>
@@ -1695,13 +1689,13 @@ export function ProjectAvatar(props: { name: string; kind?: "chat" | "project" }
 export function AgentAvatar(props: { status: string }) {
 	return (
 		<div className={`conversation-avatar agent-avatar ${props.status}`}>
-			<svg viewBox="140 140 520 520" width="28" height="28" aria-hidden="true">
-				<path
-					fill="#fff"
-					fillRule="evenodd"
-					d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-				/>
-				<path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
+			<svg viewBox="0 0 120 120" width="28" height="28" aria-hidden="true">
+				<rect x="22" y="30" width="76" height="12" rx="2" fill="#000"/>
+				<rect x="34" y="42" width="12" height="52" rx="2" fill="#000"/>
+				<rect x="74" y="42" width="12" height="32" rx="2" fill="#000"/>
+				<rect x="64" y="68" width="28" height="22" rx="4" fill="#ff8c00"/>
+				<rect x="69" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
+				<rect x="83" y="74" width="4" height="10" rx="1" fill="var(--color-bg-sidebar)"/>
 			</svg>
 		</div>
 	);
@@ -1712,24 +1706,24 @@ export function EmptyState(props: { hasProject: boolean; onCreate: () => void })
 		<div className="empty-state">
 			<div className="empty-logo">
 				<svg
-					viewBox="140 140 520 520"
-					width="66"
-					height="66"
+					viewBox="0 0 120 120"
+					width="168"
+					height="168"
 					aria-hidden="true"
 				>
-					<path
-						fill="#fff"
-						fillRule="evenodd"
-						d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-					/>
-					<path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
+					<rect x="22" y="31" width="76" height="10" rx="2" fill="#000"/>
+					<rect x="35" y="41" width="10" height="52" rx="2" fill="#000"/>
+					<rect x="75" y="41" width="10" height="32" rx="2" fill="#000"/>
+					<rect x="65" y="67" width="28" height="22" rx="4" fill="#ff8c00"/>
+					<rect x="70" y="73" width="4" height="10" rx="1" fill="var(--color-bg-app)"/>
+					<rect x="84" y="73" width="4" height="10" rx="1" fill="var(--color-bg-app)"/>
 				</svg>
 			</div>
-			<div className="empty-tagline" aria-label={`${t("app.emptyTaglineLine1")} ${t("app.emptyTaglineLine2Prefix")}${t("app.emptyTaglineYours")}`}>
-				<span>{t("app.emptyTaglineLine1")}</span>
+			<div className="empty-tagline" aria-label="A coding agent with the IDE wired in." style={{ fontWeight: 350 }}>
+				<span>A coding agent</span>
 				<span>
-					{t("app.emptyTaglineLine2Prefix")}
-					<em className="empty-tagline-yours">{t("app.emptyTaglineYours")}</em>
+					<span style={{ color: "var(--color-text-tertiary)", fontFamily: "var(--font-display)", fontStyle: "italic" }}>with the </span>
+					<span style={{ color: "oklch(0.29 0.11 346.85 / 1)" }}>IDE wired in.</span>
 				</span>
 			</div>
 			<p className="empty-subtitle">

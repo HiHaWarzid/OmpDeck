@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
@@ -91,17 +92,112 @@ export class ConfigManager {
 	/** 将配置目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
 	configureWsl(environment: WslEnvironment | null) {
 		this.configDir = environment
-			? join(environment.windowsHome, ".pi", "agent")
+			? join(environment.windowsHome, ".omp", "agent")
 			: PI_AGENT_DIR;
 	}
 
 	// ── 读取 ──────────────────────────────────────────────
 
 	async getModelsConfig(): Promise<ConfigFileReadResult<PiModelsFile>> {
+		// 优先读 models.json；不存在时从 models.yml 回退
+		const jsonPath = join(this.configDir, "models.json");
+		if (!existsSync(jsonPath)) {
+			const ymlResult = await this.readModelsYml();
+			if (ymlResult.parsed) {
+				// 同时写一份 models.json 供后续使用
+				this.writeJsonFile("models.json", ymlResult.parsed).catch(() => undefined);
+			}
+			return ymlResult;
+		}
 		return this.readJsonFile<PiModelsFile>("models.json", { providers: {} });
 	}
 
+	/** 回退：从 models.yml 解析为 PiModelsFile（简单缩进 YAML，不支持嵌套数组/对象以外的复杂结构） */
+	private async readModelsYml(): Promise<ConfigFileReadResult<PiModelsFile>> {
+		try {
+			const ymlPath = join(this.configDir, "models.yml");
+			const raw = await readFile(ymlPath, "utf-8");
+			const parsed = this.parseSimpleYaml(raw);
+			return { raw, parsed };
+		} catch {
+			return { raw: "", parsed: { providers: {} } };
+		}
+	}
+
+	/**
+	 * 解析 OMP models.yml 的简单缩进结构。
+	 * 只处理 providers -> providerName -> fields/models 两级嵌套。
+	 * 不支持数组嵌套对象以外的复杂 YAML。
+	 */
+	private parseSimpleYaml(raw: string): PiModelsFile {
+		const lines = raw.split("\n");
+		const result: PiModelsFile = { providers: {} };
+		let currentProvider: string | null = null;
+		let currentModel: Partial<PiModelItem> | null = null;
+		const models: PiModelItem[] = [];
+
+		for (const line of lines) {
+			const trimmed = line.trimEnd();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+
+			const indent = line.length - line.trimStart().length;
+			// Strip YAML array prefix `- ` at array-item indent levels
+			const content = trimmed.startsWith("- ") ? trimmed.slice(2) : trimmed;
+			const match = content.match(/^(\S[^:]*):\s*(.*)$/);
+			if (!match) continue;
+
+			const key = match[1].trim();
+			const value = match[2].trim();
+
+			if (indent === 0 && key === "providers") {
+				currentProvider = null;
+			} else if (indent === 2 && currentProvider === null) {
+				currentProvider = key;
+				result.providers[currentProvider] = { models: [] };
+			} else if (currentProvider && indent === 4) {
+				if (key === "models") {
+					// models array starts next line
+				} else if (value) {
+					(result.providers[currentProvider] as Record<string, unknown>)[key] = this.parseYamlValue(value);
+				}
+			} else if (currentProvider && indent === 6) {
+				if (currentModel) models.push(currentModel as PiModelItem);
+				currentModel = { id: key };
+				if (value) (currentModel as Record<string, unknown>)[key] = this.parseYamlValue(value);
+			} else if (currentProvider && indent === 8 && currentModel) {
+				(currentModel as Record<string, unknown>)[key] = this.parseYamlValue(value);
+			}
+		}
+		if (currentModel) models.push(currentModel as PiModelItem);
+		if (currentProvider) {
+			result.providers[currentProvider].models = models;
+		}
+		return result;
+	}
+
+	private parseYamlValue(value: string): unknown {
+		if (value === "true") return true;
+		if (value === "false") return false;
+		if (/^\d+$/.test(value)) return Number(value);
+		if (value.startsWith("\"") && value.endsWith("\"")) return value.slice(1, -1);
+		return value;
+	}
+
 	async getAuthConfig(): Promise<ConfigFileReadResult<PiAuthFile>> {
+		const jsonPath = join(this.configDir, "auth.json");
+		if (!existsSync(jsonPath)) {
+			// 从 models.yml 提取 apiKey 回退
+			const modelsResult = await this.readModelsYml();
+			if (modelsResult.parsed.providers && Object.keys(modelsResult.parsed.providers).length > 0) {
+				const auth: PiAuthFile = {};
+				for (const [provider, config] of Object.entries(modelsResult.parsed.providers)) {
+					if (config.apiKey) {
+						auth[provider] = { type: "api_key", key: config.apiKey };
+					}
+				}
+				return { raw: modelsResult.raw, parsed: auth };
+			}
+		}
 		return this.readJsonFile<PiAuthFile>("auth.json", {});
 	}
 
@@ -193,12 +289,65 @@ export class ConfigManager {
 		const validation = this.validateModels(data);
 		if (!validation.valid) return validation;
 		// 保存前统一迁移历史别名，确保写入 models.json 的 api 名称能被 pi 官方 registry 识别。
-		await this.writeJsonFile("models.json", this.normalizeModelsForPi(data));
+		const normalized = this.normalizeModelsForPi(data);
+		await this.writeJsonFile("models.json", normalized);
+		// 同步更新 models.yml 保持 OMP 配置一致
+		await this.writeModelsYml(normalized).catch(() => undefined);
 		return { valid: true };
+	}
+
+	/** 将 models 数据写成 OMP models.yml 格式 */
+	private async writeModelsYml(data: PiModelsFile): Promise<void> {
+		const lines: string[] = ["providers:"];
+		for (const [name, provider] of Object.entries(data.providers)) {
+			lines.push(`  ${this.escapeYmlKey(name)}:`);
+			if (provider.baseUrl) lines.push(`    baseUrl: ${this.escapeYmlValue(provider.baseUrl)}`);
+			if (provider.apiKey) lines.push(`    apiKey: ${this.escapeYmlValue(provider.apiKey)}`);
+			if (provider.api) lines.push(`    api: ${this.escapeYmlValue(provider.api)}`);
+			if (provider.models?.length) {
+				lines.push(`    models:`);
+				for (const model of provider.models) {
+					lines.push(`      - id: ${this.escapeYmlValue(model.id)}`);
+					if (model.name) lines.push(`        name: ${this.escapeYmlValue(model.name)}`);
+					if (model.reasoning) lines.push(`        reasoning: true`);
+					if (model.contextWindow) lines.push(`        contextWindow: ${model.contextWindow}`);
+					if (model.maxTokens) lines.push(`        maxTokens: ${model.maxTokens}`);
+				}
+			}
+		}
+		await writeFile(join(this.configDir, "models.yml"), lines.join("\n") + "\n", "utf-8");
+	}
+
+	private escapeYmlKey(key: string): string {
+		return /[:\[\]{}#]|^\s/.test(key) ? `"${key}"` : key;
+	}
+
+	private escapeYmlValue(value: string | number | boolean): string {
+		if (typeof value === "number" || typeof value === "boolean") return String(value);
+		if (/[:\[\]{}#"']|\s|^$/.test(value)) return JSON.stringify(value);
+		return value;
 	}
 
 	async saveAuthConfig(data: PiAuthFile): Promise<ConfigValidationResult> {
 		await this.writeJsonFile("auth.json", data);
+		// 同步更新 models.json 中的 apiKey，确保 OMP models.yml 与 auth 一致
+		try {
+			const modelsPath = join(this.configDir, "models.json");
+			if (existsSync(modelsPath)) {
+				const modelsRaw = await readFile(modelsPath, "utf-8");
+				const models = JSON.parse(modelsRaw) as PiModelsFile;
+				let changed = false;
+				for (const [provider, authEntry] of Object.entries(data)) {
+					if (models.providers[provider] && authEntry.key) {
+						models.providers[provider].apiKey = authEntry.key;
+						changed = true;
+					}
+				}
+				if (changed) await writeFile(modelsPath, JSON.stringify(models, null, 2), "utf-8");
+			}
+		} catch {
+			// 同步失败不影响 auth 保存
+		}
 		return { valid: true };
 	}
 
@@ -230,6 +379,15 @@ export class ConfigManager {
 		}
 
 		await this.writeJsonFile(fileName, rawJson);
+		// models.json 原始编辑后同步更新 models.yml
+		if (fileName === "models.json") {
+			try {
+				const data = JSON.parse(rawJson) as PiModelsFile;
+				await this.writeModelsYml(data);
+			} catch {
+				// YAML 同步失败不影响 JSON 保存
+			}
+		}
 		return { valid: true };
 	}
 
