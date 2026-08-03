@@ -219,8 +219,9 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 				.map((message) => stripAnsi(message.thinking ?? ""))
 				.filter(Boolean)
 				.join("\n\n"),
-			startedAt: currentThinking[0]?.timestamp ?? runStartedAt,
+			startedAt: currentThinking[0]?.thinkingStartedAt ?? currentThinking[0]?.timestamp ?? runStartedAt,
 			endedAt:
+				currentThinking[currentThinking.length - 1]?.thinkingEndedAt ??
 				currentThinking[currentThinking.length - 1]?.timestamp ?? runEndedAt,
 		};
 		if (previous?.kind === "thinking-group") {
@@ -493,18 +494,17 @@ export type SuggestionItem = {
 
 /* ── 命令管理 ── */
 
-const PINNED_COMMAND_NAMES = new Set<string>();
-const HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES = new Set([
-	"new",
-	"model",
-	"resume",
-	"fork",
-	"name",
-	"logout",
-	"goal",
-	"tree",
-	"reload",
-]);
+/**
+ * 桌面有专用 UI 承载、无需在斜线命令建议中暴露的内置命令。
+ * `model`：桌面有模型选择器（model picker），重复暴露会造成两个入口不一致。
+ */
+const HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES: Record<string, true> = { model: true };
+
+/**
+ * 置顶命令名（暂空）：预留用于将特定内置命令在建议列表中提前。
+ * 当前无置顶项，排序退化为原始 index 顺序。
+ */
+const PINNED_COMMAND_NAMES: Record<string, true> = {};
 
 function isBuiltinDesktopCommand(command: PiCommand) {
 	return command.source == null || command.source === "builtin";
@@ -513,24 +513,59 @@ function isBuiltinDesktopCommand(command: PiCommand) {
 function isVisibleDesktopCommand(command: PiCommand) {
 	return !(
 		isBuiltinDesktopCommand(command) &&
-		HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES.has(command.name.toLowerCase())
+		Boolean(HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES[command.name.toLowerCase()])
 	);
 }
 
+/**
+ * omp runtime 内置斜线命令清单（仅含 RPC 可执行命令）。
+ * 在 RPC `prompt` 链路下真正可执行的内置命令--即 builtin-registry.ts 中
+ * 定义了 `handle`（非 `handleTui`-only）的命令。`handleTui`-only 命令
+ * （如 /plan、/goal、/vibe、/login）在 RPC 模式下不会被 runtime 拦截，
+ * 只会当普通文本发给 LLM，因此不列入，避免误导用户。
+ *
+ * description 取自 omp runtime 的 acpDescription/description（英文），
+ * 与 runtime 返回的 extension/skill 命令描述语言保持一致。
+ * 用户敲这些命令时，runtime 会通过 executeAcpBuiltinSlashCommand 执行，
+ * 而非发给模型。
+ */
 function getBuiltinCommands(): PiCommand[] {
 	return [
-		{ name: "session", description: "", source: "builtin" },
-		{ name: "tree", description: "", source: "builtin" },
-		{ name: "clone", description: "", source: "builtin" },
-		{ name: "compact", description: "", source: "builtin" },
-		{ name: "copy", description: "", source: "builtin" },
-		{ name: "export", description: "", source: "builtin" },
-		{ name: "share", description: "", source: "builtin" },
-		{ name: "settings", description: "", source: "builtin" },
-		{ name: "reload", description: "", source: "builtin" },
-		{ name: "hotkeys", description: "", source: "builtin" },
-		{ name: "login", description: "", source: "builtin" },
-		{ name: "logout", description: "", source: "builtin" },
+		{ name: "session", description: "Show or configure the current session", source: "builtin" },
+		{ name: "compact", description: "Manually compact the session context", source: "builtin" },
+		{ name: "export", description: "Export session to HTML file", source: "builtin" },
+		{ name: "dump", description: "Copy session transcript to clipboard", source: "builtin" },
+		{ name: "share", description: "Share session via an encrypted link", source: "builtin" },
+		{ name: "copy", description: "Pick text or code from the conversation to copy", source: "builtin" },
+		{ name: "tools", description: "Show tools currently visible to the agent", source: "builtin" },
+		{ name: "context", description: "Show estimated context usage breakdown", source: "builtin" },
+		{ name: "todo", description: "View or modify the agent's todo list", source: "builtin" },
+		{ name: "jobs", description: "Show async background jobs status", source: "builtin" },
+		{ name: "usage", description: "Show provider usage and limits", source: "builtin" },
+		{ name: "stats", description: "Launch the local stats dashboard", source: "builtin" },
+		{ name: "changelog", description: "Show changelog entries", source: "builtin" },
+		{ name: "hotkeys", description: "Show all keyboard shortcuts", source: "builtin" },
+		{ name: "settings", description: "Open settings menu", source: "builtin" },
+		{ name: "mcp", description: "Manage MCP servers (add, list, remove, test)", source: "builtin" },
+		{ name: "ssh", description: "Manage SSH hosts (add, list, remove)", source: "builtin" },
+		{ name: "marketplace", description: "Manage marketplace plugin sources and installed plugins", source: "builtin" },
+		{ name: "plugins", description: "View and manage installed plugins", source: "builtin" },
+		{ name: "reload-plugins", description: "Reload all plugins (skills, commands, hooks, tools, agents, MCP)", source: "builtin" },
+		{ name: "memory", description: "Inspect and operate memory maintenance", source: "builtin" },
+		{ name: "fast", description: "Toggle priority service tier", source: "builtin" },
+		{ name: "computer", description: "Toggle the native computer-use tool for this session", source: "builtin" },
+		{ name: "vision", description: "Control the inspect_image vision-delegation tool", source: "builtin" },
+		{ name: "prewalk", description: "Switch to a fast/cheap model at the next action", source: "builtin" },
+		{ name: "advisor", description: "Toggle the advisor (a second model that reviews each turn)", source: "builtin" },
+		{ name: "browser", description: "Toggle browser headless vs visible mode", source: "builtin" },
+		{ name: "fresh", description: "Reset provider stream state without changing the local transcript", source: "builtin" },
+		{ name: "shake", description: "Drop heavy content from context (tool results, large blocks)", source: "builtin" },
+		{ name: "rename", description: "Rename the current session", source: "builtin" },
+		{ name: "move", description: "Move the current session to a different directory", source: "builtin" },
+		{ name: "add-dir", description: "Add a workspace directory to this session (multi-root)", source: "builtin" },
+		{ name: "remove-dir", description: "Remove a workspace directory from this session", source: "builtin" },
+		{ name: "dirs", description: "List this session's workspace directories", source: "builtin" },
+		{ name: "force", description: "Force next turn to use a specific tool", source: "builtin" },
 	];
 }
 
@@ -655,8 +690,8 @@ export function buildSuggestionItems(
 			.map((command, index) => ({ command, index }))
 			.filter(({ command }) => command.name.toLowerCase().includes(keyword))
 			.sort((a, b) => {
-				const aPinned = PINNED_COMMAND_NAMES.has(a.command.name);
-				const bPinned = PINNED_COMMAND_NAMES.has(b.command.name);
+				const aPinned = Boolean(PINNED_COMMAND_NAMES[a.command.name]);
+				const bPinned = Boolean(PINNED_COMMAND_NAMES[b.command.name]);
 				if (aPinned !== bPinned) return aPinned ? -1 : 1;
 				return a.index - b.index;
 			})
