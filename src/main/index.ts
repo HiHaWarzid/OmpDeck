@@ -12,7 +12,7 @@ import {
 } from "electron";
 import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
-import { createWriteStream, existsSync } from "node:fs";
+import { copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { is } from "@electron-toolkit/utils";
@@ -35,13 +35,45 @@ import iconPath from "../../build/icon.png?asset";
 import trayIconPath from "../../build/icons/32x32.png?asset";
 
 // 开发态与正式版隔离 userData。
-// 否则 npm run dev 会与已安装的 PiDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
+// 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
 // 必须在读取 settings / 版本单实例锁之前设置。
 if (!app.isPackaged) {
 	const baseUserData = app.getPath("userData");
 	// 仅在尚未指向 *-dev 时追加，避免重复拼接。
-	if (!/[\\/]pi-desktop-dev$/i.test(baseUserData) && !/dev$/i.test(baseUserData)) {
+	// 同时兼容历史 rebrand 前的 pi-desktop-dev，避免改名后历史数据「凭空消失」。
+	if (!/[\\/]omp-deck-dev$/i.test(baseUserData) && !/[\\/]pi-desktop-dev$/i.test(baseUserData) && !/dev$/i.test(baseUserData)) {
 		app.setPath("userData", `${baseUserData}-dev`);
+	}
+	// 一次性迁移：rebrand（pi-desktop -> omp-deck）导致 dev userData 路径变更，
+	// 旧数据留在 pi-desktop-dev。新目录首次启动时从旧目录整体拷入，保留项目列表/设置/会话缓存。
+	// 迁移成功后写入 .migrated-from-pi-desktop 标记，避免重复迁移。
+	const currentDev = app.getPath("userData");
+	const legacyDev = currentDev.replace(/[\\/]omp-deck-dev$/i, "\\pi-desktop-dev");
+	const migratedFlag = join(currentDev, ".migrated-from-pi-desktop");
+	if (
+		/[\\/]omp-deck-dev$/i.test(currentDev) &&
+		existsSync(legacyDev) &&
+		!existsSync(migratedFlag)
+	) {
+		try {
+			mkdirSync(currentDev, { recursive: true });
+			const legacyEntries = readdirSync(legacyDev);
+			for (const entry of legacyEntries) {
+				const src = join(legacyDev, entry);
+				const dest = join(currentDev, entry);
+				if (existsSync(dest)) continue; // 不覆盖已有文件（如本次刚写入的锁文件）
+				const entryStat = statSync(src);
+				if (entryStat.isDirectory()) {
+					cpSync(src, dest, { recursive: true });
+				} else {
+					copyFileSync(src, dest);
+				}
+			}
+			writeFileSync(migratedFlag, new Date().toISOString(), "utf8");
+			console.log(`[OmpDeck] 一次性迁移：已从 ${legacyDev} 恢复历史数据到 ${currentDev}`);
+		} catch (error) {
+			console.error("[OmpDeck] 历史数据迁移失败，请手动从 pi-desktop-dev 恢复:", error);
+		}
 	}
 }
 
@@ -286,6 +318,9 @@ function applyNativeThemeSource(settings: AppSettings) {
 const RELEASES_URL = "https://github.com/HiHaWarzid/OmpDeck";
 const LATEST_RELEASE_API =
 	"https://api.github.com/repos/HiHaWarzid/OmpDeck/releases/latest";
+// Fork 仓库尚未发布 Release 时回退到上游 PiDeck 检查，避免 404 导致检查更新始终失败。
+const UPSTREAM_LATEST_RELEASE_API =
+	"https://api.github.com/repos/ayuayue/PiDeck/releases/latest";
 // GitHub API 认证：设置 GITHUB_TOKEN 环境变量可提升请求限额（5000次/小时→5000次/小时），
 // 避免国内网络下因限频（403）导致检查更新失败。
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.PI_DECK_GITHUB_TOKEN ?? "";
@@ -504,7 +539,13 @@ async function checkForAppUpdate(
 	if (GITHUB_TOKEN) {
 		headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
 	}
-	const response = await fetch(LATEST_RELEASE_API, { headers });
+	// Fork 仓库可能尚未发布 Release（404），此时回退到上游 PiDeck 检查，避免检查更新始终失败。
+	let response = await fetch(LATEST_RELEASE_API, { headers });
+	let releaseUrlFallback = RELEASES_URL;
+	if (!response.ok && response.status === 404) {
+		response = await fetch(UPSTREAM_LATEST_RELEASE_API, { headers });
+		releaseUrlFallback = "https://github.com/ayuayue/PiDeck";
+	}
 	if (!response.ok) {
 		throw new Error(`GitHub Release 检查失败：HTTP ${response.status}`);
 	}
@@ -528,7 +569,7 @@ async function checkForAppUpdate(
 		hasUpdate: compareVersions(latestVersion, currentVersion) > 0,
 		releaseName: release.name || `v${latestVersion}`,
 		releaseNotes: release.body || "",
-		releaseUrl: release.html_url || RELEASES_URL,
+		releaseUrl: release.html_url || releaseUrlFallback,
 		publishedAt: release.published_at,
 		assets,
 		recommendedAsset,
@@ -676,7 +717,7 @@ function setupTray() {
 		},
 		{ type: "separator" },
 		{
-			label: "退出 PiDeck",
+			label: "退出 OmpDeck",
 			click: () => {
 				isQuitting = true;
 				app.quit();
@@ -778,7 +819,7 @@ function printStartupInfo() {
 			"color: #8b5cf6; font-weight: bold;"
 		);
 		console.log(
-			"%c│                      PiDeck Desktop                      │",
+			"%c│                     OmpDeck Desktop                       │",
 			"color: #8b5cf6; font-weight: bold; font-size: 16px;"
 		);
 		console.log(
@@ -801,7 +842,7 @@ function printStartupInfo() {
 		console.log("%c  Persistent installationType: %c${persistentInstallationType}", "color: #6b7280;", "color: #8b5cf6; font-weight: bold;");
 		console.log("");
 		console.log("%c🐛 Found a bug? Report at:", "color: #6b7280;");
-		console.log("%c  https://github.com/ayuayue/PiDeck/issues", "color: #3b82f6; text-decoration: underline;");
+		console.log("%c  https://github.com/HiHaWarzid/OmpDeck/issues", "color: #3b82f6; text-decoration: underline;");
 		console.log("");
 		console.log("%c🎉 Easter egg: You found it! Thanks for exploring.", "color: #ec4899; font-weight: bold;");
 		console.log("");
@@ -1987,7 +2028,7 @@ function registerIpc() {
 				(entry) => normalizeForCompare(entry.path) === normalizedTarget,
 			);
 			// 如果 git 已经没有该 worktree（包括用户在外部删过导致 remove 返回 false），
-			// 也要清理 PiDeck 项目记录，否则重启后会从 projects.json 恢复成“删不掉”。
+			// 也要清理 OmpDeck 项目记录，否则重启后会从 projects.json 恢复成“删不掉”。
 			if (ok || !stillInGit) {
 				const child = projectStore.findByPath(worktreePath);
 				if (child) await projectStore.remove(child.id);
@@ -2482,23 +2523,25 @@ function registerIpc() {
 						resolve(stdout.trim());
 					});
 			});
-			// Step 2: 检查 pi 是否已安装
+			// Step 2: 检查 omp CLI 是否已安装（走 PiLocator 的 binaryName，避免硬编码 "pi"）
+			// 复用已实例化的 piLocator（binaryName="omp"），保证与 RPC 启动用的是同一个命令。
+			const ompCommand = piLocator instanceof PiLocator ? piLocator.binaryName : "omp";
 			let piVersion = "";
 			try {
 				piVersion = await new Promise<string>((resolve, reject) => {
-					execFile(wslExePath, ["-d", distro, "-u", user, "pi", "--version"],
+					execFile(wslExePath, ["-d", distro, "-u", user, ompCommand, "--version"],
 						{ encoding: "utf8", timeout: 10_000, windowsHide: true, shell: wslShell },
 						(err, stdout) => {
 							if (err) { reject(err); return; }
 							resolve(stdout.trim());
 						});
 				});
-			} catch { /* pi 未安装，piVersion 保持空 */ }
+			} catch { /* omp 未安装，piVersion 保持空 */ }
 			return {
 				ok: true,
 				whoami,
 				piVersion,
-				error: piVersion ? "" : "pi CLI 未安装 — 请在 WSL 中运行 npm i -g @earendil-works/pi",
+				error: piVersion ? "" : `omp CLI 未安装 - 请在 WSL 中运行 npm i -g @oh-my-pi/omp`,
 			};
 		} catch (err) {
 			return {
@@ -3282,7 +3325,7 @@ function registerIpc() {
 	});
 
 	ipcMain.handle(ipcChannels.extensionsRestoreBuiltIn, async (_event, source: string) => {
-		// 恢复内置扩展：从 PiDeck 移除标记中删除，并确保文件存在
+		// 恢复内置扩展：从 OmpDeck 移除标记中删除，并确保文件存在
 		await extensionManager.restoreBuiltIn(source);
 		await ensurePiDeckExtension(source, activeWslEnvironment?.windowsHome);
 		void appLogger.info("extension", "Built-in extension restored", { source });
@@ -4109,7 +4152,7 @@ async function ensurePiDeckExtension(
 	wslHome?: string,
 ): Promise<PiDeckExtensionSyncResult> {
 	const home = wslHome ?? app.getPath("home");
-	const extensionsDir = join(home, ".pi", "agent", "extensions");
+	const extensionsDir = join(home, ".omp", "agent", "extensions");
 	const targetPath = join(extensionsDir, extensionName);
 
 	// 获取源文件路径：开发模式下在 resources/ 目录，打包后通过 process.resourcesPath 访问
@@ -4119,7 +4162,7 @@ async function ensurePiDeckExtension(
 
 	const sourceContent = await readFile(sourcePath, "utf-8").catch(() => null);
 	if (!sourceContent) {
-		console.warn(`[PiDeck] Extension source not found: ${sourcePath}`);
+		console.warn(`[OmpDeck] Extension source not found: ${sourcePath}`);
 		void appLogger?.warn("extension", "Built-in extension source missing", {
 			extensionName,
 			sourcePath,
@@ -4136,7 +4179,7 @@ async function ensurePiDeckExtension(
 	const action: PiDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
 	await mkdir(extensionsDir, { recursive: true });
 	await writeFile(targetPath, sourceContent, "utf-8");
-	console.log(`[PiDeck] ${action === "installed" ? "Installed" : "Updated"} extension: ${targetPath}`);
+	console.log(`[OmpDeck] ${action === "installed" ? "Installed" : "Updated"} extension: ${targetPath}`);
 	void appLogger?.info("extension", `Built-in extension ${action}`, {
 		extensionName,
 		targetPath,
@@ -4148,14 +4191,14 @@ async function ensurePiDeckExtension(
 }
 
 /**
- * 删除已下线的 PiDeck 内置扩展残留文件（如 pi-deck-project-trust.ts）。
+ * 删除已下线的 OmpDeck 内置扩展残留文件（如 pi-deck-project-trust.ts）。
  * 用于扩展废弃后清理用户扩展目录，避免 pi 仍加载无效扩展造成误解。
  * rm 的 force 选项会在文件不存在时静默忽略。
  */
 async function removeStalePiDeckExtension(extensionName: string): Promise<void> {
 	const targetPath = join(app.getPath("home"), ".pi", "agent", "extensions", extensionName);
 	await rm(targetPath, { force: true });
-	console.log(`[PiDeck] Removed stale extension: ${targetPath}`);
+	console.log(`[OmpDeck] Removed stale extension: ${targetPath}`);
 }
 
 /**

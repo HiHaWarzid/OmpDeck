@@ -1,7 +1,7 @@
 /**
  * FeishuConnectDialog — 飞书 Bot 连接配置弹窗
  *
- * 遵循 PiDeck 设计系统：CSS 变量 + ui-button / modal 体系。
+ * 遵循 OmpDeck 设计系统：CSS 变量 + ui-button / modal 体系。
  * 仅支持手动配置（App ID + Secret）。
  */
 

@@ -108,7 +108,7 @@ export class FeishuBridge {
 	private unsubscribeLocalEvents: (() => void) | null = null;
 	// 哪些 session 是飞书发起的（不需要 session mirror）
 	private feishuSessions = new Set<string>();
-	/** 飞书消息触发中的运行，agent_end 期间不要再走 PiDeck 本地同步，避免文件/文本重复发送。 */
+	/** 飞书消息触发中的运行，agent_end 期间不要再走 OmpDeck 本地同步，避免文件/文本重复发送。 */
 	private feishuDrivenRuns = new Set<string>();
 
 	private lastUserMessageId = new Map<string, string>();
@@ -171,12 +171,12 @@ export class FeishuBridge {
 	/**
 	 * 移除绑定：取消飞书群与 Agent 的关联，清理会话级别的同步状态。
 	 * 注意：这不会停止 Agent 进程，只是取消飞书侧的关联关系。
-	 * Agent 在 PiDeck 中继续正常运行。
+	 * Agent 在 OmpDeck 中继续正常运行。
 	 */
 	removeBinding(chatId: string): boolean {
 		const binding = this.chatBindings.get(chatId);
 		if (!binding) return false;
-		// 仅取消绑定，不终止 Agent。Agent 在 PiDeck 中继续独立运行。
+		// 仅取消绑定，不终止 Agent。Agent 在 OmpDeck 中继续独立运行。
 		// 用户手动取消关联不应影响 Agent 的使用状态。
 		this.sessionToChat.delete(binding.sessionId);
 		this.feishuSessions.delete(binding.sessionId);
@@ -520,7 +520,7 @@ export class FeishuBridge {
 			}
 			case "/whoami":
 				await this.sendSmartMessage(chatId,
-					`你的 open_id: \`${userId}\`\n\n📋 你可以将此 ID 填入 PiDeck 飞书配置中的「你的 Open ID」字段，以便新建会话时自动拉你进群。`
+					`你的 open_id: \`${userId}\`\n\n📋 你可以将此 ID 填入 OmpDeck 飞书配置中的「你的 Open ID」字段，以便新建会话时自动拉你进群。`
 				);
 				// 将 open_id 推回前端，用于添加 Bot 时自动填入
 				try {
@@ -792,7 +792,7 @@ export class FeishuBridge {
 			}
 		}
 
-		// 只有用户显式手动连接过的 PiDeck 会话，才把 Agent 结果同步到飞书。
+		// 只有用户显式手动连接过的 OmpDeck 会话，才把 Agent 结果同步到飞书。
 		// 本轮若已由流式卡片交付（含交付中/刚成功），跳过纯文本，避免双消息。
 		if (
 			!this.feishuSessions.has(agentId) &&
@@ -866,7 +866,7 @@ export class FeishuBridge {
 		return this.sendFeishuFile(chatId, filePath);
 	}
 
-	/** 将 PiDeck 中的用户消息转发到飞书群（双向同步：Pi → 飞书） */
+	/** 将 OmpDeck 中的用户消息转发到飞书群（双向同步：OmpDeck -> 飞书） */
 	async forwardUserMessageToFeishu(agentId: string, text: string): Promise<void> {
 		if (!this.client || !text.trim()) return;
 		const chatId = this.getBestChatId(agentId);
@@ -878,8 +878,8 @@ export class FeishuBridge {
 			}
 			return;
 		}
-		// 带上 PiDeck 标识，方便在飞书中区分消息来源
-		await this.sendSmartMessage(chatId, `💻 **PiDeck**:\n${text}`);
+		// 带上 OmpDeck 标识，方便在飞书中区分消息来源
+		await this.sendSmartMessage(chatId, `💻 **OmpDeck**:\n${text}`);
 
 		// 检测用户是否要创建飞书文档，记下来等 Agent 回答完后自动创建
 		const docTitle = wantsFeishuDoc(text);
@@ -891,7 +891,7 @@ export class FeishuBridge {
 	private async createNewSession(ctx: FeishuMessageContext, _title?: string): Promise<void> {
 		const { chatId } = ctx;
 		const projects = this.getProjects();
-		if (projects.length === 0) { await this.sendSmartMessage(chatId, "❌ 请先在 PiDeck 中添加项目（工作区），然后重试。"); return; }
+		if (projects.length === 0) { await this.sendSmartMessage(chatId, "❌ 请先在 OmpDeck 中添加项目（工作区），然后重试。"); return; }
 		const projectId = projects[0].id;
 
 		try {
@@ -1244,7 +1244,7 @@ export class FeishuBridge {
 		const binding = this.chatBindings.get(ctx.chatId);
 		if (!binding) { await this.sendSmartMessage(ctx.chatId, "当前没有绑定的会话，请先发消息创建会话。"); return; }
 		const models = await this.agentManager.getAvailableModels(binding.sessionId).catch(() => [] as AvailableModel[]);
-		if (!models.length) { await this.sendSmartMessage(ctx.chatId, "没有可用模型。请先在 PiDeck 中配置模型。"); return; }
+		if (!models.length) { await this.sendSmartMessage(ctx.chatId, "没有可用模型。请先在 OmpDeck 中配置模型。"); return; }
 		const state = await this.agentManager.getRuntimeState(binding.sessionId).catch(() => undefined);
 		const current = state ? `${state.provider}/${state.modelId}` : "无";
 		await this.sendCardMessage(ctx.chatId, buildModelPickerCard({ current, models }));

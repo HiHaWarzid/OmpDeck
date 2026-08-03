@@ -66,7 +66,7 @@ import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
-import { THINKING_LEVELS } from "./components/app/AppParts";
+import { THINKING_LEVELS, ThinkingBlock } from "./components/app/AppParts";
 import {
   buildComposerPromptSubmission,
   expandPromptTemplates,
@@ -780,6 +780,10 @@ export function App() {
 
   const [streamingThinking, setStreamingThinking] = useState<
     Record<string, string>
+  >({});
+  /** 每个 agent 流式思考的开始时间戳（首次 thinking 到达时记录），用于实时显示思考耗时 */
+  const [streamingThinkingStartedAt, setStreamingThinkingStartedAt] = useState<
+    Record<string, number>
   >({});
   /** 每个 agent 最后一次会话的开始时间(status 变为 running 时记录),用 ref 避免 effect 闭包陈旧 */
   const sessionStartByAgentRef = useRef<Record<string, number>>({});
@@ -2410,13 +2414,23 @@ export function App() {
       }
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
-    const offThinking = api.agents.onThinking((payload: ThinkingUpdate) =>
+    const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
       setStreamingThinking((current) => ({
         ...current,
         [payload.agentId]: payload.thinking,
-      })),
-    );
-    // 主进程瞬时状态反馈（如 abort 已请求停止）走 toast，不进会话时间线
+      }));
+      // 首次收到非空 thinking 时记录开始时间；thinking 清空时清除
+      setStreamingThinkingStartedAt((current) => {
+        if (payload.thinking) {
+          if (current[payload.agentId] != null) return current;
+          return { ...current, [payload.agentId]: Date.now() };
+        }
+        if (current[payload.agentId] == null) return current;
+        const next = { ...current };
+        delete next[payload.agentId];
+        return next;
+      });
+    });
     const offNotice = api.agents.onNotice((payload) => {
       const text =
         payload.i18nKey
@@ -2459,7 +2473,7 @@ export function App() {
         });
         // agent 推送了新的 widget 内容，清除该 widget 的关闭标记使其重新显示
         // 使用与 onClose 一致的 sessionPath 作为 key，避免 key 不匹配导致关闭后无法恢复
-        // ref: https://github.com/ayuayue/PiDeck/issues/73
+        // ref: https://github.com/HiHaWarzid/OmpDeck/issues/73
         if (widgetLines.length > 0) {
           const dismissedTargetAgent = agentsRef.current.find(
             (a) => a.id === request.agentId,
@@ -4747,6 +4761,12 @@ export function App() {
       applyAgentRuntimeState(agentId, { ...previous, isStreaming: false });
     }
     setStreamingThinking((current) => {
+      if (!(agentId in current)) return current;
+      const next = { ...current };
+      delete next[agentId];
+      return next;
+    });
+    setStreamingThinkingStartedAt((current) => {
       if (!(agentId in current)) return current;
       const next = { ...current };
       delete next[agentId];
@@ -7763,9 +7783,11 @@ export function App() {
               {isAwaitingAssistant && (
                 <>
                   {settings.showThinking && activeThinking && (
-                    <section className="thinking-card">
-                      <div className="thinking-card-content">{activeThinking}</div>
-                    </section>
+                    <ThinkingBlock
+                      text={activeThinking}
+                      startedAt={activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined}
+                      showThinking={settings.showThinking}
+                    />
                   )}
                   {/* 工具执行中但消息尚未到达时，显示临时占位卡片，避免状态指示器亮了但页面空白。
                       runtimeState 在工具消息到达前就已更新 isExecutingTool，存在时序间隙。 */}

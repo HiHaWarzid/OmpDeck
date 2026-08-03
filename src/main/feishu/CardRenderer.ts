@@ -1,7 +1,7 @@
 /**
  * CardRenderer v5 — RunState → 飞书 interactive 卡片 JSON
  *
- * v5 设计简化，与 PiDeck 界面风格统一：
+ * v5 设计简化，与 OmpDeck 界面风格统一：
  * - 无彩色 header，无 hr 分割线，干净的消息流
  * - 活动轨迹紧凑排列，去掉标题
  * - 思考过程用小字，工具调用简洁

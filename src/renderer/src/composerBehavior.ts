@@ -10,7 +10,7 @@ import type { ComposerAgentMode } from "@shared/types";
 export const PI_DECK_PLAN_MODE_MARKER = "__PI_DECK_PLAN_MODE__";
 
 export type ComposerPromptSubmission = {
-	/** 用户在 PiDeck 时间线里看到的原始消息，不能包含桌面端内部控制标记。 */
+	/** 用户在 OmpDeck 时间线里看到的原始消息，不能包含桌面端内部控制标记。 */
 	message: string;
 	/** 仅发给 pi agent/extension 的隐藏消息，用于触发桌面端专属模式。 */
 	agentMessage?: string;

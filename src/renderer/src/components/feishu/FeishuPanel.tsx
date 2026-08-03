@@ -1,7 +1,7 @@
 /**
  * FeishuPanel — 侧边栏飞书面板
  *
- * 遵循 PiDeck 设计系统：CSS 变量 + ui-button / icon-button 体系。
+ * 遵循 OmpDeck 设计系统：CSS 变量 + ui-button / icon-button 体系。
  * 显示连接状态、Bot 信息、聊天绑定列表，提供连接/断开/管理操作。
  */
 

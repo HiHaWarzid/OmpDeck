@@ -3,7 +3,7 @@ import { CircleCheck, Info, TriangleAlert, XCircle, Loader2 } from "lucide-react
 import { useEffect, useState } from "react";
 
 /**
- * Sonner Toaster 封装，适配 PiDeck 主题系统。
+ * Sonner Toaster 封装，适配 OmpDeck 主题系统。
  *
  * 从 document.documentElement.dataset.theme 读取当前主题（"light" | "dark"），
  * 并监听变化同步更新。不依赖 next-themes。

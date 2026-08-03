@@ -32,7 +32,9 @@ export type PiCommandInvocation = {
 
 /** Resolves the pi CLI across packaged Electron environments where shell PATH is often incomplete. */
 export class PiLocator {
-  constructor(private readonly binaryName = "pi") {}
+  // 555798c 后桌面端统一对接 omp 后端；binaryName 默认 omp，供调用方读取命令名
+  // （如 WSL 健康检测）。实例化处仍可显式覆盖。
+  constructor(readonly binaryName = "omp") {}
 
   /**
    * Resolves the pi CLI across packaged Electron environments where shell PATH is often incomplete.

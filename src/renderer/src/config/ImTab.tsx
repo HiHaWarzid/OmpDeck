@@ -588,6 +588,24 @@ export function ImTab(_props: Props) {
 									</div>
 
 									<div className="config-im-bot-detail-section">
+										<div className="config-im-section-title">{t("config.im.requireMention")}</div>
+										<label
+											style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)", cursor: "pointer", userSelect: "none" }}
+										>
+											<span>{t("config.im.requireMentionDesc")}</span>
+											<input
+												type="checkbox"
+												checked={bot.requireMention !== false}
+												onChange={async (e) => {
+													await api?.botConfig?.(bot.id, { requireMention: e.target.checked });
+													await loadData();
+												}}
+												style={{ accentColor: "var(--color-accent)", margin: 0, cursor: "pointer" }}
+											/>
+										</label>
+									</div>
+
+									<div className="config-im-bot-detail-section">
 										<div className="config-im-section-title">{t("config.im.linkedAgents", { count: botBindings.length })}</div>
 										{botBindings.length === 0 ? (
 											<div className="config-empty config-im-inline-empty">{t("config.im.noBotBindings")}</div>

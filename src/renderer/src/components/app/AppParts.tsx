@@ -2967,6 +2967,13 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 }) {
 	// 默认展开，方便用户看到推理过程；可手动折叠
 	const [expanded, setExpanded] = useState(true);
+	// 流式思考进行中（有 startedAt 无 endedAt）时每秒刷新计时
+	const [, setTick] = useState(0);
+	useEffect(() => {
+		if (props.startedAt == null || props.endedAt != null) return;
+		const timer = setInterval(() => setTick((n) => n + 1), 1000);
+		return () => clearInterval(timer);
+	}, [props.startedAt, props.endedAt]);
 	if (!props.showThinking || !props.text.trim()) return null;
 	const previewLen = 220;
 	const needsTruncate = props.text.length > previewLen;
@@ -2974,12 +2981,14 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 		expanded || !needsTruncate
 			? props.text
 			: `${props.text.slice(0, previewLen)}...`;
-	// 计算思考耗时（毫秒），有 endAt 且有 startAt 时才显示
+	// 计算思考耗时：有 endedAt 用 endedAt，流式进行中用当前时间实时计时
 	const durationMs =
-		props.endedAt && props.startedAt && props.endedAt >= props.startedAt
-			? props.endedAt - props.startedAt
+		props.startedAt != null
+			? (props.endedAt != null && props.endedAt >= props.startedAt
+				? props.endedAt
+				: Date.now()) - props.startedAt
 			: null;
-	const durationText = durationMs != null ? formatDuration(durationMs) : null;
+	const durationText = durationMs != null && durationMs >= 0 ? formatDuration(durationMs) : null;
 	return (
 		<section className="thinking-card">
 			<button
@@ -3338,8 +3347,8 @@ export const TurnRow = memo(function TurnRow(props: {
 				id: `final-thinking-${finalMessageItem?.message.id ?? run.id}`,
 				messages: finalMessageItem?.message ? [finalMessageItem.message] : [],
 				text: finalThinkingTxt,
-				startedAt: run.startedAt,
-				endedAt: finalMessageItem?.message.timestamp ?? run.endedAt,
+				startedAt: finalMessageItem?.message.thinkingStartedAt ?? run.startedAt,
+				endedAt: finalMessageItem?.message.thinkingEndedAt ?? finalMessageItem?.message.timestamp ?? run.endedAt,
 			};
 			items.push(thinkingItem);
 		}
@@ -3425,8 +3434,8 @@ export const TurnRow = memo(function TurnRow(props: {
 					id: `streaming-thinking-${last.message.id}`,
 					messages: [last.message],
 					text: stripAnsi(last.message.thinking),
-					startedAt: run.startedAt,
-					endedAt: last.message.timestamp ?? run.endedAt,
+					startedAt: last.message.thinkingStartedAt ?? run.startedAt,
+					endedAt: last.message.thinkingEndedAt ?? last.message.timestamp ?? run.endedAt,
 				};
 				return [...allItems.slice(0, -1), thinkingBlock, last];
 			}

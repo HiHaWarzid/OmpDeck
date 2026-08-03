@@ -115,6 +115,10 @@ export type ChatMessage = {
 	images?: ImageContent[]; // 用户消息中附加的图片
 	/** 思考内容：来自 thinking 内容块，用于展示模型推理过程 */
 	thinking?: string;
+	/** 思考开始时间戳（首次 thinking_delta 到达时记录） */
+	thinkingStartedAt?: number;
+	/** 思考结束时间戳（thinking_end 到达时记录） */
+	thinkingEndedAt?: number;
 };
 
 export type FileTreeNode = {

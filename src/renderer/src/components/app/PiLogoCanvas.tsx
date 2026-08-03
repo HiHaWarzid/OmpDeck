@@ -450,7 +450,7 @@ export function PiLogoCanvas(props: PiLogoCanvasProps) {
 			// 播放中不抢画布，等本轮结束后的 showStatic 会用新主题色
 			if (!busyRef.current) showStatic();
 		};
-		// PiDeck 主题切换会改 data-theme
+		// OmpDeck 主题切换会改 data-theme
 		const observer = new MutationObserver(onTheme);
 		observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
@@ -497,7 +497,7 @@ export function PiLogoCanvas(props: PiLogoCanvasProps) {
 	);
 }
 
-// ── 右侧「PiDeck」字标：与 logo 同一套 canvas 方块绘制 ──────────────
+// ── 右侧「OmpDeck」字标：与 logo 同一套 canvas 方块绘制 ──────────────
 
 /**
  * 5×7 点阵（i 为 3×7）。笔画加粗：竖干双列 / 横画更满，小字号下仍够「重」。

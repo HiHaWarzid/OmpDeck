@@ -61,6 +61,10 @@ export class AgentManager {
 
 	/** 当前流式思考的累积文本，用于实时推送给前端展示 */
 	private readonly streamingThinking = new Map<string, string>();
+	/** 思考开始时间戳（首次 thinking_delta 到达时记录），thinking_end 后写入消息并清除 */
+	private readonly thinkingStartedAt = new Map<string, number>();
+	/** 思考结束时间戳（thinking_end 到达时记录），写入消息后清除 */
+	private readonly thinkingEndedAt = new Map<string, number>();
 	/** 当前正在流式更新的 assistant 消息；tool 事件插入时仍要继续更新同一个回答块。 */
 	private readonly activeAssistantMessageIds = new Map<string, string>();
 	/** pi 的 toolCallId 贯穿 start/update/end，用它把同一次工具调用合并成一条 UI 记录。 */
@@ -1257,6 +1261,8 @@ export class AgentManager {
 		// 修改上次会话的旧消息，导致新会话消息混入被中止的旧输出。
 		this.activeAssistantMessageIds.delete(agentId);
 		this.streamingThinking.delete(agentId);
+		this.thinkingStartedAt.delete(agentId);
+		this.thinkingEndedAt.delete(agentId);
 		this.toolMessageIds.delete(agentId);
 		this.activeToolCallsByAgent.delete(agentId);
 		this.toolExecutingByAgent.set(agentId, null);
@@ -3244,6 +3250,8 @@ export class AgentManager {
 				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
 				runtime.tab.status = "idle";
 				this.streamingThinking.delete(agentId);
+				this.thinkingStartedAt.delete(agentId);
+				this.thinkingEndedAt.delete(agentId);
 				this.activeAssistantMessageIds.delete(agentId);
 				this.toolMessageIds.delete(agentId);
 				this.activeToolCallsByAgent.delete(agentId);
@@ -3679,10 +3687,13 @@ export class AgentManager {
 			);
 			return;
 		}
-
 		if (eventType === "thinking_delta") {
 			const prev = this.streamingThinking.get(agentId) ?? "";
 			const delta = String(assistantEvent.delta ?? "");
+			if (!this.thinkingStartedAt.has(agentId)) {
+				this.thinkingStartedAt.set(agentId, Date.now());
+			}
+			this.thinkingEndedAt.delete(agentId);
 			this.streamingThinking.set(agentId, prev + delta);
 			this.thinkingEmitter.push(agentId, this.stripAnsi(prev + delta));
 			this.upsertAssistantMessage(agentId, partialMessage);
@@ -3698,6 +3709,7 @@ export class AgentManager {
 				this.thinkingEmitter.push(agentId, this.stripAnsi(finalThinking));
 				this.thinkingEmitter.flush(agentId);
 			}
+			this.thinkingEndedAt.set(agentId, Date.now());
 			this.upsertAssistantMessage(agentId, partialMessage);
 			// thinking_end 是阶段性终态，立即 flush 让思考块完整落盘显示。
 			this.flushMessageEmit(agentId);
@@ -3741,11 +3753,15 @@ export class AgentManager {
 				: "";
 		const pendingThinking = this.streamingThinking.get(agentId);
 		const nextThinking = this.stripAnsi(extractedThinking || pendingThinking || "");
+		const thinkingStartedAt = this.thinkingStartedAt.get(agentId);
+		const thinkingEndedAt = this.thinkingEndedAt.get(agentId);
 
 		if (existing) {
 			existing.text = extractedText || `${existing.text}${fallbackDelta}`;
 			if (nextThinking) existing.thinking = nextThinking;
 			existing.timestamp = Date.now();
+			if (thinkingStartedAt) existing.thinkingStartedAt = thinkingStartedAt;
+			if (thinkingEndedAt) existing.thinkingEndedAt = thinkingEndedAt;
 		} else {
 			const text = extractedText || fallbackDelta;
 			if (!text) return;
@@ -3756,6 +3772,8 @@ export class AgentManager {
 				text,
 				timestamp: Date.now(),
 				...(nextThinking ? { thinking: nextThinking } : {}),
+				...(thinkingStartedAt ? { thinkingStartedAt } : {}),
+				...(thinkingEndedAt ? { thinkingEndedAt } : {}),
 			});
 		}
 
@@ -4518,6 +4536,8 @@ export class AgentManager {
 
 		runtime.tab.status = "idle";
 		this.streamingThinking.delete(agentId);
+		this.thinkingStartedAt.delete(agentId);
+		this.thinkingEndedAt.delete(agentId);
 		this.emitThinking(agentId, "");
 		this.emitState();
 		void this.emitRuntimeState(agentId);
