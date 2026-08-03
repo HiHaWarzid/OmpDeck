@@ -3922,36 +3922,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	// 启动后异步校准内置扩展：对比 resources 与用户目录全文，不一致则覆盖。
 	// 用户手动移除的记在 removedBuiltInExtensions，跳过自动部署。
 	const deployExtensionsTo = async (homeDir: string) => {
-		// 迁移旧的配置到自有设置
-		try {
-			const piSettingsPath = join(homeDir, ".pi", "agent", "settings.json");
-			const piRaw = await readFile(piSettingsPath, "utf-8").catch(() => "");
-			if (piRaw) {
-				const piSettings = JSON.parse(piRaw) as { disabledExtensions?: string[] };
-				const oldDisabled = piSettings.disabledExtensions ?? [];
-				const piDeckSettings = settingsStore.get();
-				const currentRemoved = new Set(piDeckSettings.removedBuiltInExtensions ?? []);
-				let changed = false;
-				for (const entry of oldDisabled) {
-					if (entry.startsWith("pi-deck-") && !currentRemoved.has(entry)) {
-						currentRemoved.add(entry);
-						changed = true;
-					}
-				}
-				// 清除旧的 pi disabledExtensions 防止重复迁移
-				if (piSettings.disabledExtensions && piSettings.disabledExtensions.length > 0) {
-					piSettings.disabledExtensions = piSettings.disabledExtensions.filter(
-						(s) => !s.startsWith("pi-deck-")
-					);
-					await writeFile(piSettingsPath, JSON.stringify(piSettings, null, 2), "utf-8").catch(() => {});
-				}
-				if (changed) {
-					await settingsStore.update({ removedBuiltInExtensions: [...currentRemoved] });
-				}
-			}
-		} catch {
-			// 迁移失败不影响主流程
-		}
 
 		const removedBuiltIn = new Set(settingsStore.get().removedBuiltInExtensions ?? []);
 		const summary = {
@@ -4068,16 +4038,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		console.error("Failed to restore parked extensions:", error);
 	}
 
-	// 清理已废弃的 pi-deck-project-trust 扩展：RPC 模式下 pi 的 project_trust 事件 hasUI 恒为 false，
-	// 该扩展无法弹窗，信任确认改由桌面端 AgentManager.ensureProjectTrust 自行处理，删除残留避免用户误解。
-	void removeStalePiDeckExtension("pi-deck-project-trust.ts").catch((error) => {
-		console.error("Failed to remove stale pi-deck-project-trust extension:", error);
-	});
-
-	// 清理已废弃的 pi-deck-file-capture 扩展：该扩展的功能已被 renderer 端的直接工具参数解析取代。
-	void removeStalePiDeckExtension("pi-deck-file-capture.ts").catch((error) => {
-		console.error("Failed to remove stale pi-deck-file-capture extension:", error);
-	});
 
 	void webServiceManager.applySettings(settingsStore.get()).catch((error) => {
 		console.error("Failed to start web service:", error);
@@ -4188,17 +4148,6 @@ async function ensurePiDeckExtension(
 		nextBytes: sourceContent.length,
 	});
 	return action;
-}
-
-/**
- * 删除已下线的 OmpDeck 内置扩展残留文件（如 pi-deck-project-trust.ts）。
- * 用于扩展废弃后清理用户扩展目录，避免 pi 仍加载无效扩展造成误解。
- * rm 的 force 选项会在文件不存在时静默忽略。
- */
-async function removeStalePiDeckExtension(extensionName: string): Promise<void> {
-	const targetPath = join(app.getPath("home"), ".pi", "agent", "extensions", extensionName);
-	await rm(targetPath, { force: true });
-	console.log(`[OmpDeck] Removed stale extension: ${targetPath}`);
 }
 
 /**
