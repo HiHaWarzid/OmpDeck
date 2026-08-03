@@ -1649,7 +1649,7 @@ export function LogoMark() {
 
 
 /**
- * 侧栏品牌 lockup：π 标 + PiDeck 字标，垂直居中平齐。
+ * 侧栏品牌 lockup：π 标 + OmpDeck 字标，垂直居中平齐。
  * replayToken 由 App 在 agent 启动/关闭时递增，驱动 logo 重播拼装动画。
  */
 export function BrandLockup(_props: { replayToken?: number } = {}) {

@@ -872,7 +872,7 @@ export class AgentManager {
 				this.addMessage(
 					id,
 					"system",
-					`已临时停用与 PiDeck 不兼容的扩展：${blockedOnStart.join(", ")}（仅桌面 RPC 会话期间；其它扩展与 npm 包装扩展不受影响，Agent 结束后会自动恢复，CLI 仍可正常使用）。`,
+					`已临时停用与 OmpDeck 不兼容的扩展：${blockedOnStart.join(", ")}（仅桌面 RPC 会话期间；其它扩展与 npm 包装扩展不受影响，Agent 结束后会自动恢复，CLI 仍可正常使用）。`,
 				);
 				void this.appLogger?.info("agent", "Desktop-blocked extensions skipped", {
 					agentId: id,

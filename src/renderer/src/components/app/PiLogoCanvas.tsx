@@ -660,7 +660,7 @@ function paintWordmark(canvas: HTMLCanvasElement, text: string, cellCss: number)
 	}
 }
 
-export type PiDeckWordmarkCanvasProps = {
+export type OmpDeckWordmarkCanvasProps = {
 	/** 每个点阵格的 CSS 边长；与 logo 并排时建议 4~5 */
 	cellSize?: number;
 	text?: string;
@@ -668,10 +668,10 @@ export type PiDeckWordmarkCanvasProps = {
 };
 
 /**
- * 右侧 PiDeck 字标：与左侧 logo 同一套 bevel 方块 canvas 绘制。
+ * 右侧 OmpDeck 字标：与左侧 logo 同一套 bevel 方块 canvas 绘制。
  * 主题切换时自动重绘 ink/white。
  */
-export function PiDeckWordmarkCanvas(props: PiDeckWordmarkCanvasProps) {
+export function OmpDeckWordmarkCanvas(props: OmpDeckWordmarkCanvasProps) {
 	const cellSize = props.cellSize ?? 5;
 	const text = props.text ?? "OmpDeck";
 	const canvasRef = useRef<HTMLCanvasElement>(null);

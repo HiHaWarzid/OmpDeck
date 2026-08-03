@@ -1166,7 +1166,7 @@ export class ConfigManager {
 		const data = pkg as Record<string, unknown>;
 		const files = data.files as Record<string, unknown> | undefined;
 		if (!files || typeof files !== "object") {
-			return { valid: false, error: "导入文件缺少 files 字段，请确认是 PiDeck 导出的配置包" };
+			return { valid: false, error: "导入文件缺少 files 字段，请确认是 OmpDeck 导出的配置包" };
 		}
 
 		// 按需写入，只处理三个已知文件名，忽略其他 key

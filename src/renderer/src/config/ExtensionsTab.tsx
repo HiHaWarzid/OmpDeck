@@ -17,7 +17,7 @@ type ExtensionsApi = {
 function getExtensionsApi(): ExtensionsApi {
 	const api = (window as unknown as { piDesktop?: { extensions?: ExtensionsApi } })
 		.piDesktop?.extensions;
-	if (!api) throw new Error("PiDeck extensions API is not available");
+	if (!api) throw new Error("OmpDeck extensions API is not available");
 	return api;
 }
 
@@ -26,46 +26,6 @@ const PIDEK_BUILTIN_SOURCE: Record<string, string> = {};
 
 /** 预设推荐扩展包 */
 const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
-	{
-		name: "pi-deck-todo",
-		description: "PiDeck 内置：TODO 列表扩展，支持在对话中添加和管理任务项，自动追踪完成状态并在会话间持久化。",
-		installCmd: "npm:@earendil-works/pi-deck-todo",
-		tags: ["extension"],
-		downloads: "",
-		updated: "",
-		npmUrl: "",
-		repoUrl: "https://github.com/ayuayue/PiDeck",
-	},
-	{
-		name: "pi-deck-plan-mode",
-		description: "PiDeck 内置：计划模式扩展，让 AI 在回复前首先生成执行计划，复杂任务一目了然。",
-		installCmd: "npm:@earendil-works/pi-deck-plan-mode",
-		tags: ["extension"],
-		downloads: "",
-		updated: "",
-		npmUrl: "",
-		repoUrl: "https://github.com/ayuayue/PiDeck",
-	},
-	{
-		name: "pi-deck-ask-question",
-		description: "PiDeck 内置：在对话中插入精心设计的问题卡片，引导 AI 给出更精准的回答。",
-		installCmd: "npm:@earendil-works/pi-deck-ask-question",
-		tags: ["extension"],
-		downloads: "",
-		updated: "",
-		npmUrl: "",
-		repoUrl: "https://github.com/ayuayue/PiDeck",
-	},
-	{
-		name: "pi-deck-nul-redirect-fix",
-		description: "PiDeck 内置：修复 Windows 下 pi 重定向到 NUL 设备时可能产生的残留文件问题。",
-		installCmd: "npm:@earendil-works/pi-deck-nul-redirect-fix",
-		tags: ["extension"],
-		downloads: "",
-		updated: "",
-		npmUrl: "",
-		repoUrl: "https://github.com/ayuayue/PiDeck",
-	},
 	{
 		name: "context-mode",
 		description: "MCP 插件，可节省 98% 的上下文窗口。沙箱代码执行、FTS5 知识库和意图驱动搜索。",

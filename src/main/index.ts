@@ -263,7 +263,7 @@ async function syncWslEnvironment(settings: AppSettings): Promise<WslEnvironment
 	const environment = settings.wslEnabled && settings.wslDistro && settings.wslUser
 		? await resolveWslEnvironment(settings.wslDistro, settings.wslUser, {
 			warn: (message, detail) => {
-				console.warn(`[PiDeck] ${message}`, detail);
+				console.warn(`[OmpDeck] ${message}`, detail);
 				void appLogger?.warn("wsl", message, detail);
 			},
 		})
@@ -3423,7 +3423,7 @@ function registerIpc() {
 				});
 				bridge.trackDocRequest(tab.id, docTitle);
 				void bridge.forwardUserMessageToFeishu(tab.id, input.message).catch((e) => {
-					console.error("[Feishu] forward PiDeck message failed:", e);
+					console.error("[Feishu] forward OmpDeck message failed:", e);
 				});
 				agentInstruction = `${buildFeishuActionInstruction(bridge.getSessionChatId(tab.id))}\n创建飞书文档时，先输出完整正文，最后独立一行写 [CREATE_DOC:文档标题]。`;
 			}
@@ -3436,7 +3436,7 @@ function registerIpc() {
 				});
 				if (input.message.trim()) {
 					void bridge.forwardUserMessageToFeishu(tab.id, input.message).catch((e) => {
-						console.error("[Feishu] forward PiDeck message failed:", e);
+						console.error("[Feishu] forward OmpDeck message failed:", e);
 					});
 				}
 			}
@@ -4001,7 +4001,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		}),
 		// 预热 pi --version 缓存：避免首次创建 Agent 时 trust 路径同步卡住 数秒。
 		PiProcess.warmVersionCache(settingsStore.get()).catch((error) => {
-			console.warn("[PiDeck] Failed to warm pi version cache:", error);
+			console.warn("[OmpDeck] Failed to warm pi version cache:", error);
 		}),
 		appLogger.info("app", "Application started", {
 			version: app.getVersion(),
@@ -4014,7 +4014,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	// WSL 启用时额外部署到动态解析出的 HOME。
 	if (activeWslEnvironment) {
 		void deployExtensionsTo(activeWslEnvironment.windowsHome).catch(() => {
-			console.warn("[PiDeck] Failed to deploy extensions to WSL, skipping");
+			console.warn("[OmpDeck] Failed to deploy extensions to WSL, skipping");
 		});
 	}
 

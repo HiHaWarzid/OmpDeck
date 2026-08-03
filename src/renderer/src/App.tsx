@@ -727,7 +727,7 @@ export function App() {
   const [agentDismissedWidgets, setAgentDismissedWidgets] = useState<
     Record<string, string[]>
   >(() => loadDismissedExtensionWidgets());
-  /** 输入框发送模式：normal 直接交给 agent，plan 通过隐藏标记触发 PiDeck Plan Mode 扩展。 */
+  /** 输入框发送模式：normal 直接交给 agent，plan 通过隐藏标记触发 OmpDeck Plan Mode 扩展。 */
   const [composerAgentModes, setComposerAgentModes] = useState<Record<string, ComposerAgentMode>>({});
   /** 查看器模式的发送模式（仅在无 agent 时使用） */
   // 侧栏选中态：当前活跃 Agent 对应的 session 路径（activeAgent 在后面定义，这里用函数式）

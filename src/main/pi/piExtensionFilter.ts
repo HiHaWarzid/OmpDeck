@@ -4,8 +4,8 @@ import { basename, join } from "node:path";
 /**
  * 桌面端 RPC 启动时已知不兼容 / 可能导致整应用异常的扩展。
  * CodeIsland 面向终端 pi + macOS 浮动窗；在 Electron 子进程树下
- * 曾出现「启动 Agent 后 PiDeck 整应用退出」。无法改第三方扩展时，
- * 由 PiDeck 在 RPC 生命周期内临时停放（rename）该文件，进程退出后还原。
+ * 曾出现「启动 Agent 后 OmpDeck 整应用退出」。无法改第三方扩展时，
+ * 由 OmpDeck 在 RPC 生命周期内临时停放（rename）该文件，进程退出后还原。
  *
  * 注意：不要用 --no-extensions 白名单方案——会误伤 npm packages 扩展。
  */

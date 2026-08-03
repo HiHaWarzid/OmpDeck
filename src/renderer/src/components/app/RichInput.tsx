@@ -90,7 +90,7 @@ function overlapsUrl(
  *
  * 规则：
  * - /skill 触发符 / 前一个字符不能是 : / 或字母/数字/下划线（\w），
- *   避免路径段（如 Agent/PiDeck、a/b）被误识别。
+ *   避免路径段（如 Agent/OmpDeck、a/b）被误识别。
  * - @path 触发符 @ 前同样排除 : / 和 \w。
  * - /skill：skill 名只允许字母开头 + 字母数字/连字符（skill 命名规范），
  *   且 token 后一字符不能是 /（排除 /usr/bin 这类路径）。
