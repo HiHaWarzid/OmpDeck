@@ -299,7 +299,7 @@ export class PiProcess extends EventEmitter {
       }
       // pi 退出后还原临时停放的扩展，保证 CLI 仍能加载 codeisland。
       this.restoreParkedExtensions();
-      this.rpc?.close(new Error(`pi exited: code=${code ?? "null"}, signal=${signal ?? "null"}`));
+      this.rpc?.close(new Error(`omp exited: code=${code ?? "null"}, signal=${signal ?? "null"}`));
       this.emit("exit", { code, signal });
       this.proc = undefined;
       this.rpc = undefined;
@@ -309,7 +309,7 @@ export class PiProcess extends EventEmitter {
   }
 
   get client() {
-    if (!this.rpc) throw new Error("pi process is not running");
+    if (!this.rpc) throw new Error("omp process is not running");
     return this.rpc;
   }
 

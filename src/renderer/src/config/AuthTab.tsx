@@ -159,7 +159,7 @@ export function AuthTab(props: {
 						<p className="config-auth-guide-note">
 							{t("config.authGuideNote")}{" "}
 							<a href="https://pi.dev/docs/latest/providers#auth-file" target="_blank" rel="noreferrer">
-								pi docs <ExternalLink size={12} />
+								omp docs <ExternalLink size={12} />
 							</a>
 						</p>
 					</div>

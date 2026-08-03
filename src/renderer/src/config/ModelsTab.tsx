@@ -798,7 +798,7 @@ export function ModelsTab(props: {
 													})}
 													{" "}
 													<a href="https://pi.dev/docs/latest/models" target="_blank" rel="noreferrer">
-														pi {t("config.docsModels")}
+														omp {t("config.docsModels")}
 													</a>
 													{" / "}
 													<a href="https://pi.dev/docs/latest/custom-provider" target="_blank" rel="noreferrer">

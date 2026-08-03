@@ -213,7 +213,7 @@ export function EnvironmentDialog(props: {
 	const activeStep = props.checking ? 0 : installed ? 3 : 1;
 
 	// Windows 统一使用 CMD 查找 .cmd/.exe shim，不再引导用户使用 PowerShell 的 .ps1 入口。
-	const refCmd = 'where pi';
+	const refCmd = 'where omp';
 
 	return (
 		<Modal
@@ -437,7 +437,7 @@ export function EnvironmentDialog(props: {
 								<div className="custom-path-input-row">
 									<input
 										type="text"
-										placeholder="D:\\mise-data\\installs\\node\\24 13 0\\pi.cmd"
+										placeholder="D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
 										value={props.customPath}
 										onChange={(e) =>
 											props.onCustomPathChange(e.target.value)
@@ -462,7 +462,7 @@ export function EnvironmentDialog(props: {
 										className={`custom-path-result ${props.customPathResult.installed ? "success" : "error"}`}
 									>
 										{props.customPathResult.installed
-											? `✓ ${t("environment.validatePassed", { value: props.customPathResult.version ?? "pi" })}`
+											? `✓ ${t("environment.validatePassed", { value: props.customPathResult.version ?? "omp" })}`
 											: `✗ ${t("environment.validateFailed", { value: props.customPathResult.error ?? t("environment.unableToRun") })}`}
 									</div>
 								)}
@@ -3458,7 +3458,7 @@ export const TurnRow = memo(function TurnRow(props: {
 			<article ref={rowRef} className="turn-row" data-message-id={run.id}>
 				<div className="turn-row-body">
 					<div className="turn-row-meta">
-						<span className="turn-row-agent">pi</span>
+						<span className="turn-row-agent">omp</span>
 						<time>{formatTime(run.endedAt)}</time>
 					</div>
 					{/* 按时间顺序渲染所有条目，最新的活动在底部 */}
@@ -3476,7 +3476,7 @@ export const TurnRow = memo(function TurnRow(props: {
 			<article ref={rowRef} className="turn-row" data-message-id={run.id}>
 				<div className="turn-row-body">
 					<div className="turn-row-meta">
-						<span className="turn-row-agent">pi</span>
+						<span className="turn-row-agent">omp</span>
 						<time>{formatTime(run.endedAt)}</time>
 						{showDuration && (
 							<span className="turn-row-duration">{formatDuration(duration)}</span>
@@ -3524,7 +3524,7 @@ export const TurnRow = memo(function TurnRow(props: {
 		<article ref={rowRef} className="turn-row" data-message-id={run.id}>
 			<div className="turn-row-body">
 				<div className="turn-row-meta">
-					<span className="turn-row-agent">pi</span>
+					<span className="turn-row-agent">omp</span>
 					<time>{formatTime(run.endedAt)}</time>
 					{showDuration && (
 						<span className="turn-row-duration">{formatDuration(duration)}</span>
@@ -4569,7 +4569,7 @@ export function MultiSelectModal(props: {
 									>
 										<Brain size={15} className="multi-select-node-icon assistant" />
 										<span className="multi-select-node-label">
-											<span className="multi-select-node-run-label">pi</span>
+											<span className="multi-select-node-run-label">omp</span>
 											<span className="multi-select-node-time">
 												{formatTime(item.endedAt)}
 											</span>

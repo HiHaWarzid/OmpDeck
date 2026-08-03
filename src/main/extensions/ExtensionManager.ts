@@ -452,7 +452,7 @@ export class ExtensionManager {
 				(error, stdout, stderr) => {
 					if (error) {
 						const detail = (stderr || error.message).trim();
-						reject(new Error(detail || "pi 扩展命令执行失败"));
+						reject(new Error(detail || "omp 扩展命令执行失败"));
 						return;
 					}
 					resolve(stdout);

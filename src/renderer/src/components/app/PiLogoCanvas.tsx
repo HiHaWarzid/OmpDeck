@@ -483,7 +483,7 @@ export function PiLogoCanvas(props: PiLogoCanvasProps) {
 		<button
 			type="button"
 			className={props.className ?? "pi-logo-canvas-stage"}
-			aria-label="Play Pi logo animation"
+			aria-label="Play omp logo animation"
 			onClick={handleActivate}
 			onKeyDown={(e) => {
 				if (e.key === "Enter" || e.key === " ") {

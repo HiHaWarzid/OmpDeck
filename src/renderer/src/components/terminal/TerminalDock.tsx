@@ -17,7 +17,7 @@ import { t } from "../../i18n";
 
 const TERMINAL_THEMES = {
 	"pi-soft": {
-		label: "Pi Soft",
+	label: "omp Soft",
 		xterm: {
 			background: "#ffffff",
 			foreground: "#243244",

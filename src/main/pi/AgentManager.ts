@@ -349,7 +349,37 @@ export class AgentManager {
 		]);
 		const t1 = Date.now();
 
-		const rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+		let rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+
+		// 兜底：get_messages 成功但返回空数组时，若会话文件确实存在且有内容，
+		// 说明 pi 进程 resume 会话时未完整加载（如同一会话被并发打开、或文件尚在写入），
+		// 直接回退到文件直读，避免历史消息在 UI 中空白。
+		// 仅对带 sessionPath 的历史加载生效；全新会话（无 sessionPath）空消息是合法状态。
+		if (rawMessages.length === 0 && skipEntries && runtime.tab.sessionPath) {
+			const sessionHostPath = this.toSessionHostPath(runtime.tab.sessionPath);
+			try {
+				if (existsSync(sessionHostPath) && statSync(sessionHostPath).size > 0) {
+					const fileFallback = await this.readRecentMessagesFromSessionFile(
+						runtime.tab.sessionPath,
+						AgentManager.MAX_HISTORY_LOAD_TURNS,
+					).catch(() => undefined);
+					if (fileFallback) {
+						const fallbackMessages =
+							(fileFallback.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+						if (fallbackMessages.length > 0) {
+							rawMessages = fallbackMessages;
+							void this.appLogger?.warn("agent", "get_messages returned empty; fell back to session file read", {
+								agentId,
+								sessionPath: runtime.tab.sessionPath,
+								fileMessages: fallbackMessages.length,
+							});
+						}
+					}
+				}
+			} catch {
+				// 文件不可读时维持 RPC 结果，不阻断加载
+			}
+		}
 
 		// 解析 entryId 列表（需要先于 convertAgentMessages，用于把消息关联到 pi 的会话分支）。
 		let activeEntryIds: string[] | undefined;
@@ -2924,7 +2954,7 @@ export class AgentManager {
 				agentId,
 				"error",
 				this.buildStartupFailureMessage(
-					`pi 进程退出 code=${payload.code}${payload.signal ? ` signal=${payload.signal}` : ""}`,
+					`omp 进程退出 code=${payload.code}${payload.signal ? ` signal=${payload.signal}` : ""}`,
 					diag,
 				),
 			);
@@ -2979,7 +3009,7 @@ export class AgentManager {
 		diag: ReturnType<PiProcess["getDiagnostics"]>,
 	): string {
 		if (!diag) {
-			return `⚠️ Pi RPC 启动失败\n\n${rawMessage}\n\nplatform=${globalThis.process.platform} arch=${globalThis.process.arch}`;
+			return `⚠️ omp RPC 启动失败\n\n${rawMessage}\n\nplatform=${globalThis.process.platform} arch=${globalThis.process.arch}`;
 		}
 		const lines: string[] = [];
 		if (diag.exitCode !== null) {
@@ -2990,7 +3020,7 @@ export class AgentManager {
 			const snippet = stderrText.length > 600 ? "…" + stderrText.slice(-600) : stderrText;
 			lines.push(`进程错误输出:\n${snippet}`);
 		}
-		lines.push(`pi 路径: ${diag.command}`);
+		lines.push(`omp 路径: ${diag.command}`);
 		if (diag.customPiPath) lines.push(`自定义路径: ${diag.customPiPath}`);
 		lines.push(`工作目录: ${diag.cwd}`);
 		lines.push(`版本检测: ${diag.versionCheck ? "✓ 通过" : "✗ 失败"}`);
@@ -3002,18 +3032,18 @@ export class AgentManager {
 		lines.push("");
 		lines.push("━━━ 排查步骤 ━━━");
 		if (!diag.versionCheck) {
-			lines.push("1. 在终端执行 pi --version，确认 pi 是否已安装且路径正确");
+			lines.push("1. 在终端执行 omp --version，确认 omp 是否已安装且路径正确");
 			lines.push("2. 如未安装，执行 npm install -g @earendil-works/pi-coding-agent");
-			lines.push("3. macOS 若从 Dock 启动，可在设置中填写完整 pi 路径（Homebrew 常见 /opt/homebrew/bin/pi）");
+			lines.push("3. macOS 若从 Dock 启动，可在设置中填写完整 omp 路径（Homebrew 常见 /opt/homebrew/bin/omp）");
 		} else if (diag.exitCode !== 0 && diag.exitCode !== null) {
-			lines.push("1. 在终端执行 pi --mode rpc 看是否能正常启动");
+			lines.push("1. 在终端执行 omp --mode rpc 看是否能正常启动");
 			lines.push("2. 注意终端中的错误信息（架构不匹配/权限/扩展崩溃都会体现在这里）");
 		} else if (!stderrText && diag.exitCode === null) {
-			lines.push("1. 桌面端已自动重试 get_state，但 pi 仍未响应。");
-			lines.push("2. 在终端执行 pi --mode rpc 看是否能正常启动，注意终端中的错误信息");
+			lines.push("1. 桌面端已自动重试 get_state，但 omp 仍未响应。");
+			lines.push("2. 在终端执行 omp --mode rpc 看是否能正常启动，注意终端中的错误信息");
 		} else {
-			lines.push("1. 在终端执行 pi --mode rpc 确认 pi 能否正常启动");
-			lines.push("2. 检查设置中的 pi 路径是否正确");
+			lines.push("1. 在终端执行 omp --mode rpc 确认 omp 能否正常启动");
+			lines.push("2. 检查设置中的 omp 路径是否正确");
 		}
 		const startFlags = this.settingsStore.get();
 		const noExt = Boolean(startFlags.piRpcNoExtensions);
@@ -3029,7 +3059,7 @@ export class AgentManager {
 					.filter(Boolean)
 					.join("、")}`,
 			);
-			lines.push("若仍失败，更可能是 pi 本体/路径/会话文件问题，而不是扩展加载。");
+			lines.push("若仍失败，更可能是 omp 本体/路径/会话文件问题，而不是扩展加载。");
 		} else {
 			lines.push("若怀疑某个扩展或技能导致启动失败：");
 			lines.push("1. 打开 设置 → 开发设置");
@@ -3039,7 +3069,7 @@ export class AgentManager {
 		}
 		lines.push("");
 		lines.push("如问题持续，可在 GitHub 提交 Issue 并附上以上信息与应用日志。");
-		return `⚠️ Pi RPC 启动失败\n\n${rawMessage}\n\n${lines.join("\n")}`;
+		return `⚠️ omp RPC 启动失败\n\n${rawMessage}\n\n${lines.join("\n")}`;
 	}
 
 	private handlePiEvent(agentId: string, event: unknown) {

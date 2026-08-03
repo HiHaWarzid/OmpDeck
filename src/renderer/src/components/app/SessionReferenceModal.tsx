@@ -163,7 +163,7 @@ export function SessionReferenceModal(props: {
 									>
 										<Brain size={15} className="multi-select-node-icon assistant" />
 										<span className="multi-select-node-label">
-											<span className="multi-select-node-run-label">pi</span>
+											<span className="multi-select-node-run-label">omp</span>
 											<span className="multi-select-node-time">
 												{formatTime(item.msgs[item.msgs.length - 1]?.timestamp ?? 0)}
 											</span>

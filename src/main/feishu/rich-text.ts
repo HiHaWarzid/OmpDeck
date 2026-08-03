@@ -125,7 +125,7 @@ function markdownToPost(text: string, language: "zh" | "en") {
 	const titleIndex = lines.findIndex((line) => line.trim());
 	const firstLine = titleIndex >= 0 ? lines[titleIndex].trim() : "";
 	const heading = firstLine.match(/^#{1,6}\s+(.+)$/);
-	const title = cleanInlineMarkdown(heading?.[1] || firstLine || (language === "en" ? "Pi reply" : "Pi 回复")).slice(0, 120);
+	const title = cleanInlineMarkdown(heading?.[1] || firstLine || (language === "en" ? "omp reply" : "omp 回复")).slice(0, 120);
 	const content: PostElement[][] = [];
 	let inCodeBlock = false;
 
@@ -178,10 +178,10 @@ function markdownToPost(text: string, language: "zh" | "en") {
 function extractMarkdownTitle(text: string, language: "zh" | "en") {
 	const lines = text.replace(/\r\n/g, "\n").split("\n");
 	const titleIndex = lines.findIndex((line) => line.trim());
-	if (titleIndex < 0) return { title: language === "en" ? "Pi reply" : "Pi 回复", body: text };
+	if (titleIndex < 0) return { title: language === "en" ? "omp reply" : "omp 回复", body: text };
 	const firstLine = lines[titleIndex].trim();
 	const heading = firstLine.match(/^#{1,6}\s+(.+)$/);
-	const title = cleanInlineMarkdown(heading?.[1] || firstLine || (language === "en" ? "Pi reply" : "Pi 回复")).slice(0, 120);
+	const title = cleanInlineMarkdown(heading?.[1] || firstLine || (language === "en" ? "omp reply" : "omp 回复")).slice(0, 120);
 	const body = lines
 		.filter((_, index) => index !== titleIndex)
 		.join("\n")

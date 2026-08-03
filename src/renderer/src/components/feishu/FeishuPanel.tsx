@@ -202,7 +202,7 @@ export function FeishuPanel({
 			{/* ── 无 Bot 时的空状态 ── */}
 			{bots.length === 0 && !isConnected && (
 				<div className="feishu-empty">
-					连接飞书 Bot，在飞书中与 Pi 对话
+					连接飞书 Bot，在飞书中与 omp 对话
 				</div>
 			)}
 

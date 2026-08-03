@@ -388,7 +388,7 @@ export function createPreviewApi(): PiDesktopApi {
 		pi: {
 			check: async () => ({
 				installed: true,
-				command: "pi",
+				command: "omp",
 				version: "preview",
 				searchedDirs: [],
 			}),
@@ -404,8 +404,8 @@ export function createPreviewApi(): PiDesktopApi {
 				hasUpdate: false,
 			}),
 			update: async () => ({
-				command: "pi update pi --no-approve",
-				output: "Preview mode: pi update output",
+				command: "omp update omp --no-approve",
+				output: "Preview mode: omp update output",
 				updated: false,
 			}),
 			execInstall: async (_command) => ({
@@ -461,7 +461,7 @@ export function createPreviewApi(): PiDesktopApi {
 				nodeVersion: "preview",
 				pi: {
 					installed: true,
-					command: "pi",
+					command: "omp",
 					version: "preview",
 					searchedDirs: [],
 				},
@@ -551,7 +551,7 @@ export function createPreviewApi(): PiDesktopApi {
 			removeBuiltIn: async () => undefined,
 			restoreBuiltIn: async () => undefined,
 			update: async () => ({
-				command: "pi update --extensions --no-approve",
+				command: "omp update --extensions --no-approve",
 				output: "Preview mode: extensions update output",
 				updated: false,
 			}),

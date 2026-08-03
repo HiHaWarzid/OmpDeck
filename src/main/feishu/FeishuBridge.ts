@@ -513,7 +513,7 @@ export class FeishuBridge {
 				break;
 			}
 			case "/newdoc": {
-				const title = text.split(/\s+/).slice(1).join(" ") || "Pi Agent 文档";
+				const title = text.split(/\s+/).slice(1).join(" ") || "omp Agent 文档";
 				const result = await this.createFeishuDoc(chatId, title);
 				await this.sendSmartMessage(chatId, result);
 				break;
@@ -998,7 +998,7 @@ export class FeishuBridge {
 			return undefined;
 		}
 
-		const groupName = `Pi Agent - ${(sessionTitle || `新会话 ${sessionId.slice(0, 8)}`).slice(0, 50)}`;
+		const groupName = `omp Agent - ${(sessionTitle || `新会话 ${sessionId.slice(0, 8)}`).slice(0, 50)}`;
 
 		// 1. 按 sessionId 找已有绑定（只认 session-mirror 类型，忽略私聊等）
 		let existingChatId = this.sessionToChat.get(sessionId);
@@ -1144,7 +1144,7 @@ export class FeishuBridge {
 			// 按 agent UUID 兜底键保存，确保 sessionPath 不存在时也能找到
 			setPersistentChatId(`agent:${sessionId}`, chatId);
 
-			await this.sendSmartMessage(chatId, `🤖 Pi Agent 会话已创建\n会话 ID: ${sessionId.slice(0, 8)}\n\n直接发消息即可与 Agent 对话。`);
+			await this.sendSmartMessage(chatId, `🤖 omp Agent 会话已创建\n会话 ID: ${sessionId.slice(0, 8)}\n\n直接发消息即可与 Agent 对话。`);
 			return chatId;
 		} catch (e) {
 			const errMsg = e instanceof Error ? e.message : String(e);
@@ -1317,7 +1317,7 @@ export class FeishuBridge {
 	private async sendHelpCard(chatId: string): Promise<void> {
 		await this.sendCardMessage(chatId, {
 			config: { wide_screen_mode: true, update_multi: true },
-			header: { title: { tag: "plain_text", content: "🤖 Pi Agent 帮助" }, template: "green" },
+			header: { title: { tag: "plain_text", content: "🤖 omp Agent 帮助" }, template: "green" },
 			elements: [{ tag: "markdown", content: ["**可用命令**", "", "`/new` 或 `/n` — 创建新会话", "`/stop` 或 `/s` — 停止当前 Agent", "`/model` — 打开模型切换按钮卡片", "`/status` — 查看当前状态", "`/whoami` — 查看你的 open_id", "`/help` 或 `/h` — 查看帮助", "", "**Agent 自主能力**", "让 Agent 帮你导出文件或写报告时，它会自动：", "• 发送文件到飞书聊天", "• 创建飞书文档并分享链接", ""].join("\n") }],
 		});
 	}
@@ -1384,7 +1384,7 @@ export class FeishuBridge {
 		}
 		const docMatch = text.match(/\[CREATE_DOC:([^\]]+)\]/);
 		if (docMatch) {
-			const title = docMatch[1].trim() || "Pi Agent 文档";
+			const title = docMatch[1].trim() || "omp Agent 文档";
 			const result = await this.createFeishuDoc(chatId, title, text);
 			// createFeishuDoc 内部失败时发了消息，这里补充发送
 			if (result.startsWith("❌") || result.startsWith("创建")) await this.sendSmartMessage(chatId, result);

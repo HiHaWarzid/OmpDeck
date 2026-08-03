@@ -3406,7 +3406,7 @@ export function App() {
         setSettings(saved);
         showToast(
           t("app.piCheckPassed", {
-            value: next.command ?? next.version ?? "pi",
+            value: next.command ?? next.version ?? "omp",
           }),
         );
       } else {

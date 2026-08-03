@@ -246,7 +246,7 @@ export class PiLocator {
   async validateCustomPath(customPath: string): Promise<PiInstallStatus> {
     const command = this.normalizeCustomPath(customPath);
     if (!command) {
-      return { installed: false, searchedDirs: [], error: "请输入 pi.cmd 或 pi 路径。" };
+      return { installed: false, searchedDirs: [], error: "请输入 omp.cmd 或 omp 路径。" };
     }
     if (this.isUnsupportedPowerShellShim(command)) return this.unsupportedPowerShellStatus(command);
     if (command.startsWith("wsl://")) {
@@ -330,7 +330,7 @@ export class PiLocator {
       installed: false,
       command,
       searchedDirs,
-      error: "暂不支持 PowerShell 的 pi.ps1，请使用 CMD 的 where pi 查到的 pi.cmd 或 pi.exe 路径。",
+      error: "暂不支持 PowerShell 的 omp.ps1，请使用 CMD 的 where omp 查到的 omp.cmd 或 omp.exe 路径。",
     };
   }
 

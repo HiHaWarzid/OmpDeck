@@ -48,7 +48,7 @@ const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
 	},
 	{
 		name: "pi-mcp-adapter",
-		description: "MCP（Model Context Protocol）适配器扩展，让 Pi 可以连接任何 MCP 服务器。",
+		description: "MCP（Model Context Protocol）适配器扩展，让 omp 可以连接任何 MCP 服务器。",
 		installCmd: "npm:pi-mcp-adapter",
 		tags: ["extension"],
 		downloads: "99K/mo",
@@ -266,7 +266,7 @@ export function ExtensionsTab(props: {
 									title={t("common.copy")}
 									onClick={(e) => {
 										e.stopPropagation();
-										const cmd = `pi install ${pkg.installCmd}`;
+										const cmd = `omp install ${pkg.installCmd}`;
 										writeClipboard(cmd);
 										showNotice(t("app.codeCopied"), 1200);
 									}}

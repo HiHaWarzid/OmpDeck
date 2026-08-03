@@ -20,7 +20,7 @@ export async function testPiProxy(
 	try {
 		const target = new URL(testUrl);
 		if (!settings.piProxyEnabled) {
-			return failure("请先启用 pi agent 代理。", startedAt, testUrl);
+			return failure("请先启用 omp agent 代理。", startedAt, testUrl);
 		}
 
 		const proxyValue = settings.piProxyUrl.trim();

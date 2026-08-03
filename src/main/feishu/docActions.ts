@@ -1,6 +1,6 @@
 export const FEISHU_DOC_ACTION_HINT = [
-	"\n\n[PiDeck 飞书能力]",
-	"当前会话已连接飞书，PiDeck 主进程已配置可用凭证。需要创建飞书文档时，直接产出正文和动作标记。",
+	"\n\n[OmpDeck 飞书能力]",
+	"当前会话已连接飞书，OmpDeck 主进程已配置可用凭证。需要创建飞书文档时，直接产出正文和动作标记。",
 	"请先给出要写入文档的完整正文，最后单独输出一行 [CREATE_DOC:文档标题]。",
 	"不要自己调用飞书 API，不要要求用户提供飞书凭证。",
 ].join("\n");
@@ -156,5 +156,5 @@ export function wantsFeishuDoc(text: string): string | undefined {
 	if (!hasDocIntent) return undefined;
 
 	const titleMatch = text.match(/(?:标题[是为叫]?|名称)[：:\s]*["""]?([^"""，,\s。.!！?？\n]{1,40})/);
-	return titleMatch?.[1] || "Pi Agent 文档";
+	return titleMatch?.[1] || "omp Agent 文档";
 }

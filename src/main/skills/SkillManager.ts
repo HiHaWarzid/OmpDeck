@@ -239,7 +239,7 @@ export class SkillManager {
 			warnings.push("name 只能包含字母（含中文等）、数字和单个连字符");
 		}
 		if (name.length > 64) warnings.push("name 超过 64 个字符");
-		if (!description) warnings.push("缺少 description，pi 不会加载该 skill");
+		if (!description) warnings.push("缺少 description，omp 不会加载该 skill");
 		if (description.length > 1024) warnings.push("description 超过 1024 个字符");
 		return warnings;
 	}

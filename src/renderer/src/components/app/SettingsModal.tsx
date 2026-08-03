@@ -995,12 +995,12 @@ function SettingsModalContent(props: SettingsModalProps) {
 												className={"pi-status-dot " + (props.piStatus?.installed ? "online" : "offline")}
 											/>
 											<div className="setting-pi-status-text">
-												<strong>Pi CLI</strong>
+												<strong>omp CLI</strong>
 												<span>
 													{props.piStatus
 														? props.piStatus.installed
 															? t("settings.foundPi", {
-																	version: props.piStatus.version ?? "pi",
+																	version: props.piStatus.version ?? "omp",
 																})
 															: t("settings.piMissing")
 														: t("settings.piCliAvailable")}
@@ -1167,7 +1167,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 											value={props.customPiPath}
 											placeholder={
 												piPath ||
-												"D:\\mise-data\\installs\\node\\24 13 0\\pi.cmd"
+												"D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
 											}
 											description={t("settings.customPiPathHint")}
 											disabled={props.customPathValidating}
@@ -1196,7 +1196,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 															value:
 																props.customPathResult.command ??
 																props.customPathResult.version ??
-																"pi",
+																"omp",
 														})
 													: t("settings.validateFailed", {
 															error:
