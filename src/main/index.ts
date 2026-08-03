@@ -23,6 +23,7 @@ import {
 } from "./linuxDisplayBackend";
 import {
 	readElectronChromiumSandboxPreference,
+	readPetEnabledPreference,
 	readSingleInstancePreference,
 } from "./settings/SettingsStore";
 import { acquireVersionSingleInstance } from "./singleInstance";
@@ -32,8 +33,6 @@ import type { StartupWindowMode } from "../shared/types";
 import iconPath from "../../build/icon.png?asset";
 // 托盘图标使用预渲染的小尺寸 PNG，避免从 512x512 下采样导致模糊
 import trayIconPath from "../../build/icons/32x32.png?asset";
-
-applyLinuxDisplayBackendWorkaround();
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 PiDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -45,6 +44,13 @@ if (!app.isPackaged) {
 		app.setPath("userData", `${baseUserData}-dev`);
 	}
 }
+
+// Linux XWayland 兼容层：仅当桌面宠物启用时才强制 ozone-platform=x11（#108，
+// 强制 XWayland 在部分 GNOME/Wayland 环境会导致主窗口不可见）。
+// ozone 平台一经启动不可更改，整个生命周期统一使用启动时快照。
+// 注意必须放在 dev userData 覆盖之后，否则 dev 模式会误读正式版的 petEnabled。
+const petEnabledAtLaunch = readPetEnabledPreference();
+applyLinuxDisplayBackendWorkaround(petEnabledAtLaunch);
 
 // Chromium 沙箱开关必须在 app.ready 前生效。
 // 默认关闭：Windows 上部分安全软件/旧 GPU 驱动会在沙箱初始化时触发原生断点（0x80000003）。
@@ -1044,7 +1050,7 @@ function shouldUseDevRendererUrl() {
 }
 
 function shouldShowMainWindowImmediately() {
-	return isUsingLinuxXWaylandWorkaround();
+	return isUsingLinuxXWaylandWorkaround(petEnabledAtLaunch);
 }
 
 // ===== 飞书桥接 IPC =====
