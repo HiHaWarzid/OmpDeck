@@ -711,7 +711,7 @@ export function ExtensionWidgetCard(props: {
 const HUNGRY_THRESHOLD = 0.15;
 const ARCHIVE_THRESHOLD = 0.1;
 // 仅作为路径片段，实际拼接用 joinMemoryStorePath，兼容 Windows 反斜杠。
-const MEM_STORE_SEGMENTS = [".pi", "agent", "memory-store.json"] as const;
+const MEM_STORE_SEGMENTS = [".omp", "agent", "memory-store.json"] as const;
 
 const TYPE_LABEL_KEYS: Record<string, TranslationKey> = {
 	decision: "mem.type.decision",
@@ -764,7 +764,7 @@ interface MemoryStore {
 /**
  * MemSpacedCard — 记忆管理卡片
  *
- * 直接从 ~/.pi/agent/memory-store.json 读取记忆数据，展示概览统计、低效记忆和全部记忆列表。
+ * 直接从 ~/.omp/agent/memory-store.json 读取记忆数据，展示概览统计、低效记忆和全部记忆列表。
  * 支持手动刷新、AI 整理记忆库入口。
  */
 export const MemSpacedCard = memo(function MemSpacedCard(props: {
@@ -1477,7 +1477,7 @@ export function ThinkingPicker(props: {
 }
 
 /**
- * Prompt Template 选择器：列出 ~/.pi/agent/prompts/ 下所有 .md 模板，
+ * Prompt Template 选择器：列出 ~/.omp/agent/prompts/ 下所有 .md 模板，
  * 点击后将模板内容插入到 composer 输入框。
  */
 export function PromptTemplatePicker(props: {

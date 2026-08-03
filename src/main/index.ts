@@ -1493,7 +1493,7 @@ function registerIpc() {
 		void appLogger.info("project-resource", "Project skill deleted", { projectId, skillPath });
 	});
 	ipcMain.handle(ipcChannels.projectResourcesDeleteExtension, async (_event, projectId: string, extensionPath: string) => {
-		// 项目级 extension 是自动发现的本地文件/目录，删除时仅移除项目 .pi/extensions 下对应资源。
+		// 项目级 extension 是自动发现的本地文件/目录，删除时仅移除项目 .omp/extensions 下对应资源。
 		await projectResourceManager.deleteExtension(projectId, extensionPath);
 		void appLogger.info("project-resource", "Project extension deleted", { projectId, extensionPath });
 	});
@@ -3972,7 +3972,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 					// 历史「仅标记移除、文件仍保留」会让 pi 继续加载残留扩展，
 					// 与三方同名工具（如 rpiv-todo 的 todo）冲突导致 RPC 启动失败。启动时清残留。
 					try {
-						await rm(join(homeDir, ".pi", "agent", "extensions", extensionName), { force: true });
+						await rm(join(homeDir, ".omp", "agent", "extensions", extensionName), { force: true });
 					} catch (error) {
 						const message = error instanceof Error ? error.message : String(error);
 						summary.failed.push({ name: extensionName, error: `purge residual: ${message}` });
@@ -4057,7 +4057,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	try {
 		const home = app.getPath("home");
 		const restored = restoreAllParkedExtensions([
-			join(home, ".pi", "agent", "extensions"),
+			join(home, ".omp", "agent", "extensions"),
 		]);
 		if (restored.length > 0) {
 			void appLogger.info("extension", "Restored parked incompatible extensions from previous session", {
@@ -4239,7 +4239,7 @@ async function ensurePiSettingsDefaults(configDir: string, piVersionHint?: strin
 	if (changed) {
 		await mkdir(configDir, { recursive: true });
 		await writeFile(filePath, JSON.stringify(current, null, 2), "utf8");
-		console.log('[PiDeck] Ensured pi settings defaults at:', filePath);
+		console.log('[OmpDeck] Ensured pi settings defaults at:', filePath);
 	}
 }
 
@@ -4252,12 +4252,12 @@ async function ensureAllPiSettingsDefaults(): Promise<void> {
 	}
 
 	// Windows 本地
-	const winDir = join(app.getPath("home"), ".pi", "agent");
+	const winDir = join(app.getPath("home"), ".omp", "agent");
 	await ensurePiSettingsDefaults(winDir, piVersion).catch(() => {});
 
 	// WSL（如果已配置）
 	if (activeWslEnvironment) {
-		const wslDir = join(activeWslEnvironment.windowsHome, ".pi", "agent");
+		const wslDir = join(activeWslEnvironment.windowsHome, ".omp", "agent");
 		await ensurePiSettingsDefaults(wslDir, piVersion).catch(() => {});
 	}
 }

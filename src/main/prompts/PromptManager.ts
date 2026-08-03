@@ -164,7 +164,7 @@ when appropriate. If unsure whether a skill is needed, follow the rule:
 ];
 
 /**
- * 管理 omp 全局 Prompt Templates 目录 (~/.pi/agent/prompts/)。
+ * 管理 omp 全局 Prompt Templates 目录 (~/.omp/agent/prompts/)。
  * 
  * Prompt Templates 是 markdown 文件，用户可在 pi 中输入 /<name> 快速展开。
  * frontmatter 支持 description、argument-hint 等元数据。
@@ -257,9 +257,9 @@ export class PromptManager {
 		await rm(filePath, { force: true });
 	}
 
-	/** 扫描项目 .pi/prompts/ 目录下的模板 */
+	/** 扫描项目 .omp/prompts/ 目录下的模板 */
 	async listByProject(projectPath: string): Promise<PiPromptTemplateListResult> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(projectPath, ".omp", "prompts");
 		const entries = await readdir(projectPromptsDir).catch(() => []);
 		const templates: PiPromptTemplateSummary[] = [];
 		for (const entry of entries) {
@@ -285,12 +285,12 @@ export class PromptManager {
 		return { templates, globalDir: projectPromptsDir };
 	}
 
-	/** 在项目 .pi/prompts/ 下创建模板 */
+	/** 在项目 .omp/prompts/ 下创建模板 */
 	async createInProject(
 		projectPath: string,
 		input: CreatePiPromptTemplateInput,
 	): Promise<PiPromptTemplateSummary> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(projectPath, ".omp", "prompts");
 		await mkdir(projectPromptsDir, { recursive: true });
 		const name = this.normalizeName(input.name);
 		if (!name) throw new Error("模板名称不能为空，且至少包含一个字母或数字");
@@ -311,9 +311,9 @@ export class PromptManager {
 		};
 	}
 
-	/** 从项目 .pi/prompts/ 删除模板 */
+	/** 从项目 .omp/prompts/ 删除模板 */
 	async deleteFromProject(projectPath: string, fileName: string): Promise<void> {
-		const filePath = join(projectPath, ".pi", "prompts", fileName);
+		const filePath = join(projectPath, ".omp", "prompts", fileName);
 		if (!existsSync(filePath)) throw new Error("模板文件不存在");
 		await rm(filePath, { force: true });
 	}
@@ -384,7 +384,7 @@ export class PromptManager {
 
 	/** 重命名项目级模板 */
 	async renameInProject(projectPath: string, oldName: string, newName: string): Promise<PiPromptTemplateSummary> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(projectPath, ".omp", "prompts");
 		const normalizedOld = this.normalizeName(oldName);
 		const normalizedNew = this.normalizeName(newName);
 		if (!normalizedOld || !normalizedNew) throw new Error("模板名称不能为空");

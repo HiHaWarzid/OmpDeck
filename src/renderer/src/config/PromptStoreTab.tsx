@@ -91,7 +91,7 @@ export function PromptStoreTab(props: {
 	};
 
 	/**
-	 * 导入选中的 prompt 到本地 ~/.pi/agent/prompts/。
+	 * 导入选中的 prompt 到本地 ~/.omp/agent/prompts/。
 	 * 使用主进程的 PromptManager 创建文件，成功后显示 toast 通知。
 	 */
 	const handleImport = async (item: PromptStoreItem) => {

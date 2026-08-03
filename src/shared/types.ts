@@ -606,14 +606,14 @@ export type CreatePiSkillInput = {
 	locationId: PiSkillLocation["id"];
 };
 
-/** pi Prompt Template，对应 ~/.pi/agent/prompts/<name>.md */
+/** pi Prompt Template，对应 ~/.omp/agent/prompts/<name>.md */
 export type PiPromptTemplateSummary = {
 	name: string;
 	path: string;
 	description: string;
 	content: string;
 	userCreated: boolean;
-	/** 模板范围：global (~/.pi/agent/prompts/) 或 project (.pi/prompts/) */
+	/** 模板范围：global (~/.omp/agent/prompts/) 或 project (.omp/prompts/) */
 	scope?: "global" | "project";
 };
 

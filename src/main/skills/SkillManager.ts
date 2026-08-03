@@ -24,7 +24,7 @@ const SKILL_FILE = "SKILL.md";
 
 /**
  * 管理 omp 全局 Skill 目录。
- * 第一版仅操作全局目录，不触碰项目级 .pi/.agents skills，避免误删项目资产或绕过 trusted project 规则。
+ * 第一版仅操作全局目录，不触碰项目级 .omp/.agents skills，避免误删项目资产或绕过 trusted project 规则。
  */
 export class SkillManager {
 	private locations: PiSkillLocation[];
@@ -60,7 +60,7 @@ export class SkillManager {
 			await Promise.all(this.locations.map((location) => this.scanLocation(location)))
 		).flat();
 		// 按 name 去重，优先保留 pi-global 目录下的条目
-		// （避免 ~/.pi/agent/skills/ 和 ~/.agents/skills/ 不同步导致同名重复）
+		// （避免 ~/.omp/agent/skills/ 和 ~/.agents/skills/ 不同步导致同名重复）
 		const seen = new Map<string, PiSkillSummary>();
 		for (const skill of skills) {
 			const key = skill.name.toLowerCase();

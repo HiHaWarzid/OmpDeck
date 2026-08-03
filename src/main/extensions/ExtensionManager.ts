@@ -164,7 +164,7 @@ export class ExtensionManager {
 	}
 
 	/**
-	 * 扫描 ~/.pi/agent/extensions/ 目录，发现未被 pi list 列出的本地扩展。
+	 * 扫描 ~/.omp/agent/extensions/ 目录，发现未被 pi list 列出的本地扩展。
 	 * 单文件扩展（.ts 文件）和目录扩展（含 index.ts）都会被识别。
 	 */
 	private async scanLocalExtensions(): Promise<PiExtensionSummary[]> {
@@ -215,7 +215,7 @@ export class ExtensionManager {
 	}
 
 	/**
-	 * 判断是否为本地文件扩展（~/.pi/agent/extensions 下自动发现的 .ts/目录）。
+	 * 判断是否为本地文件扩展（~/.omp/agent/extensions 下自动发现的 .ts/目录）。
 	 * pi list 的包源都带 npm:/file:/github: 等协议前缀；裸文件名只能走文件系统删除。
 	 */
 	private isLocalFileExtension(source: string): boolean {
@@ -258,7 +258,7 @@ export class ExtensionManager {
 
 	/**
 	 * 「移除」内置扩展：写入 OmpDeck 设置跳过自动部署，并删除用户目录中的扩展文件。
-	 * 必须删文件：pi 会自动加载 ~/.pi/agent/extensions 下的 .ts，仅改设置无法阻止加载，
+	 * 必须删文件：pi 会自动加载 ~/.omp/agent/extensions 下的 .ts，仅改设置无法阻止加载，
 	 * 与同名三方工具（如 npm:@juicesharp/rpiv-todo 的 todo）会直接冲突导致 RPC 启动失败。
 	 * 恢复时由 ensurePiDeckExtension 从 resources 重新部署。
 	 */

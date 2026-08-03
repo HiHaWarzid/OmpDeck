@@ -69,7 +69,7 @@ export function SettingsTab(props: {
 	};
 
 	/**
-	 * pi 会话压缩配置（~/.pi/agent/settings.json 的 compaction）。
+	 * pi 会话压缩配置（~/.omp/agent/settings.json 的 compaction）。
 	 * 与 pi 文档默认值对齐：自动压缩开启、预留 16k 回复空间、保留最近 20k tokens。
 	 * 只规范化这 3 个字段，避免把未知扩展字段写丢。
 	 */
@@ -195,7 +195,7 @@ export function SettingsTab(props: {
 		}
 	};
 
-	/** 全局会话目录：空值表示使用 pi 默认 ~/.pi/agent/sessions/<encoded-cwd>/ */
+	/** 全局会话目录：空值表示使用 pi 默认 ~/.omp/agent/sessions/<encoded-cwd>/ */
 	const sessionDirValue = typeof data.sessionDir === "string" ? data.sessionDir : "";
 	const updateSessionDir = (raw: string) => {
 		const next = raw.trim();
@@ -235,7 +235,7 @@ export function SettingsTab(props: {
 					/>
 				</div>
 
-				{/* ── 全局会话目录（仅编辑 ~/.pi/agent/settings.json 的 sessionDir） ── */}
+			{/* ── 全局会话目录（仅编辑 ~/.omp/agent/settings.json 的 sessionDir） ── */}
 				<div className="config-retry-group">
 					<div className="config-settings-row config-retry-header-row">
 						<span className="config-settings-section-title">{t("config.sessionDir.title")}</span>

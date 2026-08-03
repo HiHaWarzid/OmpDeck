@@ -3035,7 +3035,7 @@ export class AgentManager {
 			lines.push("1. 打开 设置 → 开发设置");
 			lines.push("2. 临时开启「禁用扩展启动」和/或「禁用技能启动」");
 			lines.push("3. 保存后重新启动 Agent 验证");
-			lines.push("若禁用后能启动，再逐个排查 ~/.pi/agent/extensions 与 skills。");
+			lines.push("若禁用后能启动，再逐个排查 ~/.omp/agent/extensions 与 skills。");
 		}
 		lines.push("");
 		lines.push("如问题持续，可在 GitHub 提交 Issue 并附上以上信息与应用日志。");
@@ -3538,7 +3538,7 @@ export class AgentManager {
 	 * pi 信任机制只对“含项目级 pi 资源”的项目触发，且 RPC 模式下 pi 的 project_trust 事件
 	 * hasUI 恒为 false、ctx.ui.select 不接 RPC UI 协议，无法弹窗。
 	 * 因此 pi-desktop 在启动 pi 进程前自行完成信任确认：干净项目自动信任并写入 trust.json；
-	 * 含 .pi/.agents 资源且未记录的项目弹窗让用户决策。
+	 * 含 .omp/.agents 资源且未记录的项目弹窗让用户决策。
 	 */
 	private static readonly TRUST_REQUIRING_RESOURCE_FILES = [
 		"settings.json",
@@ -3552,11 +3552,11 @@ export class AgentManager {
 
 	/**
 	 * 复刻 pi 的 hasTrustRequiringProjectResources：检查项目目录或其父目录是否存在
-	 * 需要信任才能加载的资源（.pi 下的配置/扩展/skills 等，或项目级 .agents/skills）。
+	 * 需要信任才能加载的资源（.omp 下的配置/扩展/skills 等，或项目级 .agents/skills）。
 	 * 用户全局 ~/.agents/skills 视为可信，不触发信任确认。
 	 */
 	private hasTrustRequiringResources(hostCwd: string): boolean {
-		const configDir = join(hostCwd, ".pi");
+		const configDir = join(hostCwd, ".omp");
 		if (
 			AgentManager.TRUST_REQUIRING_RESOURCE_FILES.some((file) => existsSync(join(configDir, file)))
 		) {

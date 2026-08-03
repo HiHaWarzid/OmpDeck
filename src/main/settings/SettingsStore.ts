@@ -9,7 +9,7 @@ function desktopSettingsPath() {
 	return join(app.getPath("userData"), "settings.json");
 }
 
-/** pi agent 的 settings.json 路径（~/.pi/agent/settings.json） */
+/** pi agent 的 settings.json 路径（~/.omp/agent/settings.json） */
 function piAgentSettingsPath() {
 	return join(app.getPath("home"), ".omp", "agent", "settings.json");
 }

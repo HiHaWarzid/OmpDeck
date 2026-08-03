@@ -22,7 +22,7 @@ export class SessionScanner {
   private summaryCacheFileSetKey = "";
   /**
    * 最近一次 list() 解析出的会话扫描根目录。
-   * 默认 ~/.omp/agent/sessions，加上 settings 中的 sessionDir（如项目 .pi/sessions）。
+   * 默认 ~/.omp/agent/sessions，加上 settings 中的 sessionDir（如项目 .omp/sessions）。
    * 供子会话父路径推断作为边界。
    */
   private activeScanRoots: string[] = [];
@@ -236,7 +236,7 @@ export class SessionScanner {
       // 重启后先恢复磁盘摘要缓存，避免全量重读 JSONL。
       await this.summaryCache.ensureLoaded();
 
-      // 扫描根 = 默认全局 sessions + 项目/全局 sessionDir（如 <project>/.pi/sessions）。
+      // 扫描根 = 默认全局 sessions + 项目/全局 sessionDir（如 <project>/.omp/sessions）。
       // pi/omp 配置 sessionDir 后不再写 encoded-cwd 子目录，必须额外扫该路径。
       const scanRoots = await this.resolveScanRoots(projectPath, normalizedProjectPath);
       this.activeScanRoots = scanRoots;
@@ -281,7 +281,7 @@ export class SessionScanner {
    * 解析本次应扫描的会话根目录。
    * 始终包含默认全局目录（保留历史会话）；若 settings 配置了 sessionDir 且目录存在则追加。
    *
-   * @param hostProjectPath 项目原始路径（通常是 Windows 路径，用于读 .pi/settings.json）
+   * @param hostProjectPath 项目原始路径（通常是 Windows 路径，用于读 .omp/settings.json）
    * @param runtimeProjectPath 运行时 cwd 路径（WSL 下已是 /mnt/...，用于解析相对 sessionDir）
    */
   private async resolveScanRoots(
@@ -306,13 +306,13 @@ export class SessionScanner {
 
   /**
    * 读取 pi 的 sessionDir 配置并解析为可扫描绝对路径。
-   * 优先级：项目 `.pi/settings.json` > 全局 `~/.pi/agent/settings.json`。
+   * 优先级：项目 `.omp/settings.json` > 全局 `~/.omp/agent/settings.json`。
    */
   private async resolveConfiguredSessionDir(
     hostProjectPath: string,
     runtimeProjectPath: string,
   ): Promise<string | undefined> {
-    const projectSettingsPath = join(this.toHostReadablePath(hostProjectPath), ".pi", "settings.json");
+    const projectSettingsPath = join(this.toHostReadablePath(hostProjectPath), ".omp", "settings.json");
     const projectRaw = await this.readSessionDirSettingLocal(projectSettingsPath);
 
     const globalRaw = this.wslConfig
@@ -1177,8 +1177,8 @@ export class SessionScanner {
       const encoded = normalized.slice(index + marker.length).split("/")[0];
       return this.decodeSessionDir(encoded);
     }
-    // 常见项目级 sessionDir：<project>/.pi/sessions/...
-    const customMarker = "/.pi/sessions/";
+    // 常见项目级 sessionDir：<project>/.omp/sessions/...
+    const customMarker = "/.omp/sessions/";
     const customIndex = normalized.toLowerCase().lastIndexOf(customMarker);
     if (customIndex !== -1) {
       return this.normalize(normalized.slice(0, customIndex));
@@ -1231,7 +1231,7 @@ export class SessionScanner {
     if (normalizedSessionProject === normalizedProject) return true;
     if (await this.isParentSessionForProject(normalizedSessionProject, normalizedProject, summary.filePath, signal)) return true;
 
-    // 项目级自定义 sessionDir（如 <project>/.pi/sessions）下的文件默认归属该项目。
+    // 项目级自定义 sessionDir（如 <project>/.omp/sessions）下的文件默认归属该项目。
     // 该布局不再使用 encoded-cwd 子目录，safePathToken 无法从路径反推项目。
     if (this.isUnderProjectSessionDir(summary.filePath, projectPath)) return true;
 

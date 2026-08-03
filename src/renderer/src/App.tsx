@@ -4626,7 +4626,7 @@ export function App() {
         const projectResult = await api.prompts.listByProject(activeProject.path);
         allTemplates.push(...projectResult.templates);
       } catch {
-        // 项目无 .pi/prompts/ 目录时静默跳过
+        // 项目无 .omp/prompts/ 目录时静默跳过
       }
     }
     setPromptTemplateList(allTemplates);
