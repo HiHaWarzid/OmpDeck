@@ -268,6 +268,8 @@ const TERMINAL_DOCK_MOTION_MS = 180;
 const SIDEBAR_PROJECT_CHILD_PAGE_SIZE = 5;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
 const SESSION_REFRESH_TIMEOUT_MS = 20_000;
+// 共享空数组：侧栏按 projectId 查 agents 时作为默认值，避免每次 .get() miss 都新建 []。
+const EMPTY_AGENTS: AgentTab[] = Object.freeze([]) as unknown as AgentTab[];
 
 function withTimeout<T>(
   promise: Promise<T>,
@@ -999,6 +1001,15 @@ export function App() {
     (path: string, content: string) => api.files.writeContent(path, content),
     [],
   );
+  // 稳定回调：避免每次 App 渲染新建内联箭头函数。TurnRow/UserBubble 的 memo 比较器
+  // 虽然排除了回调 prop，但内联箭头仍会产生 GC 压力，且传给非 memo 子组件时会触发重渲染。
+  const handleOpenExternal = useCallback(
+    (url: string) => api.app.openExternal(url),
+    [],
+  );
+  const handleEnterMultiSelect = useCallback(() => {
+    setMultiSelectOpen(true);
+  }, []);
   const editorTabTextBytes = (tab: EditorTab) =>
     (tab.originalContent.length + (tab.modifiedContent?.length ?? 0)) * 2;
   const trimEditorTabs = (tabs: EditorTab[], protectedId: string) => {
@@ -1429,6 +1440,9 @@ export function App() {
   const chatPaneRef = useRef<HTMLElement | null>(null);
   const sessionComboRef = useRef<HTMLDivElement | null>(null);
   const chatHeaderRef = useRef<HTMLElement | null>(null);
+  // chatHeader 高度由 ResizeObserver 异步追踪，避免在 render 中同步读 offsetHeight 触发强制布局。
+  // 初始值 78 与 CSS 默认高度一致，observer 首帧回调后修正为真实值。
+  const [chatHeaderHeight, setChatHeaderHeight] = useState(78);
   const composerRef = useRef<HTMLElement | null>(null);
   const queuedTrackRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLElement | null>(null);
@@ -1900,7 +1914,6 @@ export function App() {
         ? 34
         : activeTerminalHeight;
   const chatPaneHeight = chatLayoutHeight;
-  const chatHeaderHeight = chatHeaderRef.current?.offsetHeight ?? 78;
   const fixedChatHeight =
     chatHeaderHeight +
     COMPOSER_MIN_TIMELINE_HEIGHT +
@@ -2185,6 +2198,26 @@ export function App() {
     () => projects.map((project) => project.id).join("\n"),
     [projects],
   );
+  // 预分组：将 agents 按 projectId 分桶，避免侧栏每个 project .map() 内部都 filter 全量 agents。
+  // filteredAgents（含搜索过滤）和 displayAgents（全量）各一份，供侧栏不同分支使用。
+  const filteredAgentsByProject = useMemo(() => {
+    const map = new Map<string, typeof filteredAgents>();
+    for (const agent of filteredAgents) {
+      const list = map.get(agent.projectId);
+      if (list) list.push(agent);
+      else map.set(agent.projectId, [agent]);
+    }
+    return map;
+  }, [filteredAgents]);
+  const displayAgentsByProject = useMemo(() => {
+    const map = new Map<string, typeof displayAgents>();
+    for (const agent of displayAgents) {
+      const list = map.get(agent.projectId);
+      if (list) list.push(agent);
+      else map.set(agent.projectId, [agent]);
+    }
+    return map;
+  }, [displayAgents]);
   const canReorderProjects = search.trim().length === 0;
 
   useEffect(() => {
@@ -2781,10 +2814,28 @@ export function App() {
     }
 
     // 子会话由扩展直接写盘，运行期间保留低频兜底；工具 start/end 不应重置计时器并触发额外扫描。
-    const timer = window.setInterval(scheduleRefresh, 15_000);
+    // 窗口隐藏时暂停轮询，可见时立即补一次 + 恢复定时器。
+    let timer: number | undefined;
+    const start = () => {
+      if (timer) return;
+      timer = window.setInterval(scheduleRefresh, 15_000);
+    };
+    const stop = () => {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else { scheduleRefresh(); start(); }
+    };
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [activeProjectId, activeProjectHasBusyAgent, expandedSidebarProjects]);
 
@@ -2926,14 +2977,21 @@ export function App() {
           const next = chatPaneRef.current?.clientHeight ?? window.innerHeight;
           return current === next ? current : next;
         });
+        // 同步读取 chatHeader 高度到 state，替代 render 中直接读 offsetHeight 的强制布局。
+        const headerEl = chatHeaderRef.current;
+        if (headerEl) {
+          const next = headerEl.offsetHeight;
+          setChatHeaderHeight((current) => (current === next ? current : next));
+        }
       });
     };
 
     const box = composerBoxRef.current;
     const footer = composerRef.current;
     const chatPane = chatPaneRef.current;
+    const header = chatHeaderRef.current;
     const observer =
-      (box || footer || chatPane) &&
+      (box || footer || chatPane || header) &&
       new ResizeObserver((entries) => {
         const entry = entries[0];
         if (!entry) return;
@@ -2942,6 +3000,7 @@ export function App() {
     if (box) observer?.observe(box);
     if (footer) observer?.observe(footer);
     if (chatPane) observer?.observe(chatPane);
+    if (header) observer?.observe(header);
 
     window.addEventListener("resize", scheduleSync);
     scheduleSync();
@@ -3272,9 +3331,9 @@ export function App() {
   useEffect(() => {
     if (!activeProjectId) return;
     let stopped = false;
+    let timer: number | undefined;
     const refreshGitInfo = async () => {
       try {
-        // 轮询分支信息
         const next = await api.git.branches(activeProjectId);
         if (stopped) return;
         // 分支可能在外部终端/IDE 中切换,轮询只在状态真的变化时更新,避免不必要重渲染。
@@ -3290,10 +3349,29 @@ export function App() {
         }
       }
     };
-    const timer = window.setInterval(refreshGitInfo, 4000);
+    // 窗口可见时轮询分支信息；最小化/隐藏时停止 IPC 调用，避免无意义的 git 进程开销。
+    // 分支切换是低频操作，10s 间隔足够及时反映外部变更（原 4s 过于激进）。
+    const start = () => {
+      if (timer) return;
+      void refreshGitInfo();
+      timer = window.setInterval(refreshGitInfo, 10_000);
+    };
+    const stop = () => {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    start();
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       stopped = true;
-      window.clearInterval(timer);
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [activeProjectId]);
 
@@ -6623,12 +6701,8 @@ export function App() {
               ? t("app.chatProject")
               : displayProjectDirectoryName(project);
             const canDragProject = canReorderProjects && !projectIsChat;
-            const projectAgents = filteredAgents.filter(
-              (agent) => agent.projectId === project.id,
-            );
-            const allProjectAgents = displayAgents.filter(
-              (agent) => agent.projectId === project.id,
-            );
+            const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
+            const allProjectAgents = displayAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
             const projectSearch = search.trim();
             const projectSessions = ((projectSearch
               ? (sessionsByProject[project.id] ?? []).filter((session) =>
@@ -7704,12 +7778,12 @@ export function App() {
                       showThinking={settings.showThinking}
                       isStreaming={isRunStreaming}
                       agentRunning={isAgentBusy && index === renderedRuns.length - 1}
-                      onOpenExternal={(url) => api.app.openExternal(url)}
+                      onOpenExternal={handleOpenExternal}
                       onOpenFile={openFilePath}
                       onDiffFile={diffFilePath}
                       onEditMessage={editMessage}
                       onDeleteMessage={deleteMessage}
-                      onEnterMultiSelect={() => setMultiSelectOpen(true)}
+                      onEnterMultiSelect={handleEnterMultiSelect}
                     />
                   );
                 }
@@ -7732,7 +7806,7 @@ export function App() {
                       forking={forkingMessageId === message.id}
                       validCommandNames={validCommandNames}
                       validFilePaths={validFilePaths}
-                      onEnterMultiSelect={() => setMultiSelectOpen(true)}
+                      onEnterMultiSelect={handleEnterMultiSelect}
                     />
                   );
                 }
@@ -8813,7 +8887,7 @@ export function App() {
               const maxHeight = Math.max(
                 120,
                 chatLayoutHeight -
-                  (chatHeaderRef.current?.offsetHeight ?? 78) -
+                  chatHeaderHeight -
                   COMPOSER_MIN_TIMELINE_HEIGHT -
                   COMPOSER_MIN_HEIGHT -
                   28 -
@@ -9877,7 +9951,7 @@ export function App() {
           appInfo={appInfo}
           onClose={() => setFeedbackOpen(false)}
           onCopy={() => showToast(t("app.feedbackCopied"))}
-          onOpenExternal={(url) => api.app.openExternal(url)}
+          onOpenExternal={handleOpenExternal}
           loadEnvironment={api.app.feedbackEnvironment}
         />
       )}

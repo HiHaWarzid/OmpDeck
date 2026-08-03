@@ -3186,6 +3186,33 @@ export const AssistantText = memo(
 		const cleanText = stripThinkingTags(stripAnsi(props.text));
 		// 流式期间用轻量管线（仅 GFM + 路径链接化），回答结束后切回含数学/图表的完整渲染。
 		const streaming = Boolean(props.isStreaming);
+
+		// 稳定 remark/rehype 插件数组引用：ReactMarkdown 会对 plugins 数组做引用对比，
+		// 每次渲染新建数组会触发整条 markdown 重新解析（含 KaTeX / mermaid），是流式期间的主要卡顿源。
+		// streaming 只有两种取值，用模块级常量避免每次渲染分配。
+		const remarkPlugins = streaming ? STREAMING_REMARK_PLUGINS : FULL_REMARK_PLUGINS;
+		const rehypePlugins = streaming ? EMPTY_REHYPE_PLUGINS : FULL_REHYPE_PLUGINS;
+
+		// components 对象做 useMemo 稳定引用：a 组件需要闭包捕获 onOpenExternal/onOpenFile，
+		// 但这两个回调在 App 中是稳定的（读 ref 或 setState），故依赖 [] 即可。
+		// memo 比较器已排除回调，组件不会因回调变化而重渲染，闭包始终拿到首次渲染的引用即可。
+		const components = useMemo(
+			() => ({
+				pre: streaming ? StreamingCodeBlock : CodeBlock,
+				table: TableWrapper,
+				span: MathSpan,
+				a: (linkProps: React.ComponentProps<"a">) => (
+					<MarkdownLink
+						{...linkProps}
+						onOpenExternal={props.onOpenExternal}
+						onOpenFile={props.onOpenFile}
+					/>
+				),
+			}),
+			// eslint-disable-next-line react-hooks/exhaustive-deps
+			[streaming, props.onOpenExternal, props.onOpenFile],
+		);
+
 		return (
 			<div className="assistant-text markdown-body">
 				{props.images && props.images.length > 0 && (
@@ -3202,25 +3229,10 @@ export const AssistantText = memo(
 					</div>
 				)}
 				<ReactMarkdown
-					remarkPlugins={
-						streaming
-							? [remarkGfm, remarkLinkifyPaths]
-							: [remarkGfm, remarkMath, remarkLinkifyPaths]
-					}
-					rehypePlugins={streaming ? [] : [rehypeKatex]}
+					remarkPlugins={remarkPlugins}
+					rehypePlugins={rehypePlugins}
 					urlTransform={markdownUrlTransform}
-					components={{
-						pre: streaming ? StreamingCodeBlock : CodeBlock,
-						table: TableWrapper,
-						span: MathSpan,
-						a: (linkProps) => (
-							<MarkdownLink
-								{...linkProps}
-								onOpenExternal={props.onOpenExternal}
-								onOpenFile={props.onOpenFile}
-							/>
-						),
-					}}
+					components={components}
 				>
 					{cleanText}
 				</ReactMarkdown>
@@ -3928,6 +3940,14 @@ const remarkLinkifyPaths = () => {
 		visit(tree);
 	};
 };
+
+// ── ReactMarkdown 插件数组常量 ──
+// ReactMarkdown 对 plugins 数组做引用对比；每次渲染新建数组会触发整条 markdown 重新解析。
+// 流式/非流式两种管线各自只取一组常量引用，避免流式期间每个 token 都重新初始化插件链。
+const STREAMING_REMARK_PLUGINS = [remarkGfm, remarkLinkifyPaths];
+const FULL_REMARK_PLUGINS = [remarkGfm, remarkMath, remarkLinkifyPaths];
+const EMPTY_REHYPE_PLUGINS: [] = [];
+const FULL_REHYPE_PLUGINS = [rehypeKatex];
 
 function getToolStatus(message: ChatMessage): "running" | "done" | "error" {
 	const status = String(message.meta?.status ?? "done");
