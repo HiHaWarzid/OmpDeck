@@ -4,6 +4,11 @@ type DisplayBackendInput = {
 	platform?: NodeJS.Platform | "linux";
 	env?: NodeJS.ProcessEnv;
 	argv?: string[];
+	/**
+	 * 桌面宠物是否启用（启动时快照）。宠物依赖 X11 的绝对窗口定位，
+	 * 是应用 XWayland 兼容层的唯一理由；未启用时不得强制 XWayland（#108）。
+	 */
+	petEnabled?: boolean;
 };
 
 type CommandLineSwitch = {
@@ -30,8 +35,13 @@ function shouldDisableGpuForXWayland(env: NodeJS.ProcessEnv) {
  * Ubuntu/GNOME defaults to Wayland, but Electron 38 cannot freely position
  * BrowserWindow instances there. The desktop pet depends on absolute window
  * coordinates for initial placement, dragging and patrol, so prefer XWayland
- * when the session exposes a DISPLAY server. Users can opt back into native
- * Wayland with PIDECK_LINUX_DISPLAY_BACKEND=wayland or an explicit ozone arg.
+ * when the session exposes a DISPLAY server.
+ *
+ * 见 #108：Electron 38 在 GNOME/Wayland 上强制 XWayland 会导致主窗口不可见，
+ * 而兼容层的唯一收益是宠物的自由定位，因此默认不再无条件应用：
+ * `PIDECK_LINUX_DISPLAY_BACKEND=wayland` 强制原生 Wayland；`=x11` 强制 XWayland；
+ * 未设置时仅当桌面宠物已启用（petEnabled）才应用，未启用宠物的用户走原生
+ * Wayland，宠物按 PetWindowCaps 探测结果降级为圆角小窗。
  */
 export function getLinuxDisplayBackendSwitches(
 	input: DisplayBackendInput = {},
@@ -47,6 +57,9 @@ export function getLinuxDisplayBackendSwitches(
 		return [];
 	}
 
+	// 默认仅宠物启用时才强制 XWayland；显式 =x11 视为无条件开启。
+	if (requestedBackend !== "x11" && input.petEnabled !== true) return [];
+
 	const isWaylandSession =
 		normalizeBackend(env.XDG_SESSION_TYPE) === "wayland" ||
 		Boolean(env.WAYLAND_DISPLAY);
@@ -60,8 +73,8 @@ export function getLinuxDisplayBackendSwitches(
 	return switches;
 }
 
-export function applyLinuxDisplayBackendWorkaround() {
-	const switches = getLinuxDisplayBackendSwitches();
+export function applyLinuxDisplayBackendWorkaround(petEnabled?: boolean) {
+	const switches = getLinuxDisplayBackendSwitches({ petEnabled });
 	if (
 		switches.some(
 			(item) => item.name === "ozone-platform" && item.value === "x11",
@@ -76,8 +89,8 @@ export function applyLinuxDisplayBackendWorkaround() {
 	}
 }
 
-export function isUsingLinuxXWaylandWorkaround() {
-	return getLinuxDisplayBackendSwitches().some(
+export function isUsingLinuxXWaylandWorkaround(petEnabled?: boolean) {
+	return getLinuxDisplayBackendSwitches({ petEnabled }).some(
 		(item) => item.name === "ozone-platform" && item.value === "x11",
 	);
 }

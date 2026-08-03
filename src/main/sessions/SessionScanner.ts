@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { app, shell } from "electron";
 import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
@@ -434,63 +435,74 @@ export class SessionScanner {
   // ── 会话操作：rename / delete / copy / exportHtml / readMessages ─
 
   /**
-   * 重命名会话：在 JSONL 文件头部插入一条 sessionName 元数据。
-   * pi 读取时会取第一个遇到的 sessionName 字段，所以插在最前面即可覆盖旧名。
+   * 重命名会话：按 pi 原生格式在 JSONL 末尾追加 session_info 记录。
+   *
+   * pi 要求会话文件首条可解析记录必须是 type:"session"（buildSessionInfo 中
+   * 否则直接返回 null），旧版在文件头前置 {"sessionName":...} 会让 pi 完全无法
+   * 加载该会话（/resume 中也不可见，见 #114）。pi 原生 /rename 的做法是末尾追加
+   * {type:"session_info", id, parentId, timestamp, name}，读取时取最后一条。
+   *
+   * 顺带剔除旧版 PiDeck 写入的 sessionName 私有行，修复已被破坏的会话文件。
    * 支持 WSL 路径。
    */
   async rename(filePath: string, newName: string): Promise<void> {
     const wsl = this.isWslPath(filePath);
     const raw = wsl ? await this.readWslFile(filePath) : await readFile(filePath, "utf8");
-    const lines = raw.split(/\r?\n/);
-    const metaLine = JSON.stringify({ sessionName: newName, ts: Date.now() });
-
-    // 查找已有的 sessionName 行并替换（首条匹配），避免每次重命名都前置插入导致文件膨胀
-    let found = false;
-    let sessionNameCount = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed.sessionName === "string") {
-          sessionNameCount++;
-          if (!found) {
-            lines[i] = metaLine;
-            found = true;
-          }
-        }
-      } catch {
-        // 跳过不可解析的行
-      }
-    }
-
-    let output: string;
-    if (!found) {
-      // 没有旧 sessionName 行，前置插入（行为与 pi 原生一致）
-      output = `${metaLine}\n${raw}`;
-    } else if (sessionNameCount > 5) {
-      // sessionName 行数超过阈值，清理多余的旧 sessionName 行
-      const filtered = lines.filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return true;
-        try {
-          const parsed = JSON.parse(trimmed);
-          if (typeof parsed.sessionName === "string" && line !== metaLine) {
-            return false;
-          }
-        } catch { /* 保留不可解析的行 */ }
-        return true;
-      });
-      output = filtered.join("\n");
-    } else {
-      output = lines.join("\n");
-    }
-
+    const output = this.appendSessionInfoLine(raw, newName);
     if (wsl) {
       await this.writeWslFile(filePath, output);
     } else {
       await writeFile(filePath, output, "utf8");
     }
+  }
+
+  /**
+   * 在 JSONL 文本末尾追加 pi 原生 session_info 记录，返回新文本。
+   *
+   * id/parentId 规则与 pi SessionManager 一致：id 为文件内不冲突的 8 位十六进制，
+   * parentId 指向追加前最后一条带 id 的记录（没有则 null，由 pi 视为新根）。
+   * 会话树靠 parentId 串联，指向最后一片叶子可保持链条完整。
+   *
+   * 同时剔除旧版 PiDeck 的 {"sessionName":...} 私有行（无 type 字段）：pi 无法识别，
+   * 位于文件头时会破坏首行校验导致整个会话无法加载（#114 的存量受损文件）。
+   */
+  private appendSessionInfoLine(raw: string, name: string, extra?: Record<string, unknown>): string {
+    // 与 pi appendSessionInfo 相同的清洗规则：换行折叠为空格，避免破坏 JSONL 行结构。
+    const sanitized = name.replace(/[\r\n]+/g, " ").trim();
+    const ids = new Set<string>();
+    let lastId: string | null = null;
+    const keptLines: string[] = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let isLegacyNameLine = false;
+      try {
+        const parsed = JSON.parse(trimmed);
+        // 判定旧版私有格式：带 sessionName 且无 type；pi 原生记录一律有 type。
+        isLegacyNameLine =
+          typeof parsed.sessionName === "string" && typeof parsed.type !== "string";
+        if (!isLegacyNameLine && typeof parsed.id === "string" && parsed.id) {
+          ids.add(parsed.id);
+          lastId = parsed.id;
+        }
+      } catch {
+        // 不可解析的行原样保留，不做破坏性清理
+      }
+      if (!isLegacyNameLine) keptLines.push(trimmed);
+    }
+    // 与 pi generateId 一致：randomUUID 前 8 位，冲突时重试
+    let id = randomUUID().slice(0, 8);
+    while (ids.has(id)) id = randomUUID().slice(0, 8);
+    const entry = {
+      type: "session_info",
+      id,
+      parentId: lastId,
+      timestamp: new Date().toISOString(),
+      name: sanitized,
+      ...extra,
+    };
+    keptLines.push(JSON.stringify(entry));
+    return `${keptLines.join("\n")}\n`;
   }
 
   /**
@@ -585,7 +597,7 @@ export class SessionScanner {
   }
 
   /**
-   * 复制会话文件并写入新的 sessionName 元数据。
+   * 复制会话文件并追加新的 session_info 名称记录（pi 原生格式，见 rename/#114）。
    * 这不是 CLI 的 fork：不裁剪会话树，只生成一个可独立打开/继续的新历史会话文件。
    * 支持 WSL 路径。
    */
@@ -595,8 +607,8 @@ export class SessionScanner {
     const current = await this.readSummary(filePath).catch(() => null);
     const copyName = `${current?.name || "Untitled"} copy`;
     const targetPath = this.nextCopyPath(filePath, wsl);
-    const meta = JSON.stringify({ sessionName: copyName, copiedFrom: filePath, ts: Date.now() });
-    const content = `${meta}\n${raw}`;
+    // copiedFrom 作为附加字段保留来源信息；pi 会忽略未知字段，不影响加载。
+    const content = this.appendSessionInfoLine(raw, copyName, { copiedFrom: filePath });
 
     if (wsl) {
       await this.writeWslFile(targetPath, content);
@@ -1086,7 +1098,9 @@ export class SessionScanner {
       }
     }
 
-    const inferredName = this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
+    // 会话名优先级与 pi getSessionName 一致：最后一条 session_info 为准；
+    // 旧版 PiDeck 的 sessionName 私有行及其他字段仅作降级回退。
+    const inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
 
     const summary: SessionSummary = {
       id: filePath,
