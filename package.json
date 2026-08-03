@@ -85,7 +85,8 @@
     "next-themes": "^0.4.6",
     "node-pty": "^1.1.0",
     "radix-ui": "^1.6.7",
-    "sonner": "^2.0.7"
+    "sonner": "^2.0.7",
+    "sql.js": "^1.14.1"
   },
   "build": {
     "appId": "com.hihawarzid.omp-deck",
@@ -177,7 +178,7 @@
     "@vitejs/plugin-react": "^5.0.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "electron": "^38.8.6",
+    "electron": "^43.2.0",
     "electron-builder": "^26.8.1",
     "electron-vite": "^4.0.0",
     "eslint": "^10.6.0",
@@ -185,7 +186,7 @@
     "katex": "^0.17.0",
     "lucide-react": "^1.17.0",
     "mermaid": "^11.15.0",
-    "monaco-editor": "^0.55.1",
+    "monaco-editor": "^0.56.0",
     "png-to-ico": "^3.0.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -195,7 +196,8 @@
     "remark-gfm": "^4.0.1",
     "remark-highlight-mark": "^1.4.0",
     "remark-math": "^6.0.0",
-    "sharp": "^0.34.5",
+    "remove-markdown": "^0.6.4",
+    "sharp": "^0.35.3",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.0",
     "typescript-language-server": "^5.3.0",
