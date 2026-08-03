@@ -853,19 +853,6 @@ export type CreateProjectSkillInput = {
 	updateError?: string;
 };
 
-export type PiPackageInfo = {
-	name: string;
-	description: string;
-	installCmd: string;
-	tags: string[];
-	downloads: string;
-	updated: string;
-	npmUrl: string;
-	repoUrl?: string;
-	/** pi.dev 详情页的 name 查询参数；部分包名和扩展展示名不完全一致。 */
-	piPackageName?: string;
-};
-
 export type PiExtensionListResult = {
 	extensions: PiExtensionSummary[];
 	raw: string;

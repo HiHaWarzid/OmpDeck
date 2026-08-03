@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Copy, Download, RotateCcw, Trash2 } from "lucide-react";
-import type { PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary, PiPackageInfo } from "../../../shared/types";
+import { Copy, RotateCcw, Trash2 } from "lucide-react";
+import type { PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary } from "../../../shared/types";
 import { t } from "../i18n";
 import { showNotice } from "../utils/notice";
 import { writeClipboard } from "../utils/clipboard";
@@ -24,50 +24,6 @@ function getExtensionsApi(): ExtensionsApi {
 /** OmpDeck 已移除内置扩展（omp 提供原生能力替代） */
 const PIDEK_BUILTIN_SOURCE: Record<string, string> = {};
 
-/** 预设推荐扩展包 */
-const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
-	{
-		name: "context-mode",
-		description: "MCP 插件，可节省 98% 的上下文窗口。沙箱代码执行、FTS5 知识库和意图驱动搜索。",
-		installCmd: "npm:context-mode",
-		tags: ["extension"],
-		downloads: "107K/mo",
-		updated: "",
-		npmUrl: "https://www.npmjs.com/package/context-mode",
-		repoUrl: "https://github.com/mksglu/context-mode",
-	},
-	{
-		name: "pi-web-access",
-		description: "网络搜索、URL 抓取、GitHub 仓库克隆、PDF 提取、YouTube 视频理解和本地视频分析。",
-		installCmd: "npm:pi-web-access",
-		tags: ["extension"],
-		downloads: "99K/mo",
-		updated: "",
-		npmUrl: "https://www.npmjs.com/package/pi-web-access",
-		repoUrl: "https://github.com/nicobailon/pi-web-access",
-	},
-	{
-		name: "pi-mcp-adapter",
-		description: "MCP（Model Context Protocol）适配器扩展，让 omp 可以连接任何 MCP 服务器。",
-		installCmd: "npm:pi-mcp-adapter",
-		tags: ["extension"],
-		downloads: "99K/mo",
-		updated: "",
-		npmUrl: "https://www.npmjs.com/package/pi-mcp-adapter",
-		repoUrl: "https://github.com/nicobailon/pi-mcp-adapter",
-	},
-	{
-		name: "pi-subagents",
-		description: "任务委派扩展，支持链式、并行执行和 TUI 澄清。可将复杂任务拆解给多个子 Agent。",
-		installCmd: "npm:pi-subagents",
-		tags: ["extension"],
-		downloads: "92K/mo",
-		updated: "",
-		npmUrl: "https://www.npmjs.com/package/pi-subagents",
-		repoUrl: "https://github.com/nicobailon/pi-subagents",
-	},
-];
-
 /** 从扩展来源提取简短描述名 */
 function shortName(source: string): string {
 	return source
@@ -83,7 +39,6 @@ export function ExtensionsTab(props: {
 	onRefresh: () => void;
 	onUninstall: (extension: PiExtensionSummary) => void;
 }) {
-	const [installingSources, setInstallingSources] = useState<Set<string>>(() => new Set());
 	const [restoringBuiltIn, setRestoringBuiltIn] = useState<string | null>(null);
 	const [removingBuiltIn, setRemovingBuiltIn] = useState<string | null>(null);
 
@@ -130,28 +85,6 @@ export function ExtensionsTab(props: {
 	const [updating, setUpdating] = useState<string | null>(null);
 	const [updateResult, setUpdateResult] = useState<PiCliUpdateResult | null>(null);
 	const [showUpdateDialog, setShowUpdateDialog] = useState(false);
-
-	const handleInstall = async (pkg: PiPackageInfo) => {
-		setInstallingSources((current) => new Set(current).add(pkg.installCmd));
-		try {
-			// 对已移除的内置扩展，走恢复流程而非 npm 安装
-			const builtInSource = pkg.name.startsWith("pi-deck-") ? PIDEK_BUILTIN_SOURCE[pkg.name] : undefined;
-			if (builtInSource) {
-				await getExtensionsApi().restoreBuiltIn(builtInSource);
-			} else {
-				await getExtensionsApi().install(pkg.installCmd);
-			}
-			props.onRefresh();
-		} catch (e) {
-			alert(t("config.installFailed") + ": " + (e instanceof Error ? e.message : String(e)));
-		} finally {
-			setInstallingSources((current) => {
-				const next = new Set(current);
-				next.delete(pkg.installCmd);
-				return next;
-			});
-		}
-	};
 
 	const handleUpdateExtensions = async () => {
 		setUpdating("all");
@@ -206,82 +139,6 @@ export function ExtensionsTab(props: {
 					</div>
 				</div>
 			)}
-			{/* 预设推荐扩展 — 大列表简洁显示 */}
-			<div className="config-section" style={{ marginBottom: 20 }}>
-				<div className="config-toolbar">
-					<h3 className="extensions-installed-title">{t("config.recommendedPackages")}</h3>
-				</div>
-				<p className="config-im-form-hint" style={{ marginBottom: 12 }}>
-					{t("config.recommendedPackagesHint")}
-				</p>
-				<div className="extensions-recommended-list">
-					{RECOMMENDED_PACKAGES.map((pkg) => {
-						// 内置扩展按 source 文件名匹配，npm 扩展按 installCmd 匹配
-						const builtInSource = pkg.name.startsWith("pi-deck-") ? PIDEK_BUILTIN_SOURCE[pkg.name] : undefined;
-						const builtInExt = builtInSource
-							? props.data.extensions.find((ext) => ext.builtIn && ext.source === builtInSource)
-							: undefined;
-						// 已部署（非移除状态）视为已安装；已移除的内置扩展允许恢复安装
-						const alreadyInstalled = builtInExt
-							? builtInExt.enabled !== false
-							: props.data.extensions.some((ext) => ext.source === pkg.installCmd);
-						const installing = installingSources.has(pkg.installCmd);
-						return (
-						<div
-							key={pkg.name}
-							className="extensions-recommended-row"
-							onClick={() => {
-								// pi.dev 的详情路由使用 npm 包名,但查询参数可能是扩展内部展示名。
-								const packageName = pkg.piPackageName ?? pkg.name;
-								window.open(`https://pi.dev/packages/${pkg.name}?name=${packageName}`, '_blank');
-							}}
-							title={`${t("config.openPackageDetail")}: ${pkg.name}`}
-						>
-							<div className="extensions-recommended-info">
-								<div className="extensions-recommended-name">
-									<strong>{pkg.name}</strong>
-									{alreadyInstalled && <span className="config-im-connected-badge" style={{ marginLeft: 8 }}>{t("config.installed")}</span>}
-								</div>
-								<div className="extensions-recommended-desc">
-									{pkg.description}
-								</div>
-							</div>
-							<div className="extensions-recommended-action" onClick={(e) => e.stopPropagation()}>
-								{/* 安装中保持与图标按钮同尺寸，避免 config-btn 文本把操作区撑开错位 */}
-								<button
-									className="config-icon-btn"
-									title={installing ? t("config.installing") : alreadyInstalled ? t("config.installed") : t("config.install")}
-									onClick={() => handleInstall(pkg)}
-									disabled={alreadyInstalled || installing}
-									aria-busy={installing}
-								>
-									{installing ? (
-										<span className="skillhub-installing-dot" aria-hidden="true" />
-									) : (
-										<Download size={15} strokeWidth={1.8} aria-hidden="true" />
-									)}
-								</button>
-								<button
-									className="config-icon-btn"
-									title={t("common.copy")}
-									onClick={(e) => {
-										e.stopPropagation();
-										const cmd = `omp install ${pkg.installCmd}`;
-										writeClipboard(cmd);
-										showNotice(t("app.codeCopied"), 1200);
-									}}
-								>
-									<Copy size={14} strokeWidth={1.8} />
-								</button>
-							</div>
-						</div>
-					);
-					})}
-				</div>
-			</div>
-
-			<hr className="extensions-divider" />
-
 			{/* 已安装扩展列表 */}
 			<div className="config-section">
 				<h3 className="extensions-installed-title">{t("config.installedExtensions")}</h3>
