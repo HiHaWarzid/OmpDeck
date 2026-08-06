@@ -24,6 +24,22 @@ import { formatBashToolMessage } from "./bashResult";
 import { extractMessageText } from "./messageContent";
 import { mergeHistoryWithPreservedMessages } from "./historyMessages";
 import {
+	buildActiveBranchEntryIds,
+	buildAskCard,
+	convertAgentMessages,
+	extractAskQuestionDetails,
+	extractToolResultText,
+	extractImages,
+	extractThinking,
+	formatToolDetail,
+	getToolPathFromArgs,
+	safeJson,
+	stripAnsi,
+	truncateForDetail,
+	tryParseBatchAskEnvelope,
+	trimHistoryMessages,
+} from "./messageTimeline";
+import {
 	assertResendRootEntry,
 	collectDescendantEntryIds,
 	findLastUserMessageLine,
@@ -79,8 +95,6 @@ export class AgentManager {
 	private readonly activeToolCallsByAgent = new Map<string, Map<string, string>>();
 	/** 记录每个 agent 当前执行的工具名称，无工具时为 null */
 	private readonly toolExecutingByAgent = new Map<string, string | null>();
-	/** 缓存每个 agent 的 entryId → JSONL 行号映射，用于编辑/删除定位。每次 loadMessages 后刷新。 */
-	private readonly entryIdToLineMap = new Map<string, Map<string, number>>();
 	/** 每个 agent 的会话文件写入锁，防止并发 readFile→modify→writeFile 操作破坏 JSONL 文件 */
 	private readonly sessionLocks = new Map<string, Promise<void>>();
 	/** 流式消息 emit 节流状态。 */
@@ -109,12 +123,6 @@ export class AgentManager {
 	 * 原值 8 对于一些需要回看较多历史的长会话偏少，提高至 30 轮。
 	 */
 	private static readonly MAX_HISTORY_LOAD_TURNS = 30;
-	/**
-	 * 工具结果文本截断阈值（字符数）。工具结果（如 bash 输出、文件读取）可能达数十 KB，
-	 * 若完整存入 ChatMessage.meta 并随流式 emit 反复全量传输，会显著放大 IPC payload
-	 * 并推高渲染进程内存，是大会话白屏的重要诱因。超长结果保留首尾各一部分，中间省略。
-	 */
-	private static readonly MAX_TOOL_RESULT_CHARS = 8000;
 	/** 本地事件监听器（用于 FeishuBridge 等主进程内部订阅） */
 	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
 	/** 状态变更监听器（用于 PetStateBridge 等主进程内部模块订阅 AgentTab[] 聚合状态） */
@@ -282,7 +290,7 @@ export class AgentManager {
 			.slice(currentStartIndex)
 			.filter((entry) => entry.type === "message" && entry.message);
 		const rawMessages = currentEntries.map((entry) => entry.message);
-		const trimmed = this.trimHistoryMessages(rawMessages);
+		const trimmed = trimHistoryMessages(rawMessages);
 		const trimStart = trimmed.length > 0 ? rawMessages.indexOf(trimmed[0]) : 0;
 		const activeEntryIds = currentEntries.slice(Math.max(0, trimStart)).map((entry) => entry.id);
 
@@ -305,7 +313,7 @@ export class AgentManager {
 			}, ...trimmed];
 		}
 
-		return this.convertAgentMessages(agentId, finalRaw, activeEntryIds);
+		return convertAgentMessages(agentId, finalRaw, activeEntryIds, this.abortedDuringAsk.has(agentId));
 	}
 
 	recordHostExchange(agentId: string, userText: string, assistantText: string) {
@@ -388,13 +396,13 @@ export class AgentManager {
 				| { entries?: Array<{ id: string; parentId: string | null; type?: string; message?: { role?: string } }>; leafId?: string }
 				| undefined;
 			if (entriesData?.entries && entriesData?.leafId) {
-				activeEntryIds = this.buildActiveBranchEntryIds(entriesData.entries, entriesData.leafId);
+				activeEntryIds = buildActiveBranchEntryIds(entriesData.entries, entriesData.leafId);
 			}
 		}
 
 		// 按对话轮次截断（保留最近若干轮 user 消息）。压缩摘要不是 user 消息，会被此逻辑保留在尾部，
 		// 因此下方会单独把它插到最前面，确保不被按 user 轮次切掉。
-		const trimmed = this.trimHistoryMessages(rawMessages);
+		const trimmed = trimHistoryMessages(rawMessages);
 
 		// 解析会话文件里的压缩记录：拿到所有压缩段摘要 + 归档消息。
 		// pi 的 get_messages 对压缩会话只返回压缩后的消息，通常不带压缩摘要；
@@ -467,7 +475,7 @@ export class AgentManager {
 		// 将压缩摘要插到消息最前面（在 trim 之后，避免被按 user 轮次切掉）。
 		const finalRaw = compactionSummaryRaw ? [compactionSummaryRaw, ...trimmed] : trimmed;
 
-		const messages = this.convertAgentMessages(agentId, finalRaw, activeEntryIds);
+		const messages = convertAgentMessages(agentId, finalRaw, activeEntryIds, this.abortedDuringAsk.has(agentId));
 		const t2 = Date.now();
 		void this.appLogger?.info("agent", "Agent messages loaded", {
 			agentId,
@@ -577,7 +585,7 @@ export class AgentManager {
 		}
 
 		// 只保留最近 maxTurns 轮对话
-		const trimmed = this.trimHistoryMessages(messageEntries, maxTurns);
+	const trimmed = trimHistoryMessages(messageEntries, maxTurns);
 		const t1 = Date.now();
 
 		void this.appLogger?.info("agent", "Recent messages read from session file", {
@@ -710,7 +718,7 @@ export class AgentManager {
 				rawMessages.reverse();
 			// 转换为 ChatMessage 格式
 			try {
-				const chatMessages = this.convertAgentMessages(agentId, rawMessages);
+				const chatMessages = convertAgentMessages(agentId, rawMessages, undefined, false);
 				if (chatMessages.length > 0) {
 					archivedMessagesByCompactionId.set(compEntry.id, chatMessages);
 				}
@@ -1690,21 +1698,6 @@ export class AgentManager {
 		return Math.max(0, Math.min(100, value));
 	}
 
-	private trimHistoryMessages(rawMessages: unknown[], maxTurns = 40) {
-		if (rawMessages.length === 0) return rawMessages;
-		// 按对话轮次截断：找到最后 maxTurns 个用户提问，保留对应轮次及之后的全部消息
-		const userIndices: number[] = [];
-		for (let i = rawMessages.length - 1; i >= 0; i--) {
-			const msg = rawMessages[i] as { role?: unknown } | undefined;
-			if (msg?.role === "user") {
-				userIndices.unshift(i);
-				if (userIndices.length >= maxTurns) break;
-			}
-		}
-		if (userIndices.length === 0) return rawMessages.slice(-50);
-		return rawMessages.slice(userIndices[0]);
-	}
-
 	async cycleModel(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
 		await runtime.process.client.request({ type: "cycle_model" }, 60_000);
@@ -2083,7 +2076,7 @@ export class AgentManager {
 		// 重发若绑到更早 root 会把中间整段对话当后代删掉。
 		console.log(`[locateJsonlEntry] scheme3 scanning by role=${msg.role} + text match`);
 		if (msg.role === "user") {
-			const last = findLastUserMessageLine(lines, msg.text, (content) => this.extractText(content));
+			const last = findLastUserMessageLine(lines, msg.text, (content) => extractMessageText(content));
 			if (last) {
 				console.log(`[locateJsonlEntry] scheme3 last-user found at line=${last.lineIndex}`);
 				return last;
@@ -2100,7 +2093,7 @@ export class AgentManager {
 						entryRole === msg.role ||
 						(entryRole === "toolResult" && msg.role === "tool")
 					) {
-						const text = this.extractText((entry as any)?.message?.content);
+						const text = extractMessageText((entry as any)?.message?.content);
 						if (text === msg.text) {
 							console.log(`[locateJsonlEntry] scheme3 found at line=${i}, role=${entryRole}`);
 							return { lineIndex: i, entry };
@@ -2357,10 +2350,10 @@ export class AgentManager {
 				entry = located.entry;
 				// entryId 错位时可能定位到 assistant 或更早的 user；
 				// 校验失败则回退到「最后一条同文案 user」，禁止带着错误根继续截断。
-				assertResendRootEntry(entry, msg.text, (content) => this.extractText(content));
+				assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
 			} catch (locateError) {
 				const fallback = findLastUserMessageLine(lines, msg.text, (content) =>
-					this.extractText(content),
+					extractMessageText(content),
 				);
 				if (!fallback) throw locateError;
 				void this.appLogger?.warn("agent", "Prepare resend: entry locate mismatch, using last text match", {
@@ -2370,7 +2363,7 @@ export class AgentManager {
 				});
 				lineIndex = fallback.lineIndex;
 				entry = fallback.entry;
-				assertResendRootEntry(entry, msg.text, (content) => this.extractText(content));
+				assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
 			}
 
 			// 兜底验证：确保定位到的 entry 是文件中最后一条同文本 user 消息。
@@ -2379,7 +2372,7 @@ export class AgentManager {
 			// 纯文本消息用 findLastUserMessageLine 做二次校验；图片消息（text="[图片]"）不走此路径。
 			if (msg.text !== "[图片]") {
 				const lastMatch = findLastUserMessageLine(lines, msg.text, (content) =>
-					this.extractText(content),
+					extractMessageText(content),
 				);
 				if (lastMatch && lastMatch.lineIndex !== lineIndex) {
 					void this.appLogger?.warn("agent", "Prepare resend: entryId points to non-last duplicate, correcting", {
@@ -2392,7 +2385,7 @@ export class AgentManager {
 					});
 					lineIndex = lastMatch.lineIndex;
 					entry = lastMatch.entry;
-					assertResendRootEntry(entry, msg.text, (content) => this.extractText(content));
+					assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
 				}
 			}
 
@@ -2407,7 +2400,7 @@ export class AgentManager {
 				// 用自身文本做定位；若重复文案，findLast 已取最后一次。
 				// 下面再扫一遍确认 root 确实是全局最后一条 user（不限文本）。
 				msg.text,
-				(content) => this.extractText(content),
+				(content) => extractMessageText(content),
 			);
 			let lastUserLineIndex = lastUserInFile?.lineIndex ?? -1;
 			let lastUserEntryId =
@@ -3457,7 +3450,7 @@ export class AgentManager {
 		// 批量 ask envelope：扩展把 questions JSON 塞进 input 的 title；
 		// 桌面端识别后渲染 Tab 问卷，而不是把整段 JSON 当普通输入题。
 		const rawTitle = String(typed.title ?? typed.question ?? "");
-		const batchEnvelope = this.tryParseBatchAskEnvelope(rawTitle);
+		const batchEnvelope = tryParseBatchAskEnvelope(rawTitle);
 		const request = batchEnvelope
 			? {
 					agentId,
@@ -3725,7 +3718,7 @@ export class AgentManager {
 			}
 			this.thinkingEndedAt.delete(agentId);
 			this.streamingThinking.set(agentId, prev + delta);
-			this.thinkingEmitter.push(agentId, this.stripAnsi(prev + delta));
+			this.thinkingEmitter.push(agentId, stripAnsi(prev + delta));
 			this.upsertAssistantMessage(agentId, partialMessage);
 			return;
 		}
@@ -3736,7 +3729,7 @@ export class AgentManager {
 			);
 			if (finalThinking) {
 				this.streamingThinking.set(agentId, finalThinking);
-				this.thinkingEmitter.push(agentId, this.stripAnsi(finalThinking));
+				this.thinkingEmitter.push(agentId, stripAnsi(finalThinking));
 				this.thinkingEmitter.flush(agentId);
 			}
 			this.thinkingEndedAt.set(agentId, Date.now());
@@ -3775,14 +3768,14 @@ export class AgentManager {
 		const existing = list.find((message) => message.id === messageId);
 		const extractedText =
 			partialMessage && typeof partialMessage === "object"
-				? this.extractText((partialMessage as any).content)
+				? extractMessageText((partialMessage as any).content)
 				: "";
 		const extractedThinking =
 			partialMessage && typeof partialMessage === "object"
-				? this.extractThinking((partialMessage as any).content)
+				? extractThinking((partialMessage as any).content)
 				: "";
 		const pendingThinking = this.streamingThinking.get(agentId);
-		const nextThinking = this.stripAnsi(extractedThinking || pendingThinking || "");
+		const nextThinking = stripAnsi(extractedThinking || pendingThinking || "");
 		const thinkingStartedAt = this.thinkingStartedAt.get(agentId);
 		const thinkingEndedAt = this.thinkingEndedAt.get(agentId);
 
@@ -3854,22 +3847,17 @@ export class AgentManager {
 			event.partialResult ??
 			event.output ??
 			existing?.meta?.result;
-		const detailText = this.formatToolDetail(
-			toolName,
-			args,
-			result,
-			isError,
-		);
+		const detailText = formatToolDetail(toolName, args, result, isError);
 		const icon = status === "running" ? "▶" : isError ? "✗" : "✓";
 		const text =
 			status === "running" ? `${icon} ${toolName}` : `${icon} ${toolName}`;
 		// args 可能来自 event.args（对象）或 existing.meta.args（已序列化的 JSON 字符串）。
 		// 如果是后者（如 tool_execution_end 不带 args），直接复用已有字符串避免 double encoding。
-		const argsMeta = typeof args === "string" ? args : this.truncateForDetail(this.safeJson(args));
+		const argsMeta = typeof args === "string" ? args : truncateForDetail(safeJson(args));
 		// 提取 ask_question 详情用于渲染提问卡片；支持批量（questions 数组）和单问题两种格式。
 		// pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装）
-		const askDetails = this.extractAskQuestionDetails(toolName, result, args);
-		const askCard = this.buildAskCard(agentId, askDetails);
+		const askDetails = extractAskQuestionDetails(toolName, result, args);
+		const askCard = buildAskCard(askDetails, this.abortedDuringAsk.has(agentId));
 		const meta = {
 			status,
 			toolName,
@@ -3877,7 +3865,7 @@ export class AgentManager {
 			startedAt,
 			...(durationMs !== undefined ? { durationMs } : {}),
 			args: argsMeta,
-			result: this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result)),
+			result: truncateForDetail(extractToolResultText(result) || safeJson(result)),
 			isError,
 			detailText,
 			// originalContent 不再存储到消息中（full file 会使会话元数据体积过大）。
@@ -4020,492 +4008,6 @@ export class AgentManager {
 		this.scheduleMessageEmit(agentId, true);
 	}
 
-		/**
-	 * 从 get_entries 响应构建 active branch 的 entryId 有序列表。
-	 * 从 leafId 沿 parentId 回溯至 root 得到有序列表。
-	 * 这个列表的顺序与 get_messages 返回的消息顺序一致，
-	 * 用于在 convertAgentMessages 中按位置匹配 entryId 到 message。
-	 * 只保留 type=message 的 entryId（即 user/assistant/toolResult 角色消息），
-	 * 剔除 session、model_change、thinking_level_change、custom 等非消息条目，
-	 * 使返回的 id 列表与 get_messages 返回的 rawMessages 一一对齐。
-	 */
-	private buildActiveBranchEntryIds(
-		entries: Array<{ id: string; parentId: string | null; type?: string; message?: { role?: string } }>,
-		leafId: string,
-	): string[] {
-		const entryById = new Map<string, { id: string; parentId: string | null; type?: string; message?: { role?: string } }>();
-		for (const entry of entries) {
-			entryById.set(entry.id, entry);
-		}
-
-		// 从 leafId 回溯到 root，只保留 type=message 的条目
-		const allBranchIds: string[] = [];
-		let currentId: string | null = leafId;
-		while (currentId) {
-			allBranchIds.unshift(currentId);
-			const entry = entryById.get(currentId);
-			currentId = entry?.parentId ?? null;
-		}
-		return allBranchIds.filter((id) => entryById.get(id)?.type === "message");
-	}
-
-	private convertAgentMessages(
-		agentId: string,
-		rawMessages: unknown[],
-		activeEntryIds?: string[],
-	): ChatMessage[] {
-		const historicalToolCalls = this.collectHistoricalToolCalls(rawMessages);
-		const historicalOriginalContentByPath = this.collectHistoricalOriginalContentByPath(
-			rawMessages,
-			historicalToolCalls,
-		);
-		// 用于生成元消息 id（compaction/branchSummary）的计数器
-		let metaSeq = 0;
-		// entryId 按 active branch 顺序与 rawMessages 一一对应。
-		// 注意：entryIndex 只在 user/assistant/toolResult 时递增，
-		// 因为 compactionSummary/branchSummary 在 get_entries 中无对应 entry，
-		// 同时 activeEntryIds 还包含 model_change/thinking_level_change/custom 等非角色条目。
-		// 因此 currentEntryId 的读取必须放在各个角色块内部，不能在所有条目前统一读取，
-		// 否则非 user/assistant/toolResult 条目会提前消费 entryIndex 槽位。
-		let entryIndex = 0;
-		return rawMessages
-			.flatMap<ChatMessage>((message, index) => {
-				if (!message || typeof message !== "object") return [];
-				const typed = message as any;
-
-				if (typed.role === "user") {
-					// 先消费 activeEntryIds 槽位，再决定是否渲染。
-					// 边界：空文本 user 不展示，但 get_entries 仍有对应 entry，
-					// 若不推进 index，后续消息 entryId 会整体前移错位。
-					const taken = takeActiveEntryId(activeEntryIds, entryIndex);
-					entryIndex = taken.nextIndex;
-					const currentEntryId = taken.entryId;
-					const images = this.extractImages(typed.content);
-					const text = this.extractText(typed.content) ||
-						(images.length > 0 ? "[图片]" : "");
-					if (!text.trim()) return [];
-					return [{
-						id: `${agentId}-history-${currentEntryId ?? index}`,
-						agentId,
-						role: "user" as const,
-						text,
-						timestamp: typed.timestamp ?? Date.now(),
-						meta: {
-							...(currentEntryId ? { entryId: currentEntryId } : {}),
-							// 保留 _piDeckMsgSeq 作为旧版本回退兼容
-							_piDeckMsgSeq: index,
-						},
-						...(images.length > 0 ? { images } : {}),
-					}];
-				}
-				if (typed.role === "assistant") {
-					// 工具调用回合常见「assistant 仅含 toolCall、无可见文本」：
-					// 这时不能直接跳过，因为可能包含 thinking 内容。如果 thinking 也被丢掉，
-					// 渲染时多步思考会混入下一个回答块，用户在历史会话中看到的信息不完整。
-					// 提取 thinking，即使 text 为空也保留消息，由 renderer 端 groupToolMessages
-					// 的 isThinkingOnly 判断逻辑统一处理。
-					const taken = takeActiveEntryId(activeEntryIds, entryIndex);
-					entryIndex = taken.nextIndex;
-					const currentEntryId = taken.entryId;
-					const text = this.extractText(typed.content);
-					const thinking = this.extractThinking(typed.content);
-					// 无文本且无 thinking 时才是真正的空消息，跳过。
-					if (!text.trim() && !thinking?.trim()) return [];
-					return [{
-						id: `${agentId}-history-${currentEntryId ?? index}`,
-						agentId,
-						role: "assistant" as const,
-						text,
-						timestamp: typed.timestamp ?? Date.now(),
-						meta: {
-							...(currentEntryId ? { entryId: currentEntryId } : {}),
-							_piDeckMsgSeq: index,
-						},
-						...(thinking ? { thinking } : {}),
-					}];
-				}
-				if (typed.role === "toolResult") {
-					const taken = takeActiveEntryId(activeEntryIds, entryIndex);
-					entryIndex = taken.nextIndex;
-					const currentEntryId = taken.entryId;
-					const toolCallId = String(typed.toolCallId ?? `history-tool-${index}`);
-					const historicalCall = historicalToolCalls.get(toolCallId);
-					const toolName = String(typed.toolName ?? historicalCall?.name ?? "tool");
-					const isError = Boolean(typed.isError);
-					const startedAt =
-						typeof typed.startedAt === "number" ? typed.startedAt : historicalCall?.timestamp;
-					const durationMs =
-						typeof typed.durationMs === "number"
-							? typed.durationMs
-							: typeof startedAt === "number" && typeof typed.timestamp === "number"
-								? Math.max(0, typed.timestamp - startedAt)
-								: undefined;
-					const result = {
-						content: typed.content,
-						details: typed.details,
-					};
-					const filePath = this.getToolPathFromArgs(historicalCall?.args);
-					const piDeckOriginalContent = typed.details?._piDeckOriginalContent as
-						| string
-						| undefined;
-					const originalContent =
-						piDeckOriginalContent ??
-						(filePath
-							? historicalOriginalContentByPath.get(filePath)
-							: undefined);
-					const detailText = this.formatToolDetail(
-						toolName,
-						historicalCall?.args,
-						result,
-						isError,
-					);
-					// 从历史工具结果中提取 ask_question 详情，用于渲染提问卡片（支持单问题和批量格式）。
-					const askCard = this.buildAskCard(agentId, this.extractAskQuestionDetails(toolName, typed, historicalCall?.args));
-					// entryIndex 已在上方 takeActiveEntryId 推进
-					return [{
-						id: `${agentId}-history-${currentEntryId ?? index}`,
-						agentId,
-						role: "tool" as const,
-						text: `${isError ? "✗" : "✓"} ${toolName}`,
-						timestamp: typed.timestamp ?? Date.now(),
-						meta: {
-							...(currentEntryId ? { entryId: currentEntryId } : {}),
-							_piDeckMsgSeq: index,
-							status: isError ? "error" : "done",
-							toolName,
-							toolCallId,
-							...(startedAt !== undefined ? { startedAt } : {}),
-							...(durationMs !== undefined ? { durationMs } : {}),
-							args: this.truncateForDetail(this.safeJson(historicalCall?.args)),
-							result: this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result)),
-							isError,
-							detailText,
-							// 历史会话不保存 originalContent（full file），diff 使用工具参数
-							//（oldText/newText）展示变动区域，避免会话文件体积膨胀。
-							...(askCard ? { _askCard: askCard } : {}),
-						},
-					}];
-				}
-				// 压缩/分支摘要等元消息：显示在时间线上，不参与 _piDeckMsgSeq 计数
-				if (typed.role === "compactionSummary" || typed.role === "branchSummary") {
-					const isCompaction = typed.role === "compactionSummary";
-					metaSeq++;
-					return [{
-						id: `${agentId}-meta-${metaSeq}`,
-						agentId,
-						role: "system" as const,
-						text: typed.summary ?? (isCompaction ? "Session compacted" : "Branch summarized"),
-						timestamp: typeof typed.timestamp === "number"
-							? typed.timestamp
-							: Date.now(),
-						meta: {
-							type: isCompaction ? "compaction" : "branchSummary",
-							tokensBefore: typed.tokensBefore,
-						// 保留压缩次数（桌面端从会话文件解析得到），供前端展示“已压缩 N 次”
-						...(isCompaction && typed.meta?.compactionCount != null
-							? { compactionCount: typed.meta.compactionCount }
-							: {}),
-					// 透传归档消息（从会话文件解析的压缩前历史）
-					...(typed.meta?.archivedMessages != null
-						? { archivedMessages: typed.meta.archivedMessages }
-						: {})
-						},
-					}];
-				}
-				return [];
-			})
-			.filter((message: ChatMessage) => message.text.trim());
-	}
-
-	private collectHistoricalToolCalls(rawMessages: unknown[]) {
-		const calls = new Map<string, { name: string; args: unknown; timestamp?: number }>();
-		for (const message of rawMessages) {
-			if (!message || typeof message !== "object") continue;
-			const typed = message as any;
-			if (typed.role !== "assistant" || !Array.isArray(typed.content)) continue;
-			for (const block of typed.content) {
-				if (!block || typeof block !== "object") continue;
-				const toolCall = block as any;
-				if (toolCall.type !== "toolCall" || !toolCall.id) continue;
-				// pi 的历史文件把工具参数保存在 assistant.content 的 toolCall 块中，
-				// toolResult 只带结果；恢复历史详情时必须先建立 toolCallId → 参数映射。
-				calls.set(String(toolCall.id), {
-					name: String(toolCall.name ?? "tool"),
-					args: toolCall.arguments,
-					// 旧会话没有 durationMs，只能用发起 toolCall 的 assistant 时间戳作为兜底起点；
-					// 同一条 assistant 内并发多个工具时精度有限，但比完全不显示耗时更接近历史行为。
-					timestamp: typeof typed.timestamp === "number" ? typed.timestamp : undefined,
-				});
-			}
-		}
-		return calls;
-	}
-
-	private collectHistoricalOriginalContentByPath(
-		rawMessages: unknown[],
-		historicalToolCalls: Map<string, { name: string; args: unknown }>,
-	) {
-		const originals = new Map<string, string>();
-		for (const message of rawMessages) {
-			if (!message || typeof message !== "object") continue;
-			const typed = message as any;
-			if (typed.role !== "toolResult") continue;
-			const toolCallId = String(typed.toolCallId ?? "");
-			const historicalCall = historicalToolCalls.get(toolCallId);
-			if (!historicalCall || historicalCall.name !== "read") continue;
-			const filePath = this.getToolPathFromArgs(historicalCall.args);
-			if (!filePath) continue;
-			// 旧历史会话没有保存 originalContent；同一轮写入前通常会先 read 目标文件，
-			// 用最近一次 read 结果作为后续 write/edit/patch 的 diff 基准。
-			const content = this.extractText(typed.content);
-			if (content) originals.set(filePath, content);
-		}
-		return originals;
-	}
-
-	private getToolPathFromArgs(args: unknown) {
-		if (!args || typeof args !== "object") return "";
-		const typed = args as any;
-		return String(
-			typed.path ??
-				typed.filePath ??
-				typed.file ??
-				typed.target_file ??
-				typed.targetFile ??
-				"",
-		);
-	}
-
-	private formatToolDetail(
-		toolName: string,
-		args: unknown,
-		result: unknown,
-		isError: boolean,
-	) {
-		const details = this.extractToolDetails(result);
-		// args/结果/details 都先序列化再截断，避免单条工具详情撑大 ChatMessage.meta。
-		// 注意：args 在 end/update 事件里可能已是序列化字符串（从 existing.meta.args 回退），
-		// 此时 safeJson(string) 会二次编码导致显示异常，先反解回对象再序列化。
-		let argsObj = args;
-		if (typeof args === "string" && args.trim()) {
-			try {
-				argsObj = JSON.parse(args) as unknown;
-			} catch {
-				// truncated/不可解析时保持原样
-			}
-		}
-		const argsText = argsObj ? this.truncateForDetail(this.safeJson(argsObj)) : "";
-		const resultText = result
-			? this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result))
-			: "";
-		const detailsText = details ? this.truncateForDetail(this.safeJson(details)) : "";
-		const sections = [
-			`工具：${toolName ?? "tool"}`,
-			`状态：${isError ? "失败" : "完成"}`,
-			args ? `参数：\n${argsText}` : "",
-			result ? `结果：\n${resultText}` : "",
-			details ? `详情：\n${detailsText}` : "",
-		].filter(Boolean);
-		return sections.join("\n\n");
-	}
-
-	private extractToolDetails(result: unknown) {
-		if (!result || typeof result !== "object") return undefined;
-		return (result as any).details;
-	}
-
-	/**
-	 * 解析批量 ask envelope（扩展把 questions JSON 放在 input title 里）。
-	 * 识别键：__piDeckBatchAsk，桌面端据此渲染 Tab 问卷而非普通输入框。
-	 */
-	private tryParseBatchAskEnvelope(title: string): {
-		review?: boolean;
-		questions: Array<Record<string, unknown>>;
-	} | null {
-		const raw = title?.trim();
-		if (!raw || raw[0] !== "{") return null;
-		try {
-			const parsed = JSON.parse(raw) as Record<string, unknown>;
-			if (parsed?.__piDeckBatchAsk !== 1) return null;
-			if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) return null;
-			return {
-				review: parsed.review === true,
-				questions: parsed.questions as Array<Record<string, unknown>>,
-			};
-		} catch {
-			return null;
-		}
-	}
-
-	/**
-	 * 从工具 result/args 中提取 ask_question details。
-	 * 兼容：details 嵌套、顶层 question、仅 args 有 question、批量 answers。
-	 */
-	private extractAskQuestionDetails(
-		toolName: string,
-		result: unknown,
-		args: unknown,
-	): Record<string, any> | undefined {
-		if (toolName !== "ask_question") return undefined;
-
-		// 格式 1: result.details.question 或 result.details.answers（批量）
-		if (result && typeof result === "object") {
-			const r = result as any;
-			if (r.details?.question || Array.isArray(r.details?.answers) || Array.isArray(r.details?.questions)) {
-				return r.details;
-			}
-			// 格式 2: result 顶层（无 details 包装）——含历史 toolResult 的 typed.details
-			if (r.question || Array.isArray(r.answers) || Array.isArray(r.questions)) {
-				return r;
-			}
-		}
-
-		// 格式 3: result 仅为简单值时，从 args 回退读取提问内容
-		let parsedArgs: unknown = args;
-		if (typeof args === "string") {
-			try {
-				parsedArgs = JSON.parse(args);
-			} catch {
-				parsedArgs = undefined;
-			}
-		}
-		if (parsedArgs && typeof parsedArgs === "object") {
-			const a = parsedArgs as any;
-			// 批量 args.questions
-			if (Array.isArray(a.questions) && a.questions.length > 0) {
-				const answerValue =
-					typeof result === "string"
-						? result
-						: (result as any)?.value ?? (result as any)?.answer ?? null;
-				return {
-					questions: a.questions,
-					answers: answerValue != null ? [{ id: a.questions[0]?.id ?? "default", value: answerValue, label: String(answerValue) }] : [],
-					cancelled: false,
-				};
-			}
-			if (a.question) {
-				const answerValue =
-					typeof result === "string"
-						? result
-						: (result as any)?.value ?? (result as any)?.answer ?? null;
-				return {
-					question: a.question,
-					type: a.type,
-					options: a.options,
-					answer: answerValue,
-					// 有实际答案就标 answered，避免「未回答」假阴性
-					answered: answerValue !== null && answerValue !== undefined,
-					answerLabel: answerValue != null ? String(answerValue) : undefined,
-				};
-			}
-		}
-		return undefined;
-	}
-
-	/**
-	 * 把 ask_question details 转成前端 ToolCard 用的 _askCard。
-	 * 业务规则：
-	 * - answered 优先看显式字段；否则有非 null answer 也算已回答（兼容旧 result）
-	 * - 批量：展示全部 Q&A，不只第一题（之前只取第一题导致回答后仍像「未回答」）
-	 * - abort 中：强制未回答
-	 */
-	private buildAskCard(
-		agentId: string,
-		askDetails: Record<string, any> | undefined,
-	): Record<string, unknown> | undefined {
-		if (!askDetails) return undefined;
-		const aborted = this.abortedDuringAsk.has(agentId);
-
-		// 批量：questions + answers
-		if (Array.isArray(askDetails.questions) || Array.isArray(askDetails.answers)) {
-			const questions = Array.isArray(askDetails.questions) ? askDetails.questions : [];
-			const answers = Array.isArray(askDetails.answers) ? askDetails.answers : [];
-			const cancelled = aborted || askDetails.cancelled === true;
-			const items = questions.map((q: any, i: number) => {
-				const a = answers.find((x: any) => x?.id === q?.id) ?? answers[i];
-				const value = cancelled ? null : a?.value ?? null;
-				const hasAnswer = value !== null && value !== undefined;
-				return {
-					id: String(q?.id ?? a?.id ?? `q${i + 1}`),
-					question: String(q?.question ?? a?.id ?? ""),
-					type: String(a?.type ?? q?.type ?? "input"),
-					answered: !cancelled && hasAnswer,
-					answer: value,
-					answerLabel: cancelled ? undefined : a?.label ?? (hasAnswer ? String(value) : undefined),
-					options: q?.options,
-					wasCustom: a?.wasCustom === true,
-				};
-			});
-			// 无 questions 只有 answers 时兜底
-			if (items.length === 0 && answers.length > 0) {
-				for (const a of answers) {
-					const value = cancelled ? null : a?.value ?? null;
-					const hasAnswer = value !== null && value !== undefined;
-					items.push({
-						id: String(a?.id ?? "q"),
-						question: String(a?.id ?? ""),
-						type: String(a?.type ?? "input"),
-						answered: !cancelled && hasAnswer,
-						answer: value,
-						answerLabel: cancelled ? undefined : a?.label ?? (hasAnswer ? String(value) : undefined),
-						options: undefined,
-						wasCustom: a?.wasCustom === true,
-					});
-				}
-			}
-			const anyAnswered = items.some((it) => it.answered);
-			const first = items[0];
-			// 批量标题用「问卷（N 题）」而不是第一题文案，避免展开区与标题重复。
-			return {
-				question: `问卷（${items.length} 题）`,
-				type: "batch",
-				answered: !cancelled && anyAnswered,
-				// 顶层 answer 仅作兜底；真正展示走 items
-				answer: first?.answer ?? null,
-				answerLabel: first?.answerLabel,
-				options: undefined,
-				cancelled,
-				items,
-			};
-		}
-
-		// 单问题
-		if (askDetails.question) {
-			const rawAnswer = aborted ? null : askDetails.answer;
-			// answered 显式 false/true 优先；否则看 answer 是否非空（兼容旧数据未写 answered）
-			const hasAnswer = rawAnswer !== null && rawAnswer !== undefined && rawAnswer !== "";
-			const answered = aborted
-				? false
-				: typeof askDetails.answered === "boolean"
-					? askDetails.answered
-					: hasAnswer;
-			return {
-				question: askDetails.question,
-				type: askDetails.type,
-				answered,
-				answer: aborted ? null : askDetails.answer,
-				answerLabel: aborted ? undefined : askDetails.answerLabel ?? (hasAnswer ? String(rawAnswer) : undefined),
-				options: askDetails.options,
-			};
-		}
-		return undefined;
-	}
-
-	/** 对超长工具文本做首尾截断，保留头部和尾部以兼顾开头信息和错误堆栈。 */
-	private truncateForDetail(text: unknown): string {
-		// safeJson/extractToolResultText 在某些输入下可能返回 undefined（如 JSON.stringify(undefined)），
-		// 必须在此归一化为字符串，否则后续 .length 访问会抛 TypeError 导致主进程未捕获异常弹窗。
-		const str = typeof text === "string" ? text : text == null ? "" : String(text);
-		if (str.length <= AgentManager.MAX_TOOL_RESULT_CHARS) return str;
-		const keep = Math.floor(AgentManager.MAX_TOOL_RESULT_CHARS / 2);
-		const omitted = str.length - keep * 2;
-		return (
-			`${str.slice(0, keep)}\n` +
-			`…（已省略中间 ${omitted} 字符，完整内容共 ${str.length} 字符）\n` +
-			str.slice(-keep)
-		);
-	}
-
 	private scheduleUIRequestTimeout(agentId: string, requestId: string, timeout: unknown) {
 		if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return;
 
@@ -4573,61 +4075,6 @@ export class AgentManager {
 		void this.emitRuntimeState(agentId);
 	}
 
-	private extractToolResultText(result: unknown) {
-		if (!result || typeof result !== "object") return "";
-		const content = (result as any).content;
-		if (!Array.isArray(content)) return "";
-		return content
-			.map((item) => (typeof item?.text === "string" ? item.text : ""))
-			.filter(Boolean)
-			.join("\n");
-	}
-
-	private safeJson(value: unknown) {
-		try {
-			return JSON.stringify(value, null, 2);
-		} catch {
-			return String(value);
-		}
-	}
-
-	private extractText(content: unknown): string {
-		return extractMessageText(content);
-	}
-
-	/** 从 pi 历史消息 content 中恢复图片附件，用于历史会话重新打开后的图片展示。 */
-	private extractImages(content: unknown): ImageContent[] {
-		if (!Array.isArray(content)) return [];
-		return content.flatMap<ImageContent>((item) => {
-			if (!item || typeof item !== "object") return [];
-			const typed = item as any;
-			if (typed.type !== "image") return [];
-			const data = typeof typed.data === "string" ? typed.data : "";
-			const mimeType =
-				typeof typed.mimeType === "string"
-					? typed.mimeType
-					: typeof typed.mime_type === "string"
-						? typed.mime_type
-						: "image/png";
-			return data ? [{ type: "image", data, mimeType }] : [];
-		});
-	}
-
-	/** 从历史消息 content 数组中提取 thinking 内容块的文本，清理 ANSI 转义码 */
-	private extractThinking(content: unknown): string {
-		if (!Array.isArray(content)) return "";
-		const raw = content
-			.map((item) => {
-				if (!item || typeof item !== "object") return "";
-				const typed = item as any;
-				if (typed.type !== "thinking") return "";
-				return String(typed.thinking ?? typed.text ?? "");
-			})
-			.filter(Boolean)
-			.join("\n");
-		return this.stripAnsi(raw);
-	}
-
 	private requireRuntime(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime) throw new Error(`Agent not found: ${agentId}`);
@@ -4656,11 +4103,6 @@ export class AgentManager {
 		} catch {
 			// 通知失败不影响主流程，静默处理
 		}
-	}
-
-	/** 清理 ANSI 转义码，模型思考内容中常见终端颜色序列 */
-	private stripAnsi(text: string): string {
-		return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 	}
 
 	/**
