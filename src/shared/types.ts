@@ -150,9 +150,13 @@ export type SessionSummary = {
 	codexAgentNickname?: string;
 };
 
-export type CodexImportStatus = "new" | "current" | "outdated";
+// ── 会话导入统一类型 ───────────────────────────────────
+// 三个源（OpenCode / Claude / Codex）共用一套类型，消除重复定义。
+// Codex 线程元数据（threadSource 等）作为可选属性，仅 Codex 源有值。
 
-export type CodexSessionSummary = {
+export type ImportStatus = "new" | "current" | "outdated";
+
+export type ImportSummary = {
 	id: string;
 	sourcePath: string;
 	targetPath: string;
@@ -162,16 +166,17 @@ export type CodexSessionSummary = {
 	createdAt: number;
 	updatedAt: number;
 	messageCount: number;
-	status: CodexImportStatus;
+	status: ImportStatus;
 	sourceSize: number;
 	importedSourceMtime?: number;
+	// Codex 线程元数据：子代理会话溯源，仅 Codex 源有值
 	threadSource?: "user" | "subagent";
 	parentThreadId?: string;
 	agentRole?: string;
 	agentNickname?: string;
 };
 
-export type CodexImportResult = {
+export type ImportResult = {
 	id: string;
 	sourcePath: string;
 	targetPath?: string;
@@ -182,79 +187,25 @@ export type CodexImportResult = {
 	error?: string;
 };
 
-export type CodexImportReport = {
-	results: CodexImportResult[];
+export type ImportReport = {
+	results: ImportResult[];
 	imported: number;
 	failed: number;
 };
 
-export type ClaudeImportStatus = "new" | "current" | "outdated";
-
-export type ClaudeSessionSummary = {
-	id: string;
-	sourcePath: string;
-	targetPath: string;
-	cwd: string;
-	title: string;
-	preview: string;
-	createdAt: number;
-	updatedAt: number;
-	messageCount: number;
-	status: ClaudeImportStatus;
-	sourceSize: number;
-	importedSourceMtime?: number;
-};
-
-export type ClaudeImportResult = {
-	id: string;
-	sourcePath: string;
-	targetPath?: string;
-	title?: string;
-	success: boolean;
-	overwritten?: boolean;
-	messageCount?: number;
-	error?: string;
-};
-
-export type ClaudeImportReport = {
-	results: ClaudeImportResult[];
-	imported: number;
-	failed: number;
-};
-
-export type OpenCodeImportStatus = "new" | "current" | "outdated";
-
-export type OpenCodeSessionSummary = {
-	id: string;
-	sourcePath: string;
-	targetPath: string;
-	cwd: string;
-	title: string;
-	preview: string;
-	createdAt: number;
-	updatedAt: number;
-	messageCount: number;
-	status: OpenCodeImportStatus;
-	sourceSize: number;
-	importedSourceMtime?: number;
-};
-
-export type OpenCodeImportResult = {
-	id: string;
-	sourcePath: string;
-	targetPath?: string;
-	title?: string;
-	success: boolean;
-	overwritten?: boolean;
-	messageCount?: number;
-	error?: string;
-};
-
-export type OpenCodeImportReport = {
-	results: OpenCodeImportResult[];
-	imported: number;
-	failed: number;
-};
+// ── 旧类型别名（renderer 零感知，渐进迁移） ────────────
+export type CodexImportStatus = ImportStatus;
+export type CodexSessionSummary = ImportSummary;
+export type CodexImportResult = ImportResult;
+export type CodexImportReport = ImportReport;
+export type ClaudeImportStatus = ImportStatus;
+export type ClaudeSessionSummary = ImportSummary;
+export type ClaudeImportResult = ImportResult;
+export type ClaudeImportReport = ImportReport;
+export type OpenCodeImportStatus = ImportStatus;
+export type OpenCodeSessionSummary = ImportSummary;
+export type OpenCodeImportResult = ImportResult;
+export type OpenCodeImportReport = ImportReport;
 
 export type PiCommand = {
 	name: string;

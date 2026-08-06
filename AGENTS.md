@@ -224,3 +224,18 @@ height: min(850px, calc(100vh - 48px));
 ### GitHub协作说明
 
 请查看 docs/PiDeck-协作说明.md 文件了解 GitHub 协作流程。
+
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues（`HiHaWarzid/OmpDeck`），通过 `gh` CLI 操作。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用五个默认 triage 标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单 context 布局：`CONTEXT.md` + `docs/adr/`。详见 `docs/agents/domain.md`。

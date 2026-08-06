@@ -182,9 +182,10 @@ import { PiProcess } from "./pi/PiProcess";
 import { PiRpcClient } from "./pi/PiRpcClient";
 import { testPiProxy } from "./pi/PiProxyTester";
 import { SessionScanner } from "./sessions/SessionScanner";
-import { CodexSessionImporter } from "./sessions/CodexSessionImporter";
-import { ClaudeSessionImporter } from "./sessions/ClaudeSessionImporter";
-import { OpenCodeSessionImporter } from "./sessions/OpenCodeSessionImporter";
+import { ImportPipeline } from "./sessions/importPipeline";
+import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
+import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
+import { CodexImportAdapter } from "./sessions/adapters/codexImportAdapter";
 import { SettingsStore } from "./settings/SettingsStore";
 import { applyDesktopProxy } from "./settings/DesktopProxy";
 import { GitService } from "./git/GitService";
@@ -233,9 +234,7 @@ let isQuitting = false;
 let projectStore: ProjectStore;
 let fileSystemService: FileSystemService;
 let sessionScanner: SessionScanner;
-let codexSessionImporter: CodexSessionImporter;
-let claudeSessionImporter: ClaudeSessionImporter;
-let openCodeSessionImporter: OpenCodeSessionImporter;
+let importPipeline: ImportPipeline;
 let settingsStore: SettingsStore;
 let worktreeService: WorktreeService;
 let gitService: GitService;
@@ -1911,7 +1910,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return codexSessionImporter.scan(project.path);
+			return importPipeline.scan("codex", project.path);
 		},
 	);
 	ipcMain.handle(
@@ -1919,7 +1918,7 @@ function registerIpc() {
 		async (_event, projectId: string, sourcePaths: string[]) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return codexSessionImporter.import(project.path, sourcePaths);
+			return importPipeline.import("codex", project.path, sourcePaths);
 		},
 	);
 	ipcMain.handle(
@@ -1927,7 +1926,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return claudeSessionImporter.scan(project.path);
+			return importPipeline.scan("claude", project.path);
 		},
 	);
 	ipcMain.handle(
@@ -1935,7 +1934,7 @@ function registerIpc() {
 		async (_event, projectId: string, sourcePaths: string[]) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return claudeSessionImporter.import(project.path, sourcePaths);
+			return importPipeline.import("claude", project.path, sourcePaths);
 		},
 	);
 	ipcMain.handle(
@@ -1943,7 +1942,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return openCodeSessionImporter.scan(project.path);
+			return importPipeline.scan("opencode", project.path);
 		},
 	);
 	ipcMain.handle(
@@ -1951,7 +1950,7 @@ function registerIpc() {
 		async (_event, projectId: string, sourcePaths: string[]) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return openCodeSessionImporter.import(project.path, sourcePaths);
+			return importPipeline.import("opencode", project.path, sourcePaths);
 		},
 	);
 
@@ -2910,6 +2909,11 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.skillsOpenFolder, (_event, path?: string) =>
 		skillManager.openFolder(path),
 	);
+	ipcMain.handle(ipcChannels.skillsRename, async (_event, path: string, newName: string) => {
+		const result = await skillManager.rename(path, newName);
+		void appLogger.info("skill", "Skill renamed", { path, newName });
+		return result;
+	});
 
 	// ── Prompt Templates ──
 	ipcMain.handle(ipcChannels.promptsList, () => promptManager.list());
@@ -3830,9 +3834,10 @@ app.whenReady().then(async () => {
 	projectStore = new ProjectStore();
 	fileSystemService = new FileSystemService();
 	sessionScanner = new SessionScanner();
-	codexSessionImporter = new CodexSessionImporter();
-	claudeSessionImporter = new ClaudeSessionImporter();
-	openCodeSessionImporter = new OpenCodeSessionImporter();
+	importPipeline = new ImportPipeline(join(app.getPath("home"), ".omp", "agent", "sessions"));
+	importPipeline.registerAdapter(new OpenCodeImportAdapter(join(app.getPath("home"), ".local", "share", "opencode", "opencode.db")));
+	importPipeline.registerAdapter(new ClaudeImportAdapter(join(app.getPath("home"), ".claude", "projects")));
+	importPipeline.registerAdapter(new CodexImportAdapter(join(app.getPath("home"), ".codex", "sessions")));
 	settingsStore = new SettingsStore();
 	appLogger = new AppLogger();
 	rpcLogger = new RpcLogger();
