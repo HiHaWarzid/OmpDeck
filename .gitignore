@@ -48,8 +48,10 @@ downloads/
 .pi-subagents/
 .omp/
 
-# Local collaboration notes are machine/user-specific and must never be committed or proposed for a PR.
-docs/PiDeck-协作说明.md
+# docs/ 目录下的本地工作文档不纳入版本控制（已跟踪的历史文件不受影响）。
+docs/*
+# 例外：领域架构决策记录是团队共享知识，需纳入版本控制。
+!docs/adr/
 
 # Cloned source for reference
 opencode-source/
