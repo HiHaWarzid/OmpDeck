@@ -80,12 +80,15 @@ import {
 import {
   getAgentForSessionPath,
   getProjectAgentSessionDisplay,
+  isReplacementForPendingAgent,
   isSameSessionPath,
   isSidebarSessionRowActive,
+  type PendingAgentTab,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
 import { mergeAgentRuntimeState } from "./utils/agentRuntimeState";
-import { sameSessionSummaryList } from "./utils/sessionSummaryList";
+import { translateAgentErrorMessage } from "./utils/agentErrors";
+import { withTimeout } from "./utils/withTimeout";
 import {
   acknowledgeUnknownPrompt,
   canDiscardQueuedPrompt,
@@ -116,6 +119,7 @@ import {
 import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useSessionLoader } from "./hooks/useSessionLoader";
 import { useScratchPad } from "./hooks/useScratchPad";
+import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
@@ -267,23 +271,8 @@ const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
 const SIDEBAR_PROJECT_CHILD_PAGE_SIZE = 5;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
-const SESSION_REFRESH_TIMEOUT_MS = 20_000;
 // 共享空数组：侧栏按 projectId 查 agents 时作为默认值，避免每次 .get() miss 都新建 []。
 const EMPTY_AGENTS: AgentTab[] = Object.freeze([]) as unknown as AgentTab[];
-
-function withTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  message: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
 
 
 
@@ -451,37 +440,6 @@ function getAgentSessionStorageKey(agent?: AgentTab, fallbackAgentId?: string) {
 }
 
 
-type PendingAgentTab = AgentTab & {
-  pendingKind?: "create" | "restart";
-  pendingStartedAt?: number;
-};
-
-function isReplacementForPendingAgent(agent: AgentTab, pending: PendingAgentTab) {
-  if (agent.projectId !== pending.projectId || agent.cwd !== pending.cwd)
-    return false;
-
-  if (pending.pendingKind === "restart") {
-    const startedAt = pending.pendingStartedAt ?? pending.createdAt;
-    // 重启占位只匹配本次重启之后出现的新进程，避免误选同项目下已有的同名 Agent。
-    if (agent.createdAt < startedAt - 1000) return false;
-    if (isSameSessionPath(agent.sessionPath, pending.sessionPath)) return true;
-    return !pending.sessionPath && agent.title === pending.title;
-  }
-
-  if (!pending.id.startsWith("pending-")) return false;
-  if (isSameSessionPath(agent.sessionPath, pending.sessionPath)) return true;
-  if (pending.sessionPath && agent.createdAt >= pending.createdAt - 1000)
-    return true;
-  // noSession 匿名 agent：没有 sessionPath，靠 noSession 标记 + 归属项目匹配
-  if (pending.noSession && agent.noSession) return true;
-  return (
-    agent.title === pending.title && agent.createdAt >= pending.createdAt - 1000
-  );
-}
-
-function isPendingAgentId(agentId?: string) {
-  return Boolean(agentId?.startsWith("pending-"));
-}
 const EDITOR_LOGO_URLS: Record<string, string> = {
   vscode: new URL("./assets/editors/vscode.png", import.meta.url).href,
   cursor: new URL("./assets/editors/cursor.png", import.meta.url).href,
@@ -581,24 +539,51 @@ export function App() {
   const [branchByProject, setBranchByProject] = useState<Record<string, string | null>>({});
   const [draggingProjectId, setDraggingProjectId] = useState<string>();
   const [dragOverProjectId, setDragOverProjectId] = useState<string>();
-  const [agents, setAgents] = useState<AgentTab[]>([]);
-  const [pendingAgents, setPendingAgents] = useState<PendingAgentTab[]>([]);
   /** 侧栏 π logo 重播令牌：agent 启动（含历史会话）/关闭时递增，驱动 BrandLockup 动画 */
   const [brandLogoReplayToken, setBrandLogoReplayToken] = useState(0);
   const [activeProjectId, setActiveProjectId] = useState<string>();
   const activeProjectIdRef = useRef<string | undefined>(activeProjectId);
   activeProjectIdRef.current = activeProjectId;
-  const [activeAgentId, setActiveAgentId] = useState<string>();
+  // visibleProjectChildCountByProject 需在 useAgentSessions 之前声明：
+  // hook 的 onSessionsByProjectChanged 回调通过它更新侧栏可见子项数。
+  const [visibleProjectChildCountByProject, setVisibleProjectChildCountByProject] =
+    useState<Record<string, number>>({});
+  // 项目会话列表变更后更新侧栏可见子项数：hook 只管数据获取，UI 分页由此回调驱动。
+  const handleSessionsByProjectChanged = useCallback(
+    (projectId: string) => {
+      setVisibleProjectChildCountByProject((current) => ({
+        ...current,
+        [projectId]: current[projectId] ?? SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
+      }));
+    },
+    [],
+  );
+  // Agent/会话状态集中管理：状态、refs、计算值从 useAgentSessions 获取，
+  // RPC effect / createAgent 等通过 setters/refs 更新，行为与原内联声明一致。
+  const {
+    agents, pendingAgents, activeAgentId, activeAgentByProject,
+    messagesByAgent, runtimeStateByAgent, sessions, sessionsByProject,
+    sessionLoadingByProject,
+    setAgents, setPendingAgents, setActiveAgentId, setActiveAgentByProject,
+    setMessagesByAgent, setRuntimeStateByAgent, setSessions,
+    setSessionsByProject, setSessionLoadingByProject,
+    agentsRef, activeAgentIdRef, pendingAgentsRef, runtimeStateByAgentRef,
+    agentStatusByAgentRef, sessionRequestByProjectRef, sessionRefreshRunningRef,
+    sessionRefreshPendingRef, displayAgentsRef,
+    displayAgents, activeAgent, activeMessages,
+    applyAgentRuntimeState, refreshRuntimeState, cycleModel, cycleThinking,
+    editMessage, refreshSessions, refreshProjectSessions,
+  } = useAgentSessions({
+    api,
+    activeProjectId,
+    onSessionsByProjectChanged: handleSessionsByProjectChanged,
+  });
   // 切换 agent（新会话/恢复会话）时刷新设置，使 pi agent 的 hideThinkingBlock 立即生效
   useEffect(() => {
     if (activeAgentId) {
       void api.settings.get().then(setSettings).catch(() => undefined);
     }
   }, [activeAgentId]);
-  const activeAgentIdRef = useRef<string | undefined>(activeAgentId);
-  activeAgentIdRef.current = activeAgentId;
-  const agentsRef = useRef<AgentTab[]>(agents);
-  agentsRef.current = agents;
   // 侧栏展开集合：有 id = 展开。localStorage 首屏缓存 + settings.json 可靠落盘（dev 强杀也不丢）。
   const [expandedSidebarProjects, setExpandedSidebarProjects] = useState<Set<string>>(
     () => {
@@ -610,26 +595,7 @@ export function App() {
   expandedSidebarProjectsRef.current = expandedSidebarProjects;
   /** 已从 settings.json 合并过展开状态，避免被后续 settings 刷新覆盖用户刚点的展开 */
   const expandedSidebarFromSettingsRef = useRef(false);
-  const [activeAgentByProject, setActiveAgentByProject] = useState<
-    Record<string, string>
-  >({});
-  const [messagesByAgent, setMessagesByAgent] = useState<
-    Record<string, ChatMessage[]>
-  >({});
   const [files, setFiles] = useState<FileTreeNode[]>([]);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [sessionsByProject, setSessionsByProject] = useState<
-    Record<string, SessionSummary[]>
-  >({});
-  /** 会话扫描可能由项目展开、运行态结束和周期同步同时触发；按项目丢弃旧响应，避免慢请求覆盖新子会话。 */
-  const sessionRequestByProjectRef = useRef<Record<string, number>>({});
-  const sessionRefreshRunningRef = useRef<Set<string>>(new Set());
-  const sessionRefreshPendingRef = useRef<Set<string>>(new Set());
-  const [sessionLoadingByProject, setSessionLoadingByProject] = useState<
-    Record<string, boolean>
-  >({});
-  const [visibleProjectChildCountByProject, setVisibleProjectChildCountByProject] =
-    useState<Record<string, number>>({});
   const [gitInfo, setGitInfo] = useState<GitBranchInfo>({
     current: null,
     branches: [],
@@ -638,11 +604,6 @@ export function App() {
   // 全局 + 项目级 skills 合成的斜线命令（/skill:<name>），注入 / 建议与 chip 白名单。
   // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充，让用户输入 / 即可见到 skills。
   const [skillCommands, setSkillCommands] = useState<PiCommand[]>([]);
-  const [runtimeStateByAgent, setRuntimeStateByAgent] = useState<
-    Record<string, AgentRuntimeState>
-  >({});
-  const runtimeStateByAgentRef = useRef<Record<string, AgentRuntimeState>>({});
-  runtimeStateByAgentRef.current = runtimeStateByAgent;
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [promptTemplatePickerOpen, setPromptTemplatePickerOpen] = useState(false);
@@ -795,7 +756,6 @@ export function App() {
   >({});
   // 会话区不再维护独立的“修改文件摘要”卡片；diff 入口贴在 edit/write 工具调用处，
   // 避免会话输入框上方摘要与 Git 工作区状态/历史会话恢复互相干扰。
-  const agentStatusByAgentRef = useRef<Record<string, AgentTab["status"]>>({});
   /** RPC 日志,用于调试 */
   const [rpcLogs, setRpcLogs] = useState<
     Array<{
@@ -1450,7 +1410,6 @@ export function App() {
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
   // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
   const pendingComposerCaretRef = useRef<number | null>(null);
-  const pendingAgentsRef = useRef<PendingAgentTab[]>([]);
   const projectDragPreventClickRef = useRef(false);
 
   // ===== 飞书桥接 =====
@@ -1549,22 +1508,6 @@ export function App() {
   const sessionsProject = projects.find(
     (project) => project.id === sessionsProjectId,
   );
-  const displayAgents = useMemo(() => {
-    const realIds = new Set(agents.map((agent) => agent.id));
-    return [
-      ...agents,
-      ...pendingAgents.filter(
-        (agent) =>
-          !realIds.has(agent.id) &&
-          !agents.some((realAgent) =>
-            isReplacementForPendingAgent(realAgent, agent),
-          ),
-      ),
-    ];
-  }, [agents, pendingAgents]);
-  // displayAgents 的 ref，供只挂载一次的 IPC 监听器读取最新 Agent 列表，避免闭包陈旧
-  const displayAgentsRef = useRef(displayAgents);
-  displayAgentsRef.current = displayAgents;
   // 从 localStorage 恢复历史（组件挂载时执行一次）
   useEffect(() => {
     loadPromptHistory();
@@ -1588,10 +1531,6 @@ export function App() {
     setHistoryNavigating(false);
     setSavedPrompt("");
   }, [activeAgentId]);
-  // 查看器已移除：activeAgent 直接从 displayAgents / pendingAgents 取，不再有伪 Agent。
-  const activeAgent = activeAgentId
-    ? [...displayAgents, ...pendingAgents].find((agent) => agent.id === activeAgentId)
-    : undefined;
   // prompt 文本：优先从 live ref 读取（始终保持最新），promptByAgent 仅在 chips 变化时更新作为兜底。
   // 不建立 state 依赖——普通按键不会触发 App 重渲染，仅靠 hasComposerContent / composerBangMode
   // 等布尔状态在真正翻转时驱动 UI 刷新。建议框打开时由 composerCursor 变化驱动重渲染。
@@ -1750,9 +1689,6 @@ export function App() {
     ? drawerPinnedByProject[activeProjectId]
     : undefined;
   const drawerPinned = Boolean(drawerPinnedPanel);
-  const activeMessages = activeAgentId
-    ? (messagesByAgent[activeAgentId] ?? [])
-    : [];
   const agentRuntimeState = activeAgentId
     ? runtimeStateByAgent[activeAgentId]
     : undefined;
@@ -3646,69 +3582,6 @@ export function App() {
     }
   }
 
-  async function refreshSessions(projectId = activeProjectId) {
-    const next = await api.sessions.list(projectId);
-    setSessions([...next].sort((a, b) => b.updatedAt - a.updatedAt));
-  }
-
-  async function refreshProjectSessions(projectId: string, silent = false) {
-    if (sessionRefreshRunningRef.current.has(projectId)) {
-      // 无论来源是周期同步还是用户操作，都必须在当前快照完成后补扫一次。
-      sessionRefreshPendingRef.current.add(projectId);
-      return;
-    }
-    const request = (sessionRequestByProjectRef.current[projectId] ?? 0) + 1;
-    sessionRequestByProjectRef.current[projectId] = request;
-    sessionRefreshRunningRef.current.add(projectId);
-    const loadingStart = Date.now();
-    const MIN_LOADING_MS = 200;
-    if (!silent) {
-      setSessionLoadingByProject((current) => ({
-        ...current,
-        [projectId]: true,
-      }));
-      // 让出主线程确保 React 提交 loading 状态到 DOM，避免快速 API 响应导致 loading 状态在同一批中被覆盖
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    }
-    try {
-      const next = await withTimeout(
-        api.sessions.list(projectId),
-        SESSION_REFRESH_TIMEOUT_MS,
-        t("app.sessionRefreshTimeout"),
-      );
-      if (sessionRequestByProjectRef.current[projectId] !== request) return next;
-      const sorted = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
-      setSessionsByProject((current) => {
-        const previous = current[projectId] ?? [];
-        if (sameSessionSummaryList(previous, sorted)) return current;
-        return { ...current, [projectId]: sorted };
-      });
-      setVisibleProjectChildCountByProject((current) => ({
-        ...current,
-        [projectId]: current[projectId] ?? SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
-      }));
-      return sorted;
-    } finally {
-      if (sessionRequestByProjectRef.current[projectId] === request) {
-        sessionRefreshRunningRef.current.delete(projectId);
-        if (!silent) {
-          const elapsed = Date.now() - loadingStart;
-          if (elapsed < MIN_LOADING_MS) {
-            await new Promise<void>((resolve) => setTimeout(resolve, MIN_LOADING_MS - elapsed));
-          }
-          setSessionLoadingByProject((current) => ({
-            ...current,
-            [projectId]: false,
-          }));
-        }
-        if (sessionRefreshPendingRef.current.delete(projectId)) {
-          // 忙碌期间错过的 tick 只补扫一次，避免并发，同时覆盖“子会话刚好在请求快照后落盘”的边界。
-          void refreshProjectSessions(projectId, true).catch(() => undefined);
-        }
-      }
-    }
-  }
-
   /** 刷新项目侧栏数据：根项目会话 + worktree 列表 + worktree 子项目会话。 */
   async function refreshProjectTree(project: Project) {
     await refreshProjectSessions(project.id);
@@ -4597,24 +4470,6 @@ export function App() {
     }
   }
 
-  function applyAgentRuntimeState(agentId: string, incoming: AgentRuntimeState) {
-    const currentState = runtimeStateByAgentRef.current[agentId];
-    const nextState = mergeAgentRuntimeState(currentState, incoming);
-    if (nextState === currentState) return nextState;
-    runtimeStateByAgentRef.current = {
-      ...runtimeStateByAgentRef.current,
-      [agentId]: nextState,
-    };
-    setRuntimeStateByAgent(runtimeStateByAgentRef.current);
-    return nextState;
-  }
-
-  async function refreshRuntimeState(agentId = activeAgentId) {
-    if (!agentId || isPendingAgentId(agentId)) return;
-    const state = await api.agents.runtimeState(agentId).catch(() => undefined);
-    if (state) applyAgentRuntimeState(agentId, state);
-  }
-
   function getProjectFilter(projectId: string) {
   	return sessionSourceFilter[projectId] ?? null;
   }
@@ -4638,13 +4493,6 @@ export function App() {
   		}
   		return { ...current, [projectId]: next };
   	});
-  }
-
-  async function cycleModel() {
-    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
-    const state = await api.agents.cycleModel(activeAgentId);
-    applyAgentRuntimeState(activeAgentId, state);
-    showToast(t("app.modelCycled", { name: state.modelName ?? state.modelId }), 2000);
   }
 
   /** 调整菜单位置避免溢出视口 */
@@ -4756,12 +4604,6 @@ export function App() {
       isNowFavorite ? t("app.modelFavorited", { name: modelId }) : t("app.modelUnfavorited", { name: modelId }),
       1500,
     );
-  }
-
-  async function cycleThinking() {
-    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
-    const state = await api.agents.cycleThinking(activeAgentId);
-    applyAgentRuntimeState(activeAgentId, state);
   }
 
   async function selectThinking(level: string) {
@@ -5695,27 +5537,6 @@ export function App() {
       }
       showToast(error instanceof Error ? error.message : String(error), 4000);
       return false;
-    }
-  }
-
-  /** 将主进程抛出的错误消息中的 BUSY_ 前缀码转为前端多语言文案 */
-  function translateAgentErrorMessage(msg: string): string {
-    if (msg.startsWith("BUSY_STREAMING:")) return t("message.busyStreaming");
-    if (msg.startsWith("BUSY_TOOL:")) return t("message.busyTool");
-    if (msg.startsWith("BUSY_GENERIC:")) return t("message.busyGeneric");
-    return msg;
-  }
-
-  /**
-   * 编辑消息：修改 JSONL + 重载会话。用户已点击「编辑 + 保存」两步操作，意图明确，不额外弹框确认。
-   */
-  async function editMessage(messageId: string, newText: string) {
-    if (!activeAgentId) return;
-    try {
-      await api.agents.editMessage(activeAgentId, messageId, newText);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      showToast(`${t("message.editFailed")}: ${translateAgentErrorMessage(msg)}`, 5000);
     }
   }
 

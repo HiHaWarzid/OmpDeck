@@ -2,6 +2,38 @@ import type { AgentTab, SessionSummary } from "../../shared/types";
 
 const DEFAULT_VISIBLE_PROJECT_CHILD_LIMIT = 5;
 
+/** 占位 Agent：真实进程尚未就绪时的侧栏临时条目，进程到达后被替换。 */
+export type PendingAgentTab = AgentTab & {
+	pendingKind?: "create" | "restart";
+	pendingStartedAt?: number;
+};
+
+/**
+ * 判断真实 Agent 是否是某个 Pending 占位的替换者。
+ * 重启占位只匹配本次重启之后出现的新进程，避免误选同项目下已有的同名 Agent。
+ */
+export function isReplacementForPendingAgent(agent: AgentTab, pending: PendingAgentTab) {
+	if (agent.projectId !== pending.projectId || agent.cwd !== pending.cwd)
+		return false;
+
+	if (pending.pendingKind === "restart") {
+		const startedAt = pending.pendingStartedAt ?? pending.createdAt;
+		if (agent.createdAt < startedAt - 1000) return false;
+		if (isSameSessionPath(agent.sessionPath, pending.sessionPath)) return true;
+		return !pending.sessionPath && agent.title === pending.title;
+	}
+
+	if (!pending.id.startsWith("pending-")) return false;
+	if (isSameSessionPath(agent.sessionPath, pending.sessionPath)) return true;
+	if (pending.sessionPath && agent.createdAt >= pending.createdAt - 1000)
+		return true;
+	// noSession 匿名 agent：没有 sessionPath，靠 noSession 标记 + 归属项目匹配
+	if (pending.noSession && agent.noSession) return true;
+	return (
+		agent.title === pending.title && agent.createdAt >= pending.createdAt - 1000
+	);
+}
+
 export type ProjectChildItem =
 	| {
 			type: "agent";
