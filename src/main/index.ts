@@ -173,7 +173,6 @@ import { AgentManager } from "./pi/AgentManager";
 import { PiLocator } from "./pi/PiLocator";
 import { PiProcess } from "./pi/PiProcess";
 import { PiRpcClient } from "./pi/PiRpcClient";
-import { testPiProxy } from "./pi/PiProxyTester";
 import { SessionScanner } from "./sessions/SessionScanner";
 import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
@@ -211,6 +210,7 @@ import { registerConfigHandlers } from "./ipc/configHandlers";
 import { registerFeishuHandlers } from "./ipc/feishuHandlers";
 import { registerPiHandlers } from "./ipc/piHandlers";
 import { registerAgentHandlers } from "./ipc/agentHandlers";
+import { registerAppHandlers } from "./ipc/appHandlers";
 import { RpcLogger } from "./logging/RpcLogger";
 import { resolveWslEnvironment } from "./wsl/WslEnvironment";
 import type { WslEnvironment } from "./wsl/WslPaths";
@@ -1115,6 +1115,26 @@ function registerIpc() {
 		appLogger,
 		getFeishuBridge: () => feishuBridge,
 	});
+	registerAppHandlers({
+		appLogger,
+		settingsStore,
+		agentManager,
+		terminalManager,
+		piLocator,
+		releasesUrl: RELEASES_URL,
+		getMainWindow: () => mainWindow,
+		setIsQuitting: (value: boolean) => {
+			isQuitting = value;
+		},
+		getPetSystem: () => petSystem,
+		getWebServiceManager: () => webServiceManager,
+		checkForAppUpdate,
+		downloadUpdateAsset,
+		installDownloadedUpdate,
+		openExternalUrl,
+		syncWslEnvironment,
+		applyNativeThemeSource,
+	});
 
 	async function ensureGenProcess(
 		projectPath: string,
@@ -1413,171 +1433,6 @@ function registerIpc() {
 			}
 		},
 	);
-	ipcMain.handle(ipcChannels.appInfo, () => ({
-		version: app.getVersion(),
-		releasesUrl: RELEASES_URL,
-		platform: process.platform,
-	}));
-	ipcMain.handle(ipcChannels.appPreferredSystemLanguages, () => {
-		// Renderer navigator.language can reflect Chromium launch flags or a stale browser locale.
-		// Electron exposes the OS preference order directly; use it for the "follow system" setting.
-		try {
-			return app.getPreferredSystemLanguages();
-		} catch {
-			return [];
-		}
-	});
-	ipcMain.handle(ipcChannels.appCheckUpdate, () =>
-		checkForAppUpdate(settingsStore.get().installationType),
-	);
-	ipcMain.handle(
-		ipcChannels.appDownloadUpdate,
-		async (_event, asset: AppUpdateAsset) => downloadUpdateAsset(asset),
-	);
-	ipcMain.handle(
-		ipcChannels.appInstallUpdate,
-		async (_event, filePath: string) => installDownloadedUpdate(filePath),
-	);
-	ipcMain.on(ipcChannels.preloadReady, (event) => {
-		void appLogger.info("app", "Preload API exposed", {
-			url: event.sender.getURL(),
-		});
-	});
-	ipcMain.on(ipcChannels.preloadError, (event, detail) => {
-		void appLogger.error("app", "Preload API expose failed", {
-			url: event.sender.getURL(),
-			detail,
-		});
-	});
-	/** 开关某 agent 的 RPC 日志记录 */
-	ipcMain.handle(ipcChannels.rpcLoggingSet, async (_event, agentId: string, enabled: boolean) => {
-		agentManager.setRpcLogging(agentId, enabled);
-		return enabled;
-	});
-	/** 查询某 agent 的 RPC 日志记录状态 */
-	ipcMain.handle(ipcChannels.rpcLoggingGet, async (_event, agentId: string) => agentManager.isRpcLogging(agentId));
-	ipcMain.handle(ipcChannels.appFeedbackEnvironment, async () => {
-		// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
-		const pi = await piLocator.check();
-		return {
-			appVersion: app.getVersion(),
-			platform: process.platform,
-			arch: process.arch,
-			electronVersion: process.versions.electron ?? "",
-			chromeVersion: process.versions.chrome ?? "",
-			nodeVersion: process.versions.node,
-			pi,
-		};
-	});
-	ipcMain.handle(ipcChannels.appOpenExternal, async (_event, url: string, forceSystem?: boolean) => {
-		// 外部链接统一经主进程打开，避免 renderer 直接依赖 shell 权限，并遵守用户设置的打开方式。
-		// forceSystem 为 true 时绕过 linkOpenMode 检查，始终用系统默认浏览器。
-		await openExternalUrl(url, forceSystem);
-	});
-	ipcMain.handle(ipcChannels.appRestart, async () => {
-		// 标记为退出状态，避免 closeToTray 阻止重启
-		isQuitting = true;
-		// 停止所有 Agent 和服务
-		await webServiceManager?.stop();
-		terminalManager?.closeAll();
-		agentManager?.stopAll();
-		// 重启应用
-		app.relaunch();
-		app.quit();
-	});
-	ipcMain.handle(ipcChannels.appWindowMinimize, () => {
-		if (!mainWindow || mainWindow.isDestroyed()) return;
-		mainWindow.minimize();
-	});
-	ipcMain.handle(ipcChannels.appWindowToggleMaximize, () => {
-		if (!mainWindow || mainWindow.isDestroyed()) return;
-		if (mainWindow.isMaximized()) mainWindow.unmaximize();
-		else mainWindow.maximize();
-	});
-	ipcMain.handle(ipcChannels.appWindowToggleAlwaysOnTop, () => {
-		if (!mainWindow || mainWindow.isDestroyed()) return false;
-		const next = !mainWindow.isAlwaysOnTop();
-		// floating 适合工具型桌面窗口；跨平台由 Electron 映射到各系统的置顶层级。
-		mainWindow.setAlwaysOnTop(next, "floating");
-		return next;
-	});
-	ipcMain.handle(ipcChannels.appWindowClose, () => {
-		if (!mainWindow || mainWindow.isDestroyed()) return;
-		mainWindow.close();
-	});
-
-	ipcMain.handle(ipcChannels.settingsGet, () => settingsStore.get());
-	ipcMain.handle(
-		ipcChannels.settingsUpdate,
-		async (_event, patch: Partial<AppSettings>) => {
-			// 记录更新前的设置，用于驱动桌面宠物对 pet 字段变化的反应
-			const prevSettings = settingsStore.get();
-			const settings = await settingsStore.update(patch);
-			void appLogger.info("settings", "Settings updated", { keys: Object.keys(patch) });
-			// 桌面宠物：设置面板走 settings.update，这里统一驱动开窗/切换/置顶
-			await petSystem?.reactToSettings(prevSettings, settings);
-			if (
-				"desktopProxyEnabled" in patch ||
-				"desktopProxyUrl" in patch ||
-				"desktopProxyBypass" in patch
-			) {
-				await applyDesktopProxy(settings);
-			}
-			if ("theme" in patch) {
-				applyNativeThemeSource(settings);
-			}
-			if ("useNativeTitleBar" in patch) {
-				settingsStore.notifyTitleBarChange(mainWindow);
-			}
-			if ("zoomFactor" in patch) {
-				mainWindow?.webContents.setZoomFactor(settings.zoomFactor);
-			}
-			if (
-				"webServiceEnabled" in patch ||
-				"webServiceHost" in patch ||
-				"webServicePort" in patch
-			) {
-				try {
-					await webServiceManager.applySettings(settings);
-				} catch (error) {
-					if (settings.webServiceEnabled) {
-						await settingsStore.update({ webServiceEnabled: false });
-					}
-					throw error;
-				}
-			}
-			// WSL 设置变更时同步更新会话扫描器和配置管理器
-			if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
-				await syncWslEnvironment(settings);
-			}
-			return settings;
-		},
-	);
-	ipcMain.handle(
-		ipcChannels.settingsTestPiProxy,
-		async () => {
-			const result = await testPiProxy(settingsStore.get());
-			void appLogger.info("settings", "Pi proxy tested", {
-				success: result.success,
-				elapsedMs: result.elapsedMs,
-				statusCode: result.statusCode,
-				error: result.error,
-			});
-			return result;
-		},
-	);
-
-	// ── 配置管理 ──────────────────────────────────────
-	// 切换开发者控制台
-	ipcMain.handle(ipcChannels.appToggleDevTools, () => {
-		if (!mainWindow || mainWindow.isDestroyed()) return false;
-		if (mainWindow.webContents.isDevToolsOpened()) {
-			mainWindow.webContents.closeDevTools();
-			return false;
-		}
-		mainWindow.webContents.openDevTools({ mode: "detach" });
-		return true;
-	});
 }
 
 function sendTelemetryHeartbeat() {
