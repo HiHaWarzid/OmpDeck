@@ -5,8 +5,8 @@
  * 从 index.ts 的 registerIpc() 迁移而来。
  * 依赖较多顶层函数和可变状态，全部通过 dep 显式传递：
  * - 可变状态：mainWindow / isQuitting / petSystem / webServiceManager 用 getter/setter
- * - 顶层函数：checkForAppUpdate / downloadUpdateAsset / installDownloadedUpdate /
- *   openExternalUrl / syncWslEnvironment / applyNativeThemeSource 作为函数 dep 传入
+ * - 更新流程：updateManager（UpdateManager 实例）封装检查/下载/安装
+ * - 顶层函数：openExternalUrl / syncWslEnvironment / applyNativeThemeSource 作为函数 dep 传入
  * - applyDesktopProxy / testPiProxy 是独立模块，直接 import
  */
 import { app, ipcMain, type BrowserWindow } from "electron";
@@ -14,8 +14,6 @@ import { ipcChannels } from "../../shared/ipc";
 import type {
 	AppSettings,
 	AppUpdateAsset,
-	AppUpdateDownloadResult,
-	AppUpdateInfo,
 } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
@@ -27,6 +25,7 @@ import type { PetSystem } from "../pet";
 import type { WslEnvironment } from "../wsl/WslPaths";
 import { applyDesktopProxy } from "../settings/DesktopProxy";
 import { testPiProxy } from "../pi/PiProxyTester";
+import { UpdateManager, RELEASES_URL } from "../update/UpdateManager";
 
 interface AppHandlerDeps {
 	appLogger: AppLogger;
@@ -34,16 +33,13 @@ interface AppHandlerDeps {
 	agentManager: AgentManager;
 	terminalManager: TerminalSessionManager;
 	piLocator: PiLocator;
-	releasesUrl: string;
+	updateManager: UpdateManager;
 	// 可变状态 getter/setter
 	getMainWindow: () => BrowserWindow | null;
 	setIsQuitting: (value: boolean) => void;
 	getPetSystem: () => PetSystem | null;
 	getWebServiceManager: () => WebServiceManager | undefined;
 	// 顶层函数 dep（定义留在 index.ts）
-	checkForAppUpdate: (installationType?: "portable" | "installed") => Promise<AppUpdateInfo>;
-	downloadUpdateAsset: (asset: AppUpdateAsset) => Promise<AppUpdateDownloadResult>;
-	installDownloadedUpdate: (filePath: string) => Promise<void>;
 	openExternalUrl: (url: string, forceSystem?: boolean) => Promise<void>;
 	syncWslEnvironment: (settings: AppSettings) => Promise<WslEnvironment | null>;
 	applyNativeThemeSource: (settings: AppSettings) => void;
@@ -56,14 +52,11 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		agentManager,
 		terminalManager,
 		piLocator,
-		releasesUrl,
+		updateManager,
 		getMainWindow,
 		setIsQuitting,
 		getPetSystem,
 		getWebServiceManager,
-		checkForAppUpdate,
-		downloadUpdateAsset,
-		installDownloadedUpdate,
 		openExternalUrl,
 		syncWslEnvironment,
 		applyNativeThemeSource,
@@ -71,7 +64,7 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 
 	ipcMain.handle(ipcChannels.appInfo, () => ({
 		version: app.getVersion(),
-		releasesUrl,
+		releasesUrl: RELEASES_URL,
 		platform: process.platform,
 	}));
 	ipcMain.handle(ipcChannels.appPreferredSystemLanguages, () => {
@@ -84,15 +77,15 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		}
 	});
 	ipcMain.handle(ipcChannels.appCheckUpdate, () =>
-		checkForAppUpdate(settingsStore.get().installationType),
+		updateManager.checkForAppUpdate(settingsStore.get().installationType),
 	);
 	ipcMain.handle(
 		ipcChannels.appDownloadUpdate,
-		async (_event, asset: AppUpdateAsset) => downloadUpdateAsset(asset),
+		async (_event, asset: AppUpdateAsset) => updateManager.downloadUpdateAsset(asset),
 	);
 	ipcMain.handle(
 		ipcChannels.appInstallUpdate,
-		async (_event, filePath: string) => installDownloadedUpdate(filePath),
+		async (_event, filePath: string) => updateManager.installDownloadedUpdate(filePath),
 	);
 	ipcMain.on(ipcChannels.preloadReady, (event) => {
 		void appLogger.info("app", "Preload API exposed", {
