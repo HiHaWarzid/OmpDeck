@@ -21,9 +21,6 @@ function getExtensionsApi(): ExtensionsApi {
 	return api;
 }
 
-/** OmpDeck 已移除内置扩展（omp 提供原生能力替代） */
-const PIDEK_BUILTIN_SOURCE: Record<string, string> = {};
-
 /** 从扩展来源提取简短描述名 */
 function shortName(source: string): string {
 	return source

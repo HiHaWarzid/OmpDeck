@@ -16,7 +16,7 @@ AFK 的工作单元来源。**单一来源 = GitHub Issue**（via `gh` CLI，仓
 从一个 Ticket 派生出的运行时实体，含：ticketRef（issue number）、worktree 路径、分支名、agent tab id、状态、起止时间。持久化于 `userData/afk-state.json`。
 
 ### Brief（任务简报）
-派发给 spawned agent 的工单内容。**原样派发**：issue title 作 goal，issue body 作 brief 原文，`workflow:*` 标签作工作流提示。AFK 不解析改写（呼应 Q11：不强制工作流，工单声明什么就派什么）。
+派发给 spawned agent 的工单内容。**原样派发**：issue title 作 goal，issue body 作 brief 原文，`workflow:*` 标签作工作流提示。AFK 不解析改写——工单声明什么就派什么。
 
 ### Complete（完成）
 AFK 终态之一。判据：spawned agent 的 `AgentStatus` 由 `running` 经 `agent_settled` 转为 `idle`，且未触发 `error`。**`complete` 只表示"跑到停"，不表示"做对了"。**
@@ -46,7 +46,7 @@ AFK 作用于 OmpDeck 中**当前选中的项目**：工单来自该项目的 gi
 单 agent 最大等待 **30 分钟**（写入 AppSettings 可配）。超时 → `failed`，按 ADR-0003 留 WIP、不裸删。
 
 ### Failed 条件（枚举）
-任一即 `failed`：agent `error` 状态 / 超时 / RPC 预检失败 / orchestrator 异常。（`error` 与 `idle` 的精确关系由 scout 核验后微调实现，不改变决策。）
+任一即 `failed`：agent `error` 状态 / 超时 / RPC 预检失败 / orchestrator 异常。
 
 ### Review（独立评审）
 `complete` 后：AFK 推 afk 分支、`gh pr create`、issue 重标 `ready-for-agent`→`ready-for-human`、AFK 停手。PR 合并由人决定，issue 由人关闭。AFK 不 spawn review agent。`success` 判定在 review 阶段，不在 AFK 内。
@@ -55,7 +55,7 @@ AFK 作用于 OmpDeck 中**当前选中的项目**：工单来自该项目的 gi
 `failed` 时：`gh issue comment` 附失败原因（best-effort）+ 重标 `ready-for-agent`→`needs-info`，不自动重试（ADR-0005）。
 
 ### Retry（重试）
-AFK 不自动重试失败任务。人修 issue 后重标 `ready-for-agent` 触发重跑，碰撞复用从 `[afk-wip]` 继续（Q6）。
+AFK 不自动重试失败任务。人修 issue 后重标 `ready-for-agent` 触发重跑，碰撞复用从 `[afk-wip]` commit 继续。
 
 ### Rebase-on-Reuse（重跑 rebase）
 重跑碰撞复用时先 rebase afk 分支 onto 当前 main；冲突 → `failed`（ADR-0006）。

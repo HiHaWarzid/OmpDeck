@@ -1,9 +1,8 @@
 /**
- * 统一通知接口：保留 showNotice / subscribeToNotice API，内部使用 sonner 实现。
+ * 统一通知接口，内部使用 sonner 实现。
  *
  * showNotice(message, duration?, kind?) — 全局通知，非模态。
- * subscribeToNotice(cb) — 保留兼容导出，但不再依赖组件订阅渲染；
- *   sonner 的 <Toaster /> 已在 App 根渲染，自动展示所有通知。
+ * sonner 的 <Toaster /> 已在 App 根渲染，自动展示所有通知。
  *
  * 通知类型映射：
  *   "error"   → sonner error
@@ -14,16 +13,6 @@
 import { toast } from "sonner";
 
 export type NoticeKind = "info" | "error" | "warning";
-
-type Listener = (data: { message: string; duration: number; kind?: NoticeKind } | null) => void;
-
-/**
- * 兼容导出：旧组件可能还用于检测是否有订阅者。
- * 实际通知已改为直接调用 sonner toast，不再通过 listener 转发。
- */
-export function subscribeToNotice(_cb: Listener): () => void {
-  return () => {};
-}
 
 /**
  * 显示全局通知。

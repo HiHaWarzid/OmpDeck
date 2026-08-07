@@ -48,7 +48,7 @@ src/
 
 ## 共享 UI 组件（必须使用）
 
-> **核心规则：新增 UI 时优先使用 `src/renderer/src/components/ui/` 下的共享组件，不要自己造轮子，也不要用原生 HTML 控件。**
+> **核心规则：新增 UI 时使用 `src/renderer/src/components/ui/` 下的共享组件。**
 
 ### 已有组件
 
@@ -82,7 +82,7 @@ src/
 
 ## 图标系统
 
-> **图标统一使用 `lucide-react`，不要引入其他图标库，不要用 emoji 代替功能图标。**
+> **图标统一使用 `lucide-react`。功能图标用 lucide 组件，品牌标识用 `LogoMark`/`AgentAvatar`。**
 
 ### 使用规范
 
@@ -223,19 +223,19 @@ height: min(850px, calc(100vh - 48px));
 
 ### GitHub协作说明
 
-请查看 docs/PiDeck-协作说明.md 文件了解 GitHub 协作流程。
+GitHub 协作流程（fork/branch/PR 规范）见 `docs/PiDeck-协作说明.md`，创建 PR 前查阅。
 
 
 ## Agent skills
 
 ### Issue tracker
 
-GitHub Issues（`HiHaWarzid/OmpDeck`），通过 `gh` CLI 操作。详见 `docs/agents/issue-tracker.md`。
+GitHub Issues（`HiHaWarzid/OmpDeck`），通过 `gh` CLI 操作。操作命令和查询模式见 `docs/agents/issue-tracker.md`。
 
 ### Triage labels
 
-使用五个默认 triage 标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。详见 `docs/agents/triage-labels.md`。
+使用五个默认 triage 标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。标签语义和使用时机见 `docs/agents/triage-labels.md`。
 
 ### Domain docs
 
-单 context 布局：`CONTEXT.md` + `docs/adr/`。详见 `docs/agents/domain.md`。
+AFK 领域术语表 `CONTEXT.md` + 架构决策记录 `docs/adr/`。领域建模流程和术语维护规则见 `docs/agents/domain.md`。
