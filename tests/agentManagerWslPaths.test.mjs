@@ -25,13 +25,6 @@ function loadWslPaths() {
 
 function loadAgentManager() {
 	const wslPaths = loadWslPaths();
-	const sessionEntryIds = (() => {
-		const sandbox = { exports: {}, require };
-		vm.runInNewContext(transpile("src/main/pi/sessionEntryIds.ts"), sandbox, {
-			filename: "sessionEntryIds.ts",
-		});
-		return sandbox.exports;
-	})();
 	const calls = {
 		copyFile: [],
 		existsSync: [],
@@ -55,53 +48,69 @@ function loadAgentManager() {
 		unlink: async (...args) => { calls.unlink.push(args); },
 		writeFile: async (...args) => { calls.writeFile.push(args); },
 	};
+	const fsSync = {
+		existsSync: (filePath) => {
+			calls.existsSync.push(filePath);
+			return false;
+		},
+		readdirSync: (dir) => {
+			calls.readdirSync.push(dir);
+			return ["session.jsonl.100.edit-backup", "session.jsonl.200.edit-backup"];
+		},
+		statSync: (filePath) => {
+			calls.statSync.push(filePath);
+			return { size: 128 };
+		},
+	};
 	class LatestByKeyEmitter {
 		push() {}
 		flush() {}
 		cancel() {}
 	}
-	const sandbox = {
-		Buffer,
-		clearTimeout,
-		console: { log() {}, warn() {}, error() {} },
-		exports: {},
-		process: { ...process, platform: "win32" },
-		setTimeout,
-		require: (id) => {
-			if (id === "electron") return { app: {}, Notification: class {} };
-			if (id === "node:fs/promises") return fsPromises;
-			if (id === "node:fs") {
-				return {
-					existsSync: (filePath) => {
-						calls.existsSync.push(filePath);
-						return false;
-					},
-					readdirSync: (dir) => {
-						calls.readdirSync.push(dir);
-						return ["session.jsonl.100.edit-backup", "session.jsonl.200.edit-backup"];
-					},
-					statSync: (filePath) => {
-						calls.statSync.push(filePath);
-						return { size: 128 };
-					},
-				};
-			}
-			if (id === "node:path") return path.win32;
-			if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
-			if (id === "../../shared/ipc") return { ipcChannels: {} };
-			if (id === "./PiProcess") return { PiProcess: class {} };
-			if (id === "./bashResult") return { formatBashToolMessage: () => ({}) };
-			if (id === "./messageContent") return { extractMessageText: (value) => String(value ?? "") };
-			if (id === "./historyMessages") return { mergeHistoryWithPreservedMessages: (value) => value };
-			if (id === "./sessionEntryIds") return sessionEntryIds;
-			if (id === "./LatestByKeyEmitter") return { LatestByKeyEmitter };
-			if (id === "../../shared/toolRuntimeState") return { updateActiveToolCalls: () => new Map() };
-			if (id === "../wsl/WslPaths") return wslPaths;
-			return require(id);
-		},
-	};
-	vm.runInNewContext(transpile("src/main/pi/AgentManager.ts"), sandbox, { filename: "AgentManager.ts" });
-	return { ...sandbox.exports, calls, wslPaths };
+
+	// 共享 require：被 AgentManager 及其依赖（messageTimeline / streamGate / sessionJsonl）
+	// 在各自 vm 沙箱中统一使用。registry 保存已转译的 TS 模块，按依赖顺序填充。
+	const registry = {};
+	function sharedRequire(id) {
+		if (id in registry) return registry[id];
+		if (id === "electron") return { app: {}, Notification: class {} };
+		if (id === "node:fs/promises") return fsPromises;
+		if (id === "node:fs") return fsSync;
+		if (id === "node:path") return path.win32;
+		if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
+		if (id === "../../shared/ipc") return { ipcChannels: {} };
+		if (id === "./PiProcess") return { PiProcess: class {} };
+		if (id === "./bashResult") return { formatBashToolMessage: () => ({}) };
+		if (id === "./messageContent") return { extractMessageText: (value) => String(value ?? "") };
+		if (id === "./historyMessages") return { mergeHistoryWithPreservedMessages: (value) => value };
+		if (id === "./LatestByKeyEmitter") return { LatestByKeyEmitter };
+		if (id === "../../shared/toolRuntimeState") return { updateActiveToolCalls: () => new Map() };
+		if (id === "../wsl/WslPaths") return wslPaths;
+		return require(id);
+	}
+
+	function loadModule(filePath, filename) {
+		const sandbox = {
+			Buffer,
+			clearTimeout,
+			console: { log() {}, warn() {}, error() {} },
+			exports: {},
+			process: { ...process, platform: "win32" },
+			setTimeout,
+			require: sharedRequire,
+		};
+		vm.runInNewContext(transpile(filePath), sandbox, { filename });
+		return sandbox.exports;
+	}
+
+	// 依赖顺序：sessionEntryIds <- messageTimeline <- sessionJsonl；streamGate 独立。
+	registry["./sessionEntryIds"] = loadModule("src/main/pi/sessionEntryIds.ts", "sessionEntryIds.ts");
+	registry["./messageTimeline"] = loadModule("src/main/pi/messageTimeline.ts", "messageTimeline.ts");
+	registry["./streamGate"] = loadModule("src/main/pi/streamGate.ts", "streamGate.ts");
+	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
+
+	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
+	return { ...agentManagerExports, calls, wslPaths };
 }
 
 function createManager(AgentManager, configManager = {}) {
@@ -134,9 +143,11 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 	const loadDecision = manager.getHistoryAutoLoadDecision(sessionPath);
 	assert.equal(loadDecision.shouldLoad, true);
 	assert.equal(loadDecision.sizeBytes, 128);
-	await manager.readRecentMessagesFromSessionFile(sessionPath, 1);
-	await manager.backupSessionFile(sessionPath);
-	const latestBackup = manager.findLatestBackup(sessionPath);
+	// JSONL 文件 IO 已抽取到 SessionJsonl 模块；AgentManager 在构造时注入 resolveHostPath
+	// 闭包（this.toSessionHostPath），因此 sessionJsonl 的所有磁盘操作都经过 WSL 路径解析。
+	await manager.sessionJsonl.readRecentMessages(sessionPath, 1);
+	await manager.sessionJsonl.backup(sessionPath);
+	const latestBackup = manager.sessionJsonl.findLatestBackup(sessionPath);
 	manager.agents.set("agent", {
 		process: { client: {} },
 		tab: {

@@ -92,8 +92,11 @@ export interface ConvertedSession {
 
 export class ImportPipeline {
 	private readonly adapters = new Map<ImportSource, SourceAdapter>();
+	private readonly piRoot: string;
 
-	constructor(private readonly piRoot: string) {}
+	constructor(piRoot: string) {
+		this.piRoot = piRoot;
+	}
 
 	registerAdapter(adapter: SourceAdapter): void {
 		this.adapters.set(adapter.source, adapter);
