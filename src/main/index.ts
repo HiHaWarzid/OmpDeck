@@ -3,12 +3,8 @@
 	BrowserWindow,
 	dialog,
 	ipcMain,
-	Menu,
-	nativeImage,
 	nativeTheme,
 	net,
-	shell,
-	Tray,
 } from "electron";
 import { basename, join, resolve } from "node:path";
 import { copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -30,8 +26,6 @@ import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
 import iconPath from "../../build/icon.png?asset";
-// 托盘图标使用预渲染的小尺寸 PNG，避免从 512x512 下采样导致模糊
-import trayIconPath from "../../build/icons/32x32.png?asset";
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -208,6 +202,8 @@ import { registerPiHandlers } from "./ipc/piHandlers";
 import { registerAgentHandlers } from "./ipc/agentHandlers";
 import { registerAppHandlers } from "./ipc/appHandlers";
 import { UpdateManager } from "./update/UpdateManager";
+import { LinkOpener } from "./links/LinkOpener";
+import { TrayManager } from "./tray/TrayManager";
 import { RpcLogger } from "./logging/RpcLogger";
 import { resolveWslEnvironment } from "./wsl/WslEnvironment";
 import type { WslEnvironment } from "./wsl/WslPaths";
@@ -222,7 +218,6 @@ import { FeishuBridge } from "./feishu/FeishuBridge";
 import { listBots } from "./feishu/FeishuConfig";
 
 let mainWindow: BrowserWindow | null = null;
-let tray: Tray | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
 let isQuitting = false;
 let projectStore: ProjectStore;
@@ -246,6 +241,8 @@ let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
 let rpcLogger: RpcLogger;
 let updateManager: UpdateManager;
+let linkOpener: LinkOpener;
+let trayManager: TrayManager;
 let feishuBridge: FeishuBridge | null = null;
 let activeWslEnvironment: WslEnvironment | null = null;
 
@@ -284,21 +281,10 @@ const POSTHOG_PROJECT_KEY =
 	"phc_xgJ8gFUMgExZEEPzZ7VRa7698ENcaDRquWZVGYb2dCFK";
 const POSTHOG_HOST = process.env.POSTHOG_HOST ?? "https://us.i.posthog.com";
 
-/** 从托盘/任务栏/二次启动唤起主窗口：处理最小化、隐藏到托盘两种状态。 */
+// focusMainWindow 和 setupTray 的实现已提取到 TrayManager 类。
+// 这里转发调用以保持对现有调用点的兼容性。
 function focusMainWindow() {
-	if (!mainWindow || mainWindow.isDestroyed()) return;
-	if (mainWindow.isMinimized()) mainWindow.restore();
-	// 托盘隐藏时需重新显示任务栏按钮，否则只 focus 可能仍不可见。
-	if (typeof mainWindow.setSkipTaskbar === "function") {
-		mainWindow.setSkipTaskbar(false);
-	}
-	mainWindow.show();
-	mainWindow.focus();
-	// Windows：短暂置顶再取消，避免已有窗口在后台时 second-instance 只亮任务栏不前置。
-	if (process.platform === "win32") {
-		mainWindow.setAlwaysOnTop(true);
-		mainWindow.setAlwaysOnTop(false);
-	}
+	trayManager?.focusMainWindow();
 }
 
 /**
@@ -327,32 +313,7 @@ function handleVersionFocusRequest() {
 focusExistingWindow = handleVersionFocusRequest;
 
 function setupTray() {
-	// 托盘图标：直接使用预渲染 32x32 PNG，高 DPI 下清晰；不额外 resize 以免模糊
-	tray = new Tray(nativeImage.createFromPath(trayIconPath));
-	tray.setToolTip("OmpDeck");
-
-	// 双击托盘图标恢复窗口（Windows 常见交互）
-	tray.on("double-click", () => {
-		focusMainWindow();
-	});
-
-	const contextMenu = Menu.buildFromTemplate([
-		{
-			label: "显示窗口",
-			click: () => {
-				focusMainWindow();
-			},
-		},
-		{ type: "separator" },
-		{
-			label: "退出 OmpDeck",
-			click: () => {
-				isQuitting = true;
-				app.quit();
-			},
-		},
-	]);
-	tray.setContextMenu(contextMenu);
+	trayManager?.setupTray();
 }
 
 /** 启动窗口预设 → BrowserWindow 初始尺寸；fullscreen/maximized 另用 setFullScreen/maximize。 */
@@ -399,29 +360,8 @@ function applyStartupWindowMode(
 }
 
 async function openExternalUrl(url: string, forceSystem?: boolean) {
-	// 允许 http/https 以及 file:// 协议（用于本地 HTML 预览等场景）
-	if (!url.startsWith("http:") && !url.startsWith("https:") && !url.startsWith("file:")) return;
-	// forceSystem 为 true 时绕过 linkOpenMode 设置，始终用系统默认浏览器
-	if (forceSystem) {
-		await shell.openExternal(url);
-		return;
-	}
-	const settings = settingsStore.get();
-	if (settings.linkOpenMode === "internal") {
-		openInternalLinkInBrowserPanel(url);
-		return;
-	}
-	await shell.openExternal(url);
-}
-
-function openInternalLinkInBrowserPanel(url: string) {
-	// 内部打开：将 URL 发送到渲染进程，由 BrowserPanel 在侧栏/弹框中加载，
-	// 替代之前的独立 BrowserWindow 方案，保持一致的浏览体验。
-	if (!mainWindow || mainWindow.isDestroyed()) {
-		void shell.openExternal(url);
-		return;
-	}
-	mainWindow.webContents.send(ipcChannels.appOpenInBrowser, url);
+	// 转发给 LinkOpener 处理
+	await linkOpener.openExternalUrl(url, forceSystem);
 }
 
 function printStartupInfo() {
@@ -1182,6 +1122,8 @@ app.whenReady().then(async () => {
 	appLogger = new AppLogger();
 	rpcLogger = new RpcLogger();
 	updateManager = new UpdateManager({ appLogger, getMainWindow: () => mainWindow });
+	linkOpener = new LinkOpener({ getMainWindow: () => mainWindow, getSettings: () => settingsStore.get() });
+	trayManager = new TrayManager({ getMainWindow: () => mainWindow, setIsQuitting: (v) => { isQuitting = v; }, onQuit: () => { app.quit(); } });
 	gitService = new GitService();
 	worktreeService = new WorktreeService();
 	piLocator = new PiLocator("omp");
@@ -1568,8 +1510,7 @@ async function ensureAllPiSettingsDefaults(): Promise<void> {
 
 app.on("before-quit", () => {
 	isQuitting = true;
-	tray?.destroy();
-	tray = null;
+	trayManager?.destroy();
 	void webServiceManager?.stop();
 	terminalManager?.closeAll();
 	agentManager?.stopAll();
