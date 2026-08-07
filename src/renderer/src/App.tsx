@@ -159,7 +159,7 @@ import {
   type SessionModifiedFile,
 } from "./components/app/AppParts";
 import { GitPanel } from "./components/app/GitPanel";
-import { BrowserPanel, moduleState, navigateTo } from "./components/app/BrowserPanel";
+import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
 import {
   groupToolMessages,
   getMultiSelectImageCaptureIds,
@@ -6550,12 +6550,8 @@ export function App() {
       setActiveTabId(null);
       setEditorTabs([]);
     }
-    // 通过 navigateTo 设置 URL 后重置 navigateKey，让 webview 直接加载 file:// URL
     const fileUrl = 'file:///' + filePath.split('\\').join('/');
     navigateTo(fileUrl);
-    if (moduleState!.navigateKey) {
-      moduleState!.navigateKey = 0;
-    }
     lastToolDrawerRef.current = "browser";
     setDrawer("browser");
     setDrawerCollapsed(false);
