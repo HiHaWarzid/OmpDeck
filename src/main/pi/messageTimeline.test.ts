@@ -4,19 +4,23 @@ import { test } from "node:test";
 import type { ChatMessage } from "../../shared/types";
 import {
 	buildActiveBranchEntryIds,
-	buildAskCard,
 	convertAgentMessages,
+	getToolPathFromArgs,
+	trimHistoryMessages,
+} from "./messageTimeline";
+import {
+	buildAskCard,
 	extractAskQuestionDetails,
+	tryParseBatchAskEnvelope,
+} from "./askQuestionCard";
+import {
 	extractImages,
 	extractThinking,
 	extractToolResultText,
-	getToolPathFromArgs,
 	safeJson,
 	stripAnsi,
 	truncateForDetail,
-	trimHistoryMessages,
-	tryParseBatchAskEnvelope,
-} from "./messageTimeline";
+} from "./messageTextUtils";
 
 // ── trimHistoryMessages ─────────────────────────────────
 

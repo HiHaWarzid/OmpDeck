@@ -103,8 +103,10 @@ function loadAgentManager() {
 		return sandbox.exports;
 	}
 
-	// 依赖顺序：sessionEntryIds <- messageTimeline <- sessionJsonl；streamGate 独立。
+	// 依赖顺序：sessionEntryIds <- messageTextUtils <- askQuestionCard <- messageTimeline <- sessionJsonl；streamGate 独立。
 	registry["./sessionEntryIds"] = loadModule("src/main/pi/sessionEntryIds.ts", "sessionEntryIds.ts");
+	registry["./messageTextUtils"] = loadModule("src/main/pi/messageTextUtils.ts", "messageTextUtils.ts");
+	registry["./askQuestionCard"] = loadModule("src/main/pi/askQuestionCard.ts", "askQuestionCard.ts");
 	registry["./messageTimeline"] = loadModule("src/main/pi/messageTimeline.ts", "messageTimeline.ts");
 	registry["./streamGate"] = loadModule("src/main/pi/streamGate.ts", "streamGate.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");

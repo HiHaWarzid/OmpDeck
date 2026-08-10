@@ -25,20 +25,24 @@ import { extractMessageText } from "./messageContent";
 import { mergeHistoryWithPreservedMessages } from "./historyMessages";
 import {
 	buildActiveBranchEntryIds,
-	buildAskCard,
 	convertAgentMessages,
-	extractAskQuestionDetails,
-	extractToolResultText,
-	extractImages,
-	extractThinking,
 	formatToolDetail,
 	getToolPathFromArgs,
+	trimHistoryMessages,
+} from "./messageTimeline";
+import {
+	buildAskCard,
+	extractAskQuestionDetails,
+	tryParseBatchAskEnvelope,
+} from "./askQuestionCard";
+import {
+	extractImages,
+	extractThinking,
+	extractToolResultText,
 	safeJson,
 	stripAnsi,
 	truncateForDetail,
-	tryParseBatchAskEnvelope,
-	trimHistoryMessages,
-} from "./messageTimeline";
+} from "./messageTextUtils";
 import {
 	assertResendRootEntry,
 	collectDescendantEntryIds,

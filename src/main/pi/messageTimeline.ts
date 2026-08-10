@@ -1,6 +1,17 @@
-import type { ChatMessage, ImageContent } from "../../shared/types";
+import type { ChatMessage } from "../../shared/types";
 import { extractMessageText } from "./messageContent";
 import { takeActiveEntryId } from "./sessionEntryIds";
+import {
+	buildAskCard,
+	extractAskQuestionDetails,
+} from "./askQuestionCard";
+import {
+	extractImages,
+	extractThinking,
+	extractToolResultText,
+	safeJson,
+	truncateForDetail,
+} from "./messageTextUtils";
 
 /**
  * 会话消息时间线 -- 把 pi 原始条目（rawMessages）转换为 UI 可渲染的 ChatMessage[]。
@@ -9,12 +20,14 @@ import { takeActiveEntryId } from "./sessionEntryIds";
  * 所有方法接收原始数据 + 参数，返回 ChatMessage[]/string/Map。
  * buildAskCard 的 aborted 状态由调用方传入，不再读 AgentManager 实例字段。
  *
+ * 职责边界：
+ *   - 本模块：核心转换流水线（convertAgentMessages / trimHistoryMessages）+ branch/工具调用历史重建
+ *   - askQuestionCard.ts：ask_question 专属解析（envelope/details/_askCard）
+ *   - messageTextUtils.ts：通用文本工具（safeJson/stripAnsi/extractImages/extractThinking/truncateForDetail/extractToolResultText）
+ *
  * 依赖方向：messageTimeline 不依赖 AgentManager，不依赖 SessionJsonl。
- * 被 AgentManager（live 路径 + 历史加载）和未来的 SessionJsonl 模块共同消费。
+ * 被 AgentManager（live 路径 + 历史加载）和 SessionJsonl 模块共同消费。
  */
-
-/** 工具结果文本截断阈值（字符数），从 AgentManager.MAX_TOOL_RESULT_CHARS 提取为模块常量。 */
-const MAX_TOOL_RESULT_CHARS = 8000;
 
 /** 从 unknown 值中安全提取 number timestamp，回退到 Date.now()。 */
 function toTimestamp(value: unknown): number {
@@ -317,232 +330,4 @@ export function formatToolDetail(
 function extractToolDetails(result: unknown): unknown {
 	if (!result || typeof result !== "object") return undefined;
 	return (result as Record<string, unknown>).details;
-}
-
-// ── Ask question 解析 ───────────────────────────────────
-
-export function tryParseBatchAskEnvelope(title: string): {
-	review?: boolean;
-	questions: Array<Record<string, unknown>>;
-} | null {
-	const raw = title?.trim();
-	if (!raw || raw[0] !== "{") return null;
-	try {
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		if (parsed?.__piDeckBatchAsk !== 1) return null;
-		if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) return null;
-		return {
-			review: parsed.review === true,
-			questions: parsed.questions as Array<Record<string, unknown>>,
-		};
-	} catch {
-		return null;
-	}
-}
-
-export function extractAskQuestionDetails(
-	toolName: string,
-	result: unknown,
-	args: unknown,
-): Record<string, unknown> | undefined {
-	if (toolName !== "ask_question") return undefined;
-
-	if (result && typeof result === "object") {
-		const r = result as Record<string, unknown>;
-		const rDetails = r.details as Record<string, unknown> | undefined;
-		if (rDetails?.question || Array.isArray(rDetails?.answers) || Array.isArray(rDetails?.questions)) {
-			return rDetails;
-		}
-		if (r.question || Array.isArray(r.answers) || Array.isArray(r.questions)) {
-			return r;
-		}
-	}
-
-	let parsedArgs: unknown = args;
-	if (typeof args === "string") {
-		try {
-			parsedArgs = JSON.parse(args);
-		} catch {
-			parsedArgs = undefined;
-		}
-	}
-	if (parsedArgs && typeof parsedArgs === "object") {
-		const a = parsedArgs as Record<string, unknown>;
-		if (Array.isArray(a.questions) && a.questions.length > 0) {
-			const answerValue =
-				typeof result === "string"
-					? result
-					: (result as Record<string, unknown>)?.value ?? (result as Record<string, unknown>)?.answer ?? null;
-			return {
-				questions: a.questions,
-				answers: answerValue != null ? [{ id: (a.questions[0] as Record<string, unknown>)?.id ?? "default", value: answerValue, label: String(answerValue) }] : [],
-				cancelled: false,
-			};
-		}
-		if (a.question) {
-			const answerValue =
-				typeof result === "string"
-					? result
-					: (result as Record<string, unknown>)?.value ?? (result as Record<string, unknown>)?.answer ?? null;
-			return {
-				question: a.question,
-				type: a.type,
-				options: a.options,
-				answer: answerValue,
-				answered: answerValue !== null && answerValue !== undefined,
-				answerLabel: answerValue != null ? String(answerValue) : undefined,
-			};
-		}
-	}
-	return undefined;
-}
-
-/**
- * 把 ask_question details 转成前端 ToolCard 用的 _askCard。
- * aborted 参数由调用方传入（live 路径传 this.abortedDuringAsk.has(agentId)，历史路径传 false）。
- */
-export function buildAskCard(
-	askDetails: Record<string, unknown> | undefined,
-	aborted: boolean,
-): Record<string, unknown> | undefined {
-	if (!askDetails) return undefined;
-
-	if (Array.isArray(askDetails.questions) || Array.isArray(askDetails.answers)) {
-		const questions = Array.isArray(askDetails.questions) ? askDetails.questions : [];
-		const answers = Array.isArray(askDetails.answers) ? askDetails.answers : [];
-		const cancelled = aborted || askDetails.cancelled === true;
-		const items = questions.map((q: Record<string, unknown>, i: number) => {
-			const a = answers.find((x: Record<string, unknown>) => x?.id === q?.id) ?? answers[i];
-			const value = cancelled ? null : (a as Record<string, unknown>)?.value ?? null;
-			const hasAnswer = value !== null && value !== undefined;
-			return {
-				id: String(q?.id ?? (a as Record<string, unknown>)?.id ?? `q${i + 1}`),
-				question: String(q?.question ?? (a as Record<string, unknown>)?.id ?? ""),
-				type: String((a as Record<string, unknown>)?.type ?? q?.type ?? "input"),
-				answered: !cancelled && hasAnswer,
-				answer: value,
-				answerLabel: cancelled ? undefined : (a as Record<string, unknown>)?.label ?? (hasAnswer ? String(value) : undefined),
-				options: q?.options,
-				wasCustom: (a as Record<string, unknown>)?.wasCustom === true,
-			};
-		});
-		if (items.length === 0 && answers.length > 0) {
-			for (const a of answers as Array<Record<string, unknown>>) {
-				const value = cancelled ? null : a?.value ?? null;
-				const hasAnswer = value !== null && value !== undefined;
-				items.push({
-					id: String(a?.id ?? "q"),
-					question: String(a?.id ?? ""),
-					type: String(a?.type ?? "input"),
-					answered: !cancelled && hasAnswer,
-					answer: value,
-					answerLabel: cancelled ? undefined : a?.label ?? (hasAnswer ? String(value) : undefined),
-					options: undefined,
-					wasCustom: a?.wasCustom === true,
-				});
-			}
-		}
-		const anyAnswered = items.some((it: { answered: boolean }) => it.answered);
-		const first = items[0] as { answer: unknown; answerLabel: unknown } | undefined;
-		return {
-			question: `问卷（${items.length} 题）`,
-			type: "batch",
-			answered: !cancelled && anyAnswered,
-			answer: first?.answer ?? null,
-			answerLabel: first?.answerLabel,
-			options: undefined,
-			cancelled,
-			items,
-		};
-	}
-
-	if (askDetails.question) {
-		const rawAnswer = aborted ? null : askDetails.answer;
-		const hasAnswer = rawAnswer !== null && rawAnswer !== undefined && rawAnswer !== "";
-		const answered = aborted
-			? false
-			: typeof askDetails.answered === "boolean"
-				? askDetails.answered
-				: hasAnswer;
-		return {
-			question: askDetails.question,
-			type: askDetails.type,
-			answered,
-			answer: aborted ? null : askDetails.answer,
-			answerLabel: aborted ? undefined : (askDetails.answerLabel as string | undefined) ?? (hasAnswer ? String(rawAnswer) : undefined),
-			options: askDetails.options,
-		};
-	}
-	return undefined;
-}
-
-// ── 文本工具 ────────────────────────────────────────────
-
-/** 对超长工具文本做首尾截断，保留头部和尾部以兼顾开头信息和错误堆栈。 */
-export function truncateForDetail(text: unknown): string {
-	const str = typeof text === "string" ? text : text == null ? "" : String(text);
-	if (str.length <= MAX_TOOL_RESULT_CHARS) return str;
-	const keep = Math.floor(MAX_TOOL_RESULT_CHARS / 2);
-	const omitted = str.length - keep * 2;
-	return (
-		`${str.slice(0, keep)}\n` +
-		`…（已省略中间 ${omitted} 字符，完整内容共 ${str.length} 字符）\n` +
-		str.slice(-keep)
-	);
-}
-
-export function extractToolResultText(result: unknown): string {
-	if (!result || typeof result !== "object") return "";
-	const content = (result as Record<string, unknown>).content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((item) => (typeof (item as Record<string, unknown>)?.text === "string" ? (item as Record<string, unknown>).text as string : ""))
-		.filter(Boolean)
-		.join("\n");
-}
-
-export function safeJson(value: unknown): string {
-	try {
-		return JSON.stringify(value, null, 2);
-	} catch {
-		return String(value);
-	}
-}
-
-/** 从 pi 历史消息 content 中恢复图片附件，用于历史会话重新打开后的图片展示。 */
-export function extractImages(content: unknown): ImageContent[] {
-	if (!Array.isArray(content)) return [];
-	return content.flatMap<ImageContent>((item) => {
-		if (!item || typeof item !== "object") return [];
-		const typed = item as Record<string, unknown>;
-		if (typed.type !== "image") return [];
-		const data = typeof typed.data === "string" ? typed.data : "";
-		const mimeType =
-			typeof typed.mimeType === "string"
-				? typed.mimeType
-				: typeof typed.mime_type === "string"
-					? typed.mime_type
-					: "image/png";
-		return data ? [{ type: "image", data, mimeType }] : [];
-	});
-}
-
-/** 从历史消息 content 数组中提取 thinking 内容块的文本，清理 ANSI 转义码 */
-export function extractThinking(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	const raw = content
-		.map((item) => {
-			if (!item || typeof item !== "object") return "";
-			const typed = item as Record<string, unknown>;
-			if (typed.type !== "thinking") return "";
-			return String(typed.thinking ?? typed.text ?? "");
-		})
-		.filter(Boolean)
-		.join("\n");
-	return stripAnsi(raw);
-}
-
-/** 清理 ANSI 转义码，模型思考内容中常见终端颜色序列 */
-export function stripAnsi(text: string): string {
-	return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 }
