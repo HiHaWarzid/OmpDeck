@@ -96,7 +96,6 @@ import {
   claimIdleHead,
   claimNextSteerPrompt,
   enqueuePrompt,
-  migrateQueuedPrompts,
   QUEUED_PROMPT_LIMIT,
   QUEUED_PROMPT_VISIBLE,
   replaceAgentQueue,
@@ -106,7 +105,6 @@ import {
 } from "./utils/queuedPromptQueue";
 import {
   loadTerminalHeight,
-  migrateTerminalDockAgentState,
   projectTerminalSessionKey,
   pruneTerminalDockState,
   resolveTerminalOwner,
@@ -120,6 +118,7 @@ import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useSessionLoader } from "./hooks/useSessionLoader";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
+import { useAgentLifecycle, migrateAgentRecord } from "./hooks/useAgentLifecycle";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
@@ -487,19 +486,6 @@ interface UiRequest {
 	widgetPlacement?: "aboveEditor" | "belowEditor";
 }
 
-function migrateAgentRecord<T>(
-  current: Record<string, T>,
-  replacementById: Map<string, string>,
-  liveIds: Set<string>,
-) {
-  const next: Record<string, T> = {};
-  for (const [agentId, value] of Object.entries(current)) {
-    const nextAgentId = replacementById.get(agentId) ?? agentId;
-    if (liveIds.has(nextAgentId)) next[nextAgentId] = value;
-  }
-  return next;
-}
-
 /** Agent 运行时暂存在 renderer、尚未提交给 pi 的消息。 */
 type QueuedPrompt = QueuedPromptSnapshot;
 
@@ -578,6 +564,17 @@ export function App() {
     activeProjectId,
     onSessionsByProjectChanged: handleSessionsByProjectChanged,
   });
+  // Agent 生命周期 per-agent 状态：prompt/images/queuedPrompts/terminalDock/
+  // drawerPinned/promptHistory/queueFlush，以及 agent 替换时的原子迁移方法。
+  const {
+    promptByAgent, setPromptByAgent, livePromptByAgentRef,
+    attachedImagesByAgent, setAttachedImagesByAgent, attachedImagesByAgentRef,
+    queuedPrompts, setQueuedPrompts, queuedPromptsRef,
+    terminalDockStateByOwner, setTerminalDockStateByOwner,
+    drawerPinnedByProject, setDrawerPinnedByProject,
+    promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
+    migratePerAgentState, commitPendingToReal,
+  } = useAgentLifecycle();
   // 切换 agent（新会话/恢复会话）时刷新设置，使 pi agent 的 hideThinkingBlock 立即生效
   useEffect(() => {
     if (activeAgentId) {
@@ -621,12 +618,6 @@ export function App() {
   >(undefined);
   const [sessionActionsOpen, setSessionActionsOpen] = useState(false);
   const [switchingBranch, setSwitchingBranch] = useState<string | null>(null);
-  const [promptByAgent, setPromptByAgent] = useState<Record<string, string>>(
-    {},
-  );
-  // contentEditable 的实时值通过 livePromptByAgentRef 保持最新，发送路径始终从这里读取草稿。
-  // promptByAgent 仅用于驱动 RichInput 的 chip 渲染（非文本同步），只在 chips 变化时更新。
-  const livePromptByAgentRef = useRef<Record<string, string>>({});
   // 仅跟踪输入框中是否有非空白文本（驱动发送按钮状态），避免每键触发全量 App 重渲染。
   const [hasComposerText, setHasComposerText] = useState(false);
   // 仅跟踪 ! / !! 前缀变化（驱动 CSS 类和 placeholder），避免每键触发重渲染。
@@ -637,11 +628,6 @@ export function App() {
   const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
   /** 用户点击 ask_question 取消/abort 后的过渡标记，立即隐藏运行指示器。 */
   const [cancellingUi, setCancellingUi] = useState(false);
-  const [attachedImagesByAgent, setAttachedImagesByAgent] = useState<
-    Record<string, ImageContent[]>
-  >({});
-  const attachedImagesByAgentRef = useRef<Record<string, ImageContent[]>>(attachedImagesByAgent);
-  attachedImagesByAgentRef.current = attachedImagesByAgent;
   const [previewImage, setPreviewImage] = useState<ImageContent | null>(null);
   /** 存储用户在 select 弹框自定义输入框中键入的值，用于在后续 input 弹框中自动提交 */
   const pendingCustomInputRef = useRef("");
@@ -726,10 +712,6 @@ export function App() {
   const GOAL_MAX_CONTINUATIONS = 5;
   /** 上一次 isAgentBusy 状态,用于检测 busy→idle 转换 */
   const prevIsAgentBusyRef = useRef(false);
-  /** 客户端队列按 agent 记录 flush 锁，避免 tool-end 与 idle 并发投递。 */
-  const queueFlushByAgentRef = useRef<Set<string>>(new Set());
-  const [queuedPrompts, setQueuedPrompts] = useState<Record<string, QueuedPrompt[]>>({});
-  const queuedPromptsRef = useRef<Record<string, QueuedPrompt[]>>({});
   const activeQueuedPrompts = activeAgentId ? (queuedPrompts[activeAgentId] ?? []) : [];
 
   /** 当前 agent 流式思考的实时文本,agent_end 时清空 */
@@ -1129,9 +1111,6 @@ export function App() {
       // localStorage 不可用时忽略
     }
   }
-  /** 跟踪哪些 agent 已经用会话消息重建过 prompt history；重启/替换时清除标记，下次 onMessages 重新重建 */
-  const promptHistoryInitedRef = useRef<Set<string>>(new Set());
-  const promptHistoryRef = useRef<Record<string, string[]>>({});
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [historyNavigating, setHistoryNavigating] = useState(false);
   const [savedPrompt, setSavedPrompt] = useState("");
@@ -1380,9 +1359,6 @@ export function App() {
   const [chatLayoutHeight, setChatLayoutHeight] = useState(() => window.innerHeight);
   const [composerAutoHeight, setComposerAutoHeight] =
     useState(COMPOSER_MIN_HEIGHT);
-  // open/collapsed 按 owner（agent 或 project）会话内记忆；高度全局一份并落盘
-  const [terminalDockStateByOwner, setTerminalDockStateByOwner] =
-    useState<TerminalDockStateByOwner>({});
   const [terminalHeight, setTerminalHeight] = useState(() =>
     loadTerminalHeight(COMPOSER_DEFAULT_TERMINAL_HEIGHT),
   );
@@ -1393,9 +1369,6 @@ export function App() {
   const terminalDockCloseTimerRef = useRef<number | null>(null);
   const [listCollapsed, setListCollapsed] = useState(false);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
-  const [drawerPinnedByProject, setDrawerPinnedByProject] = useState<
-    Record<string, DrawerPanel>
-  >({});
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const chatPaneRef = useRef<HTMLElement | null>(null);
   const sessionComboRef = useRef<HTMLDivElement | null>(null);
@@ -2246,55 +2219,14 @@ export function App() {
         if (replacement) return replacement.id;
         return pendingAgent ? current : undefined;
       });
-    const activeIds = new Set(nextAgents.map((agent) => agent.id));
       const activeProjectIds = new Set(nextAgents.map((agent) => agent.projectId));
       const draftIds = new Set([
         ...nextAgents.map((agent) => agent.id),
         ...remainingPendingAgents.map((agent) => agent.id),
       ]);
-      // 仅迁移/裁剪 agent 键；project 键留给 projects+displayAgents effect。
-      // 禁止用 agentId 集合 prune project 键（流式 onState 会误关 Dock）。
-      setTerminalDockStateByOwner((current) =>
-        migrateTerminalDockAgentState(
-          current,
-          pendingReplacementById,
-          draftIds,
-        ),
-      );
-      setDrawerPinnedByProject((current) =>
-        Object.fromEntries(
-          Object.entries(current).filter(([projectId]) => activeProjectIds.has(projectId)),
-        ),
-      );
-      setPromptByAgent((current) => {
-        const next = migrateAgentRecord(current, pendingReplacementById, draftIds);
-        livePromptByAgentRef.current = migrateAgentRecord(
-          livePromptByAgentRef.current,
-          pendingReplacementById,
-          draftIds,
-        );
-        return next;
-      });
-      setAttachedImagesByAgent((current) =>
-        migrateAgentRecord(current, pendingReplacementById, draftIds),
-      );
-      // 发送中的条目必须保持 sending，直到对应 IPC promise 明确完成。
-      // 普通 state 推送（包括 sendPrompt 先发出的 running）不能把它重新开放为可撤回。
-      updateQueuedPrompts((current) =>
-        migrateQueuedPrompts(current, pendingReplacementById, draftIds),
-      );
-      // 重启/替换 agent 时清除 prompt history 重建标记，等待 onMessages 重新从会话重建
-      for (const [oldAgentId] of pendingReplacementById) {
-        promptHistoryInitedRef.current.delete(oldAgentId);
-        delete promptHistoryRef.current[oldAgentId];
-      }
-
-      for (const [oldAgentId] of pendingReplacementById) {
-        queueFlushByAgentRef.current.delete(oldAgentId);
-      }
-      for (const agentId of queueFlushByAgentRef.current) {
-        if (!draftIds.has(agentId)) queueFlushByAgentRef.current.delete(agentId);
-      }
+      // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
+      // terminalDock/drawerPinned/promptHistory/queueFlush）
+      migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
       // 裁剪已关闭 agent 的消息缓存，释放 renderer 内存；重启占位需要参与 liveIds，避免旧进程移除时聊天记录闪空。
       setMessagesByAgent((current) =>
         migrateAgentRecord(current, pendingReplacementById, draftIds),
@@ -4413,22 +4345,8 @@ export function App() {
             }
           : current,
       );
-      setPromptByAgent((current) => {
-        const draft = livePromptByAgentRef.current[pendingTab.id] ?? current[pendingTab.id];
-        if (draft == null) return current;
-        const next = { ...current, [tab.id]: draft };
-        delete next[pendingTab.id];
-        livePromptByAgentRef.current[tab.id] = draft;
-        delete livePromptByAgentRef.current[pendingTab.id];
-        return next;
-      });
-      setAttachedImagesByAgent((current) => {
-        const draft = current[pendingTab.id];
-        if (draft == null) return current;
-        const next = { ...current, [tab.id]: draft };
-        delete next[pendingTab.id];
-        return next;
-      });
+      // 将 pending 阶段的 prompt 草稿和附加图片原子迁移到真实 tab
+      commitPendingToReal(pendingTab.id, tab.id);
       // 全新创建的会话需要刷新历史列表以显示新文件；从已有历史会话打开的 agent 跳过刷新，避免文件 mtime 被不必要地读/写导致排序提前
       if (!sessionPath) {
         void refreshProjectSessions(projectId).catch(() => undefined);

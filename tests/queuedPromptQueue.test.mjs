@@ -6,6 +6,10 @@ import { setI18nLocale, t } from "../src/renderer/src/i18n.ts";
 import { mergeAgentRuntimeState } from "../src/renderer/src/utils/agentRuntimeState.ts";
 
 const appSource = readFileSync("src/renderer/src/App.tsx", "utf8");
+const lifecycleSource = readFileSync(
+  "src/renderer/src/hooks/useAgentLifecycle.ts",
+  "utf8",
+);
 const stylesSource = readFileSync("src/renderer/src/styles.css", "utf8");
 const runtimeStateSource = readFileSync(
   "src/renderer/src/utils/agentRuntimeState.ts",
@@ -93,7 +97,8 @@ test("busy composer keeps stop and queued-send controls separate", () => {
 });
 
 test("App keeps native typing responsive with a live draft ref and transition", () => {
-  assert.match(appSource, /const livePromptByAgentRef = useRef<Record<string, string>>\(\{\}\)/);
+  // livePromptByAgentRef 声明已迁移到 useAgentLifecycle hook
+  assert.match(lifecycleSource, /const livePromptByAgentRef = useRef<Record<string, string>>\(\{\}\)/);
   assert.match(appSource, /const \[, startPromptTransition\] = useTransition\(\)/);
   assert.match(appSource, /function setPromptFromNativeInput\(agentId: string, value: string\)/);
   assert.match(appSource, /startPromptTransition\(\(\) => \{\s*setPromptByAgent/s);
@@ -102,7 +107,8 @@ test("App keeps native typing responsive with a live draft ref and transition", 
   assert.match(appSource, /queuedPrompt\.behavior === "direct" \? undefined : queuedPrompt\.behavior/);
   assert.match(appSource, /const currentDraft =[\s\S]*?livePromptByAgentRef\.current\[agentId\] \?\? promptByAgent\[agentId\]/);
   assert.match(appSource, /setPromptForAgent\(request\.agentId, text\)/);
-  assert.match(appSource, /livePromptByAgentRef\.current = migrateAgentRecord/);
+  // migrateAgentRecord 调用已迁移到 useAgentLifecycle hook 的 migratePerAgentState
+  assert.match(lifecycleSource, /livePromptByAgentRef\.current = migrateAgentRecord/);
   assert.match(appSource, /sendBehaviorMenuOpen && showBusySendControls && hasComposerContent/);
   assert.match(appSource, /clearTimeout\(sendBehaviorMenuCloseTimerRef\.current\)/);
   assert.match(appSource, /className="send-behavior-option steer" type="button"/);
@@ -110,7 +116,8 @@ test("App keeps native typing responsive with a live draft ref and transition", 
 });
 
 test("queue drain is serialized and waits for an ordered raw tool-end event", () => {
-  assert.match(appSource, /queueFlushByAgentRef = useRef<Set<string>>/);
+  // queueFlushByAgentRef 声明已迁移到 useAgentLifecycle hook
+  assert.match(lifecycleSource, /queueFlushByAgentRef = useRef<Set<string>>/);
   assert.match(
     appSource,
     /previous\?\.isExecutingTool\s*&&\s*!nextState\.isExecutingTool[\s\S]*?flushQueuedSteerPrompts\(payload\.agentId\)/,
