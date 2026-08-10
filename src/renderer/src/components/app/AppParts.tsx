@@ -5947,6 +5947,11 @@ function SessionsPanel(props: {
 											{t(`sessionSource.${session.source}` as any)}
 										</span>
 									)}
+									{session.degraded && (
+										<span className="session-degraded-badge" title={t("drawer.sessionDegraded")}>
+											<AlertTriangle size={12} strokeWidth={2} aria-hidden="true" />
+										</span>
+									)}
 									<small>
 										{new Date(session.updatedAt).toLocaleString()} ·{" "}
 										{t("drawer.sessionMessages", {
@@ -6561,6 +6566,11 @@ export function SessionManagerModal(props: {
 									{session.source && session.source !== "pi" && (
 										<span className={`session-source-badge ${session.source}`}>
 											{t(`sessionSource.${session.source}` as any)}
+										</span>
+									)}
+									{session.degraded && (
+										<span className="session-degraded-badge" title={t("drawer.sessionDegraded")}>
+											<AlertTriangle size={12} strokeWidth={2} aria-hidden="true" />
 										</span>
 									)}
 								</div>

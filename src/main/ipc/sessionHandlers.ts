@@ -22,8 +22,14 @@ export function registerSessionHandlers(deps: SessionHandlerDeps) {
 	const { projectStore, sessionScanner, importPipeline, agentManager, appLogger } = deps;
 
 	ipcMain.handle(ipcChannels.sessionsList, async (_event, projectId?: string) => {
-		const project = projectId ? projectStore.get(projectId) : undefined;
-		return sessionScanner.list(project?.path);
+		try {
+			const project = projectId ? projectStore.get(projectId) : undefined;
+			return await sessionScanner.list(project?.path);
+		} catch (error) {
+			// 会话列表是核心加载路径，失败时记录错误便于诊断，同时保留 rejection 供 renderer 提示用户。
+			void appLogger.error("session", "Failed to list sessions", { projectId, error });
+			throw error;
+		}
 	});
 	ipcMain.handle(ipcChannels.sessionsRename, async (_event, filePath: string, newName: string) => {
 		await sessionScanner.rename(filePath, newName);

@@ -20,6 +20,11 @@ export type SessionSummary = {
 	source?: "pi" | "codex" | "claude" | "opencode";
 	/** 标记此会话文件来自 WSL，rename/delete/copy 等操作需走 wsl.exe */
 	wsl?: boolean;
+	/**
+	 * 会话文件部分损坏（存在无法解析的 JSONL 行，如截断写入/编码残留）。
+	 * 列表仍展示该会话，但 messageCount 与预览可能不完整，UI 应给出提示。
+	 */
+	degraded?: boolean;
 	codexSessionId?: string;
 	codexThreadSource?: "user" | "subagent";
 	codexParentThreadId?: string;

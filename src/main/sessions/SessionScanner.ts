@@ -705,7 +705,15 @@ export class SessionScanner {
     if (cached !== undefined) return cached;
 
     const raw = await this.fileAdapter.read(filePath, signal);
-    const lines = raw.split(/\r?\n/).filter(Boolean);
+    // UTF-8 BOM 会让首行 JSON.parse 失败，导致会话头信息（name/cwd 等）丢失，先剥离。
+    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    // UTF-16 等双字节编码按 utf8 解码后几乎必然出现 NUL 字节，且每行都无法解析；
+    // 这类文件不是合法 JSONL，直接判定不可读并隐藏，避免显示成"空会话"的幽灵条目。
+    if (text.slice(0, 4096).includes("\u0000")) {
+      this.summaryCache.set(filePath, version, null);
+      return null;
+    }
+    const lines = text.split(/\r?\n/).filter(Boolean);
     if (lines.length === 0) {
       this.summaryCache.set(filePath, version, null);
       return null;
@@ -717,6 +725,9 @@ export class SessionScanner {
     let firstUserText = "";
     let firstAssistantText = "";
     let messageCount = 0;
+    /** 可解析行与损坏行计数：全部损坏时隐藏会话，部分损坏时标记 degraded。 */
+    let parsedLines = 0;
+    let skippedLines = 0;
     /** 会话来源：扫描前几行检测导入标记 */
     let source: SessionSummary["source"] = "pi";
     let codexSessionId: string | undefined;
@@ -730,7 +741,18 @@ export class SessionScanner {
     let hasSubagentChildMarker = false;
 
     for (const line of lines) {
-      const entry = JSON.parse(line) as any;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+        parsedLines += 1;
+      } catch {
+        // 单行 JSON 损坏（进程中断导致的截断写入、编码损坏、并发写竞争）不应拖垮整个会话：
+        // 跳过该行继续解析其余记录，保证会话仍能出现在历史列表，而不是整个文件被判定为不可读而消失。
+        skippedLines += 1;
+        continue;
+      }
+      // JSONL 行可能是合法 JSON 但非对象（null/字符串/数字），访问属性前先判空，避免 TypeError。
+      if (!entry || typeof entry !== "object") continue;
       if (entry.type === "session_info") {
         // Forked sessions may contain an older copied name; only the latest marker is authoritative.
         latestSessionInfoName = this.optionalString(entry.name ?? entry.data?.name);
@@ -769,6 +791,12 @@ export class SessionScanner {
         if (text && message.role === "user" && !firstUserText) firstUserText = text;
         if (text && message.role === "assistant" && !firstAssistantText) firstAssistantText = text;
       }
+    }
+
+    // 全部行都无法解析（损坏文件/二进制残留）：不显示成"空会话"幽灵条目，与无法读取的文件同等处理。
+    if (parsedLines === 0) {
+      this.summaryCache.set(filePath, version, null);
+      return null;
     }
 
     // 检测子会话：任意扩展产生的内部 worker/reviewer 会话。
@@ -854,6 +882,8 @@ export class SessionScanner {
       parentSessionPath,
       // 标记 WSL 来源，供 rename/delete/copy/readMessages 等操作识别
       wsl: isWsl || undefined,
+      // 部分行损坏时标记 degraded，供 UI 提示 messageCount/预览可能不完整。
+      degraded: skippedLines > 0 ? true : undefined,
     };
     this.summaryCache.set(filePath, version, summary);
     return summary;
@@ -875,9 +905,13 @@ export class SessionScanner {
       if (target !== root && !target.startsWith(`${root}/`)) return undefined;
       const raw = await this.fileAdapter.read(sourcePath);
       for (const line of raw.split(/\r?\n/).filter(Boolean).slice(0, 16)) {
-        const entry = JSON.parse(line) as any;
-        if (entry.type === "session_meta" && entry.payload) {
-          return getCodexSessionThreadInfo(entry.payload);
+        try {
+          const entry = JSON.parse(line) as any;
+          if (entry.type === "session_meta" && entry.payload) {
+            return getCodexSessionThreadInfo(entry.payload);
+          }
+        } catch {
+          // 跳过损坏行，继续检查后续行，避免单行损坏导致整个 thread 元数据推断失败。
         }
       }
     } catch {

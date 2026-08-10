@@ -2652,6 +2652,15 @@ body.is-resizing .wechat-shell {
   color: #0891b2;
   background: color-mix(in srgb, #0891b2 14%, var(--color-bg-panel));
 }
+/* 会话文件部分损坏标记：提示 messageCount/预览可能不完整，悬停展示完整说明。 */
+.session-degraded-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  color: var(--color-warning);
+  cursor: help;
+  vertical-align: middle;
+}
 /* 父行内嵌的子会话折叠按钮：置于行尾，不单独占横条 */
 .subagent-inline-toggle {
   display: inline-flex;

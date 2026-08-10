@@ -12,7 +12,9 @@ export function sameSessionSummaryList(
       a.id === b.id &&
       a.updatedAt === b.updatedAt &&
       a.name === b.name &&
-      a.projectPath === b.projectPath
+      a.projectPath === b.projectPath &&
+      // degraded 参与比较：会话由健康转为损坏（或反之）时需触发重渲染更新警告徽标。
+      a.degraded === b.degraded
     );
   });
 }

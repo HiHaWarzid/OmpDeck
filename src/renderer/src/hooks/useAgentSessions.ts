@@ -178,10 +178,25 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 
 	// ===== 会话加载 =====
 
-	/** 刷新活跃项目的会话列表（用于 sessions state，非按项目分组的 sessionsByProject）。 */
-	async function refreshSessions(projectId = activeProjectId) {
-		const next = await api.sessions.list(projectId);
-		setSessions([...next].sort((a, b) => b.updatedAt - a.updatedAt));
+	/**
+	 * 刷新活跃项目的会话列表（用于 sessions state，非按项目分组的 sessionsByProject）。
+	 * silent=true 用于删除/重命名/复制等操作后的静默刷新：失败时保留旧列表且不弹错误提示，
+	 * 避免与操作自身的成功提示叠加成矛盾通知；错误统一在此捕获，杜绝调用点产生未捕获 rejection。
+	 */
+	async function refreshSessions(projectId = activeProjectId, silent = false) {
+		try {
+			const next = await withTimeout(
+				api.sessions.list(projectId),
+				SESSION_REFRESH_TIMEOUT_MS,
+				t("app.sessionRefreshTimeout"),
+			);
+			setSessions([...next].sort((a, b) => b.updatedAt - a.updatedAt));
+		} catch (error) {
+			if (!silent) {
+				const msg = error instanceof Error ? error.message : String(error);
+				showNotice(`${t("app.sessionLoadFailed")}: ${msg}`, 4000, "error");
+			}
+		}
 	}
 
 	/**

@@ -3689,6 +3689,8 @@ export function App() {
     try {
       // 项目历史弹框内的刷新需要显式进入 loading 状态;否则刷新很快完成时用户会误以为按钮没有响应。
       await refreshSessions(projectId);
+    } catch {
+      // refreshSessions 内部已捕获并提示错误；这里仅兜底，避免调用方产生未捕获 rejection。
     } finally {
       setSessionHistoryLoading(false);
     }
@@ -3715,7 +3717,7 @@ export function App() {
       return;
     }
     showToast(t("app.sessionCopied"));
-    await refreshSessions(projectId);
+    await refreshSessions(projectId, true);
     await refreshProjectSessions(projectId);
   }
 
@@ -3730,7 +3732,9 @@ export function App() {
     await api.sessions.delete(session.filePath);
     showToast(t("app.sessionDeleted"), 2200);
     const projectId = sessionsProjectId ?? activeProjectId;
-    await refreshSessions(projectId);
+    // 乐观移除已删除的会话，避免刷新失败时残留无法打开的条目。
+    setSessions((current) => current.filter((s) => s.filePath !== session.filePath));
+    await refreshSessions(projectId, true);
     if (projectId) await refreshProjectSessions(projectId);
   }
 
@@ -3744,7 +3748,7 @@ export function App() {
       }
       showToast(t("app.currentSessionCopied"));
       await refreshRuntimeState(agentId);
-      await refreshSessions(activeProjectId);
+      await refreshSessions(activeProjectId, true);
       if (activeProjectId) await refreshProjectSessions(activeProjectId);
     } finally {
       setAgentActionLoading(null);
@@ -3785,7 +3789,7 @@ export function App() {
       showToast(t("app.sessionRenamed"), 2200);
       await refreshProjectSessions(tab.projectId);
       if (sessionsProjectId === tab.projectId)
-        await refreshSessions(tab.projectId);
+        await refreshSessions(tab.projectId, true);
     } catch (error) {
       showToast(
         t("app.sessionRenameFailed", {
@@ -3810,7 +3814,7 @@ export function App() {
       await api.sessions.rename(sessionRenameTarget.session.filePath, name);
       await refreshProjectSessions(sessionRenameTarget.projectId);
       if (sessionsProjectId === sessionRenameTarget.projectId) {
-        await refreshSessions(sessionRenameTarget.projectId);
+        await refreshSessions(sessionRenameTarget.projectId, true);
       }
       setSessionRenameTarget(null);
       setAgentRenameValue("");
@@ -3936,7 +3940,7 @@ export function App() {
       await scanCodexSessions(codexImportProject, false);
       await refreshProjectSessions(codexImportProject.id);
       if (sessionsProjectId === codexImportProject.id)
-        await refreshSessions(codexImportProject.id);
+        await refreshSessions(codexImportProject.id, true);
       showToast(
         t("codex.importDone", {
           imported: report.imported,
@@ -4017,7 +4021,7 @@ export function App() {
       await scanClaudeSessions(claudeImportProject, false);
       await refreshProjectSessions(claudeImportProject.id);
       if (sessionsProjectId === claudeImportProject.id)
-        await refreshSessions(claudeImportProject.id);
+        await refreshSessions(claudeImportProject.id, true);
       showToast(
         t("claude.importDone", {
           imported: report.imported,
@@ -4099,7 +4103,7 @@ export function App() {
       await scanOpenCodeSessions(openCodeImportProject, false);
       await refreshProjectSessions(openCodeImportProject.id);
       if (sessionsProjectId === openCodeImportProject.id)
-        await refreshSessions(openCodeImportProject.id);
+        await refreshSessions(openCodeImportProject.id, true);
       showToast(
         t("opencode.importDone", {
           imported: report.imported,
@@ -9036,7 +9040,7 @@ export function App() {
               }
               onRenameSession={async (filePath, newName) => {
                 await api.sessions.rename(filePath, newName);
-                await refreshSessions(sessionsProjectId ?? activeProjectId);
+                await refreshSessions(sessionsProjectId ?? activeProjectId, true);
               }}
               onCopySession={(session) =>
                 copySession(
