@@ -219,6 +219,14 @@ import { listBots } from "./feishu/FeishuConfig";
 let mainWindow: BrowserWindow | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
 let isQuitting = false;
+// 主窗口主 frame 加载健康状态（自愈判断用，见 handleVersionFocusRequest）。
+// mainFrameLoadFailed：最近一次主 frame 导航失败（含 dev server 失联导致的错误页）。
+// pendingErrorPageFinish：did-fail-load 之后紧跟的那次 did-finish-load 属于错误页本身，
+// 不能据此清除失败标记——只有真实页面加载成功才清除。
+let mainFrameLoadFailed = false;
+let pendingErrorPageFinish = false;
+// dev URL 首次加载失败后回退到已构建的 renderer 产物，只回退一次，避免无产物时反复重试。
+let mainWindowDevFallbackTried = false;
 let projectStore: ProjectStore;
 let fileSystemService: FileSystemService;
 let sessionScanner: SessionScanner;
@@ -288,18 +296,43 @@ function focusMainWindow() {
 }
 
 /**
- * 同版本次实例请求聚焦：窗口已在则前置；若窗口尚未创建/已销毁，ready 后重建。
+ * 主窗口是否处于不可用状态（空白页/崩溃），需要重建而非仅聚焦。
+ * 除渲染进程崩溃外，主 frame 加载失败（如 dev server 失联）也会让窗口停留在
+ * 错误页——此时二次启动只聚焦无济于事，必须重建窗口走一遍加载/回退逻辑。
+ */
+function mainWindowNeedsRecovery(window: BrowserWindow): boolean {
+	if (window.isDestroyed()) return true;
+	if (window.webContents.isCrashed()) return true;
+	return mainFrameLoadFailed;
+}
+
+/**
+ * 同版本次实例请求聚焦：窗口健康则前置；窗口损坏（加载失败/渲染崩溃）则销毁重建；
+ * 若窗口尚未创建/已销毁，ready 后重建。
  * 挂到顶层 focusExistingWindow，供版本单实例锁的 .focus 信号调用。
  */
 function handleVersionFocusRequest() {
-	if (mainWindow && !mainWindow.isDestroyed()) {
+	if (
+		mainWindow &&
+		!mainWindow.isDestroyed() &&
+		!mainWindowNeedsRecovery(mainWindow)
+	) {
 		focusMainWindow();
 		return;
 	}
 	void app.whenReady().then(() => {
 		if (mainWindow && !mainWindow.isDestroyed()) {
-			focusMainWindow();
-			return;
+			if (!mainWindowNeedsRecovery(mainWindow)) {
+				focusMainWindow();
+				return;
+			}
+			// 窗口还在但渲染已坏：重建而非聚焦，避免用户反复启动都看到空白页
+			void appLogger?.warn("app", "Recreating unhealthy main window on version focus request", {
+				crashed: mainWindow.webContents.isCrashed(),
+				loadFailed: mainFrameLoadFailed,
+				url: mainWindow.webContents.getURL(),
+			});
+			mainWindow.destroy();
 		}
 		if (settingsStore) {
 			void createWindow().catch((error) => {
@@ -423,6 +456,10 @@ async function prepareMainPreloadPath() {
 }
 
 async function createWindow() {
+	// 重建窗口时重置加载健康状态，让新窗口重新尝试 dev URL（若仍失联则再次回退构建产物）
+	mainFrameLoadFailed = false;
+	pendingErrorPageFinish = false;
+	mainWindowDevFallbackTried = false;
 	applyNativeThemeSource(settingsStore.get());
 	const windowOptions = settingsStore.createWindowOptions();
 	const showMainWindowImmediately = shouldShowMainWindowImmediately();
@@ -513,6 +550,13 @@ async function createWindow() {
 		void appLogger.info("app", "Main window load finished", {
 			url: mainWindow?.webContents.getURL(),
 		});
+		// 紧跟 did-fail-load 的这次 finish 是 Chromium 错误页本身，不视为加载成功；
+		// 其余 finish 说明真实页面已加载，清除失败标记。
+		if (pendingErrorPageFinish) {
+			pendingErrorPageFinish = false;
+		} else {
+			mainFrameLoadFailed = false;
+		}
 		// 恢复用户设置的窗口缩放；在 did-finish-load 后应用，避免早期设置被覆盖。
 		mainWindow?.webContents.setZoomFactor(settingsStore.get().zoomFactor);
 	});
@@ -525,6 +569,20 @@ async function createWindow() {
 				validatedURL,
 				isMainFrame,
 			});
+			if (!isMainFrame) return;
+			mainFrameLoadFailed = true;
+			pendingErrorPageFinish = true;
+			// dev server 失联（承载它的终端/父进程被关）时，窗口会永远停在错误页。
+			// 回退到已构建的 renderer 产物，保证至少能看到界面而不是空白；只回退一次。
+			if (shouldUseDevRendererUrl() && !mainWindowDevFallbackTried) {
+				mainWindowDevFallbackTried = true;
+				void appLogger.warn("app", "Dev server unreachable, falling back to built renderer", {
+					errorCode,
+					errorDescription,
+					validatedURL,
+				});
+				void mainWindow?.loadFile(join(__dirname, "../renderer/index.html"));
+			}
 		},
 	);
 	mainWindow.webContents.on("render-process-gone", (_event, details) => {

@@ -128,7 +128,17 @@ export class PetWindow {
 			? process.env.ELECTRON_RENDERER_URL
 			: undefined;
 		const url = devRendererUrl ? `${devRendererUrl}/pet.html` : join(__dirname, "../renderer/pet.html");
-		await (devRendererUrl ? this.win.loadURL(url) : this.win.loadFile(url));
+		if (devRendererUrl) {
+			// dev server 失联时回退到构建产物，避免宠物窗口停在空白（与主窗口同策略）
+			try {
+				await this.win.loadURL(url);
+			} catch (error) {
+				console.warn("[PetWindow] dev server unreachable, fallback to built pet.html", error);
+				await this.win.loadFile(join(__dirname, "../renderer/pet.html"));
+			}
+		} else {
+			await this.win.loadFile(url);
+		}
 
 		// 启动尺寸校正守护（每 5 秒检查），解决透明窗口在部分平台拖拽后尺寸漂移
 		this.startSizeGuard();
