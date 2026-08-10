@@ -4,6 +4,7 @@ import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
 import { net } from "electron";
+import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
 import {
 	ensureOpenAiVersionPath,
@@ -110,6 +111,34 @@ export class ConfigManager {
 			return ymlResult;
 		}
 		return this.readJsonFile<PiModelsFile>("models.json", { providers: {} });
+	}
+
+	/**
+	 * 只保留 models.json 里显式配置过的模型。
+	 * pi 会把「配置了 API Key（含环境变量）的供应商」的完整内置目录也算作可用模型，
+	 * 例如设置了 OPENAI_API_KEY 但从未在 models.json 配置 openai 时，模型选择器会
+	 * 冒出一整组未配置的 gpt 模型。这里以 models.json 为准做两层收敛：
+	 * - 供应商不在配置中 → 整个剔除；
+	 * - 供应商配置里显式列出了 models → 再按模型 id 收敛（pi 可能混入发现/缓存的多余模型）。
+	 */
+	async filterConfiguredModels(models: AvailableModel[]): Promise<AvailableModel[]> {
+		const result = await this.getModelsConfig();
+		const providers = result.parsed.providers ?? {};
+		const allowedProviders = new Set(Object.keys(providers));
+		if (allowedProviders.size === 0) return [];
+		// 显式列出模型的供应商：仅放行清单内的 id
+		const explicitModelIds = new Map<string, Set<string>>();
+		for (const [provider, config] of Object.entries(providers)) {
+			const ids = (config.models ?? [])
+				.map((m) => m.id)
+				.filter((id): id is string => typeof id === "string");
+			if (ids.length > 0) explicitModelIds.set(provider, new Set(ids));
+		}
+		return models.filter((model) => {
+			if (!allowedProviders.has(model.provider)) return false;
+			const ids = explicitModelIds.get(model.provider);
+			return !ids || ids.has(model.id);
+		});
 	}
 
 	/** 回退：从 models.yml 解析为 PiModelsFile（简单缩进 YAML，不支持嵌套数组/对象以外的复杂结构） */

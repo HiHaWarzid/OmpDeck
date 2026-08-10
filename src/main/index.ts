@@ -767,7 +767,7 @@ function registerIpc() {
 	registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger });
 	registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! });
 	registerConfigHandlers({ configManager, agentManager, appLogger });
-	registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger });
+	registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager });
 	registerAgentHandlers({
 		agentManager,
 		terminalManager,

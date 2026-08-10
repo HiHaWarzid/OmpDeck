@@ -1451,7 +1451,9 @@ export class AgentManager {
 			{ type: "get_available_models" },
 			60_000,
 		);
-		return ((response.data as any)?.models ?? []) as AvailableModel[];
+		const models = ((response.data as any)?.models ?? []) as AvailableModel[];
+		// pi 会把有 Key（含环境变量）的供应商内置目录也返回，这里只保留 models.json 显式配置的模型
+		return this.configManager.filterConfiguredModels(models);
 	}
 
 	async setModel(agentId: string, provider: string, modelId: string) {

@@ -382,7 +382,14 @@ function EnabledModelsInput(props: {
 }) {
 	const [open, setOpen] = useState(false);
 	const [filter, setFilter] = useState("");
-	const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+	const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+		// 默认折叠所有供应商分组
+		const set = new Set<string>();
+		for (const m of props.models) {
+			set.add(m.provider);
+		}
+		return set;
+	});
 	const containerRef = useRef<HTMLDivElement>(null);
 	const selected = new Set(props.value ?? []);
 

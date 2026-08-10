@@ -1166,7 +1166,18 @@ export function ModelPicker(props: {
 	onToggleFavorite: (provider: string, modelId: string) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
-	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
+		// 默认折叠所有供应商分组，避免长列表一次性铺开
+		const set = new Set<string>();
+		for (const m of props.models) {
+			set.add(m.provider || 'other');
+		}
+		const favSet = new Set(props.favoriteModels ?? []);
+		if (props.models.some(m => favSet.has(`${m.provider}/${m.id}`))) {
+			set.add('__favorites__');
+		}
+		return set;
+	});
 	const normalizedSearch = modelPickerSearch.trim().toLowerCase();
 	const selectedItemRef = useRef<HTMLButtonElement | null>(null);
 	const modelPickerListRef = useRef<HTMLDivElement | null>(null);

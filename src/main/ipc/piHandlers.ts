@@ -9,10 +9,12 @@ import { ipcMain } from "electron";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ipcChannels } from "../../shared/ipc";
+import type { AvailableModel } from "../../shared/types";
 import { PiLocator } from "../pi/PiLocator";
 import type { ExtensionManager } from "../extensions/ExtensionManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AppLogger } from "../logging/AppLogger";
+import type { ConfigManager } from "../config/ConfigManager";
 
 /**
  * 解析 pi --list-models 表格输出为 AvailableModel[]。
@@ -63,10 +65,11 @@ interface PiHandlerDeps {
 	settingsStore: SettingsStore;
 	extensionManager: ExtensionManager;
 	appLogger: AppLogger;
+	configManager: ConfigManager;
 }
 
 export function registerPiHandlers(deps: PiHandlerDeps) {
-	const { piLocator, settingsStore, extensionManager, appLogger } = deps;
+	const { piLocator, settingsStore, extensionManager, appLogger, configManager } = deps;
 
 	ipcMain.handle(ipcChannels.piCheck, async () => {
 		// 用户手动指定的路径优先于自动检测
@@ -83,8 +86,8 @@ export function registerPiHandlers(deps: PiHandlerDeps) {
 
 	// 从 pi --list-models 获取可用模型列表（无需启动 agent）
 	// 全局缓存：首次运行后复用，避免每次打开选择器都 fork 子进程
-	let cachedListModels: ReturnType<typeof parsePiListModels> | null = null;
-	let cachedListModelsPending: Promise<ReturnType<typeof parsePiListModels>> | null = null;
+	let cachedListModels: AvailableModel[] | null = null;
+	let cachedListModelsPending: Promise<AvailableModel[]> | null = null;
 	ipcMain.handle(ipcChannels.projectsListModels, async (_event, _projectId?: string) => {
 		try {
 			if (cachedListModels) return cachedListModels;
@@ -118,7 +121,7 @@ export function registerPiHandlers(deps: PiHandlerDeps) {
 						}
 					});
 				});
-				const models = parsePiListModels(result.stdout);
+				const models = await configManager.filterConfiguredModels(parsePiListModels(result.stdout));
 				cachedListModels = models;
 				return models;
 			})();
