@@ -61,6 +61,15 @@ function loadPiProcess(spawnCalls) {
 			if (id === "./PiRpcClient") return { PiRpcClient: FakeRpcClient };
 			if (id === "./PiLocator") return { PiLocator: FakePiLocator };
 			if (id === "../wsl/WslPaths") return paths;
+			// PiProcess 启动期调用 parkBlockedExtensionsInDir/unparkBlockedExtensions；
+			// WSL spawn 路径测试不关心扩展过滤，提供空实现避免真实文件系统访问。
+			// 注意：这两个函数是同步的（返回数组/void），不能写成 async，否则 spread Promise 报错。
+			if (id === "./piExtensionFilter") {
+				return {
+					parkBlockedExtensionsInDir: () => [],
+					unparkBlockedExtensions: () => {},
+				};
+			}
 			return require(id);
 		},
 	};
@@ -109,12 +118,12 @@ test("starts WSL pi with Linux cwd/session while keeping a Windows-accessible sp
 		createLocator(invocationCalls),
 	);
 
-	await process.start("\\\\wsl$\\Ubuntu-24.04\\root\\.pi\\agent\\sessions\\session.jsonl");
+	await process.start("\\\\wsl$\\Ubuntu-24.04\\root\\.omp\\agent\\sessions\\session.jsonl");
 
 	assert.equal(invocationCalls[0].options.wslCwd, "/root/ba_cli");
 	assert.deepEqual(
 		invocationCalls[0].args,
-		["--mode", "rpc", "--no-themes", "--offline", "--session", "/root/.pi/agent/sessions/session.jsonl"],
+		["--mode", "rpc", "--resume", "/root/.omp/agent/sessions/session.jsonl"],
 	);
 	assert.equal(spawnCalls[0].options.cwd, "\\\\wsl.localhost\\Ubuntu-24.04\\root\\ba_cli");
 	assert.deepEqual(
@@ -123,8 +132,7 @@ test("starts WSL pi with Linux cwd/session while keeping a Windows-accessible sp
 			"-d", "Ubuntu-24.04",
 			"-u", "root",
 			"--cd", "/root/ba_cli",
-			"pi", "--mode", "rpc", "--no-themes", "--offline",
-			"--session", "/root/.pi/agent/sessions/session.jsonl",
+			"pi", "--mode", "rpc", "--resume", "/root/.omp/agent/sessions/session.jsonl",
 		],
 	);
 	assert.equal(process.getDiagnostics().cwd, "/root/ba_cli");

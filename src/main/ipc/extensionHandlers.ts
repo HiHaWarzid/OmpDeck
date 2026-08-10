@@ -1,8 +1,7 @@
 /**
  * 扩展管理 IPC handler：list/install/uninstall/remove/restore/update。
  *
- * restoreBuiltIn 额外调用 ensurePiDeckExtension 确保文件存在，
- * 该函数定义在 index.ts（启动任务也用），通过 dep 注入。
+ * restoreBuiltIn 额外调用 extensionManager.ensureExtension 确保文件存在。
  */
 import { ipcMain } from "electron";
 import { ipcChannels } from "../../shared/ipc";
@@ -12,14 +11,12 @@ import type { AppLogger } from "../logging/AppLogger";
 interface ExtensionHandlerDeps {
 	extensionManager: ExtensionManager;
 	appLogger: AppLogger;
-	/** 确保内置扩展文件存在（定义在 index.ts，启动任务也用） */
-	ensurePiDeckExtension: (extensionName: string, wslHome?: string) => Promise<unknown>;
 	/** 当前 WSL 环境（运行期可变，通过 getter 读取最新值） */
 	getActiveWslEnvironment: () => { windowsHome?: string } | null;
 }
 
 export function registerExtensionHandlers(deps: ExtensionHandlerDeps) {
-	const { extensionManager, appLogger, ensurePiDeckExtension, getActiveWslEnvironment } = deps;
+	const { extensionManager, appLogger, getActiveWslEnvironment } = deps;
 
 	// forceRefresh=true 时跳过内存缓存，重新跑 pi list 并查 npm 版本；默认走缓存。
 	ipcMain.handle(ipcChannels.extensionsList, (_event, forceRefresh?: boolean) =>
@@ -43,7 +40,12 @@ export function registerExtensionHandlers(deps: ExtensionHandlerDeps) {
 	ipcMain.handle(ipcChannels.extensionsRestoreBuiltIn, async (_event, source: string) => {
 		// 恢复内置扩展：从 OmpDeck 移除标记中删除，并确保文件存在
 		await extensionManager.restoreBuiltIn(source);
-		await ensurePiDeckExtension(source, getActiveWslEnvironment()?.windowsHome);
+		const wslHome = getActiveWslEnvironment()?.windowsHome;
+		// ensureExtension 需要明确的 homeDir；WSL 启用时用 WSL home，否则用默认 home
+		await extensionManager.ensureExtension(
+			source,
+			wslHome ?? extensionManager.homeDir,
+		);
 		void appLogger.info("extension", "Built-in extension restored", { source });
 	});
 	ipcMain.handle(ipcChannels.extensionsUpdate, async () => {

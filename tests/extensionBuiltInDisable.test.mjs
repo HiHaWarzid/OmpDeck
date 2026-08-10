@@ -55,6 +55,14 @@ function loadExtensionManager({ homeDir, runPiOutput = "", fsOverrides = {} } = 
 			}
 			if (id === "../wsl/WslPaths") return wslPaths;
 			if (id === "../pi/PiLocator") return {};
+			// ExtensionManager.ensureExtension 通过 is.dev 判断资源路径，且模块加载期
+			// @electron-toolkit/utils 会访问 electron.app.isPackaged；纯 Node 测试需 mock。
+			if (id === "electron") {
+				return { app: { getAppPath: () => process.cwd(), isPackaged: false } };
+			}
+			if (id === "@electron-toolkit/utils") {
+				return { is: { dev: true, prod: false } };
+			}
 			return require(id);
 		},
 	};
@@ -66,7 +74,7 @@ function loadExtensionManager({ homeDir, runPiOutput = "", fsOverrides = {} } = 
 
 test("disableBuiltIn records removal and deletes user extension file", async () => {
 	const fixtureHome = mkdtempSync(join(tmpdir(), "pideck-disable-builtin-"));
-	const extensionsDir = join(fixtureHome, ".pi", "agent", "extensions");
+	const extensionsDir = join(fixtureHome, ".omp", "agent", "extensions");
 	mkdirSync(extensionsDir, { recursive: true });
 	const target = join(extensionsDir, "pi-deck-todo.ts");
 	writeFileSync(target, "// builtin todo\n", "utf8");
@@ -103,67 +111,9 @@ test("disableBuiltIn records removal and deletes user extension file", async () 
 	rmSync(fixtureHome, { recursive: true, force: true });
 });
 
-test("list auto-disables built-in todo and deletes file when third-party rpiv-todo is present", async () => {
-	const fixtureHome = mkdtempSync(join(tmpdir(), "pideck-conflict-todo-"));
-	const extensionsDir = join(fixtureHome, ".pi", "agent", "extensions");
-	mkdirSync(extensionsDir, { recursive: true });
-	const builtinPath = join(extensionsDir, "pi-deck-todo.ts");
-	writeFileSync(builtinPath, "// builtin\n", "utf8");
-
-	let settings = { removedBuiltInExtensions: [] };
-	const piListOutput = [
-		"User packages:",
-		"npm:@juicesharp/rpiv-todo",
-		join(fixtureHome, ".pi", "agent", "npm", "node_modules", "@juicesharp", "rpiv-todo"),
-		"",
-	].join("\n");
-
-	const { ExtensionManager } = loadExtensionManager({
-		homeDir: fixtureHome,
-		runPiOutput: piListOutput,
-	});
-
-	// 绕过 noApproveSupported 的版本探测：直接 stub getPiVersion 路径
-	// detectPiVersion 走 locator.check；给一个有效版本即可。
-	const locator = {
-		check: async () => ({ installed: true, version: "0.80.0" }),
-		createInvocation: (cmd, args) => ({
-			command: cmd,
-			args,
-			shell: false,
-			pathPrefix: undefined,
-			wsl: false,
-			windowsVerbatimArguments: false,
-		}),
-		createProcessEnv: () => ({ ...process.env }),
-		resolveCommand: () => "pi",
-	};
-
-	const manager = new ExtensionManager(
-		locator,
-		() => ({}),
-		() => settings,
-		async (patch) => {
-			settings = { ...settings, ...patch };
-			return settings;
-		},
-	);
-
-	assert.equal(existsSync(builtinPath), true);
-	const result = await manager.list(false);
-
-	assert.equal(settings.removedBuiltInExtensions.includes("pi-deck-todo.ts"), true);
-	assert.equal(existsSync(builtinPath), false, "conflicting built-in file must be deleted");
-	assert.ok(result.conflicts?.some((c) => c.builtIn === "pi-deck-todo.ts"));
-	const builtin = result.extensions.find((e) => e.source === "pi-deck-todo.ts");
-	assert.equal(builtin?.enabled, false);
-
-	rmSync(fixtureHome, { recursive: true, force: true });
-});
-
 test("list purges residual built-in file already marked removed", async () => {
 	const fixtureHome = mkdtempSync(join(tmpdir(), "pideck-residual-todo-"));
-	const extensionsDir = join(fixtureHome, ".pi", "agent", "extensions");
+	const extensionsDir = join(fixtureHome, ".omp", "agent", "extensions");
 	mkdirSync(extensionsDir, { recursive: true });
 	const builtinPath = join(extensionsDir, "pi-deck-todo.ts");
 	writeFileSync(builtinPath, "// leftover after disable-without-delete\n", "utf8");

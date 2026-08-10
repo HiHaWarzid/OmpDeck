@@ -1,7 +1,6 @@
 /**
- * Git IPC handler：分支/提交/暂存/差异/worktree/push/pull/fetch/init 等。
- * 注意：`gitGenerateCommitMessage` 依赖 QuickGen 持久化 RPC 进程（genProcess 等可变状态），
- * 暂留在 index.ts，不随此模块迁移。
+ * Git IPC handler：分支/提交/暂存/差异/worktree/push/pull/fetch/init 等，
+ * 以及依赖 QuickGen 持久化 RPC 进程的 gitGenerateCommitMessage。
  */
 import { ipcMain } from "electron";
 import { resolve } from "node:path";
@@ -11,6 +10,7 @@ import type { ProjectStore } from "../projects/ProjectStore";
 import type { GitService } from "../git/GitService";
 import type { WorktreeService } from "../git/WorktreeService";
 import type { AppLogger } from "../logging/AppLogger";
+import type { QuickGenProcess } from "../pi/QuickGenProcess";
 
 interface GitHandlerDeps {
 	projectStore: ProjectStore;
@@ -18,10 +18,12 @@ interface GitHandlerDeps {
 	settingsStore: { get(): AppSettings };
 	worktreeService: WorktreeService;
 	appLogger: AppLogger;
+	/** 持久化轻量 pi RPC 进程，用于 commit message 等快速文本生成 */
+	quickGen: QuickGenProcess;
 }
 
 export function registerGitHandlers(deps: GitHandlerDeps) {
-	const { projectStore, gitService, settingsStore, worktreeService, appLogger } = deps;
+	const { projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen } = deps;
 
 	ipcMain.handle(ipcChannels.gitBranches, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);
@@ -211,7 +213,39 @@ export function registerGitHandlers(deps: GitHandlerDeps) {
 	});
 
 	// ── push / pull / fetch / init ──
-	// gitGenerateCommitMessage 留在 index.ts（依赖 QuickGen 持久化 RPC 进程）
+
+	/**
+	 * 基于 staged diff 生成 commit message。
+	 * 通过 QuickGen 持久化 RPC 进程调用 pi，避免每次启动新进程的开销。
+	 * 提示词模板可在设置中自定义，{diff} 占位符会被替换为 staged diff（截断到 8000 字符）。
+	 */
+	ipcMain.handle(
+		ipcChannels.gitGenerateCommitMessage,
+		async (_event, projectId: string) => {
+			const project = projectStore.get(projectId);
+			if (!project) return "";
+
+			const diff = await gitService.getStagedDiff(project.path, 10000);
+			if (!diff.trim()) return "";
+
+			const promptTemplate = settingsStore.get().gitCommitMessagePrompt ||
+				"请根据以下 git diff 生成一条中文 git commit message。\n\n{diff}\n\n直接输出 commit 消息。";
+			const prompt = promptTemplate.replace("{diff}", diff.slice(0, 8000));
+
+			try {
+				const result = await quickGen.generate(project.path, prompt);
+				void appLogger.warn("git", "Generate commit message result", {
+					length: result.length,
+					text: result.slice(0, 100),
+				});
+				return result.trim();
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				void appLogger.warn("git", "Generate commit message failed", { error: msg });
+				throw err;
+			}
+		},
+	);
 
 	ipcMain.handle(ipcChannels.gitPush, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);

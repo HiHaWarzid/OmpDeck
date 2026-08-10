@@ -59,6 +59,15 @@ function loadPiProcess(spawnImpl) {
 			if (id === "./PiRpcClient") return { PiRpcClient: FakeRpcClient };
 			if (id === "./PiLocator") return { PiLocator: FakePiLocator };
 			if (id === "../wsl/WslPaths") return paths;
+			// PiProcess 启动期调用 parkBlockedExtensionsInDir/unparkBlockedExtensions；
+			// 错误安全测试不关心扩展过滤，提供空实现避免真实文件系统访问。
+			// 注意：这两个函数是同步的（返回数组/void），不能写成 async，否则 spread Promise 报错。
+			if (id === "./piExtensionFilter") {
+				return {
+					parkBlockedExtensionsInDir: () => [],
+					unparkBlockedExtensions: () => {},
+				};
+			}
 			return require(id);
 		},
 	};

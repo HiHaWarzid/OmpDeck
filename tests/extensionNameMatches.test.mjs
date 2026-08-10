@@ -29,6 +29,14 @@ function loadExtensionConflictHelpers() {
 		exports: {},
 		require: (id) => {
 			if (id === "../wsl/WslPaths") return wslPaths;
+			// ExtensionManager.ensureExtension 通过 is.dev 判断资源路径，且模块加载期
+			// @electron-toolkit/utils 会访问 electron.app.isPackaged；纯 Node 测试需 mock。
+			if (id === "electron") {
+				return { app: { getAppPath: () => process.cwd(), isPackaged: false } };
+			}
+			if (id === "@electron-toolkit/utils") {
+				return { is: { dev: true, prod: false } };
+			}
 			return require(id);
 		},
 	};
@@ -43,14 +51,9 @@ function loadExtensionConflictHelpers() {
 
 const { extensionNameMatches, BUILT_IN_CONFLICT_KEYWORDS } = loadExtensionConflictHelpers();
 
-test("only todo / plan / ask built-ins participate in conflict detection", () => {
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS.length, 3);
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[0][0], "pi-deck-todo.ts");
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[0][1], "todo");
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[1][0], "pi-deck-plan-mode.ts");
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[1][1], "plan");
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[2][0], "pi-deck-ask-question.ts");
-	assert.equal(BUILT_IN_CONFLICT_KEYWORDS[2][1], "ask");
+test("BUILT_IN_CONFLICT_KEYWORDS is empty after omp native capability replacement", () => {
+	// omp 提供原生能力替代 pi-deck-todo/plan/ask 内置扩展后，冲突检测关键词已清空。
+	assert.equal(BUILT_IN_CONFLICT_KEYWORDS.length, 0);
 });
 
 test("names containing todo conflict with system todo keyword", () => {

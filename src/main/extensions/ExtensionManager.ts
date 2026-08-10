@@ -1,15 +1,36 @@
 import { execFile } from "node:child_process";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
+import { app } from "electron";
+import { is } from "@electron-toolkit/utils";
 import type { AppSettings, PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary, PiUpdateCheckResult } from "../../shared/types";
 import type { PiLocator } from "../pi/PiLocator";
+import type { AppLogger } from "../logging/AppLogger";
 import { toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 type SettingsProvider = () => AppSettings;
 
 /** OmpDeck 内置扩展列表（已全部移除，omp 提供原生能力替代） */
 export const BUILT_IN_EXTENSIONS = [] as const;
+
+/** ensurePiDeckExtension 的校准结果，供启动任务汇总日志。 */
+export type PiDeckExtensionSyncResult =
+	| "installed"
+	| "updated"
+	| "unchanged"
+	| "missing-source";
+
+/** 启动时内置扩展部署汇总，供日志输出。 */
+export interface ExtensionDeploySummary {
+	homeDir: string;
+	installed: string[];
+	updated: string[];
+	unchanged: string[];
+	skippedRemoved: string[];
+	missingSource: string[];
+	failed: Array<{ name: string; error: string }>;
+}
 
 /**
  * 通过 omp CLI 管理已安装插件，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
@@ -39,6 +60,8 @@ export class ExtensionManager {
 		private readonly getPiDeckSettings: () => AppSettings,
 		/** 保存 OmpDeck 桌面设置的部分更新 */
 		private readonly patchPiDeckSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>,
+		/** 应用日志器，用于部署/校准过程记录 */
+		private readonly appLogger?: AppLogger,
 	) {}
 
 	/** 将扩展文件边界切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
@@ -48,7 +71,8 @@ export class ExtensionManager {
 		this.invalidateListCache();
 	}
 
-	private get homeDir(): string {
+	/** 当前扩展文件边界 HOME（WSL 启用时为 WSL home，否则为系统 home）。 */
+	get homeDir(): string {
 		return this.wslEnvironment?.windowsHome ?? homedir();
 	}
 
@@ -60,6 +84,130 @@ export class ExtensionManager {
 		// 允许下一次 list() 立刻发起新请求，而不是复用失效前的 inflight。
 		this.listInflight = null;
 		this.listInflightForce = false;
+	}
+
+	/**
+	 * 启动时异步校准内置扩展：对比 resources 源文件与用户扩展目录，
+	 * 不一致则覆盖。用户在设置里「移除」的内置扩展按 removedBuiltInExtensions 跳过，
+	 * 同时清理残留文件避免 pi 加载旧版导致 RPC 启动失败。
+	 *
+	 * @param homeDir 目标 HOME 目录；不传则使用当前 homeDir（Windows 本地或 WSL）。
+	 */
+	async deploy(homeDir?: string): Promise<ExtensionDeploySummary> {
+		const target = homeDir ?? this.homeDir;
+		const summary: ExtensionDeploySummary = {
+			homeDir: target,
+			installed: [],
+			updated: [],
+			unchanged: [],
+			skippedRemoved: [],
+			missingSource: [],
+			failed: [],
+		};
+
+		const removedBuiltIn = new Set(this.getPiDeckSettings().removedBuiltInExtensions ?? []);
+
+		// 并行校准：磁盘 IO 为主，互不依赖
+		await Promise.all(
+			BUILT_IN_EXTENSIONS.map(async (extensionName) => {
+				if (removedBuiltIn.has(extensionName)) {
+					summary.skippedRemoved.push(extensionName);
+					// 历史「仅标记移除、文件仍保留」会让 pi 继续加载残留扩展，
+					// 与三方同名工具（如 rpiv-todo 的 todo）冲突导致 RPC 启动失败。启动时清残留。
+					try {
+						await rm(join(target, ".omp", "agent", "extensions", extensionName), { force: true });
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						summary.failed.push({ name: extensionName, error: `purge residual: ${message}` });
+					}
+					return;
+				}
+				try {
+					const result = await this.ensureExtension(extensionName, target);
+					if (result === "installed") summary.installed.push(extensionName);
+					else if (result === "updated") summary.updated.push(extensionName);
+					else if (result === "unchanged") summary.unchanged.push(extensionName);
+					else if (result === "missing-source") summary.missingSource.push(extensionName);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					summary.failed.push({ name: extensionName, error: message });
+				}
+			}),
+		);
+
+		const changedCount = summary.installed.length + summary.updated.length;
+		if (changedCount > 0) {
+			// 文件有变时清扩展列表缓存，配置页/下次 list 能看到最新状态
+			this.invalidateListCache();
+		}
+
+		void this.appLogger?.info("extension", "Built-in extensions sync finished", {
+			homeDir: summary.homeDir,
+			installed: summary.installed,
+			updated: summary.updated,
+			unchanged: summary.unchanged,
+			skippedRemoved: summary.skippedRemoved,
+			missingSource: summary.missingSource,
+			failed: summary.failed,
+			changedCount,
+		});
+		if (summary.failed.length > 0) {
+			void this.appLogger?.warn("extension", "Some built-in extensions failed to sync", {
+				homeDir: summary.homeDir,
+				failed: summary.failed,
+			});
+		}
+
+		return summary;
+	}
+
+	/**
+	 * 确保单个内置扩展文件存在于目标目录。
+	 * - 目标不存在 → 安装
+	 * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
+	 * - 内容一致 → 跳过写盘
+	 *
+	 * 供 restoreBuiltIn IPC handler 在用户「恢复」内置扩展时调用，
+	 * 也供 deploy() 内部并行校准使用。
+	 */
+	async ensureExtension(
+		extensionName: string,
+		homeDir: string,
+	): Promise<PiDeckExtensionSyncResult> {
+		const extensionsDir = join(homeDir, ".omp", "agent", "extensions");
+		const targetPath = join(extensionsDir, extensionName);
+
+		// 获取源文件路径：开发模式下在 resources/ 目录，打包后通过 process.resourcesPath 访问
+		const sourcePath = is.dev
+			? join(app.getAppPath(), "resources", "extensions", extensionName)
+			: join(process.resourcesPath, "extensions", extensionName);
+
+		const sourceContent = await readFile(sourcePath, "utf-8").catch(() => null);
+		if (!sourceContent) {
+			void this.appLogger?.warn("extension", "Built-in extension source missing", {
+				extensionName,
+				sourcePath,
+			});
+			return "missing-source";
+		}
+
+		const existingContent = await readFile(targetPath, "utf-8").catch(() => null);
+		// 全文比对：任意与 resources 不一致都覆盖，避免用户仍跑旧版 ask/plan/todo 扩展。
+		if (existingContent === sourceContent) {
+			return "unchanged";
+		}
+
+		const action: PiDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
+		await mkdir(extensionsDir, { recursive: true });
+		await writeFile(targetPath, sourceContent, "utf-8");
+		void this.appLogger?.info("extension", `Built-in extension ${action}`, {
+			extensionName,
+			targetPath,
+			sourcePath,
+			previousBytes: existingContent?.length ?? 0,
+			nextBytes: sourceContent.length,
+		});
+		return action;
 	}
 
 	/**

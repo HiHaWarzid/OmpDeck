@@ -200,7 +200,7 @@ export class PiProcess extends EventEmitter {
       spawnCwd = toWindowsHostPath(this.cwd, environment);
       diagnosticCwd = wslCwd;
 
-      const sessionIndex = args.indexOf("--session");
+      const sessionIndex = args.indexOf("--resume");
       if (sessionIndex >= 0) {
         finalPiArgs = args.map((arg, index) =>
           index === sessionIndex + 1 ? toWslLinuxPath(arg, environment) : arg,

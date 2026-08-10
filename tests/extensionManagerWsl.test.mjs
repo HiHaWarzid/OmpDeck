@@ -33,6 +33,14 @@ function loadExtensionManager(fsOverrides = {}) {
 			if (id === "node:fs/promises") {
 				return { ...require(id), ...fsOverrides };
 			}
+			// ExtensionManager.ensureExtension 通过 is.dev 判断资源路径，且模块加载期
+			// @electron-toolkit/utils 会访问 electron.app.isPackaged；纯 Node 测试需 mock。
+			if (id === "electron") {
+				return { app: { getAppPath: () => process.cwd(), isPackaged: false } };
+			}
+			if (id === "@electron-toolkit/utils") {
+				return { is: { dev: true, prod: false } };
+			}
 			if (id === "../wsl/WslPaths") return wslPaths;
 			return require(id);
 		},
@@ -82,7 +90,7 @@ test("reads an installed WSL npm extension version through its canonical host pa
 test("removeBuiltIn deletes the extension file under the active WSL HOME", async () => {
 	const fixtureHome = mkdtempSync(join(tmpdir(), "pideck-builtin-remove-"));
 	// 模拟 //wsl.localhost/Ubuntu-24.04/root 映射到临时目录的语义：直接用本地 fixture 作为 windowsHome
-	const extensionsDir = join(fixtureHome, ".pi", "agent", "extensions");
+	const extensionsDir = join(fixtureHome, ".omp", "agent", "extensions");
 	mkdirSync(extensionsDir, { recursive: true });
 	const targetFile = join(extensionsDir, "pi-deck-todo.ts");
 	writeFileSync(targetFile, "export default function () {}", "utf8");

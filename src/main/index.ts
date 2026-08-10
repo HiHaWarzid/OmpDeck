@@ -1,4 +1,4 @@
-﻿import {
+import {
 	app,
 	BrowserWindow,
 	dialog,
@@ -6,10 +6,8 @@
 	nativeTheme,
 	net,
 } from "electron";
-import { basename, join, resolve } from "node:path";
-import { copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
+import { join, resolve } from "node:path";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { is } from "@electron-toolkit/utils";
 import { PetSystem, type PetSystemDeps } from "./pet";
 import {
@@ -162,7 +160,8 @@ import { FileSystemService } from "./fs/FileSystemService";
 import { AgentManager } from "./pi/AgentManager";
 import { PiLocator } from "./pi/PiLocator";
 import { PiProcess } from "./pi/PiProcess";
-import { PiRpcClient } from "./pi/PiRpcClient";
+import { QuickGenProcess } from "./pi/QuickGenProcess";
+import { ensureAllPiSettingsDefaults } from "./pi/PiSettingsDefaults";
 import { SessionScanner } from "./sessions/SessionScanner";
 import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
@@ -178,7 +177,7 @@ import { TelemetryService } from "./telemetry/TelemetryService";
 import { PromptManager } from "./prompts/PromptManager";
 import { XuePromptManager } from "./prompts/XuePromptManager";
 import { SkillManager } from "./skills/SkillManager";
-import { BUILT_IN_EXTENSIONS, ExtensionManager } from "./extensions/ExtensionManager";
+import { ExtensionManager } from "./extensions/ExtensionManager";
 import { restoreAllParkedExtensions } from "./pi/piExtensionFilter";
 import { ProjectResourceManager } from "./projects/ProjectResourceManager";
 import { WebServiceManager } from "./web/WebServiceManager";
@@ -245,6 +244,7 @@ let linkOpener: LinkOpener;
 let trayManager: TrayManager;
 let feishuBridge: FeishuBridge | null = null;
 let activeWslEnvironment: WslEnvironment | null = null;
+let quickGen: QuickGenProcess | null = null;
 
 /**
  * WSL HOME 只在这里解析一次，再把同一个环境对象下发给所有文件边界消费者。
@@ -683,7 +683,6 @@ function registerIpc() {
 	registerExtensionHandlers({
 		extensionManager,
 		appLogger,
-		ensurePiDeckExtension,
 		getActiveWslEnvironment: () => activeWslEnvironment,
 	});
 	registerEditorHandlers({
@@ -708,7 +707,7 @@ function registerIpc() {
 	});
 	registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger });
 	registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger });
-	registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger });
+	registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! });
 	registerConfigHandlers({ configManager, agentManager, appLogger });
 	registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger });
 	registerAgentHandlers({
@@ -734,182 +733,6 @@ function registerIpc() {
 		syncWslEnvironment,
 		applyNativeThemeSource,
 	});
-
-	async function ensureGenProcess(
-		projectPath: string,
-		command: string,
-	): Promise<PiRpcClient> {
-		console.log("[QuickGen] ensureGenProcess", { projectPath, command, existingPid: genProcess?.pid ?? null });
-
-		// 如果已有进程还在运行，直接复用（跨项目也复用）
-		if (genProcess && genRpcClient && genProcess.exitCode === null) {
-			console.log("[QuickGen] reusing existing process, pid:", genProcess.pid);
-			genProcessCwd = projectPath;
-			resetGenIdleTimer();
-			return genRpcClient;
-		}
-
-		// 清理旧进程（已死才重建）
-		if (genProcess) {
-			console.log("[QuickGen] stopping old process");
-			stopGenProcess();
-		}
-
-		const settings = settingsStore.get();
-		const invocation = piLocator.createInvocation(command, [
-			"--mode", "rpc",
-			"--no-session",
-			"--no-tools",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--no-themes",
-			"--thinking", "off",
-		]);
-
-		console.log("[QuickGen] spawning", { command: invocation.command, args: invocation.args, cwd: projectPath });
-
-		genProcess = spawn(invocation.command, invocation.args, {
-			cwd: projectPath,
-			env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
-			stdio: ["pipe", "pipe", "pipe"],
-			shell: invocation.shell,
-			windowsHide: true,
-			windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-		});
-		genProcessCwd = projectPath;
-		console.log("[QuickGen] spawned, pid:", genProcess.pid);
-
-		genRpcClient = new PiRpcClient(genProcess.stdin!, genProcess.stdout!);
-		console.log("[QuickGen] RPC client created");
-
-		// stderr 仅用于调试日志
-		genProcess.stderr!.on("data", (chunk: Buffer) => {
-			const text = chunk.toString("utf8").slice(0, 300);
-			console.log("[QuickGen] stderr:", text);
-			void appLogger?.warn("git", "QuickGen stderr", text);
-		});
-
-		// 进程退出时清理状态
-		genProcess.on("exit", (code, signal) => {
-			console.log("[QuickGen] process exited", { code, signal });
-			void appLogger?.warn("git", "QuickGen process exited", { code, signal });
-			stopGenProcess();
-		});
-
-		genProcess.on("error", (err) => {
-			console.log("[QuickGen] process ERROR", err.message);
-			void appLogger?.error("git", "QuickGen process error", err.message);
-		});
-
-		resetGenIdleTimer();
-		return genRpcClient;
-	}
-
-	/** 通过持久化的 RPC 进程快速生成文本 */
-	async function quickGenerate(projectPath: string, prompt: string): Promise<string> {
-		console.log("[QuickGen] quickGenerate called", { projectPath });
-		const settings = settingsStore.get();
-		const command = piLocator.resolveCommand(
-			settings.customPiPath,
-			settings.wslEnabled,
-			settings.wslDistro,
-			settings.wslUser,
-		);
-		console.log("[QuickGen] resolved command", { command });
-
-		const rpc = await ensureGenProcess(projectPath, command);
-		console.log("[QuickGen] process ready, sending prompt", { length: prompt.length });
-
-		return new Promise<string>((resolve, reject) => {
-			const collected: string[] = [];
-			let settled = false;
-			const timeout = setTimeout(() => {
-				if (!settled) {
-					console.log("[QuickGen] TIMEOUT", { collected: collected.join("").slice(0, 200) });
-					void appLogger?.warn("git", "QuickGen timed out", { collected: collected.join("").slice(0, 200) });
-					reject(new Error("Quick generate timed out"));
-				}
-			}, 60_000);
-
-			const onEvent = (event: Record<string, unknown>) => {
-				const eventType = event.type as string;
-				if (eventType === "message_update") {
-					const ae = (event as Record<string, unknown>).assistantMessageEvent as Record<string, unknown> | undefined;
-					if (ae?.type === "text_delta" && typeof ae.delta === "string") {
-						collected.push(ae.delta);
-						console.log("[QuickGen] text_delta", { delta: ae.delta.slice(0, 50) });
-					}
-				}
-				if (eventType === "agent_settled" || eventType === "agent_end") {
-					console.log("[QuickGen] event received", { eventType });
-					settled = true;
-					clearTimeout(timeout);
-					rpc.off("event", onEvent);
-					const text = collected.join("");
-					console.log("[QuickGen] completed", { length: text.length });
-					void appLogger?.warn("git", "QuickGen completed", { length: text.length });
-					resolve(text);
-				}
-			};
-
-			rpc.on("event", onEvent);
-
-			console.log("[QuickGen] sending prompt via RPC");
-			rpc.request({ type: "prompt", message: prompt }).then((response) => {
-				console.log("[QuickGen] prompt response", { success: response.success, error: response.error });
-				if (!response.success) {
-					clearTimeout(timeout);
-					rpc.off("event", onEvent);
-					reject(new Error(response.error ?? "Prompt rejected"));
-				}
-			}).catch((err) => {
-				console.log("[QuickGen] prompt request failed", { error: err.message });
-				clearTimeout(timeout);
-				rpc.off("event", onEvent);
-				reject(err);
-			});
-		});
-	}
-
-	console.log("[QuickGen] gitGenerateCommitMessage handler registered");
-	ipcMain.handle(
-		ipcChannels.gitGenerateCommitMessage,
-		async (_event, projectId: string) => {
-			console.log("[QuickGen] IPC handler called", { projectId });
-			const project = projectStore.get(projectId);
-			if (!project) {
-				console.log("[QuickGen] project not found");
-				return "";
-			}
-
-			const diff = await gitService.getStagedDiff(project.path, 10000);
-			if (!diff.trim()) {
-				console.log("[QuickGen] no staged diff");
-				return "";
-			}
-			console.log("[QuickGen] diff obtained", { length: diff.length });
-
-			// 从设置中读取提示词模板，替换 {diff} 为实际 diff 内容
-			const promptTemplate = settingsStore.get().gitCommitMessagePrompt ||
-				"请根据以下 git diff 生成一条中文 git commit message。\n\n{diff}\n\n直接输出 commit 消息。";
-			const prompt = promptTemplate.replace("{diff}", diff.slice(0, 8000));
-
-			try {
-				console.log("[QuickGen] calling quickGenerate");
-				const result = await quickGenerate(project.path, prompt);
-				console.log("[QuickGen] done", { length: result.length });
-				void appLogger?.warn("git", "Generate commit message result", { length: result.length, text: result.slice(0, 100) });
-				return result.trim();
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.log("[QuickGen] FAILED", { error: msg });
-				void appLogger?.warn("git", "Generate commit message failed", { error: msg });
-				throw err;
-			}
-		},
-	);
 
 	/**
 	 * 执行 npm install 安装命令，返回 stdout/stderr/exitCode。
@@ -1073,37 +896,6 @@ async function detectExternalEditorsOnFirstLaunch() {
 	void appLogger.info("editor", "External editors detected on first launch", { count: detected.length });
 }
 
-// ── 持久化轻量 pi RPC 进程（用于快速文本生成，避免每次启动开销） ──────
-let genProcess: ChildProcess | null = null;
-let genRpcClient: PiRpcClient | null = null;
-let genProcessCwd = "";
-let genIdleTimer: NodeJS.Timeout | null = null;
-
-/** 清理快速生成进程，包括 RPC 客户端和空闲定时器 */
-function stopGenProcess() {
-	if (genIdleTimer) {
-		clearTimeout(genIdleTimer);
-		genIdleTimer = null;
-	}
-	genRpcClient?.close();
-	genRpcClient = null;
-	if (genProcess && genProcess.exitCode === null) {
-		try { genProcess.kill(); } catch { /* ignore */ }
-	}
-	genProcess = null;
-	genProcessCwd = "";
-}
-
-/** 重置空闲定时器：30 分钟无请求自动杀掉进程释放内存 */
-function resetGenIdleTimer() {
-	if (genIdleTimer) clearTimeout(genIdleTimer);
-	genIdleTimer = setTimeout(() => {
-		void appLogger?.debug("git", "QuickGen idle timeout, killing process");
-		stopGenProcess();
-	}, 30 * 60 * 1000);
-	if (genIdleTimer && typeof genIdleTimer === "object") genIdleTimer.unref?.();
-}
-
 // 同版本二次启动的唤起由 acquireVersionSingleInstance 的 .focus 文件 + handleVersionFocusRequest 完成。
 // 不再使用 Electron 全局 second-instance（它无法按版本区分）。
 
@@ -1136,7 +928,13 @@ app.whenReady().then(async () => {
 		() => settingsStore.get(),
 		() => settingsStore.get(),
 		(patch) => settingsStore.update(patch),
+		appLogger,
 	);
+	quickGen = new QuickGenProcess({
+		locator: piLocator,
+		getSettings: () => settingsStore.get(),
+		appLogger,
+	});
 	projectResourceManager = new ProjectResourceManager((projectId) => projectStore.get(projectId));
 	agentManager = new AgentManager(
 		(id) => projectStore.get(id),
@@ -1216,81 +1014,12 @@ app.whenReady().then(async () => {
  * 这些工作不影响首帧可见，但会拖慢 packaged app 的“点击图标 → 窗口出来”。
  */
 async function runPostWindowStartupTasks(): Promise<void> {
-	// 启动后异步校准内置扩展：对比 resources 与用户目录全文，不一致则覆盖。
-	// 用户手动移除的记在 removedBuiltInExtensions，跳过自动部署。
-	const deployExtensionsTo = async (homeDir: string) => {
-
-		const removedBuiltIn = new Set(settingsStore.get().removedBuiltInExtensions ?? []);
-		const summary = {
-			homeDir,
-			installed: [] as string[],
-			updated: [] as string[],
-			unchanged: [] as string[],
-			skippedRemoved: [] as string[],
-			missingSource: [] as string[],
-			failed: [] as Array<{ name: string; error: string }>,
-		};
-
-		// 并行校准：磁盘 IO 为主，互不依赖
-		await Promise.all(
-			BUILT_IN_EXTENSIONS.map(async (extensionName) => {
-				if (removedBuiltIn.has(extensionName)) {
-					summary.skippedRemoved.push(extensionName);
-					// 历史「仅标记移除、文件仍保留」会让 pi 继续加载残留扩展，
-					// 与三方同名工具（如 rpiv-todo 的 todo）冲突导致 RPC 启动失败。启动时清残留。
-					try {
-						await rm(join(homeDir, ".omp", "agent", "extensions", extensionName), { force: true });
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						summary.failed.push({ name: extensionName, error: `purge residual: ${message}` });
-						console.error(`Failed to purge residual ${extensionName}:`, error);
-					}
-					return;
-				}
-				try {
-					const result = await ensurePiDeckExtension(extensionName, homeDir);
-					if (result === "installed") summary.installed.push(extensionName);
-					else if (result === "updated") summary.updated.push(extensionName);
-					else if (result === "unchanged") summary.unchanged.push(extensionName);
-					else if (result === "missing-source") summary.missingSource.push(extensionName);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					summary.failed.push({ name: extensionName, error: message });
-					console.error(`Failed to sync ${extensionName}:`, error);
-				}
-			}),
-		);
-
-		const changedCount = summary.installed.length + summary.updated.length;
-		if (changedCount > 0) {
-			// 文件有变时清扩展列表缓存，配置页/下次 list 能看到最新状态
-			extensionManager.invalidateListCache();
-		}
-
-		void appLogger.info("extension", "Built-in extensions sync finished", {
-			homeDir: summary.homeDir,
-			installed: summary.installed,
-			updated: summary.updated,
-			unchanged: summary.unchanged,
-			skippedRemoved: summary.skippedRemoved,
-			missingSource: summary.missingSource,
-			failed: summary.failed,
-			changedCount,
-		});
-		if (summary.failed.length > 0) {
-			void appLogger.warn("extension", "Some built-in extensions failed to sync", {
-				homeDir: summary.homeDir,
-				failed: summary.failed,
-			});
-		}
-	};
-
 	// 并行做无依赖的后台初始化，缩短窗口出现后的空闲等待。
 	await Promise.all([
 		syncWslEnvironment(settingsStore.get()).catch((error) => {
 			console.error("Failed to sync WSL config:", error);
 		}),
-		deployExtensionsTo(app.getPath("home")).catch((error) => {
+		extensionManager.deploy(app.getPath("home")).catch((error) => {
 			console.error("Failed to deploy extensions:", error);
 		}),
 		applyDesktopProxy(settingsStore.get()).catch((error) => {
@@ -1310,13 +1039,13 @@ async function runPostWindowStartupTasks(): Promise<void> {
 
 	// WSL 启用时额外部署到动态解析出的 HOME。
 	if (activeWslEnvironment) {
-		void deployExtensionsTo(activeWslEnvironment.windowsHome).catch(() => {
+		void extensionManager.deploy(activeWslEnvironment.windowsHome).catch(() => {
 			console.warn("[OmpDeck] Failed to deploy extensions to WSL, skipping");
 		});
 	}
 
 	// 补齐 pi settings.json 缺失的默认配置项，新安装或精简配置的用户无需手动添加。
-	void ensureAllPiSettingsDefaults().catch((error) => {
+	void ensureAllPiSettingsDefaults(settingsStore.get(), piLocator, activeWslEnvironment).catch((error) => {
 		console.error("Failed to ensure pi settings defaults:", error);
 	});
 
@@ -1389,125 +1118,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	}, 0);
 }
 
-/** ensurePiDeckExtension 的校准结果，供启动任务汇总日志。 */
-type PiDeckExtensionSyncResult =
-	| "installed"
-	| "updated"
-	| "unchanged"
-	| "missing-source";
-
-/**
- * 将内置扩展部署到用户扩展目录。
- * 启动时异步对比 resources 源文件与 ~/.omp/agent/extensions 目标：
- * - 目标不存在 → 安装
- * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
- * - 内容一致 → 跳过写盘
- * 用户在设置里「移除」的内置扩展由调用方按 removedBuiltInExtensions 跳过，本函数不读该列表。
- */
-async function ensurePiDeckExtension(
-	extensionName: string,
-	wslHome?: string,
-): Promise<PiDeckExtensionSyncResult> {
-	const home = wslHome ?? app.getPath("home");
-	const extensionsDir = join(home, ".omp", "agent", "extensions");
-	const targetPath = join(extensionsDir, extensionName);
-
-	// 获取源文件路径：开发模式下在 resources/ 目录，打包后通过 process.resourcesPath 访问
-	const sourcePath = is.dev
-		? join(app.getAppPath(), "resources", "extensions", extensionName)
-		: join(process.resourcesPath, "extensions", extensionName);
-
-	const sourceContent = await readFile(sourcePath, "utf-8").catch(() => null);
-	if (!sourceContent) {
-		console.warn(`[OmpDeck] Extension source not found: ${sourcePath}`);
-		void appLogger?.warn("extension", "Built-in extension source missing", {
-			extensionName,
-			sourcePath,
-		});
-		return "missing-source";
-	}
-
-	const existingContent = await readFile(targetPath, "utf-8").catch(() => null);
-	// 全文比对：任意与 resources 不一致都覆盖，避免用户仍跑旧版 ask/plan/todo 扩展。
-	if (existingContent === sourceContent) {
-		return "unchanged";
-	}
-
-	const action: PiDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
-	await mkdir(extensionsDir, { recursive: true });
-	await writeFile(targetPath, sourceContent, "utf-8");
-	console.log(`[OmpDeck] ${action === "installed" ? "Installed" : "Updated"} extension: ${targetPath}`);
-	void appLogger?.info("extension", `Built-in extension ${action}`, {
-		extensionName,
-		targetPath,
-		sourcePath,
-		previousBytes: existingContent?.length ?? 0,
-		nextBytes: sourceContent.length,
-	});
-	return action;
-}
-
-/**
- * 补齐 pi 全局 settings.json 的推荐默认项。
- * 仅添加缺失的 key，不覆盖用户已有配置。
- * 适用于新安装 pi 或配置精简的用户。
- */
-/** 补齐指定 configDir 下 settings.json 的缺失默认项 */
-async function ensurePiSettingsDefaults(configDir: string, piVersionHint?: string): Promise<void> {
-	const filePath = join(configDir, "settings.json");
-	let current: Record<string, unknown> = {};
-	try {
-		const raw = await readFile(filePath, "utf8");
-		current = JSON.parse(raw) as Record<string, unknown>;
-	} catch { /* 文件不存在或解析失败，使用空对象 */ }
-
-	let changed = false;
-	const defaults: Record<string, unknown> = {
-		theme: "dark",
-		hideThinkingBlock: false,
-		defaultProjectTrust: "ask",
-		compaction: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
-		retry: { enabled: true, maxRetries: 3 },
-	};
-
-	if (piVersionHint && !current.lastChangelogVersion) {
-		current.lastChangelogVersion = piVersionHint;
-		changed = true;
-	}
-
-	for (const [key, defaultValue] of Object.entries(defaults)) {
-		if (!(key in current)) {
-			current[key] = defaultValue;
-			changed = true;
-		}
-	}
-
-	if (changed) {
-		await mkdir(configDir, { recursive: true });
-		await writeFile(filePath, JSON.stringify(current, null, 2), "utf8");
-		console.log('[OmpDeck] Ensured pi settings defaults at:', filePath);
-	}
-}
-
-/** 对当前环境和 WSL 环境（如果启用）都补齐 settings.json 默认项 */
-async function ensureAllPiSettingsDefaults(): Promise<void> {
-	const s = settingsStore.get();
-	let piVersion = "";
-	if (piLocator) {
-		piVersion = (await piLocator.check(undefined, s.wslEnabled, s.wslDistro, s.wslUser).catch(() => null))?.version ?? "";
-	}
-
-	// Windows 本地
-	const winDir = join(app.getPath("home"), ".omp", "agent");
-	await ensurePiSettingsDefaults(winDir, piVersion).catch(() => {});
-
-	// WSL（如果已配置）
-	if (activeWslEnvironment) {
-		const wslDir = join(activeWslEnvironment.windowsHome, ".omp", "agent");
-		await ensurePiSettingsDefaults(wslDir, piVersion).catch(() => {});
-	}
-}
-
 app.on("before-quit", () => {
 	isQuitting = true;
 	trayManager?.destroy();
@@ -1518,7 +1128,7 @@ app.on("before-quit", () => {
 	void sessionScanner?.flushSummaryCache();
 	petSystem?.stop();
 	petSystem = null;
-	stopGenProcess();
+	quickGen?.stop();
 });
 
 app.on("window-all-closed", () => {
