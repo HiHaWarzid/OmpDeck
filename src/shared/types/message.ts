@@ -50,3 +50,28 @@ export type ThinkingUpdate = {
 
 /** 输入框发送模式，决定消息直接执行还是以只读方式触发生成计划。 */
 export type ComposerAgentMode = "normal" | "plan";
+
+/**
+ * TodoWrite 工具单项状态。与 pi RPC 的 TodoWrite 入参一致，
+ * 由 AgentManager 从 tool_execution_end 事件派生并维护到 AgentRuntime.currentTodos。
+ */
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+/** TodoWrite 工具的单项内容。 */
+export type TodoItem = {
+	content: string;
+	status: TodoStatus;
+	/** 进行时短语，模型在 in_progress 项上填写，用于折叠态摘要。 */
+	activeForm?: string;
+};
+
+/**
+ * setWidget 协议升级后的结构化行元素。
+ * 兼容老协议：widgetLines 元素可以是 string（老扩展）或 WidgetLineItem（todo 等结构化扩展）。
+ * 渲染层按 typeof 收窄。
+ */
+export type WidgetLineItem = {
+	content: string;
+	status: TodoStatus;
+	activeForm?: string;
+};

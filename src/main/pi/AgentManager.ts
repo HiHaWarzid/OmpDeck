@@ -16,6 +16,8 @@ import type {
 	SendPromptInput,
 	SendPromptResult,
 	ThinkingUpdate,
+	TodoItem,
+	WidgetLineItem,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
 import { PiProcess } from "./PiProcess";
@@ -454,6 +456,9 @@ export class AgentManager {
 			options?.preserveMessagesAfter,
 		);
 		runtime.messages = nextMessages;
+		// 重建 TodoWrite 快照：从该 agent 最后一条 TodoWrite 工具消息的 meta.args 反解 todos。
+		// 历史恢复时无 tool_execution_end 事件可派生，靠工具消息自身存储的 args 重建。
+		this.rebuildTodosFromHistory(runtime);
 		this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
 		return nextMessages;
@@ -3332,6 +3337,119 @@ export class AgentManager {
 		this.scheduleMessageEmit(runtime);
 	}
 
+	/**
+	 * 识别 TodoWrite 工具（大小写不敏感，兼容 todo_write / TodoWrite 命名变体）。
+	 * 只匹配写入工具，不匹配 todo_list / todo_get 等只读查询——它们不更新 todo 列表。
+	 */
+	private isTodoWriteTool(toolName: string): boolean {
+		const key = (toolName ?? "").toLowerCase();
+		return key === "todowrite" || key === "todo_write";
+	}
+
+	/**
+	 * 从 TodoWrite 工具入参提取 todos 并派生 currentTodos 快照，同时 emit setWidget
+	 * 驱动渲染层的持久 TODO widget。直接从 event.args.todos（对象）取值，避免反解 argsMeta。
+	 */
+	private deriveAndEmitTodos(runtime: AgentRuntime, event: Record<string, any>) {
+		const args = event.args;
+		if (!args || typeof args !== "object") return;
+		const todos = (args as { todos?: unknown }).todos;
+		if (!Array.isArray(todos)) return;
+		// 只保留结构合法的项，过滤掉模型偶发的畸形数据
+		const normalized: TodoItem[] = [];
+		for (const item of todos) {
+			if (!item || typeof item !== "object") continue;
+			const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
+			if (typeof obj.content !== "string" || !obj.content) continue;
+			const status = obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
+				? obj.status
+				: "pending";
+			normalized.push({
+				content: obj.content,
+				status,
+				...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
+			});
+		}
+		runtime.currentTodos = normalized;
+		// 复用 setWidget 通道推送结构化 widgetLines，渲染层按联合类型收窄渲染
+		const widgetLines: WidgetLineItem[] = normalized.map((t) => ({
+			content: t.content,
+			status: t.status,
+			...(t.activeForm ? { activeForm: t.activeForm } : {}),
+		}));
+		this.emit(ipcChannels.agentsUiRequest, {
+			agentId: runtime.tab.id,
+			requestId: `todo-${Date.now()}`,
+			method: "setWidget",
+			title: "",
+			widgetKey: "pi-deck-todo",
+			widgetLines,
+		});
+	}
+
+	/**
+	 * 会话恢复后从历史工具消息重建 currentTodos 快照。
+	 * 反向扫描该 agent 的工具消息，取最后一条 TodoWrite 的 meta.args.todos。
+	 * args 在历史路径里是 truncateForDetail(safeJson(args)) 存储的 JSON 字符串，
+	 * MAX_TOOL_RESULT_CHARS=8000 对 todo 清单足够（通常几百到一两千字符，不触发截断）。
+	 */
+	private rebuildTodosFromHistory(runtime: AgentRuntime) {
+		for (let i = runtime.messages.length - 1; i >= 0; i--) {
+			const msg = runtime.messages[i];
+			if (msg.role !== "tool") continue;
+			const toolName = msg.meta?.toolName;
+			if (typeof toolName !== "string" || !this.isTodoWriteTool(toolName)) continue;
+			const argsRaw = msg.meta?.args;
+			if (typeof argsRaw !== "string") {
+				runtime.currentTodos = [];
+				return;
+			}
+			try {
+				const parsed = JSON.parse(argsRaw) as { todos?: unknown };
+				if (Array.isArray(parsed.todos)) {
+					// 复用 deriveAndEmitTodos 的归一化逻辑，但不 emit（loadMessages 后渲染层会全量刷新）
+					const normalized: TodoItem[] = [];
+					for (const item of parsed.todos) {
+						if (!item || typeof item !== "object") continue;
+						const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
+						if (typeof obj.content !== "string" || !obj.content) continue;
+						const status = obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
+							? obj.status
+							: "pending";
+						normalized.push({
+							content: obj.content,
+							status,
+							...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
+						});
+					}
+					runtime.currentTodos = normalized;
+					// 重建后也推送一次 widget，让渲染层立即显示
+					const widgetLines: WidgetLineItem[] = normalized.map((t) => ({
+						content: t.content,
+						status: t.status,
+						...(t.activeForm ? { activeForm: t.activeForm } : {}),
+					}));
+					this.emit(ipcChannels.agentsUiRequest, {
+						agentId: runtime.tab.id,
+						requestId: `todo-rebuild-${Date.now()}`,
+						method: "setWidget",
+						title: "",
+						widgetKey: "pi-deck-todo",
+						widgetLines,
+					});
+				} else {
+					runtime.currentTodos = [];
+				}
+				return;
+			} catch {
+				runtime.currentTodos = [];
+				return;
+			}
+		}
+		// 没找到 TodoWrite 工具消息，保持空快照
+		runtime.currentTodos = [];
+	}
+
 	private upsertToolMessage(
 		runtime: AgentRuntime,
 		event: Record<string, any>,
@@ -3405,6 +3523,13 @@ export class AgentManager {
 				timestamp: Date.now(),
 				meta,
 			});
+		}
+
+		// TodoWrite 终态时派生 currentTodos 并推送 widget。
+		// 只在 done/error 时触发：running 态 args 可能不完整，且 todo 是替换语义无需中间态。
+		// 直接从 event.args（对象）取值，零额外解析成本。
+		if (status !== "running" && this.isTodoWriteTool(toolName)) {
+			this.deriveAndEmitTodos(runtime, event);
 		}
 
 		this.scheduleMessageEmit(runtime);
@@ -3786,6 +3911,13 @@ type AgentRuntime = {
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;
 
+	/**
+	 * TodoWrite 工具维护的当前 todo 快照。由 tool_execution_end 事件派生，
+	 * 会话恢复时从最后一条 TodoWrite 工具消息的 meta.args 重建。
+	 * 用于驱动输入框上方的持久 TODO widget。
+	 */
+	currentTodos: TodoItem[];
+
 	// 会话文件写入互斥锁链（readFile→modify→writeFile 原子化）
 	sessionLock?: Promise<void>;
 
@@ -3821,6 +3953,7 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 		streamGate: createStreamGateState(),
 		pendingMessage: false,
 		pendingUIRequests: new Map(),
+		currentTodos: [],
 		rpcLogging: false,
 		compacting: false,
 		rpcCompacting: false,

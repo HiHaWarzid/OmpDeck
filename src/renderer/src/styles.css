@@ -8321,6 +8321,95 @@ body.is-composer-resizing .composer-resize-handle::after {
   color: var(--color-success);
   font-weight: 700;
 }
+
+/* ── TodoWrite 工具卡展开态清单 ── */
+/* 与持久 widget 的三态视觉统一：✓ 绿 / ● 蓝 / ○ 灰 */
+.todo-write-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.todo-write-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-tight);
+  color: var(--color-text-secondary);
+}
+.todo-write-line-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  margin-top: 1px;
+}
+.todo-write-line-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.todo-write-line--completed .todo-write-line-text {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+  text-decoration-color: var(--color-text-tertiary);
+}
+.todo-write-line--in_progress .todo-write-line-text {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.todo-line-icon--done {
+  color: var(--color-success);
+}
+.todo-line-icon--active {
+  color: var(--color-accent);
+}
+.todo-line-icon--pending {
+  color: var(--color-text-tertiary);
+}
+
+/* ── 持久 widget 结构化 todo 行（新协议 WidgetLineItem） ── */
+/* 复用三态配色，行内 flex 让图标与文本对齐；覆盖父级 nowrap 以支持换行 */
+.extension-widget-card-line .widget-todo-line {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: 100%;
+  white-space: normal;
+  font-family: var(--font-family-base);
+}
+.widget-todo-line-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  margin-top: 1px;
+}
+.widget-todo-line-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.widget-todo-line--completed .widget-todo-line-text {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+  text-decoration-color: var(--color-text-tertiary);
+}
+.widget-todo-line--in_progress .widget-todo-line-text {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.widget-todo-icon--done {
+  color: var(--color-success);
+}
+.widget-todo-icon--active {
+  color: var(--color-accent);
+}
+.widget-todo-icon--pending {
+  color: var(--color-text-tertiary);
+}
 /* ── 底部操作栏（OpenCode 风格）── */
 .composer-bottom-bar {
   display: flex;

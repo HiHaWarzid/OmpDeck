@@ -160,6 +160,7 @@ import {
   stripMarkdown,
   type DrawerPanel,
   type SessionModifiedFile,
+  type WidgetLine,
 } from "./components/app/AppParts";
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
@@ -237,6 +238,7 @@ import type {
   SessionSummary,
   ComposerAgentMode,
   ThinkingUpdate,
+  WidgetLineItem,
 } from "../../shared/types";
 
 const isLanWeb =
@@ -482,7 +484,7 @@ interface UiRequest {
 	notifyType?: "info" | "warning" | "error";
 	text?: string;
 	widgetKey?: string;
-	widgetLines?: string[];
+	widgetLines?: WidgetLine[];
 	widgetPlacement?: "aboveEditor" | "belowEditor";
 }
 
@@ -659,7 +661,7 @@ export function App() {
   const [activeUiRequest, setActiveUiRequest] = useState<Record<string, UiRequest> | null>(null);
   /** Extension 通过 RPC setWidget 推送的轻量状态块；按 agent 隔离，避免切换会话串台。 */
   const [extensionWidgetsByAgent, setExtensionWidgetsByAgent] = useState<
-    Record<string, Record<string, string[]>>
+    Record<string, Record<string, WidgetLine[]>>
   >({});
   /** Extension widget 容器折叠状态（全局持久化，不按 agentId 隔离，重启后恢复） */
   const [widgetsCollapsed, setWidgetsCollapsed] = useState(() => {
@@ -2363,8 +2365,14 @@ export function App() {
       if (request.method === "setWidget") {
         const widgetRequest = request as UiRequest;
         const widgetKey = widgetRequest.widgetKey || widgetRequest.requestId;
+        // 兼容新协议：widgetLines 元素可以是 string（老扩展）或 WidgetLineItem（todo 等结构化扩展）
+        // 过滤掉 null/undefined 等非法值，保留 string 和带 content 的对象
         const widgetLines = Array.isArray(widgetRequest.widgetLines)
-          ? widgetRequest.widgetLines.filter((line) => typeof line === "string")
+          ? widgetRequest.widgetLines.filter(
+              (line): line is WidgetLine =>
+                typeof line === "string" ||
+                (typeof line === "object" && line !== null && typeof (line as { content?: unknown }).content === "string"),
+            )
           : [];
         setExtensionWidgetsByAgent((current) => {
           const agentWidgets = { ...(current[request.agentId] ?? {}) };
@@ -7730,7 +7738,22 @@ export function App() {
 
             return (
               <div className="extension-widgets-container" key="widgets-container">
-                {taskSections.length > 0 && (
+                {taskSections.length > 0 && (() => {
+                  // 合并卡 meta：TODO 分区有结构化数据时显示 "TODO 3/5"，否则回退 "TODO 3"
+                  // Plan 分区无结构化状态，始终只显示数量
+                  const todoLines = todoEntry?.[1] ?? [];
+                  const todoItems = todoLines.filter(
+                    (l): l is WidgetLineItem => typeof l !== "string",
+                  );
+                  const todoDone = todoItems.filter((i) => i.status === "completed").length;
+                  const todoLabel = (todoItems.length === todoLines.length && todoItems.length > 0)
+                    ? `TODO ${todoDone}/${todoItems.length}`
+                    : `TODO ${todoLines.length}`;
+                  const planLabel = `Plan ${planEntry?.[1]?.length ?? 0}`;
+                  const mergedMeta = taskSections.length > 1
+                    ? `${todoLabel} · ${planLabel}`
+                    : (todoItems.length > 0 ? `${todoDone}/${todoItems.length}` : undefined);
+                  return (
                   <ExtensionWidgetCard
                     key={MERGED_TASK_WIDGET_KEY}
                     widgetKey={
@@ -7740,18 +7763,12 @@ export function App() {
                     }
                     lines={[]}
                     sections={taskSections}
-                    meta={
-                      taskSections.length > 1
-                        ? t("app.widgetTodosMeta", {
-                            todo: String(todoEntry?.[1]?.length ?? 0),
-                            plan: String(planEntry?.[1]?.length ?? 0),
-                          })
-                        : undefined
-                    }
+                    meta={mergedMeta}
                     sessionIdOrPath={widgetSessionKey}
                     onClose={() => dismissKeys(taskSections.map((s) => s.key))}
                   />
-                )}
+                  );
+                })()}
                 {otherEntries.map(([widgetKey, widgetLines]) => (
                   <ExtensionWidgetCard
                     key={widgetKey}

@@ -61,6 +61,8 @@ import {
 	Brush,
 	Check,
 	ChevronDown,
+	Circle,
+	CircleDot,
 	ChevronLeft,
 	ChevronRight,
 	ChevronsUpDown,
@@ -135,6 +137,9 @@ import type {
 	PiUpdateCheckResult,
 	Project,
 	SessionSummary,
+	TodoItem,
+	TodoStatus,
+	WidgetLineItem,
 } from "../../../../shared/types";
 import { parseRichInputChips, unwrapFileChipPath, type RichInputChip } from "./RichInput";
 import removeMarkdown from "remove-markdown";
@@ -568,27 +573,61 @@ export type ExtensionWidgetSection = {
 	/** 原始 widget key，关闭合并卡时用于逐个 dismiss */
 	key: string;
 	label: string;
-	lines: string[];
+	lines: WidgetLine[];
 };
 
-/** 渲染 widget 单行内容，将 ✓ 标记高亮为绿色，让 todo 等扩展的完成态更醒目。 */
-function renderWidgetLine(line: string): ReactNode {
-	const parts = line.split(/(✓)/g);
-	if (parts.length <= 1) return line;
-	return parts.map((part, i) =>
-		part === "✓" ? (
-			<span key={i} className="widget-check-done">
-				✓
-			</span>
+/** widget 行元素：兼容老协议的 string 和新协议的 WidgetLineItem（结构化三态）。 */
+export type WidgetLine = string | WidgetLineItem;
+
+/**
+ * 渲染 widget 单行内容。
+ * - string：老协议，将 ✓ 标记高亮为绿色（兼容旧扩展）
+ * - WidgetLineItem：新协议，按 status 渲染三态图标 + content，in_progress 加粗
+ */
+function renderWidgetLine(line: WidgetLine): ReactNode {
+	if (typeof line === "string") {
+		const parts = line.split(/(✓)/g);
+		if (parts.length <= 1) return line;
+		return parts.map((part, i) =>
+			part === "✓" ? (
+				<span key={i} className="widget-check-done">
+					✓
+				</span>
+			) : (
+				part
+			),
+		);
+	}
+	// 结构化行：三态图标 + content，与 ToolCard 展开态清单视觉一致
+	const icon =
+		line.status === "completed" ? (
+			<Check size={13} strokeWidth={2.4} className="widget-todo-icon widget-todo-icon--done" aria-label={t("todo.statusCompleted")} />
+		) : line.status === "in_progress" ? (
+			<CircleDot size={13} strokeWidth={2.2} className="widget-todo-icon widget-todo-icon--active" aria-label={t("todo.statusInProgress")} />
 		) : (
-			part
-		),
+			<Circle size={13} strokeWidth={1.8} className="widget-todo-icon widget-todo-icon--pending" aria-label={t("todo.statusPending")} />
+		);
+	return (
+		<span className={`widget-todo-line widget-todo-line--${line.status}`} title={line.content}>
+			<span className="widget-todo-line-icon" aria-hidden="true">{icon}</span>
+			<span className="widget-todo-line-text">{line.content}</span>
+		</span>
 	);
+}
+
+/** 计算 widget 行数组的进度摘要（已完成/总数）。仅对 WidgetLineItem[] 有意义，string[] 返回 null。 */
+function summarizeWidgetLinesProgress(lines: WidgetLine[]): { done: number; total: number } | null {
+	const items = lines.filter((l): l is WidgetLineItem => typeof l !== "string");
+	if (items.length === 0 || items.length !== lines.length) return null;
+	return {
+		done: items.filter((i) => i.status === "completed").length,
+		total: items.length,
+	};
 }
 
 export function ExtensionWidgetCard(props: {
 	widgetKey: string;
-	lines: string[];
+	lines: WidgetLine[];
 	onClose: () => void;
 	/** 会话唯一标识，用于避免 Todo 等同名 widget 在不同 agent 间共享折叠状态。 */
 	sessionIdOrPath?: string;
@@ -597,7 +636,7 @@ export function ExtensionWidgetCard(props: {
 	 * 而不是并排两张卡。有 sections 时优先渲染分区，忽略顶层 lines。
 	 */
 	sections?: ExtensionWidgetSection[];
-	/** 合并卡标题旁的摘要，如 “TODO 3 · Plan 2” */
+	/** 合并卡标题旁的摘要，如 “TODO 3 · Plan 2”；TODO 分区可内部派生进度 */
 	meta?: string;
 }) {
 	const storageKey = props.sessionIdOrPath
@@ -639,6 +678,17 @@ export function ExtensionWidgetCard(props: {
 	const [activeTabIndex, setActiveTabIndex] = useState(0);
 	const activeSection = sections[activeTabIndex];
 
+	// header 摘要：优先用外部 meta（合并卡的 "TODO 3 · Plan 2"）；
+	// 单 TODO 卡时从 lines 内部派生进度 "3/5"，让用户不展开就能看到完成度
+	const effectiveMeta = (() => {
+		if (props.meta) return props.meta;
+		if (props.widgetKey === TODO_WIDGET_KEY) {
+			const progress = summarizeWidgetLinesProgress(props.lines);
+			if (progress && progress.total > 0) return `${progress.done}/${progress.total}`;
+		}
+		return undefined;
+	})();
+
 	return (
 		<div className="extension-widget-card" data-widget-key={props.widgetKey}>
 			<div className="extension-widget-card-header">
@@ -652,8 +702,8 @@ export function ExtensionWidgetCard(props: {
 						className={`extension-widget-card-chevron${expanded ? " open" : ""}`}
 					/>
 					<span className="extension-widget-card-title">{widgetLabel}</span>
-					{props.meta ? (
-						<span className="extension-widget-card-meta">{props.meta}</span>
+					{effectiveMeta ? (
+						<span className="extension-widget-card-meta">{effectiveMeta}</span>
 					) : null}
 				</button>
 				<button
@@ -2027,6 +2077,81 @@ function getToolKindLabel(toolName: string): string {
 	return "";
 }
 
+/** 识别 TodoWrite 工具（兼容 todo_write / TodoWrite 命名变体，大小写不敏感）。 */
+function isTodoWriteTool(toolName: string): boolean {
+	const key = (toolName ?? "").toLowerCase();
+	return key === "todowrite" || key === "todo_write";
+}
+
+/**
+ * 从工具消息的 meta.args 解析 TodoWrite 入参的 todos 数组。
+ * meta.args 在实时和历史路径里都是 JSON 字符串（truncateForDetail(safeJson(args))），
+ * MAX_TOOL_RESULT_CHARS=8000 对 todo 清单足够，不会触发截断。
+ * 解析失败或结构不合法时返回空数组。
+ */
+function parseTodoItemsFromArgs(meta: Record<string, unknown> | undefined): TodoItem[] {
+	const argsRaw = meta?.args;
+	if (typeof argsRaw !== "string") return [];
+	try {
+		const parsed = JSON.parse(argsRaw) as { todos?: unknown };
+		if (!Array.isArray(parsed.todos)) return [];
+		const items: TodoItem[] = [];
+		for (const item of parsed.todos) {
+			if (!item || typeof item !== "object") continue;
+			const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
+			if (typeof obj.content !== "string" || !obj.content) continue;
+			const status: TodoStatus =
+				obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
+					? obj.status
+					: "pending";
+			items.push({
+				content: obj.content,
+				status,
+				...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
+			});
+		}
+		return items;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * 计算 todo 列表的进度摘要：已完成数/总数 + 当前 in_progress 项的摘要文本。
+ * 返回 { done, total, currentText }，currentText 优先用 activeForm，fallback 到 content 截断。
+ */
+function summarizeTodoProgress(items: TodoItem[]): { done: number; total: number; currentText: string } {
+	const total = items.length;
+	const done = items.filter((i) => i.status === "completed").length;
+	const inProgress = items.find((i) => i.status === "in_progress");
+	const currentText = inProgress
+		? (inProgress.activeForm || inProgress.content).slice(0, 40)
+		: "";
+	return { done, total, currentText };
+}
+
+/** 渲染 TodoWrite 展开态清单的单行：三态图标 + content，in_progress 加粗。 */
+function renderTodoLine(item: TodoItem, index: number): ReactNode {
+	const icon =
+		item.status === "completed" ? (
+			<Check size={13} strokeWidth={2.4} className="todo-line-icon todo-line-icon--done" aria-label={t("todo.statusCompleted")} />
+		) : item.status === "in_progress" ? (
+			<CircleDot size={13} strokeWidth={2.2} className="todo-line-icon todo-line-icon--active" aria-label={t("todo.statusInProgress")} />
+		) : (
+			<Circle size={13} strokeWidth={1.8} className="todo-line-icon todo-line-icon--pending" aria-label={t("todo.statusPending")} />
+		);
+	return (
+		<li
+			key={index}
+			className={`todo-write-line todo-write-line--${item.status}`}
+			title={item.content}
+		>
+			<span className="todo-write-line-icon" aria-hidden="true">{icon}</span>
+			<span className="todo-write-line-text">{item.content}</span>
+		</li>
+	);
+}
+
 /** 单个工具调用卡片：trigger 行（图标+工具名+副标题+状态+耗时）+ 展开后详情。 */
 /** 格式化 ask 答案展示：长文本可换行，避免 fixed height 下覆盖错位 */
 function formatAskAnswerText(answer: unknown, answerLabel?: string): string {
@@ -2046,14 +2171,24 @@ export const ToolCard = memo(function ToolCard(props: {
 	const toolName = getToolName(props.message);
 	const detailText = getToolDetailText(props.message);
 	const tone = getToolTone(props.message);
-	const subtitle = getToolSubtitle(props.message);
 	const kindLabel = getToolKindLabel(toolName);
 	const diffTarget = getToolDiffTarget(props.message);
+	// TodoWrite 特化：从 meta.args 解析 todos 数组，派生进度摘要并隐藏无意义的耗时
+	const isTodoWrite = isTodoWriteTool(toolName);
+	const todoItems = isTodoWrite ? parseTodoItemsFromArgs(props.message.meta) : [];
+	const todoSummary = isTodoWrite ? summarizeTodoProgress(todoItems) : null;
+	// 折叠态 subtitle：TodoWrite 用进度摘要（{done}/{total} · activeForm），其它工具走原 subtitle
+	const subtitle = isTodoWrite && todoSummary
+		? (todoSummary.total > 0
+			? `${todoSummary.done}/${todoSummary.total}${todoSummary.currentText ? " · " + todoSummary.currentText : ""}`
+			: "")
+		: getToolSubtitle(props.message);
 	const durationMs =
 		typeof props.message.meta?.durationMs === "number"
 			? props.message.meta.durationMs
 			: undefined;
-	const showDuration = status !== "running" && durationMs !== undefined;
+	// TodoWrite 是瞬时记账操作，耗时对用户无信息量，隐藏；其它工具 status 非running 时显示
+	const showDuration = !isTodoWrite && status !== "running" && durationMs !== undefined;
 	// 模型用 read 工具读取 SKILL.md 来加载 skill：识别后以 skill 徽标样式渲染
 	const skillName = getReadSkillName(props.message);
 	const isSkillRead = Boolean(skillName);
@@ -2279,6 +2414,10 @@ const statusLabel =
 								);
 							})()}
 						</div>
+					) : isTodoWrite && todoItems.length > 0 ? (
+						<ol className="todo-write-list">
+							{todoItems.map((item, idx) => renderTodoLine(item, idx))}
+						</ol>
 					) : (
 						<pre className="tool-card-detail">{detailText}</pre>
 					)}
