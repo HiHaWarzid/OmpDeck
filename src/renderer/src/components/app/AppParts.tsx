@@ -3106,10 +3106,13 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 }) {
 	// 默认展开，方便用户看到推理过程；可手动折叠
 	const [expanded, setExpanded] = useState(true);
-	// 流式思考进行中（有 startedAt 无 endedAt）时每秒刷新计时
+	// 流式思考进行中（有起点、未正常结束）时每秒刷新计时
 	const [, setTick] = useState(0);
 	useEffect(() => {
-		if (props.startedAt == null || props.endedAt != null) return;
+		// endedAt 早于 startedAt 视为残留数据（新一轮思考已开始而旧结束标记未清），
+		// 仍按进行中实时计时，与下方 duration 的兜底逻辑保持一致。
+		if (props.startedAt == null) return;
+		if (props.endedAt != null && props.endedAt >= props.startedAt) return;
 		const timer = setInterval(() => setTick((n) => n + 1), 1000);
 		return () => clearInterval(timer);
 	}, [props.startedAt, props.endedAt]);

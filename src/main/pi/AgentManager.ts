@@ -3239,7 +3239,10 @@ export class AgentManager {
 		if (eventType === "thinking_delta") {
 			const prev = runtime.streamingThinking;
 			const delta = String(assistantEvent.delta ?? "");
-			if (runtime.thinkingStartedAt === undefined) {
+			// 同一轮 agent 内可能有多段思考（思考→工具→再思考）。
+			// 上一段已结束（thinkingEndedAt 有值）时视为新一轮思考，刷新起点，
+			// 否则时长会从第一段起点累计，把工具调用等无关时间算进本轮思考。
+			if (runtime.thinkingStartedAt === undefined || runtime.thinkingEndedAt !== undefined) {
 				runtime.thinkingStartedAt = Date.now();
 			}
 			runtime.thinkingEndedAt = undefined;
@@ -3260,6 +3263,9 @@ export class AgentManager {
 			}
 			runtime.thinkingEndedAt = Date.now();
 			this.upsertAssistantMessage(runtime, partialMessage);
+			// 一段思考结束：清空累积缓冲。否则工具调用后第二段思考的
+			// thinking_delta 会追加到本段完整文本之后，造成内容重复。
+			runtime.streamingThinking = "";
 			// thinking_end 是阶段性终态，立即 flush 让思考块完整落盘显示。
 			this.flushMessageEmit(runtime);
 			return;
@@ -3310,7 +3316,14 @@ export class AgentManager {
 			existing.text = extractedText || `${existing.text}${fallbackDelta}`;
 			if (nextThinking) existing.thinking = nextThinking;
 			existing.timestamp = Date.now();
-			if (thinkingStartedAt) existing.thinkingStartedAt = thinkingStartedAt;
+			if (thinkingStartedAt) {
+				if (existing.thinkingStartedAt !== thinkingStartedAt) {
+					// 新一轮思考开始（起点已刷新）：旧的 thinkingEndedAt 不再适用，
+					// 必须清除，否则 UI 会误判思考已结束、停止实时计时。
+					existing.thinkingEndedAt = undefined;
+				}
+				existing.thinkingStartedAt = thinkingStartedAt;
+			}
 			if (thinkingEndedAt) existing.thinkingEndedAt = thinkingEndedAt;
 		} else {
 			const text = extractedText || fallbackDelta;
