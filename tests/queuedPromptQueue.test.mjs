@@ -28,7 +28,8 @@ const webServiceSource = readFileSync(
   "src/main/web/WebServiceManager.ts",
   "utf8",
 );
-const sharedTypesSource = readFileSync("src/shared/types.ts", "utf8");
+// shared/types.ts 已拆分为 types/ 目录下的领域文件，delivery 字段定义在 types/message.ts
+const sharedTypesSource = readFileSync("src/shared/types/message.ts", "utf8");
 
 test("pending prompts render inside the composer before composer-box", () => {
   const footerIndex = appSource.indexOf('<footer ref={composerRef} className="composer">');
