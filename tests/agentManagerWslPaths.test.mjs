@@ -158,10 +158,26 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 			createdAt: 1,
 			sessionPath,
 		},
+		messages: [
+			{ id: "message", agentId: "agent", role: "user", text: "hello", meta: { entryId: "entry-user" } },
+		],
+		toolMessageIds: new Map(),
+		streamingThinking: "",
+		toolStateSequence: 0,
+		activeToolCalls: new Map(),
+		toolExecuting: null,
+		streamGate: { sealed: false, waitingForAbortSettled: false },
+		pendingMessage: false,
+		pendingUIRequests: new Map(),
+		rpcLogging: false,
+		compacting: false,
+		rpcCompacting: false,
+		modelRefreshing: false,
+		userInitiatedStop: false,
+		autoRestartAttempted: false,
+		recentlyAborted: false,
+		abortedDuringAsk: false,
 	});
-	manager.messages.set("agent", [
-		{ id: "message", agentId: "agent", role: "user", text: "hello", meta: { entryId: "entry-user" } },
-	]);
 	manager.reloadSession = async () => {};
 	await manager.prepareResendFromMessage("agent", "message");
 

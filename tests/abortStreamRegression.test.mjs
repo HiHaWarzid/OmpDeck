@@ -16,37 +16,39 @@ test("abort feedback is toast-only and seals stream generation", () => {
 	// 1) 停止反馈不得再 addMessage 系统卡片
 	assert.doesNotMatch(
 		agentManager,
-		/addMessage\(agentId,\s*"system",\s*"已请求停止当前响应"/,
+		/addMessage\(runtime,\s*"system",\s*"已请求停止当前响应"/,
 	);
 	assert.match(agentManager, /ipcChannels\.agentsNotice/);
 	assert.match(ipc, /agentsNotice:\s*"agents:notice"/);
 
 	// 2) abort 必须封印 stream generation，并走 settled 协同解封
-	assert.match(agentManager, /this\.sealAgentStream\(agentId\)/);
-	assert.match(agentManager, /this\.openAgentStream\(agentId\)/);
-	assert.match(agentManager, /this\.noteAgentAbortSettled\(agentId\)/);
-	assert.match(agentManager, /isAgentStreamSealed\(agentId\)/);
+	// 现在所有 stream gate 调用接收 runtime（不再按 agentId 索引 Map）
+	assert.match(agentManager, /this\.sealAgentStream\(runtime\)/);
+	assert.match(agentManager, /this\.openAgentStream\(runtime\)/);
+	assert.match(agentManager, /this\.noteAgentAbortSettled\(runtime\)/);
+	assert.match(agentManager, /isAgentStreamSealed\(runtime\)/);
 	assert.match(streamGate, /sealedGeneration/);
 	assert.match(streamGate, /currentGeneration/);
 	assert.match(streamGate, /waitingForAbortSettled/);
 	assert.match(streamGate, /pendingOpenAfterSettled/);
 
-	// 3) message_update / tool 事件不得再依赖“有 activeAssistantMessageIds 就放行”的例外
+	// 3) message_update / tool 事件不得再依赖“有 activeAssistantMessageId 就放行”的例外
+	// AgentRuntime 化后：recentlyAborted 是 runtime 字段，activeAssistantMessageId 也是 runtime 字段
 	assert.doesNotMatch(
 		agentManager,
-		/recentlyAborted\.has\(agentId\)\s*&&\s*!this\.activeAssistantMessageIds\.has\(agentId\)/,
+		/runtime\.recentlyAborted\s*&&\s*!runtime\.activeAssistantMessageId/,
 	);
 	assert.doesNotMatch(
 		agentManager,
-		/recentlyAborted\.has\(agentId\)\s*&&\s*!this\.activeToolCallsByAgent\.has\(agentId\)/,
+		/runtime\.recentlyAborted\s*&&\s*!runtime\.activeToolCalls/,
 	);
 
 	// 4) agent_settled 必须 noteAbortSettled，但不得直接 openAgentStream
 	const settledBlock = agentManager.match(
 		/if \(typed\.type === "agent_settled"\) \{[\s\S]*?\n\t\t\}/,
 	)?.[0] ?? "";
-	assert.match(settledBlock, /noteAgentAbortSettled\(agentId\)/);
-	assert.match(settledBlock, /recentlyAborted\.delete\(agentId\)/);
+	assert.match(settledBlock, /noteAgentAbortSettled\(runtime\)/);
+	assert.match(settledBlock, /runtime\.recentlyAborted\s*=\s*false/);
 	assert.doesNotMatch(settledBlock, /openAgentStream/);
 
 	// 5) 前端 abort 立即清本地 thinking，并订阅 notice toast
