@@ -2741,7 +2741,7 @@ body.is-resizing .wechat-shell {
   gap: 8px;
   margin-top: 2px;
   min-width: 0;
-  font-size: var(--font-size-xs);
+  font-size: var(--font-size-micro);
   line-height: 1.3;
 }
 .codex-subagent-sidebar-row .subagent-row-preview {

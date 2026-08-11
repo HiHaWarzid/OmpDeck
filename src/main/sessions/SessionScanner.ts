@@ -853,7 +853,18 @@ export class SessionScanner {
 
     // 会话名优先级与 pi getSessionName 一致：最后一条 session_info 为准；
     // 旧版 PiDeck 的 sessionName 私有行及其他字段仅作降级回退。
-    const inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
+    let inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
+
+    // omp/pi 子代理会话常没有显式标题（title 为空），且首条消息都是 task 工具的固定前缀
+    // （"Complete the assignment below, thoroughly: ..."），此时名字会退化成同一条截断文本，
+    // 展开后整组子会话无法区分。子会话布局下文件名即代理标签（如 AgentManagerApi），
+    // 无显式标题时用文件名作为名字；session.jsonl 这类通用名无区分度，仍保持消息回退。
+    if (parentSessionPath && !latestSessionInfoName && !name) {
+      const fileLabel = basename(filePath).replace(/\.jsonl$/i, "");
+      if (fileLabel && fileLabel !== "session") {
+        inferredName = this.cleanTitle(fileLabel) ?? inferredName;
+      }
+    }
 
     const summary: SessionSummary = {
       id: filePath,

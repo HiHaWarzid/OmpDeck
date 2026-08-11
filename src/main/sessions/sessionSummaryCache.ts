@@ -31,8 +31,10 @@ interface DiskCacheFile<V> {
  * 磁盘缓存 schema 版本：不兼容时整表丢弃（见 loadFromDisk）。
  * 2：修复 Windows 本地子会话父路径推断（posix 函数误用于反斜杠路径），
  *    旧缓存中的摘要缺失 parentSessionPath 且不会因文件未变而重推断，必须丢弃重建。
+ * 3：子会话无显式标题时改用文件名作为名字（此前退化成 task 工具固定前缀的首条消息，
+ *    整组子会话同名无法区分）；旧缓存里的名字不会因文件未变而重推断，必须丢弃重建。
  */
-const DISK_SCHEMA_VERSION = 2;
+const DISK_SCHEMA_VERSION = 3;
 const SAVE_DEBOUNCE_MS = 800;
 
 export class SessionSummaryCache<V> {
