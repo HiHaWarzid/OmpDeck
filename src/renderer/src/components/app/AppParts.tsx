@@ -1164,6 +1164,10 @@ export function ModelPicker(props: {
 	favoriteModels: string[];
 	/** 切换收藏状态 */
 	onToggleFavorite: (provider: string, modelId: string) => void;
+	/** 当前 omp 默认模型 key（格式：provider/modelId）；不配对或未设置时为 undefined */
+	defaultModelKey?: string;
+	/** 将某模型设为 omp 默认模型（新会话初始模型），由调用方负责 IPC 写入与 toast */
+	onSetDefault: (provider: string, modelId: string) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -1249,6 +1253,8 @@ export function ModelPicker(props: {
 		const modelKey = `${model.provider}/${model.id}`;
 		const selected = modelKey === currentModelKey;
 		const favorited = favoritesSet.has(modelKey);
+		const isDefault = modelKey === props.defaultModelKey;
+		const canSetDefault = Boolean(model.provider);
 		return (
 			<button
 				ref={selected ? selectedItemRef : undefined}
@@ -1270,6 +1276,18 @@ export function ModelPicker(props: {
 				<span className="picker-palette-label">{model.name ?? model.id}</span>
 				<span className="picker-palette-desc">
 					{model.provider}/{model.id}
+				</span>
+				{/* 设为默认按钮：钉住 = omp 新会话初始模型。已默认时填充态不可点；无供应商的模型无法表达默认供应商，置灰不可点 */}
+				<span
+					className={`model-default-pin${isDefault ? " is-default" : ""}${!canSetDefault ? " disabled" : ""}`}
+					title={isDefault ? t("app.modelIsDefault") : canSetDefault ? t("app.modelSetDefault") : t("app.modelNoProvider")}
+					onClick={(e) => {
+						e.stopPropagation();
+						if (isDefault || !canSetDefault) return;
+						props.onSetDefault(model.provider, model.id);
+					}}
+				>
+					<Pin size={14} strokeWidth={1.8} fill={isDefault ? 'currentColor' : 'none'} aria-hidden="true" />
 				</span>
 				{selected && <span className="picker-palette-check">✓</span>}
 			</button>

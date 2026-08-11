@@ -219,6 +219,8 @@ export const ipcChannels = {
 	configSaveModels: "config:save-models",
 	configSaveAuth: "config:save-auth",
 	configSaveSettings: "config:save-settings",
+	/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write，避免渲染层并发覆盖 settings.json） */
+	configSetDefaultModel: "config:set-default-model",
 	configSaveRaw: "config:save-raw",
 	configExport: "config:export",
 	configImport: "config:import",

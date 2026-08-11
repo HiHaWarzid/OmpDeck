@@ -2734,6 +2734,34 @@ body.is-resizing .wechat-shell {
 .codex-subagent-sidebar-row .conversation-title strong {
   color: var(--color-text-tertiary);
 }
+/* 子会话行：预览 + 更新时间，避免展开后同名列无法区分 */
+.codex-subagent-sidebar-row .subagent-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  min-width: 0;
+  font-size: var(--font-size-xs);
+  line-height: 1.3;
+}
+.codex-subagent-sidebar-row .subagent-row-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-tertiary);
+}
+.codex-subagent-sidebar-row .subagent-row-time {
+  flex: 0 0 auto;
+  color: var(--color-text-hint);
+  font-family: var(--font-family-business);
+  white-space: nowrap;
+}
+/* 孙级子会话组：比父级再缩进一档，保持树状层级 */
+.codex-subagent-sidebar-group.nested {
+  margin-left: 12px;
+}
 .project-session-loading {
   display: flex;
   align-items: center;
@@ -11548,6 +11576,43 @@ body.is-composer-resizing .composer-resize-handle::after {
 
 .model-favorite-star.favorited {
   color: var(--color-warning);
+}
+
+/* 设为默认按钮：与收藏星同尺寸同交互，钉住态用 accent 色填充；无供应商/已默认时不可点 */
+.model-default-pin {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--color-text-quaternary);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    transform 0.15s;
+  border-radius: var(--radius-md);
+}
+
+.model-default-pin:hover {
+  color: var(--color-accent);
+  transform: scale(1.15);
+}
+
+.model-default-pin.is-default {
+  color: var(--color-accent);
+  cursor: default;
+}
+
+.model-default-pin.disabled {
+  color: var(--color-text-quaternary);
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.model-default-pin.disabled:hover {
+  color: var(--color-text-quaternary);
+  transform: none;
 }
 
 .picker-palette-check {

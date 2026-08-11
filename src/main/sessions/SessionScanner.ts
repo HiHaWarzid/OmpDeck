@@ -6,9 +6,10 @@ import { app, shell } from "electron";
 import { existsSync } from "node:fs";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
-import { basename as posixBasename, dirname as posixDirname, isAbsolute as posixIsAbsolute, join as posixJoin } from "node:path/posix";
+import { dirname as posixDirname, isAbsolute as posixIsAbsolute, join as posixJoin } from "node:path/posix";
 import type { ChatMessage, ChatRole, SessionSummary } from "../../shared/types";
 import { getCodexSessionThreadInfo } from "../../shared/codexSessionMeta";
+import { inferParentCandidatesFromPath } from "./subagentParentInference";
 import { extractMessageText, extractThinkingRaw } from "../pi/messageContent";
 import { toWslLinuxPath, type WslEnvironment } from "../wsl/WslPaths";
 import { SessionSummaryCache } from "./sessionSummaryCache";
@@ -632,11 +633,14 @@ export class SessionScanner {
    *
    * 算法：从子会话文件所在目录向上遍历，在每一层检查同级目录中是否存在
    * <dirname>.jsonl 文件，并校验其内容为合法 Pi Agent 会话 JSONL。
+   * 候选路径的生成是纯路径运算（见 inferParentCandidatesFromPath），此处只做
+   * 存在性与合法性校验。
    *
    * 支持的布局（任一扩展都可用）：
    *   - pi-subagents:  <stem>/<run-id>/run-N/session.jsonl → 父 = <stem>.jsonl
    *   - Claude Code 式: <stem>/subagents/agent-<id>.jsonl    → 父 = <stem>.jsonl
    *   - 自定义嵌套:     <stem>/any/deep/path/session.jsonl   → 父 = <stem>.jsonl
+   *   - omp:            <stem>/<label>.jsonl                 → 父 = <stem>.jsonl
    *
    * 深度限制 10 层，且不超出 sessions 根目录，避免误判和性能问题。
    */
@@ -646,25 +650,11 @@ export class SessionScanner {
 
     // 自定义 sessionDir 与默认根并存时，以包含该文件的最近扫描根为边界。
     const normalizedRoot = this.normalize(this.findSessionsRootForFile(filePath));
-    // 统一用 posix 路径语义：node:fs 在 Windows 上同样接受 `/` 分隔符，WSL 路径本来就是 posix。
-    let currentDir = posixDirname(filePath);
 
-    for (let depth = 0; depth < 10; depth++) {
-      const normalizedDir = this.normalize(currentDir);
-      // 停止条件：到达或超出 sessions 根目录
-      if (normalizedDir === normalizedRoot || !normalizedDir.startsWith(`${normalizedRoot}/`)) break;
-
-      const dirName = posixBasename(currentDir);
-      if (!dirName) break;
-
-      const parentDir = posixDirname(currentDir);
-      const candidateParent = posixJoin(parentDir, `${dirName}.jsonl`);
-
+    for (const candidateParent of inferParentCandidatesFromPath(filePath, normalizedRoot)) {
       if ((await this.fileAdapter.exists(candidateParent, signal)) && (await this.isSessionFile(candidateParent, signal))) {
         return candidateParent;
       }
-
-      currentDir = parentDir;
     }
 
     return undefined;

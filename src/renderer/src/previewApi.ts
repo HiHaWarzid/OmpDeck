@@ -663,6 +663,7 @@ export function createPreviewApi(): PiDesktopApi {
 			saveModels: async () => ({ valid: true }),
 			saveAuth: async () => ({ valid: true }),
 			saveSettings: async () => ({ valid: true }),
+			setDefaultModel: async () => ({ valid: true }),
 			saveRaw: async () => ({ valid: true }),
 			export: async () =>
 				JSON.stringify({

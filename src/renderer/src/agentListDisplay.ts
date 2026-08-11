@@ -62,6 +62,11 @@ export type ProjectAgentSessionDisplay = {
 	children: ProjectChildItem[];
 	visibleChildren: ProjectChildItem[];
 	hiddenChildCount: number;
+	/**
+	 * 归一化父路径 → 子会话列表 的分组映射。
+	 * 除顶层嵌套外，还供侧栏递归渲染孙级（子会话的子会话），避免多级链被孤儿恢复平铺到顶层。
+	 */
+	piSubagentsByParent: ReadonlyMap<string, SessionSummary[]>;
 };
 
 // 会话文件路径可能来自扫描器或 Agent 状态回写，比较时统一分隔符和大小写，避免同一历史会话重复显示/重复激活。
@@ -307,12 +312,19 @@ export function getProjectAgentSessionDisplay({
 	];
 
 	// 孤儿恢复：父会话缺失（被删除/过滤/搜索排除）时，将子会话降级回顶层。
-	// 先收集已被嵌套展示的子会话路径，避免孤儿恢复与嵌套展示同时命中导致重复显示。
+	// 先收集所有已被嵌套展示的子会话路径（含孙级，沿 piSubagentsByParent 递归），
+	// 避免孤儿恢复与嵌套展示同时命中导致重复显示，或孙级被错误平铺到顶层。
 	const nestedSubagentPaths = new Set<string>();
-	for (const child of children) {
-		for (const sa of child.piSubagents) {
-			nestedSubagentPaths.add(normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath);
+	const collectNestedPaths = (subagents: SessionSummary[]) => {
+		for (const sa of subagents) {
+			const key = normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath;
+			nestedSubagentPaths.add(key);
+			const grandchildren = piSubagentsByParent.get(key);
+			if (grandchildren && grandchildren.length > 0) collectNestedPaths(grandchildren);
 		}
+	};
+	for (const child of children) {
+		collectNestedPaths(child.piSubagents);
 		for (const sa of child.codexSubagents) {
 			nestedSubagentPaths.add(normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath);
 		}
@@ -328,6 +340,8 @@ export function getProjectAgentSessionDisplay({
 		}
 	}
 	for (const [parentKey, orphanSubagents] of piSubagentsByParent) {
+		// 父本身已被嵌套展示（孙级）：由递归渲染挂在父下，不应再提升为顶层孤儿。
+		if (nestedSubagentPaths.has(parentKey)) continue;
 		if (!visibleParentKeys.has(parentKey) && orphanSubagents.length > 0) {
 			for (const orphan of orphanSubagents) {
 				const orphanKey = normalizeSessionPathForCompare(orphan.filePath) ?? orphan.filePath;
@@ -353,5 +367,6 @@ export function getProjectAgentSessionDisplay({
 		children,
 		visibleChildren,
 		hiddenChildCount: Math.max(0, children.length - visibleChildren.length),
+		piSubagentsByParent,
 	};
 }

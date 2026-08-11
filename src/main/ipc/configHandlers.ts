@@ -46,6 +46,25 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps) {
 		void appLogger.info("config", "Pi settings config saved", { keys: Object.keys(settings ?? {}) });
 		return result;
 	});
+	// 原子设置 omp 默认供应商/模型：先读当前 settings.json 再合并写回，
+	// 避免与设置页的整对象保存互相覆盖；默认模型必须与供应商成对写入，
+	// 否则 omp 会用旧 defaultProvider 去匹配新模型 id 导致配不上。
+	ipcMain.handle(ipcChannels.configSetDefaultModel, async (_event, provider: unknown, modelId: unknown) => {
+		const trimmedProvider = typeof provider === "string" ? provider.trim() : "";
+		const trimmedModel = typeof modelId === "string" ? modelId.trim() : "";
+		if (!trimmedProvider || !trimmedModel) {
+			return { valid: false, error: "provider 与 modelId 不能为空" };
+		}
+		const current = await configManager.getSettingsConfig();
+		const next = {
+			...current.parsed,
+			defaultProvider: trimmedProvider,
+			defaultModel: trimmedModel,
+		};
+		const result = await configManager.saveSettingsConfig(next);
+		void appLogger.info("config", "Default model set", { provider: trimmedProvider, model: trimmedModel, valid: result.valid });
+		return result;
+	});
 	ipcMain.handle(ipcChannels.configSaveRaw, async (_event, fileName, rawJson) => {
 		const result = await configManager.saveRawConfig(fileName, rawJson);
 		void appLogger.info("config", "Raw config saved", {

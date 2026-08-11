@@ -822,6 +822,12 @@ const api = {
 				valid: boolean;
 				error?: string;
 			}>,
+		/** 原子设置 omp 默认供应商/默认模型，返回是否写入成功 */
+		setDefaultModel: (provider: string, modelId: string) =>
+			ipcRenderer.invoke(ipcChannels.configSetDefaultModel, provider, modelId) as Promise<{
+				valid: boolean;
+				error?: string;
+			}>,
 		saveRaw: (fileName: string, rawJson: string) =>
 			ipcRenderer.invoke(
 				ipcChannels.configSaveRaw,

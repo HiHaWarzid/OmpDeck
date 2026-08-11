@@ -83,6 +83,7 @@ import {
   isReplacementForPendingAgent,
   isSameSessionPath,
   isSidebarSessionRowActive,
+  normalizeSessionPathForCompare,
   type PendingAgentTab,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
@@ -180,6 +181,7 @@ import {
   getToolNewContent,
   getToolChangedLineCount,
   countTextLines,
+  formatTime,
   type MessageItem,
 } from "./components/app/AppUtils";
 import {
@@ -316,6 +318,8 @@ const SIDEBAR_EXPANDED_PROJECTS_KEY = "pid:sidebar-expanded-projects";
 const SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY = "pid:sidebar-collapsed-projects";
 /** 与主进程 ProjectStore 内置 chat id 保持一致 */
 const BUILTIN_CHAT_PROJECT_ID = "builtin-chat";
+/** 侧栏子会话展开状态持久化键（含孙级递归树） */
+const SUBAGENT_GROUPS_STORAGE_KEY = "pid:sidebar-expanded-subagent-groups";
 
 function parseProjectIdArray(raw: string | null): string[] | null {
 	if (raw === null) return null;
@@ -844,9 +848,35 @@ export function App() {
   const [sessionSourceFilter, setSessionSourceFilter] = useState<
   	Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null>
   >(() => loadSessionSourceFilter());
-  /** 侧栏子会话展开状态（统一管理 Codex 子代理和 pi 子会话） */
+  /** 侧栏子会话展开状态（统一管理 Codex 子代理和 pi 子会话），localStorage 持久化 */
   const [expandedSubagentGroups, setExpandedSubagentGroups] =
-    useState<Set<string>>(() => new Set());
+    useState<Set<string>>(() => {
+      try {
+        const raw = localStorage.getItem(SUBAGENT_GROUPS_STORAGE_KEY);
+        if (!raw) return new Set<string>();
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed)
+          ? new Set(parsed.filter((key): key is string => typeof key === "string"))
+          : new Set<string>();
+      } catch {
+        // localStorage 不可用/损坏时退化为全部收起
+        return new Set<string>();
+      }
+    });
+  /** 切换子会话组展开状态并持久化（父行/孙级 toggle 共用） */
+  const toggleSubagentGroup = (key: string) => {
+    setExpandedSubagentGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      try {
+        localStorage.setItem(SUBAGENT_GROUPS_STORAGE_KEY, JSON.stringify([...next]));
+      } catch {
+        // 配额/隐私模式失败时静默忽略，展开状态仅本次会话有效
+      }
+      return next;
+    });
+  };
 
   /** 来源过滤弹窗（关联项目ID和位置） */
   const [sessionFilterOpen, setSessionFilterOpen] = useState<{
@@ -4437,8 +4467,22 @@ export function App() {
 
   // 无 agent 时模型列表缓存，避免每次打开模型选择器都 fork pi --list-models
   const cachedModelsRef = useRef<AvailableModel[] | null>(null);
+  // omp 当前默认模型 key（provider/modelId），打开选模型弹框时从 settings.json 读取，设置成功后同步更新
+  const [defaultModelKey, setDefaultModelKey] = useState<string | undefined>(undefined);
 
   async function openModelPicker() {
+    // 顺路读取 omp 默认供应商/模型，供弹框内“设为默认”按钮标记当前默认项；
+    // 两键不配对（缺一或为空）时视为未设置默认，不点亮任何行。
+    try {
+      const settingsRes = await api.config.getSettings();
+      const parsed = settingsRes.parsed as Record<string, unknown> | undefined;
+      const provider = typeof parsed?.defaultProvider === "string" ? parsed.defaultProvider : "";
+      const model = typeof parsed?.defaultModel === "string" ? parsed.defaultModel : "";
+      setDefaultModelKey(provider && model ? `${provider}/${model}` : undefined);
+    } catch {
+      // 读取失败不阻塞弹框，仅视为无默认
+      setDefaultModelKey(undefined);
+    }
     // 有 agent → 走 RPC 路径获取可用模型
     if (activeAgentId && !isPendingAgentId(activeAgentId)) {
       const models = await api.agents.availableModels(activeAgentId);
@@ -4456,6 +4500,21 @@ export function App() {
     cachedModelsRef.current = models;
     setAvailableModels(models);
     setModelPickerOpen(true);
+  }
+
+  /** 将某模型设为 omp 默认模型（写入 settings.json 的 defaultProvider/defaultModel），仅影响之后新建的会话 */
+  async function setDefaultModel(provider: string, modelId: string) {
+    try {
+      const res = await api.config.setDefaultModel(provider, modelId);
+      if (res.valid) {
+        setDefaultModelKey(`${provider}/${modelId}`);
+        showToast(t("app.modelSetDefaultSuccess", { name: modelId }), 2000);
+      } else {
+        showToast(res.error || t("app.modelSetDefaultFailed"), 3000);
+      }
+    } catch {
+      showToast(t("app.modelSetDefaultFailed"), 3000);
+    }
   }
 
   async function openPromptTemplatePicker() {
@@ -6711,6 +6770,7 @@ export function App() {
                     const renderSubagentRow = (
                       subagent: SessionSummary,
                       label: ReactNode,
+                      toggle?: ReactNode,
                     ) => {
                       const subagentAgent = getAgentForSessionPath(
                         allProjectAgents,
@@ -6754,7 +6814,25 @@ export function App() {
                           }}
                         >
                           <div className="conversation-body">
-                            <div className="conversation-title">{label}</div>
+                            <div className="conversation-title">
+                              {label}
+                              {toggle}
+                              {subagentAgent?.status && (
+                                <AgentStatusIndicator status={subagentAgent.status} />
+                              )}
+                            </div>
+                            {(subagent.preview || subagent.updatedAt > 0) && (
+                              <div className="subagent-row-meta">
+                                {subagent.preview && (
+                                  <span className="subagent-row-preview">{subagent.preview}</span>
+                                )}
+                                {subagent.updatedAt > 0 && (
+                                  <span className="subagent-row-time">
+                                    {formatTime(subagent.updatedAt)}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </button>
                       );
@@ -6775,28 +6853,58 @@ export function App() {
                         </div>
                       );
                     };
-                    const renderPiSubagents = (subagents: SessionSummary[]) => {
-                      if (subagents.length === 0 || !subagentsExpanded) return null;
+                    // 递归渲染 pi 子会话树（含孙级）：孙级挂在父子会话行下，不再被孤儿恢复平铺到顶层。
+                    // 根层展开由父行 toggle（subagentGroupKey）控制，孙级由各自的 toggle 控制。
+                    const renderPiSubagentTree = (
+                      subagents: SessionSummary[],
+                      groupKey: string,
+                      depth: number,
+                    ): ReactNode => {
+                      if (subagents.length === 0) return null;
+                      if (depth > 0 && !expandedSubagentGroups.has(groupKey)) return null;
                       return (
-                        <div className="codex-subagent-sidebar-group">
-                          {subagents.map((subagent) => renderSubagentRow(
-                            subagent,
-                            <strong>{formatPiSubagentName(subagent)}</strong>,
-                          ))}
+                        <div className={`codex-subagent-sidebar-group${depth > 0 ? " nested" : ""}`}>
+                          {subagents.map((subagent) => {
+                            const subagentKey = normalizeSessionPathForCompare(subagent.filePath) ?? subagent.filePath;
+                            const grandchildren = projectDisplay.piSubagentsByParent.get(subagentKey) ?? [];
+                            const grandGroupKey = `${groupKey}:${subagentKey}`;
+                            const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
+                            return (
+                              <Fragment key={subagent.filePath}>
+                                {renderSubagentRow(
+                                  subagent,
+                                  <strong>{formatPiSubagentName(subagent)}</strong>,
+                                  grandchildren.length > 0 ? (
+                                    <span
+                                      className="subagent-inline-toggle"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        toggleSubagentGroup(grandGroupKey);
+                                      }}
+                                      title={t("app.piSubagentCount", { count: grandchildren.length })}
+                                    >
+                                      <ChevronDown size={10} className={grandExpanded ? "expanded" : ""} />
+                                      <span className="subagent-inline-count">{grandchildren.length}</span>
+                                    </span>
+                                  ) : null,
+                                )}
+                                {renderPiSubagentTree(grandchildren, grandGroupKey, depth + 1)}
+                              </Fragment>
+                            );
+                          })}
                         </div>
                       );
+                    };
+                    const renderPiSubagents = (subagents: SessionSummary[]) => {
+                      if (subagents.length === 0 || !subagentsExpanded) return null;
+                      return renderPiSubagentTree(subagents, subagentGroupKey, 0);
                     };
                     const renderInlineSubagentToggle = totalSubagentCount > 0 ? (
                       <span
                         className="subagent-inline-toggle"
                         onClick={(e) => {
                           e.stopPropagation();
-                          setExpandedSubagentGroups((current) => {
-                            const next = new Set(current);
-                            if (next.has(subagentGroupKey)) next.delete(subagentGroupKey);
-                            else next.add(subagentGroupKey);
-                            return next;
-                          });
+                          toggleSubagentGroup(subagentGroupKey);
                         }}
                         title={t("app.piSubagentCount", { count: totalSubagentCount })}
                       >
@@ -6976,6 +7084,61 @@ export function App() {
                       // 完整路径放 title，不再行内显示目录名——分支与目录名不一致时会参差不齐。
                       const displayBranchName = wt.branch.replace(/^ompdeck\//, "");
                       const wtKey = `wt:${wt.path}`;
+                      // worktree 内 pi 子会话递归渲染（含孙级）：与主侧栏 renderPiSubagentTree 同构，
+                      // 根层展开由父行 toggle 控制，孙级由各自 toggle 控制。
+                      const renderWtPiSubagentTree = (
+                        subagents: SessionSummary[],
+                        groupKey: string,
+                        depth: number,
+                      ): ReactNode => {
+                        if (subagents.length === 0) return null;
+                        if (depth > 0 && !expandedSubagentGroups.has(groupKey)) return null;
+                        return (
+                          <div className={`codex-subagent-sidebar-group${depth > 0 ? " nested" : ""}`}>
+                            {subagents.map((sa) => {
+                              const saKey = normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath;
+                              const grandchildren = wtDisplay?.piSubagentsByParent.get(saKey) ?? [];
+                              const grandGroupKey = `${groupKey}:${saKey}`;
+                              const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
+                              return (
+                                <Fragment key={sa.filePath}>
+                                  <button
+                                    className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`}
+                                    title={sa.filePath}
+                                    onClick={() => void openSidebarSession(childProject!.id, sa)}
+                                  >
+                                    <div className="conversation-body">
+                                      <div className="conversation-title">
+                                        <strong>{formatPiSubagentName(sa)}</strong>
+                                        {grandchildren.length > 0 && (
+                                          <span
+                                            className="subagent-inline-toggle"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              toggleSubagentGroup(grandGroupKey);
+                                            }}
+                                            title={t("app.piSubagentCount", { count: grandchildren.length })}
+                                          >
+                                            <ChevronDown size={10} className={grandExpanded ? "expanded" : ""} />
+                                            <span className="subagent-inline-count">{grandchildren.length}</span>
+                                          </span>
+                                        )}
+                                      </div>
+                                      {(sa.preview || sa.updatedAt > 0) && (
+                                        <div className="subagent-row-meta">
+                                          {sa.preview && <span className="subagent-row-preview">{sa.preview}</span>}
+                                          {sa.updatedAt > 0 && <span className="subagent-row-time">{formatTime(sa.updatedAt)}</span>}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </button>
+                                  {renderWtPiSubagentTree(grandchildren, grandGroupKey, depth + 1)}
+                                </Fragment>
+                              );
+                            })}
+                          </div>
+                        );
+                      };
                       const isChildActive =
                         !!childProject && activeProjectId === childProject.id;
                       const canFoldWorkspace =
@@ -7104,7 +7267,7 @@ export function App() {
                                         </span>
                                       )}
                                       {totalSubagentCount > 0 && (
-                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); setExpandedSubagentGroups(c => { const n = new Set(c); n.has(subagentGroupKey) ? n.delete(subagentGroupKey) : n.add(subagentGroupKey); return n; }); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
+                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); toggleSubagentGroup(subagentGroupKey); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
                                           <ChevronDown size={10} className={subagentExpanded ? "expanded" : ""} />
                                           <span className="subagent-inline-count">{totalSubagentCount}</span>
                                         </span>
@@ -7124,13 +7287,7 @@ export function App() {
                                   </div>
                                 )}
                                 {subagentExpanded && item.piSubagents?.length > 0 && (
-                                  <div className="codex-subagent-sidebar-group">
-                                    {item.piSubagents.map((sa) => (
-                                      <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong></div></div>
-                                      </button>
-                                    ))}
-                                  </div>
+                                  renderWtPiSubagentTree(item.piSubagents, subagentGroupKey, 0)
                                 )}
                               </Fragment>
                             );
@@ -7152,7 +7309,7 @@ export function App() {
                                     <div className="conversation-title">
                                       <strong title={session.name || t("common.untitled")}>{session.name || t("common.untitled")}</strong>
                                       {totalSubagentCount > 0 && (
-                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); setExpandedSubagentGroups(c => { const n = new Set(c); n.has(subagentGroupKey) ? n.delete(subagentGroupKey) : n.add(subagentGroupKey); return n; }); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
+                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); toggleSubagentGroup(subagentGroupKey); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
                                           <ChevronDown size={10} className={subagentExpanded ? "expanded" : ""} />
                                           <span className="subagent-inline-count">{totalSubagentCount}</span>
                                         </span>
@@ -7170,13 +7327,7 @@ export function App() {
                                   </div>
                                 )}
                                 {subagentExpanded && item.piSubagents?.length > 0 && (
-                                  <div className="codex-subagent-sidebar-group">
-                                    {item.piSubagents.map((sa) => (
-                                      <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong></div></div>
-                                      </button>
-                                    ))}
-                                  </div>
+                                  renderWtPiSubagentTree(item.piSubagents, subagentGroupKey, 0)
                                 )}
                               </Fragment>
                             );
@@ -9629,9 +9780,11 @@ export function App() {
           }}
           onClose={() => setModelPickerOpen(false)}
           onPick={selectModel}
-          favoriteModels={settings.favoriteModels}
-          onToggleFavorite={toggleFavoriteModel}
-        />
+						  favoriteModels={settings.favoriteModels}
+						  onToggleFavorite={toggleFavoriteModel}
+						  defaultModelKey={defaultModelKey}
+						  onSetDefault={setDefaultModel}
+					/>
       )}
       {composerModePickerOpen && (
         <ComposerModePicker
