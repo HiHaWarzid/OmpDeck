@@ -480,20 +480,13 @@ async function createWindow() {
 
 	// 根据用户的主题设置选择窗口背景色，避免系统标题栏与暗色主题间出现浅色条带。
 	const theme = settingsStore.get().theme;
-	const lightBg = settingsStore.get().lightBackground;
 	const isDark =
 		theme === "dark" ||
 		(theme === "system" && nativeTheme.shouldUseDarkColors);
-	const lightBgColors: Record<string, string> = {
-		white: "#ffffff",
-		warm: "#f3f4f1",
-		paper: "#f7f6f1",
-		blue: "#f4f8ff",
-		green: "#f4fbf6",
-	};
-	const backgroundColor = isDark
-		? "#111315"
-		: (lightBgColors[lightBg] ?? "#f3f4f1");
+	// 窗口背景色同时是启动链上两帧的间隙底色：data URL loading 页 → boot-overlay
+	// 跨文档导航时旧页面销毁、新页面未提交，此间隙会露出 backgroundColor。
+	// 对齐两处 loading 渐变的主色（浅 #eef0f3 / 深 #111315），避免闪出异色纯色帧。
+	const backgroundColor = isDark ? "#111315" : "#eef0f3";
 
 	const startupWindowMode = settingsStore.get().startupWindowMode ?? "maximized";
 	const startupBounds = resolveStartupWindowBounds(startupWindowMode);
@@ -706,10 +699,18 @@ async function createWindow() {
 	const devRendererUrl = shouldUseDevRendererUrl()
 		? process.env.ELECTRON_RENDERER_URL
 		: undefined;
+
+	// 直接加载真实 renderer（其 index.html 自带 boot-overlay 启动画面），不再先切
+	// data URL loading 页：跨文档导航会整页替换（旧页消失→间隙→新页出现），即使两页
+	// 内容同构也造成可感知的闪烁。窗口显示由 ready-to-show 门控（Electron 保证该时机
+	// 显示无视觉闪烁），窗口出现时 boot-overlay 已渲染完成，启动画面与 React 之间
+	// 只有 boot-overlay 自身的淡出过渡，全程无整页切换。
 	if (devRendererUrl) {
-		mainWindow.loadURL(devRendererUrl);
+		void mainWindow.loadURL(devRendererUrl).catch((error) => {
+			void appLogger.error("app", "Main renderer load failed", { error });
+		});
 	} else {
-		mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
+		void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
 	}
 }
 
