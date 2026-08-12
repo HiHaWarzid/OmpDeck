@@ -1043,13 +1043,30 @@ function SettingsModalContent(props: SettingsModalProps) {
 												loading={props.piUpdating}
 												disabled={
 													draftSettings.disableUpdateCheck ||
-													!props.piUpdateCheck?.hasUpdate
+													(!props.piUpdateCheck?.hasUpdate &&
+														!props.piUpdateCheck?.error)
 												}
 											>
 												{t("settings.updatePi")}
 											</Button>
 										</div>
 									</div>
+									{props.piUpdateCheck &&
+										(props.piUpdateCheck.currentVersion || props.piUpdateCheck.latestVersion) && (
+											<div className="setting-update-versions">
+												<span className={"setting-status " + (props.piUpdateCheck.hasUpdate ? "warning" : "success")}>
+													{t("settings.piUpdateStatus", {
+														current: props.piUpdateCheck.currentVersion ?? "?",
+														latest: props.piUpdateCheck.latestVersion ?? "?",
+													})}
+												</span>
+												{props.piUpdateCheck.error && (
+													<span className="setting-status error">
+														{props.piUpdateCheck.error}
+													</span>
+												)}
+											</div>
+										)}
 									{props.piUpdateResult && (
 										<pre className="setting-update-output">
 											{props.piUpdateResult.command}

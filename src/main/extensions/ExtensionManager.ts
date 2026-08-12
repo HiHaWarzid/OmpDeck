@@ -475,14 +475,25 @@ export class ExtensionManager {
 		return result;
 	}
 
+	/** omp 本体 npm 包名（与 omp update 内部一致，见 cli.js EAh）。 */
+	private static readonly PI_NPM_PACKAGE = "@oh-my-pi/pi-coding-agent";
+
 	async checkPiUpdate(): Promise<PiUpdateCheckResult> {
 		try {
 			const status = await this.locator.check(this.getSettings().customPiPath);
 			if (!status.installed) return { hasUpdate: false, error: status.error ?? "omp 未安装" };
-			// omp 自身版本检查通过 update --check，不通过 npm
+			// 用 npm view 查询最新版本：npm 继承 HTTP(S)_PROXY 等代理配置，比 omp 内置
+			// update --check（bun fetch 直连 registry.npmjs.org）在代理环境下更可靠。
+			const latestVersion = await this.npmViewVersion(ExtensionManager.PI_NPM_PACKAGE);
+			// omp --version 输出形如 "omp/17.2.12"，提取语义版本号后再比较。
+			const currentVersion =
+				status.version?.trim().match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/)?.[0] ??
+				status.version?.trim() ??
+				"";
 			return {
-				currentVersion: status.version,
-				hasUpdate: false,
+				currentVersion,
+				latestVersion,
+				hasUpdate: this.compareVersions(latestVersion, currentVersion) > 0,
 			};
 		} catch (error) {
 			return { hasUpdate: false, error: error instanceof Error ? error.message : String(error) };
@@ -490,15 +501,42 @@ export class ExtensionManager {
 	}
 
 	async updatePi(): Promise<PiCliUpdateResult> {
+		// 主路径 omp update：按安装方式（brew/mise/bun/npm）自动选择更新命令。
+		// 慢网络（代理/国内直连）下 12MB tarball 下载实测可达 300s+；
+		// 超时太短会导致 npm 只写完小文件、cli.js 未落盘，留下损坏安装。
 		try {
-			const output = await this.runPi(["update"], 120_000);
+			const output = await this.runPi(["update"], 600_000);
 			return this.toUpdateResult("omp update", output, true);
 		} catch (error) {
-			return {
-				command: "omp update",
-				output: error instanceof Error ? error.message : String(error),
-				updated: false,
-			};
+			const ompError = error instanceof Error ? error.message : String(error);
+			// omp update 内置版本检查用 bun fetch 直连 registry，代理环境下检查阶段即失败；
+			// npm 命令继承代理配置，回退 npm install 更可靠。仅当 omp 确为 npm 全局安装时
+			// 回退，避免给 brew/mise 用户装出并存的 npm 副本。
+			try {
+				if (!(await this.isPiInstalledViaNpm())) {
+					return { command: "omp update", output: ompError, updated: false };
+				}
+				// 同样给足 10 分钟：tarball 在慢网络下可能远超 2 分钟，提前杀掉会让
+				// package.json 与 cli.js 版本不一致，破坏 omp 安装。
+				const output = await this.runNpm(["install", "-g", `${ExtensionManager.PI_NPM_PACKAGE}@latest`], 600_000);
+				return this.toUpdateResult(`npm install -g ${ExtensionManager.PI_NPM_PACKAGE}@latest`, output, true);
+			} catch (npmError) {
+				return {
+					command: "omp update",
+					output: `${ompError}\n\nnpm 回退安装失败：${npmError instanceof Error ? npmError.message : String(npmError)}`,
+					updated: false,
+				};
+			}
+		}
+	}
+
+	/** 检测 omp 是否安装自 npm 全局目录；非 npm 安装时避免回退装出并存的副本。 */
+	private async isPiInstalledViaNpm(): Promise<boolean> {
+		try {
+			const output = await this.runNpm(["ls", "-g", ExtensionManager.PI_NPM_PACKAGE], 30_000);
+			return output.includes(ExtensionManager.PI_NPM_PACKAGE);
+		} catch {
+			return false;
 		}
 	}
 
@@ -539,16 +577,29 @@ export class ExtensionManager {
 	}
 
 	private npmViewVersion(packageName: string) {
-		const invocation = this.locator.createInvocation("npm", ["view", packageName, "version"]);
+		return this.runNpm(["view", packageName, "version"], 30_000);
+	}
+
+	/**
+	 * 执行 npm 命令。WSL 模式下 npm 也要在 WSL 内运行（与 omp 同一运行时环境），
+	 * 通过 wsl:// 前缀让 PiLocator 构造 wsl.exe 调用。
+	 */
+	private runNpm(args: string[], timeout: number): Promise<string> {
+		const settings = this.getSettings();
+		const command =
+			settings.wslEnabled && process.platform === "win32"
+				? `wsl://${settings.wslDistro}/${settings.wslUser}/npm`
+				: "npm";
+		const invocation = this.locator.createInvocation(command, args);
 		return new Promise<string>((resolve, reject) => {
 			execFile(
 				invocation.command,
 				invocation.args,
 				{
-					env: this.locator.createProcessEnv(this.getSettings(), invocation.pathPrefix),
+					env: this.locator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
 					shell: invocation.shell,
 					windowsHide: true,
-					timeout: 30_000,
+					timeout,
 					encoding: "utf8",
 					windowsVerbatimArguments: invocation.windowsVerbatimArguments,
 				},

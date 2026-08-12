@@ -12196,6 +12196,15 @@ body.is-composer-resizing .composer-resize-handle::after {
 }
 
 /* 更新命令输出 */
+.setting-update-versions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--space-1) 0 var(--space-2);
+}
+.setting-update-versions .setting-status {
+  margin-top: 0;
+}
 .setting-update-output {
   max-height: min(360px, 45vh);
   margin: var(--space-2) 0 var(--space-3);
