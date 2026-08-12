@@ -3909,6 +3909,22 @@ body.is-terminal-resizing {
 .message-list.message-list > * + * {
   margin-top: var(--space-4);
 }
+/* 新消息入场：淡入 + 轻微上滑（仅 transform/opacity，核显合成友好）。
+   React 复用同 key DOM，流式期间内容更新不会重触发动画；只在元素首次挂载时播放。
+   reduced-motion 由全局媒体查询统一降级。 */
+.message-list > * {
+  animation: message-enter 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 /* 会话定位跳转命中时的短暂高亮，帮助用户在长会话中识别落点。 */
 @keyframes messageJumpHighlight {
   0% {
@@ -4487,7 +4503,10 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  margin-top: var(--space-3);
+  /* 展开时淡入上滑（transform/opacity，核显友好）；收起即时（条件渲染卸载）。
+     与消息入场同一缓动，保证动效语言一致。 */
+  animation: message-enter 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  padding-top: var(--space-2);
 }
 .execution-summary-collapse {
   display: flex;
@@ -4785,6 +4804,14 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   color: var(--color-text-primary);
   font-size: var(--font-size-chat);
   line-height: 1.68;
+}
+
+/* 流式期间的纯文本近似渲染（Q8）：pre-wrap 保留换行/代码缩进，
+   不做 markdown 解析；回答结束后由 AssistantText 切换完整 markdown 渲染。 */
+.assistant-text-streaming {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* ---------- 诊断卡片：错误 / RPC / 系统状态 ---------- */

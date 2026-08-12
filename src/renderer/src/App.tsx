@@ -51,8 +51,6 @@ import {
   X,
   PanelLeft,
   PanelRight,
-  // 上下文压缩：用 FoldVertical 表达“折叠上下文”，比 Shrink 更克制、不抢模型名视线。
-  FoldVertical,
 } from "lucide-react";
 import { showNotice } from "./utils/notice";
 import { createPreviewApi } from "./previewApi";
@@ -66,7 +64,7 @@ import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
-import { THINKING_LEVELS } from "./components/app/AppParts";
+import { ComposerStatusChips } from "./components/app/AppParts";
 import {
   buildComposerPromptSubmission,
   expandPromptTemplates,
@@ -3128,10 +3126,17 @@ export function App() {
 
     // 使用 ref 而非闭包值，防止 DOM 变化与 React 状态更新之间的时序间隙造成滚动抢跑：
     // 用户已滚到上方（autoScroll=false），但状态更新尚未生效，observer 闭包中的 autoScroll 仍为 true。
+    // rAF 合并：流式期间内容每 50ms 增长触发一次 observer，同一帧内多次触发只执行一次
+    // scrollTo，避免每次 token 都做同步布局读取 + 滚动（虚拟显卡上这是滚动卡顿源）。
+    let scrollFrame = 0;
     const scrollIfNeeded = () => {
-      if (!autoScrollRef.current) return;
-      programmaticScrollRef.current = true;
-      timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
+      if (scrollFrame) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = 0;
+        if (!autoScrollRef.current) return;
+        programmaticScrollRef.current = true;
+        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
+      });
     };
     // 重建 observer 时先主动滚一次，处理 autoScroll 从 false→true 但列表高度未变的场景。
     scrollIfNeeded();
@@ -3139,7 +3144,10 @@ export function App() {
     const resizeObserver = new ResizeObserver(scrollIfNeeded);
     resizeObserver.observe(messageList);
 
-    return () => resizeObserver.disconnect();
+    return () => {
+      if (scrollFrame) cancelAnimationFrame(scrollFrame);
+      resizeObserver.disconnect();
+    };
   }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length]);
 
   // 加载更多历史消息后，按顶部锁定的方式恢复滚动位置。
@@ -8530,87 +8538,18 @@ export function App() {
                 />
               </div>
               <div className="composer-bottom-center">
-                <button
-                  type="button"
-                  className="composer-bar-btn model"
-                  disabled={isAgentBusy || isAgentStarting}
-                  onClick={openModelPicker}
-                  title={t("app.modelPickerTitle")}
-                >
-                  {activeRuntimeState?.modelName
-                    ? `${activeRuntimeState.provider ? `${activeRuntimeState.provider}/` : ""}${activeRuntimeState.modelName}`
-                    : t("app.model") + ": —"}
-                </button>
-                {activeRuntimeState?.thinkingLevel && (
-                  <button
-                    type="button"
-                    className="composer-bar-btn thinking"
-                    disabled={isAgentBusy || isAgentStarting}
-                    onClick={() => setThinkingPickerOpen(true)}
-                    title={t("app.thinkingPickerTitle")}
-                  >
-                    {(() => {
-                      const level = THINKING_LEVELS.find((l) => l.value === activeRuntimeState.thinkingLevel);
-                      return level ? t(level.labelKey) : activeRuntimeState.thinkingLevel;
-                    })()}
-                  </button>
-                )}
-                {/* 上下文压缩：与 /compact 同一路径。
-                    仅在占用达到阈值后显示，避免会话过小仍点压缩触发 Nothing to compact。
-                    阈值与旧 ComposerToolbar 一致（>30%）；压缩进行中始终保留入口。 */}
-                {(() => {
-                  const contextPercent =
-                    activeRuntimeState?.contextPercent != null
-                      ? Number(activeRuntimeState.contextPercent)
-                      : null;
-                  const isCompactingNow =
-                    compacting || Boolean(activeRuntimeState?.isCompacting);
-                  // 30% 以下几乎总会被 pi 拒绝；70%/90% 用色阶提示紧迫度，而不是常驻抢眼按钮。
-                  // 压缩进行中即使百分比短暂缺失也保留入口，避免状态闪断。
-                  const showCompactButton =
-                    Boolean(activeAgentId) &&
-                    !isPendingAgentId(activeAgentId) &&
-                    (isCompactingNow ||
-                      (contextPercent != null && contextPercent > 30));
-                  if (!showCompactButton) return null;
-                  const urgency =
-                    contextPercent != null && contextPercent >= 90
-                      ? " critical"
-                      : contextPercent != null && contextPercent >= 70
-                        ? " warn"
-                        : "";
-                  return (
-                    <button
-                      type="button"
-                      className={`composer-bar-btn compact${urgency}${isCompactingNow ? " compacting" : ""}`}
-                      disabled={
-                        isAgentStarting ||
-                        isCompactingNow ||
-                        Boolean(activeRuntimeState?.isStreaming)
-                      }
-                      onClick={() => void compactAgent()}
-                      title={
-                        contextPercent != null
-                          ? t("app.contextCompactTitle", {
-                              percent: contextPercent.toFixed(1),
-                            })
-                          : t("app.compact")
-                      }
-                      aria-label={t("app.compact")}
-                    >
-                      <FoldVertical size={13} strokeWidth={1.8} aria-hidden="true" />
-                      <span>
-                        {isCompactingNow
-                          ? t("app.compacting")
-                          : contextPercent != null
-                            ? t("app.compactUsage", {
-                                percent: contextPercent.toFixed(0),
-                              })
-                            : t("app.compact")}
-                      </span>
-                    </button>
-                  );
-                })()}
+                {/* 模型/思考级别/上下文压缩 chips：抽为 memo 组件，流式期间
+                    activeRuntimeState 引用稳定，避免每 token 重渲染这些按钮。 */}
+                <ComposerStatusChips
+                  state={activeRuntimeState}
+                  activeAgentId={activeAgentId}
+                  isAgentBusy={isAgentBusy}
+                  isAgentStarting={isAgentStarting}
+                  compacting={compacting}
+                  onOpenModelPicker={openModelPicker}
+                  onOpenThinkingPicker={() => setThinkingPickerOpen(true)}
+                  onCompact={() => void compactAgent()}
+                />
               </div>
               <div className="composer-bottom-right">
                 {/* 当前项目分支只读展示：放右侧发送区前，纯文本样式无边框阴影。 */}

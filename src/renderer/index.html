@@ -142,6 +142,16 @@
         .boot-progress-bar {
           animation: none !important;
         }
+        /* 动画被禁用时进度条不应静止在 42% 中间像卡死：
+           改为满轨淡色条，保留“正在加载”语义但不暗示进度停滞。 */
+        .boot-progress-bar {
+          width: 100%;
+          background: linear-gradient(
+            90deg,
+            rgba(26, 158, 60, 0.3),
+            rgba(34, 197, 94, 0.3)
+          );
+        }
         #boot-overlay {
           transition-duration: 120ms;
         }

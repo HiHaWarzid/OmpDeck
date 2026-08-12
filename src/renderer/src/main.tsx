@@ -80,7 +80,13 @@ ReactDOM.createRoot(rootElement).render(
  * 再用 requestAnimationFrame 触发 fade-out 类，让浏览器在下一次帧中
  * 执行 CSS transition，实现平滑过渡。
  * 额外设置 fallback 超时，避免 transitionend 丢失导致遮罩残留。
+ *
+ * 最小展示时长 MIN_BOOT_MS：防止"加载页秒没"——React 挂载极快时读条几乎不可见，
+ * 给读条留出存在感；若真实启动本来就慢（已超过该时长），则立即淡出不额外拖慢。
  */
+const MIN_BOOT_MS = 800;
+const bootMountedAt = performance.now();
+
 requestAnimationFrame(() => {
   writeStartupLog("info", "Renderer React tree mounted");
 
@@ -94,13 +100,14 @@ requestAnimationFrame(() => {
     overlay.remove();
   };
 
-  // 下一帧触发 fade-out class，确保 CSS transition 生效
-  requestAnimationFrame(() => {
+  // 已展示时长不足最小展示时长时，推迟到满足后再淡出。
+  const remaining = Math.max(0, MIN_BOOT_MS - (performance.now() - bootMountedAt));
+  window.setTimeout(() => {
     overlay.classList.add("fade-out");
 
     // 过渡结束后从 DOM 移除覆盖层，释放层级上下文
     overlay.addEventListener("transitionend", removeOverlay, { once: true });
     // 兜底：某些环境下 transitionend 可能不触发
     window.setTimeout(removeOverlay, 700);
-  });
+  }, remaining);
 });

@@ -99,6 +99,7 @@ import {
 	UserPen,
 	// 会话 fork：从该用户消息切出新会话（对应 pi /fork），忙碌时不展示。
 	GitFork,
+	FoldVertical,
 } from "lucide-react";
 import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../fileIcons";
 import { normalizeSessionPathForCompare } from "../../agentListDisplay";
@@ -510,7 +511,7 @@ export function EnvironmentDialog(props: {
 	);
 }
 
-export function SessionStatus(props: {
+export const SessionStatus = memo(function SessionStatus(props: {
 	state?: AgentRuntimeState;
 	duration?: number;
 }) {
@@ -557,12 +558,129 @@ export function SessionStatus(props: {
 			)}
 		</div>
 	);
-}
+});
 
 /** 单个 extension widget 卡片：可折叠标题栏 + 内容行，支持手动关闭 */
 // widgetKey 由扩展定义且跨重启稳定,可按 widgetKey 持久化折叠状态。
 const EXTENSION_WIDGET_COLLAPSED_KEY_PREFIX =
 	"pid:extension-widget-collapsed:";
+
+/**
+ * Composer 底栏状态 chips（模型 / 思考级别 / 上下文压缩）。
+ * 从巨型 App() 抽出并 memo：activeRuntimeState 在纯文本流式期间引用稳定
+ * （主进程仅在工具边沿推送 runtimeState），流式 token 不应让这些按钮重渲染。
+ * 回调类 prop 由比较器忽略（App 侧函数声明每次重执行重建，但内容不变时无需渲染）。
+ */
+export const ComposerStatusChips = memo(
+	function ComposerStatusChips(props: {
+		state?: AgentRuntimeState;
+		activeAgentId?: string;
+		isAgentBusy: boolean;
+		isAgentStarting: boolean;
+		compacting: boolean;
+		onOpenModelPicker: () => void;
+		onOpenThinkingPicker: () => void;
+		onCompact: () => void;
+	}) {
+		const {
+			state,
+			activeAgentId,
+			isAgentBusy,
+			isAgentStarting,
+			compacting,
+			onOpenModelPicker,
+			onOpenThinkingPicker,
+			onCompact,
+		} = props;
+		return (
+			<div className="composer-bottom-center">
+				<button
+					type="button"
+					className="composer-bar-btn model"
+					disabled={isAgentBusy || isAgentStarting}
+					onClick={onOpenModelPicker}
+					title={t("app.modelPickerTitle")}
+				>
+					{state?.modelName
+						? `${state.provider ? `${state.provider}/` : ""}${state.modelName}`
+						: t("app.model") + ": —"}
+				</button>
+				{state?.thinkingLevel && (
+					<button
+						type="button"
+						className="composer-bar-btn thinking"
+						disabled={isAgentBusy || isAgentStarting}
+						onClick={onOpenThinkingPicker}
+						title={t("app.thinkingPickerTitle")}
+					>
+						{(() => {
+							const level = THINKING_LEVELS.find((l) => l.value === state.thinkingLevel);
+							return level ? t(level.labelKey) : state.thinkingLevel;
+						})()}
+					</button>
+				)}
+				{/* 上下文压缩：与 /compact 同一路径。
+				    仅在占用达到阈值后显示，避免会话过小仍点压缩触发 Nothing to compact。
+				    阈值与旧 ComposerToolbar 一致（>30%）；压缩进行中始终保留入口。 */}
+				{(() => {
+					const contextPercent =
+						state?.contextPercent != null ? Number(state.contextPercent) : null;
+					const isCompactingNow = compacting || Boolean(state?.isCompacting);
+					// 30% 以下几乎总会被 pi 拒绝；70%/90% 用色阶提示紧迫度，而不是常驻抢眼按钮。
+					// 压缩进行中即使百分比短暂缺失也保留入口，避免状态闪断。
+					const showCompactButton =
+						Boolean(activeAgentId) &&
+						!activeAgentId?.startsWith("pending-") &&
+						(isCompactingNow || (contextPercent != null && contextPercent > 30));
+					if (!showCompactButton) return null;
+					const urgency =
+						contextPercent != null && contextPercent >= 90
+							? " critical"
+							: contextPercent != null && contextPercent >= 70
+								? " warn"
+								: "";
+					return (
+						<button
+							type="button"
+							className={`composer-bar-btn compact${urgency}${isCompactingNow ? " compacting" : ""}`}
+							disabled={
+								isAgentStarting ||
+								isCompactingNow ||
+								Boolean(state?.isStreaming)
+							}
+							onClick={onCompact}
+							title={
+								contextPercent != null
+									? t("app.contextCompactTitle", {
+											percent: contextPercent.toFixed(1),
+										})
+									: t("app.compact")
+							}
+							aria-label={t("app.compact")}
+						>
+							<FoldVertical size={13} strokeWidth={1.8} aria-hidden="true" />
+							<span>
+								{isCompactingNow
+									? t("app.compacting")
+									: contextPercent != null
+										? t("app.compactUsage", {
+												percent: contextPercent.toFixed(0),
+											})
+										: t("app.compact")}
+							</span>
+						</button>
+					);
+				})()}
+			</div>
+		);
+	},
+	(previous, next) =>
+		previous.state === next.state &&
+		previous.activeAgentId === next.activeAgentId &&
+		previous.isAgentBusy === next.isAgentBusy &&
+		previous.isAgentStarting === next.isAgentStarting &&
+		previous.compacting === next.compacting,
+);
 
 /** Todo / Plan 两个扩展各自 setWidget，桌面端合成一张任务卡时用此 key 做折叠持久化。 */
 export const MERGED_TASK_WIDGET_KEY = "pi-deck-task-board";
@@ -3317,31 +3435,6 @@ function TableWrapper(props: React.ComponentProps<"table">) {
 	);
 }
 
-/** 流式输出期间的轻量代码块：不加载 mermaid、不跑数学/语法高亮，只展示原始文本，
- *  避免未闭合的 ```mermaid 围栏触发 mermaid.initialize/render 挤占主线程。 */
-function StreamingCodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
-	const child = Array.isArray(props.children) ? props.children[0] : props.children;
-	const codeProps = isValidElement(child)
-		? (child.props as { className?: string; children?: ReactNode })
-		: undefined;
-	const text = extractText(codeProps?.children ?? props.children);
-	const [copied, setCopied] = useState(false);
-	const handleCopy = () => {
-		writeClipboard(text);
-		setCopied(true);
-		showNotice(t("app.codeCopied"), 1200);
-		setTimeout(() => setCopied(false), 1800);
-	};
-	return (
-		<div className="code-block-wrap">
-			<button className="code-copy" onClick={handleCopy} title={t("code.copy")}>
-				{copied ? <Check size={14} /> : <Copy size={14} />}
-			</button>
-			<pre {...props}>{props.children}</pre>
-		</div>
-	);
-}
-
 export const AssistantText = memo(
 	function AssistantText(props: {
 		text: string;
@@ -3349,27 +3442,22 @@ export const AssistantText = memo(
 		onPreviewImage: (image: ImageContent) => void;
 		onOpenExternal: (url: string) => void;
 		onOpenFile?: (path: string) => void;
-		/** 当前消息是否正在流式追加。为 true 时走轻量渲染路径，跳过 KaTeX 数学解析与
-		 *  mermaid 图渲染，避免每个 token 都对不断增长的全量正文调用重型插件导致主线程卡死。 */
+		/** 当前消息是否正在流式追加。为 true 时走纯文本近似渲染（不解析 markdown），
+		 *  回答结束后一次性切完整渲染——流式期间避免每个 token 都对不断增长的全量正文
+		 *  跑 remark 解析（O(n²) 卡顿源）。取舍：流式中无行内格式，结束瞬间切换。 */
 		isStreaming?: boolean;
 	}) {
 		// 清理 ANSI 转义码与 <thinking> 标签，thinking 由调用方通过 ThinkingBlock 渲染
 		const cleanText = stripThinkingTags(stripAnsi(props.text));
-		// 流式期间用轻量管线（仅 GFM + 路径链接化），回答结束后切回含数学/图表的完整渲染。
+		// 流式期间用纯文本近似渲染，回答结束后切回含数学/图表的完整渲染。
 		const streaming = Boolean(props.isStreaming);
-
-		// 稳定 remark/rehype 插件数组引用：ReactMarkdown 会对 plugins 数组做引用对比，
-		// 每次渲染新建数组会触发整条 markdown 重新解析（含 KaTeX / mermaid），是流式期间的主要卡顿源。
-		// streaming 只有两种取值，用模块级常量避免每次渲染分配。
-		const remarkPlugins = streaming ? STREAMING_REMARK_PLUGINS : FULL_REMARK_PLUGINS;
-		const rehypePlugins = streaming ? EMPTY_REHYPE_PLUGINS : FULL_REHYPE_PLUGINS;
 
 		// components 对象做 useMemo 稳定引用：a 组件需要闭包捕获 onOpenExternal/onOpenFile，
 		// 但这两个回调在 App 中是稳定的（读 ref 或 setState），故依赖 [] 即可。
 		// memo 比较器已排除回调，组件不会因回调变化而重渲染，闭包始终拿到首次渲染的引用即可。
 		const components = useMemo(
 			() => ({
-				pre: streaming ? StreamingCodeBlock : CodeBlock,
+				pre: CodeBlock,
 				table: TableWrapper,
 				span: MathSpan,
 				a: (linkProps: React.ComponentProps<"a">) => (
@@ -3381,27 +3469,39 @@ export const AssistantText = memo(
 				),
 			}),
 			// eslint-disable-next-line react-hooks/exhaustive-deps
-			[streaming, props.onOpenExternal, props.onOpenFile],
+			[props.onOpenExternal, props.onOpenFile],
 		);
+
+		const imagesMarkup = props.images && props.images.length > 0 ? (
+			<div className="message-images">
+				{props.images.map((img, index) => (
+					<img
+						key={index}
+						src={`data:${img.mimeType};base64,${img.data}`}
+						alt={t("app.imageAlt", { index: index + 1 })}
+						className="message-image"
+						onClick={() => props.onPreviewImage(img)}
+					/>
+				))}
+			</div>
+		) : null;
+
+		// 流式：纯文本 + pre-wrap，不做 markdown 解析（消除 O(n²) 全文重解析）。
+		if (streaming) {
+			return (
+				<div className="assistant-text markdown-body">
+					{imagesMarkup}
+					<div className="assistant-text-streaming">{cleanText}</div>
+				</div>
+			);
+		}
 
 		return (
 			<div className="assistant-text markdown-body">
-				{props.images && props.images.length > 0 && (
-					<div className="message-images">
-						{props.images.map((img, index) => (
-							<img
-								key={index}
-								src={`data:${img.mimeType};base64,${img.data}`}
-								alt={t("app.imageAlt", { index: index + 1 })}
-								className="message-image"
-								onClick={() => props.onPreviewImage(img)}
-							/>
-						))}
-					</div>
-				)}
+				{imagesMarkup}
 				<ReactMarkdown
-					remarkPlugins={remarkPlugins}
-					rehypePlugins={rehypePlugins}
+					remarkPlugins={FULL_REMARK_PLUGINS}
+					rehypePlugins={FULL_REHYPE_PLUGINS}
 					urlTransform={markdownUrlTransform}
 					components={components}
 				>
@@ -4114,10 +4214,8 @@ const remarkLinkifyPaths = () => {
 
 // ── ReactMarkdown 插件数组常量 ──
 // ReactMarkdown 对 plugins 数组做引用对比；每次渲染新建数组会触发整条 markdown 重新解析。
-// 流式/非流式两种管线各自只取一组常量引用，避免流式期间每个 token 都重新初始化插件链。
-const STREAMING_REMARK_PLUGINS = [remarkGfm, remarkLinkifyPaths];
+// 完整渲染管线常量：引用稳定，避免每次渲染重新初始化插件链。
 const FULL_REMARK_PLUGINS = [remarkGfm, remarkMath, remarkLinkifyPaths];
-const EMPTY_REHYPE_PLUGINS: [] = [];
 const FULL_REHYPE_PLUGINS = [rehypeKatex];
 
 function getToolStatus(message: ChatMessage): "running" | "done" | "error" {
