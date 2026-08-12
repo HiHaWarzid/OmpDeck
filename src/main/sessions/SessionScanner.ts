@@ -33,6 +33,12 @@ export class SessionScanner {
    */
   private readonly projectMatchTextCache = new Map<string, { version: FileVersion; text: string }>();
   /**
+   * isSessionFile 校验结果的指纹缓存：父会话候选文件（<stem>.jsonl）只在子会话
+   * 结束时才更新，每次扫描对每个候选父做 stat + readHead(4096) 的成本可省。
+   * 与 projectMatchTextCache 同一处修剪。
+   */
+  private readonly sessionFileCheckCache = new Map<string, { version: FileVersion; valid: boolean }>();
+  /**
    * 最近一次 list() 解析出的会话扫描根目录。
    * 默认 ~/.omp/agent/sessions，加上 settings 中的 sessionDir（如项目 .omp/sessions）。
    * 供子会话父路径推断作为边界。
@@ -142,6 +148,10 @@ export class SessionScanner {
         const fileSet = new Set(files.map((f) => this.normalize(f)));
         for (const key of this.projectMatchTextCache.keys()) {
           if (!fileSet.has(this.normalize(key))) this.projectMatchTextCache.delete(key);
+        }
+        // 父会话校验缓存同样只保留当前扫描集合内的条目。
+        for (const key of this.sessionFileCheckCache.keys()) {
+          if (!fileSet.has(this.normalize(key))) this.sessionFileCheckCache.delete(key);
         }
         this.summaryCacheFileSetKey = fileSetKey;
       }
@@ -679,7 +689,15 @@ export class SessionScanner {
    */
   private async isSessionFile(filePath: string, signal?: AbortSignal): Promise<boolean> {
     try {
-      return this.hasSessionHeader(await this.fileAdapter.readHead(filePath, 4096, signal));
+      const info = await this.fileAdapter.stat(filePath, signal);
+      const version = { mtimeMs: info.mtimeMs, size: info.size };
+      const cached = this.sessionFileCheckCache.get(filePath);
+      if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
+        return cached.valid;
+      }
+      const valid = this.hasSessionHeader(await this.fileAdapter.readHead(filePath, 4096, signal));
+      this.sessionFileCheckCache.set(filePath, { version, valid });
+      return valid;
     } catch {
       return false;
     }
