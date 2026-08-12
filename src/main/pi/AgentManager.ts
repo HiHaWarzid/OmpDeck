@@ -32,6 +32,7 @@ import {
 	getToolPathFromArgs,
 	trimHistoryMessages,
 } from "./messageTimeline";
+import { perfEnd, perfStart } from "../perf";
 import {
 	buildAskCard,
 	extractAskQuestionDetails,
@@ -177,8 +178,14 @@ export class AgentManager {
 		return false;
 	}
 
-	getMessages(agentId: string) {
-		return this.requireRuntime(agentId).messages;
+	/**
+	 * 返回某 agent 当前内存中的完整消息数组（只读快照）。
+	 * 供渲染层增量失同步自愈（渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）、
+	 * FeishuBridge/WebService 同步时间线使用。不存在该 agent 时返回空数组，
+	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
+	 */
+	getMessages(agentId: string): ChatMessage[] {
+		return this.agents.get(agentId)?.messages ?? [];
 	}
 
 	/**
@@ -456,6 +463,8 @@ export class AgentManager {
 			options?.preserveMessagesAfter,
 		);
 		runtime.messages = nextMessages;
+		// 整组重建：下一次 flush 必须是全量基线（渲染层整体替换），不能用增量合并。
+		this.markAllMessagesDirty(runtime);
 		// 重建 TodoWrite 快照：从该 agent 最后一条 TodoWrite 工具消息的 meta.args 反解 todos。
 		// 历史恢复时无 tool_execution_end 事件可派生，靠工具消息自身存储的 args 重建。
 		this.rebuildTodosFromHistory(runtime);
@@ -725,7 +734,10 @@ export class AgentManager {
 							loadingMessage.text = "历史会话加载失败，可继续使用当前 Agent 或重新打开会话重试。";
 							loadingMessage.meta = { historyLoading: "failed" };
 							loadingMessage.timestamp = Date.now();
-							if (rt) this.scheduleMessageEmit(rt, true);
+							if (rt) {
+								this.markMessageDirty(rt, loadingMessage);
+								this.scheduleMessageEmit(rt, true);
+							}
 						}
 						void this.appLogger?.warn("agent", "Agent history background load failed", {
 							agentId: id,
@@ -759,7 +771,10 @@ export class AgentManager {
 							loadingMessage.text = "历史会话加载失败，可继续使用当前 Agent 或重新打开会话重试。";
 							loadingMessage.meta = { historyLoading: "failed" };
 							loadingMessage.timestamp = Date.now();
-							if (rt) this.scheduleMessageEmit(rt, true);
+							if (rt) {
+								this.markMessageDirty(rt, loadingMessage);
+								this.scheduleMessageEmit(rt, true);
+							}
 						}
 						void this.appLogger?.warn("agent", "Agent recent history file load failed", {
 							agentId: id,
@@ -1068,6 +1083,7 @@ export class AgentManager {
 				);
 				if (idx !== -1) {
 					messages.splice(idx, 1);
+					this.markMessagesDirty(runtime, idx);
 				}
 			}
 			pending.clear();
@@ -3064,6 +3080,7 @@ export class AgentManager {
 			);
 			if (idx !== -1) {
 				messages.splice(idx, 1);
+				this.markMessagesDirty(runtime, idx);
 			}
 		} else {
 			for (const msg of messages) {
@@ -3075,6 +3092,7 @@ export class AgentManager {
 				) {
 					(msg.meta as Record<string, string>).status = "answered";
 					(msg.meta as Record<string, unknown>).response = response;
+					this.markMessageDirty(runtime, msg);
 					break;
 				}
 			}
@@ -3327,6 +3345,8 @@ export class AgentManager {
 				existing.thinkingStartedAt = thinkingStartedAt;
 			}
 			if (thinkingEndedAt) existing.thinkingEndedAt = thinkingEndedAt;
+			// 就地更新：标记该消息自上次 flush 起已变更，增量推送需覆盖它。
+			this.markMessageDirty(runtime, existing);
 		} else {
 			const text = extractedText || fallbackDelta;
 			if (!text) return;
@@ -3340,6 +3360,7 @@ export class AgentManager {
 				...(thinkingStartedAt ? { thinkingStartedAt } : {}),
 				...(thinkingEndedAt ? { thinkingEndedAt } : {}),
 			});
+			this.markMessagesDirty(runtime, list.length - 1);
 		}
 
 		if (nextThinking && (extractedText || fallbackDelta)) {
@@ -3529,6 +3550,7 @@ export class AgentManager {
 			existing.text = text;
 			existing.timestamp = Date.now();
 			existing.meta = meta;
+			this.markMessageDirty(runtime, existing);
 		} else {
 			list.push({
 				id: messageId,
@@ -3538,6 +3560,7 @@ export class AgentManager {
 				timestamp: Date.now(),
 				meta,
 			});
+			this.markMessagesDirty(runtime, list.length - 1);
 		}
 
 		// TodoWrite 终态时派生 currentTodos 并推送 widget。
@@ -3567,6 +3590,7 @@ export class AgentManager {
 			meta,
 			...(images && images.length > 0 ? { images } : {}),
 		});
+		this.markMessagesDirty(runtime, runtime.messages.length - 1);
 		if (role === "user" || role === "assistant") this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
 	}
@@ -3637,6 +3661,7 @@ export class AgentManager {
 				timestamp: Date.now(),
 			};
 			list.push(message);
+			this.markMessagesDirty(runtime, list.length - 1);
 			runtime.retryStatusMessageId = messageId;
 		}
 
@@ -3658,6 +3683,7 @@ export class AgentManager {
 		}
 		message.timestamp = Date.now();
 		message.meta = { status, attempt, maxAttempts, delayMs, errorMessage: reason };
+		this.markMessageDirty(runtime, message);
 
 		this.scheduleMessageEmit(runtime, true);
 	}
@@ -3683,6 +3709,7 @@ export class AgentManager {
 			);
 			if (idx !== -1) {
 				messages.splice(idx, 1);
+				this.markMessagesDirty(runtime, idx);
 				this.scheduleMessageEmit(runtime, false);
 			}
 
@@ -3829,6 +3856,23 @@ export class AgentManager {
 		runtime.messageFlushTimer = timer;
 	}
 
+	/** 记录消息数组自上次 flush 以来的最早变更下标，增量推送据此计算 replaceFrom。 */
+	private markMessagesDirty(runtime: AgentRuntime, fromIndex: number): void {
+		if (fromIndex < runtime.messageDirtyFrom) runtime.messageDirtyFrom = fromIndex;
+	}
+
+	/** 记录某条消息被就地变更（按引用定位下标，避免各调用方自己维护 index）。 */
+	private markMessageDirty(runtime: AgentRuntime, message: ChatMessage | undefined): void {
+		if (!message) return;
+		const index = runtime.messages.indexOf(message);
+		if (index !== -1) this.markMessagesDirty(runtime, index);
+	}
+
+	/** 整组消息被重建（历史加载/重启替换），下一次 flush 必须全量推送基线。 */
+	private markAllMessagesDirty(runtime: AgentRuntime): void {
+		runtime.messageDirtyFrom = 0;
+	}
+
 	/** 取消尚未 flush 的消息推送，abort 时避免旧数组晚到覆盖 UI。 */
 	private cancelMessageEmit(runtime: AgentRuntime) {
 		const timer = runtime.messageFlushTimer;
@@ -3846,9 +3890,23 @@ export class AgentManager {
 			runtime.messageFlushTimer = undefined;
 		}
 		runtime.pendingMessage = false;
+		const messages = runtime.messages;
+		// 增量推送：只传输 messageDirtyFrom 之后的变更。replaceFrom === 0 时是
+		// 全量基线（渲染层 slice(0,0) 合并即整体替换），其余情况为尾部增量。
+		const replaceFrom = Math.min(runtime.messageDirtyFrom, messages.length);
+		// 本轮变更已随 slice 发出，重置为数组尾部；下一次变更再向前收缩。
+		runtime.messageDirtyFrom = messages.length;
+		const t0 = perfStart("agents:message-flush");
 		this.emit(ipcChannels.agentsMessage, {
 			agentId: runtime.tab.id,
-			messages: runtime.messages,
+			replaceFrom,
+			messages: messages.slice(replaceFrom),
+		});
+		perfEnd("agents:message-flush", t0, {
+			agentId: runtime.tab.id,
+			replaceFrom,
+			sent: messages.length - replaceFrom,
+			total: messages.length,
 		});
 	}
 
@@ -3922,6 +3980,12 @@ type AgentRuntime = {
 	// 消息 emit 节流
 	messageFlushTimer?: NodeJS.Timeout;
 	pendingMessage: boolean;
+	/**
+	 * 自上次 flush 以来最早被变更的消息下标，作为增量推送的 replaceFrom。
+	 * flush 后重置为 messages.length；任何消息增/删/就地更新都向前收缩该值。
+	 * 历史加载/重启重建时置 0，强制下一次 flush 全量推送基线。
+	 */
+	messageDirtyFrom: number;
 
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;
@@ -3967,6 +4031,7 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 		toolExecuting: null,
 		streamGate: createStreamGateState(),
 		pendingMessage: false,
+		messageDirtyFrom: 0,
 		pendingUIRequests: new Map(),
 		currentTodos: [],
 		rpcLogging: false,

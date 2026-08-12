@@ -1,4 +1,5 @@
 import type { FileAdapter } from "../fs/adapters/fileAdapter";
+import type { FileVersion } from "../fs/adapters/fileAdapter";
 import { LocalFileAdapter } from "../fs/adapters/localFileAdapter";
 import { WslFileAdapter } from "../fs/adapters/wslFileAdapter";
 import { randomUUID } from "node:crypto";
@@ -25,6 +26,12 @@ export class SessionScanner {
   private scanTimeoutMs = 18_000;
   private readonly summaryCache = new SessionSummaryCache<SessionSummary | null>();
   private summaryCacheFileSetKey = "";
+  /**
+   * isSameProject 内容校验的文本缓存：以 (mtimeMs, size) 为指纹。
+   * 只有「父目录 cwd 会话」才需要整读内容匹配项目路径（isParentSessionForProject），
+   * 重复扫描时避免对同一文件反复整读；随 summaryCache 的 fileSetKey 变化一起修剪。
+   */
+  private readonly projectMatchTextCache = new Map<string, { version: FileVersion; text: string }>();
   /**
    * 最近一次 list() 解析出的会话扫描根目录。
    * 默认 ~/.omp/agent/sessions，加上 settings 中的 sessionDir（如项目 .omp/sessions）。
@@ -131,6 +138,11 @@ export class SessionScanner {
       if (fileSetKey !== this.summaryCacheFileSetKey) {
         // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
         this.summaryCache.prune(files, this.wslConfig ? "wsl" : "local");
+        // 同步修剪项目匹配文本缓存，避免已删除会话的整读文本长期残留内存。
+        const fileSet = new Set(files.map((f) => this.normalize(f)));
+        for (const key of this.projectMatchTextCache.keys()) {
+          if (!fileSet.has(this.normalize(key))) this.projectMatchTextCache.delete(key);
+        }
         this.summaryCacheFileSetKey = fileSetKey;
       }
 
@@ -1043,8 +1055,16 @@ export class SessionScanner {
 
   private async readCachedText(filePath: string, signal?: AbortSignal) {
     try {
+      const info = await this.fileAdapter.stat(filePath, signal);
+      const version = { mtimeMs: info.mtimeMs, size: info.size };
+      const cached = this.projectMatchTextCache.get(filePath);
+      if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
+        return cached.text;
+      }
       const raw = await this.fileAdapter.read(filePath, signal);
-      return raw.replace(/\\/g, "/").toLowerCase();
+      const text = raw.replace(/\\/g, "/").toLowerCase();
+      this.projectMatchTextCache.set(filePath, { version, text });
+      return text;
     } catch {
       return "";
     }

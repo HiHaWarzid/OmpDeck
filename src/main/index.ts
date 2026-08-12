@@ -215,6 +215,7 @@ import {
 } from "./editors/EditorDetector";
 import { FeishuBridge } from "./feishu/FeishuBridge";
 import { listBots } from "./feishu/FeishuConfig";
+import { perfDump } from "./perf";
 
 let mainWindow: BrowserWindow | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
@@ -1187,6 +1188,8 @@ app.on("before-quit", () => {
 	petSystem?.stop();
 	petSystem = null;
 	quickGen?.stop();
+	// PIDECK_PERF=1 时输出本次会话关键路径耗时汇总。
+	perfDump();
 });
 
 app.on("window-all-closed", () => {

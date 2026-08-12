@@ -11,6 +11,7 @@ import type { GitService } from "../git/GitService";
 import type { WorktreeService } from "../git/WorktreeService";
 import type { AppLogger } from "../logging/AppLogger";
 import type { QuickGenProcess } from "../pi/QuickGenProcess";
+import { perfEnd, perfStart } from "../perf";
 
 interface GitHandlerDeps {
 	projectStore: ProjectStore;
@@ -145,7 +146,15 @@ export function registerGitHandlers(deps: GitHandlerDeps) {
 	ipcMain.handle(ipcChannels.gitStatus, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);
 		if (!project) return { merge: [], index: [], workingTree: [], untracked: [] };
-		return gitService.getStatus(project.path);
+		const t0 = perfStart("git:status");
+		try {
+			const status = await gitService.getStatus(project.path);
+			perfEnd("git:status", t0, { projectId });
+			return status;
+		} catch (error) {
+			perfEnd("git:status", t0, { projectId, error: true });
+			throw error;
+		}
 	});
 
 	ipcMain.handle(
@@ -273,6 +282,8 @@ export function registerGitHandlers(deps: GitHandlerDeps) {
 		const execFileAsync = promisify(execFile);
 		// 初始化仓库并创建 main 分支，生成一个初始空提交
 		await execFileAsync("git", ["init"], { cwd: project.path });
+		// 此前非 git 仓库的失败状态可能还在冷却缓存内，init 后必须失效，否则抽屉仍提示"非 git 项目"。
+		gitService.invalidateStatusCache(project.path);
 		try {
 			await execFileAsync("git", ["checkout", "-b", "main"], { cwd: project.path });
 		} catch {

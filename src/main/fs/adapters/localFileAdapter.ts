@@ -1,20 +1,33 @@
-import { copyFile, readFile, readdir, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, open, readFile, readdir, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { FileAdapter, FileVersion } from "./fileAdapter";
 
 /**
  * 本地文件系统实现。包装 node:fs/promises。
- * readHead 用 readFile + slice（本地读取头部与全量同成本，直接截断）。
  */
 export class LocalFileAdapter implements FileAdapter {
 	async read(path: string, signal?: AbortSignal): Promise<string> {
 		return readFile(path, { encoding: "utf8", signal });
 	}
 
-	async readHead(path: string, maxBytes: number, signal?: AbortSignal): Promise<string> {
-		const raw = await readFile(path, { encoding: "utf8", signal });
-		return raw.slice(0, maxBytes);
+	/**
+	 * 只读取文件头部 maxBytes 字节。
+	 *
+	 * 旧实现是 readFile 全量读后再 slice——会话扫描对每个候选父文件调用 readHead(4096)，
+	 * 大 JSONL 会被完整读进内存再丢弃，扫描成本随会话体积线性增长。
+	 * 这里用 fs.open + 定位读，只取头部字节（末尾多字节字符可能被截断，调用方只做行级解析，可容忍）。
+	 * 注意：定位读不支持 AbortSignal，4KB 读取本身是亚毫秒级，由外层扫描 watchdog 兜底。
+	 */
+	async readHead(path: string, maxBytes: number, _signal?: AbortSignal): Promise<string> {
+		const handle = await open(path, "r");
+		try {
+			const buffer = Buffer.alloc(maxBytes);
+			const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+			return buffer.subarray(0, bytesRead).toString("utf8");
+		} finally {
+			await handle.close();
+		}
 	}
 
 	async write(path: string, content: string): Promise<void> {

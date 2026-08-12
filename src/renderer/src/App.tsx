@@ -66,7 +66,7 @@ import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
-import { THINKING_LEVELS, ThinkingBlock } from "./components/app/AppParts";
+import { THINKING_LEVELS } from "./components/app/AppParts";
 import {
   buildComposerPromptSubmission,
   expandPromptTemplates,
@@ -88,6 +88,7 @@ import {
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
 import { mergeAgentRuntimeState } from "./utils/agentRuntimeState";
+import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
@@ -125,9 +126,7 @@ import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
-  CompactionCard,
   ConversationOutline,
-  DiagnosticMessageCard,
   DrawerContent,
   EmptyState,
   EnvironmentDialog,
@@ -143,14 +142,10 @@ import {
   PromptSuggestions,
   SessionContextMenu,
   SessionManagerModal,
-  RespondingIndicator,
   SessionStatus,
 
   ComposerModePicker,
   ThinkingPicker,
-  UserBubble,
-  TurnRow,
-  AskQuestionCard,
   BatchAskInlineBar,
   ExtensionWidgetCard,
   MERGED_TASK_WIDGET_KEY,
@@ -165,6 +160,7 @@ import {
 } from "./components/app/AppParts";
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
+import { MessageListContent } from "./components/app/MessageListContent";
 import {
   groupToolMessages,
   getMultiSelectImageCaptureIds,
@@ -984,6 +980,18 @@ export function App() {
   const handleEnterMultiSelect = useCallback(() => {
     setMultiSelectOpen(true);
   }, []);
+  /** AskQuestionCard 应答回调（从时间线内联箭头提为稳定回调）。
+   *  cancelled 通过 sendUiResponse 正常发送；select/input/editor：cancelled 或 value:null → undefined/null。
+   *  原生 confirm：pi 会把 cancelled 解析成 false（与「否」同值）；ask_question 扩展已把 confirm
+   *  改走 select，避免点叉误答成否。 */
+  const handleRespondAsk = useCallback(
+    (requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
+      if (!activeAgentId) return;
+      if (response.cancelled) setCancellingUi(true);
+      api.agents.sendUiResponse(activeAgentId, requestId, response);
+    },
+    [activeAgentId],
+  );
   const editorTabTextBytes = (tab: EditorTab) =>
     (tab.originalContent.length + (tab.modifiedContent?.length ?? 0)) * 2;
   const trimEditorTabs = (tabs: EditorTab[], protectedId: string) => {
@@ -1846,6 +1854,12 @@ export function App() {
   const activeThinking = activeAgentId
     ? (streamingThinking[activeAgentId] ?? "")
     : "";
+  // PIDECK_PERF=1 帧率诊断：agent 运行/流式期间采样帧间隔，结束时输出 P50/P95（验收指标）。
+  const isStreamingNow = Boolean(activeRuntimeState?.isStreaming) || activeAgent?.status === "running";
+  useEffect(() => {
+    if (isStreamingNow) startFrameSampling();
+    else stopFrameSampling();
+  }, [isStreamingNow]);
   // 高度全局共享：切 agent/项目不重置；仅用户拖拽会改并落盘
   const activeTerminalHeight = terminalHeight;
   const requestedTerminalRowHeight =
@@ -2160,6 +2174,9 @@ export function App() {
     return map;
   }, [displayAgents]);
   const canReorderProjects = search.trim().length === 0;
+  // 增量推送代数计数器：每应用一个 agents:message delta 递增，失同步自愈的全量拉取
+  // 结果只在没有更新的 delta 到达时生效（见 onMessages），避免旧基线覆盖新消息。
+  const messageDeltaSeqRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     window.setTimeout(() => void refreshProjects(), 0);
@@ -2264,40 +2281,64 @@ export function App() {
         migrateAgentRecord(current, pendingReplacementById, draftIds),
       );
     });
-    // 优化:历史会话加载时消息更新频繁,只在消息真正变化时 update state,避免不必要的重渲染导致输入卡顿
-    const offMessages = api.agents.onMessages((payload) =>
-      setMessagesByAgent((current) => {
-        const prevMessages = current[payload.agentId];
-        const agentId = payload.agentId;
-        // 消息数量相同且引用相同时跳过更新,减少输入框重渲染
-        if (
-          prevMessages?.length === payload.messages.length &&
-          prevMessages === payload.messages
-        ) {
-          return current;
-        }
+    // 首次加载/重启后加载会话时，从全量消息重建 prompt history（幂等，只执行一次）。
+    const rebuildPromptHistory = (agentId: string, messages: ChatMessage[]) => {
+      if (promptHistoryInitedRef.current.has(agentId)) return;
+      promptHistoryInitedRef.current.add(agentId);
+      const userMessages = messages
+        .filter((m) => m.role === "user" && m.text?.trim())
+        .map((m) => m.text.trim());
+      if (userMessages.length > 0) {
+        // 反向排列：最新的在前
+        promptHistoryRef.current[agentId] = userMessages.reverse().slice(0, 50);
+      } else {
+        delete promptHistoryRef.current[agentId];
+      }
+      savePromptHistory();
+    };
 
-        // 首次加载/重启后加载会话时，重建 prompt history
-        if (!promptHistoryInitedRef.current.has(agentId)) {
-          promptHistoryInitedRef.current.add(agentId);
-          const userMessages = payload.messages
-            .filter((m) => m.role === "user" && m.text?.trim())
-            .map((m) => m.text.trim());
-          if (userMessages.length > 0) {
-            // 反向排列：最新的在前
-            promptHistoryRef.current[agentId] = userMessages.reverse().slice(0, 50);
-          } else {
-            delete promptHistoryRef.current[agentId];
-          }
-          savePromptHistory();
+    // 优化:历史会话加载时消息更新频繁,只在消息真正变化时 update state,避免不必要的重渲染导致输入卡顿
+    // 主进程走增量推送（AgentMessagesDelta）：流式期间每条 text_delta 只发尾部变更，
+    // replaceFrom 之前的部分保持原数组引用，减少 IPC 传输与合并成本。
+    const offMessages = api.agents.onMessages((payload) => {
+      const agentId = payload.agentId;
+      // 每应用一个 delta 递增代数；失同步自愈的全量拉取结果只在没有更新的 delta
+      // 到达时生效，避免旧基线覆盖新消息。
+      const seq = (messageDeltaSeqRef.current[agentId] ?? 0) + 1;
+      messageDeltaSeqRef.current[agentId] = seq;
+      setMessagesByAgent((current) => {
+        const prevMessages = current[agentId] ?? [];
+        // 增量失同步（如渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）：
+        // 异步拉取全量基线补平。
+        if (payload.replaceFrom > prevMessages.length) {
+          void api.agents.getMessages(agentId).then((full) => {
+            if (messageDeltaSeqRef.current[agentId] !== seq) return;
+            setMessagesByAgent((cur) => ({ ...cur, [agentId]: full }));
+            rebuildPromptHistory(agentId, full);
+          });
+        }
+        // replaceFrom === 0 即全量基线（历史加载/重启重建），整体替换；
+        // 否则只替换 replaceFrom 之后的尾部（含就地更新的消息与增删）。
+        const merged =
+          payload.replaceFrom === 0
+            ? payload.messages
+            : [
+                ...prevMessages.slice(0, Math.min(payload.replaceFrom, prevMessages.length)),
+                ...payload.messages,
+              ];
+
+        // 首次加载/重启后加载会话时，重建 prompt history。
+        // 只在全量基线上重建——增量事件可能只含尾部消息，用它重建会得到不完整历史。
+        if (payload.replaceFrom === 0) {
+          rebuildPromptHistory(agentId, merged);
         }
 
         return {
           ...current,
-          [agentId]: payload.messages,
+          [agentId]: merged,
         };
-      }),
-    );
+      });
+    });
     const offLog = api.agents.onLog((payload) =>
       setLogs((current) => {
         // 优化:只在超过200条时才slice,减少不必要的数组操作
@@ -7656,142 +7697,33 @@ export function App() {
             />
           )}
           {(activeAgent && activeAgent.status !== "starting" && activeMessages.length > 0) ? (
-            <div className="message-list">
-              {/* 使用 groupToolMessages 渲染：user/error/system 独立条目，
-                  assistant + tool 聚合为 agnet-run（TurnRow 自带操作栏） */}
-              {renderedRuns.map((item, index) => {
-                if (item.kind === "agent-run") {
-                  // 判断该 run 是否包含正在流式的消息
-                  const isRunStreaming = Boolean(
-                    streamingMessageId &&
-                    item.items.some(
-                      (i) => i.kind === "message" && i.message.id === streamingMessageId,
-                    ),
-                  );
-                  return (
-                    <TurnRow
-                      key={item.id}
-                      run={item}
-                      onPreviewImage={setPreviewImage}
-                      showThinking={settings.showThinking}
-                      isStreaming={isRunStreaming}
-                      agentRunning={isAgentBusy && index === renderedRuns.length - 1}
-                      onOpenExternal={handleOpenExternal}
-                      onOpenFile={openFilePath}
-                      onDiffFile={diffFilePath}
-                      onEditMessage={editMessage}
-                      onDeleteMessage={deleteMessage}
-                      onEnterMultiSelect={handleEnterMultiSelect}
-                    />
-                  );
-                }
-                // 独立消息条目：user / error / system
-                // 理论上顶层的 thinking-group / tool-group 不会穿透到此（
-                // 它们总是被聚合进 agent-run），但 TypeScript 需要穷举
-                if (item.kind !== "message") return null;
-                const message = item.message;
-                if (message.role === "user") {
-                  return (
-                    <UserBubble
-                      key={message.id}
-                      message={message}
-                      onPreviewImage={setPreviewImage}
-                      onOpenFile={openFilePath}
-                      onEditMessage={editMessage}
-                      onDeleteMessage={deleteMessage}
-                      onForkMessage={forkFromUserMessage}
-                      agentRunning={isAgentBusy}
-                      forking={forkingMessageId === message.id}
-                      validCommandNames={validCommandNames}
-                      validFilePaths={validFilePaths}
-                      onEnterMultiSelect={handleEnterMultiSelect}
-                    />
-                  );
-                }
-                if (message.role === "error") {
-                  return (
-                    <DiagnosticMessageCard key={message.id} message={message} />
-                  );
-                }
-                if (message.role === "system") {
-                  const meta = message.meta as any;
-                  if (meta?.type === "askQuestion") {
-                    // 正在用 composer 内联栏回答同一 request 时，隐藏时间线 pending 卡，避免双份 UI。
-                    // 已回答/取消的卡由 AskQuestionCard 内部 return null，最终结果看 ToolCard。
-                    const req = meta.uiRequest as { requestId?: string } | undefined;
-                    const isActivePending =
-                      meta.status === "pending" &&
-                      Boolean(req?.requestId) &&
-                      Boolean(activeUiAsk?.requestId) &&
-                      req?.requestId === activeUiAsk?.requestId;
-                    if (isActivePending) return null;
-                    return (
-                      <AskQuestionCard key={message.id} message={message} onRespond={(response) => {
-                        if (!req?.requestId || !activeAgentId) return;
-                        // cancelled 通过 sendUiResponse 正常发送。
-                        // select/input/editor：cancelled 或 value:null → undefined/null。
-                        // 原生 confirm：pi 会把 cancelled 解析成 false（与「否」同值）；
-                        // ask_question 扩展已把 confirm 改走 select，避免点叉误答成否。
-                        if (response.cancelled) {
-                          setCancellingUi(true);
-                          api.agents.sendUiResponse(activeAgentId, req.requestId, response);
-                        } else {
-                          api.agents.sendUiResponse(activeAgentId, req.requestId, response);
-                        }
-                      }} />
-                    );
-                  }
-                  if (meta?.type === "compaction") {
-                    return (
-                      <CompactionCard key={message.id} message={message} />
-                    );
-                  }
-                  return (
-                    <DiagnosticMessageCard key={message.id} message={message} />
-                  );
-                }
-                return null;
-              })}
-              {isAwaitingAssistant && (
-                <>
-                  {settings.showThinking && activeThinking && (
-                    <ThinkingBlock
-                      text={activeThinking}
-                      startedAt={activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined}
-                      showThinking={settings.showThinking}
-                    />
-                  )}
-                  {/* 工具执行中但消息尚未到达时，显示临时占位卡片，避免状态指示器亮了但页面空白。
-                      runtimeState 在工具消息到达前就已更新 isExecutingTool，存在时序间隙。 */}
-                  {activeRuntimeState?.isExecutingTool && !renderedRuns.some(r => r.kind === "agent-run" && r.items.some(i => i.kind === "tool-group")) && (
-                    <section className="tool-card tone-info" data-status="running">
-                      <div className="tool-card-header">
-                        <span className="tool-card-trigger">
-                          <span className="tool-card-icon">
-                            <Wrench size={14} />
-                          </span>
-                          <span className="tool-card-name">{t("tool.pending")}</span>
-                          <span className="tool-card-status">
-                            <span className="tool-card-spinner" aria-hidden="true" />
-                            {t("tool.statusRunning")}
-                          </span>
-                        </span>
-                      </div>
-                    </section>
-                  )}
-                </>
-              )}
-              {/* 响应指示器：agent 运行或流式期间显示三点动画 */}
-              {activeAgent && !cancellingUi &&
-                (activeAgent.status === "running" || activeRuntimeState?.isStreaming) && (
-                <RespondingIndicator
-                  thinking={activeThinking}
-                  showThinking={settings.showThinking}
-                  isExecutingTool={activeRuntimeState?.isExecutingTool}
-                  isStreaming={activeRuntimeState?.isStreaming}
-                />
-              )}
-            </div>
+            <MessageListContent
+              renderedRuns={renderedRuns}
+              streamingMessageId={streamingMessageId}
+              agentRunning={isAgentBusy}
+              statusRunning={activeAgent.status === "running"}
+              isAwaitingAssistant={isAwaitingAssistant}
+              showThinking={settings.showThinking}
+              activeThinking={activeThinking}
+              thinkingStartedAt={activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined}
+              isExecutingTool={activeRuntimeState?.isExecutingTool}
+              isStreaming={activeRuntimeState?.isStreaming}
+              cancellingUi={cancellingUi}
+              activeUiAskRequestId={activeUiAsk?.requestId}
+              activeAgentId={activeAgentId}
+              forkingMessageId={forkingMessageId}
+              validCommandNames={validCommandNames}
+              validFilePaths={validFilePaths}
+              onPreviewImage={setPreviewImage}
+              onOpenFile={openFilePath}
+              onDiffFile={diffFilePath}
+              onEditMessage={editMessage}
+              onDeleteMessage={deleteMessage}
+              onForkMessage={forkFromUserMessage}
+              onEnterMultiSelect={handleEnterMultiSelect}
+              onOpenExternal={handleOpenExternal}
+              onRespondAsk={handleRespondAsk}
+            />
           ) : null}
 
           {/* 多选分享弹框：会话树 */}

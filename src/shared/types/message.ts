@@ -48,6 +48,21 @@ export type ThinkingUpdate = {
 	thinking: string;
 };
 
+/**
+ * agents:message 增量推送负载。
+ *
+ * replaceFrom 语义：渲染层以 `current.slice(0, replaceFrom) + messages` 合并。
+ * - replaceFrom === 0 且 messages 为全量 → 全量基线（历史加载/重启重建/首个事件）。
+ * - replaceFrom > 0 → 增量：只传输 replaceFrom 之后的变更（含就地更新的消息与追加/删除）。
+ * 流式期间每条 text_delta 只改最后一条 assistant 消息，50ms 冲刷时仅序列化该条，
+ * 避免整条会话消息数组随 token 增长线性变大。
+ */
+export type AgentMessagesDelta = {
+	agentId: string;
+	replaceFrom: number;
+	messages: ChatMessage[];
+};
+
 /** 输入框发送模式，决定消息直接执行还是以只读方式触发生成计划。 */
 export type ComposerAgentMode = "normal" | "plan";
 

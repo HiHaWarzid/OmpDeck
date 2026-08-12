@@ -9,6 +9,7 @@ import type { SessionScanner } from "../sessions/SessionScanner";
 import type { ImportPipeline } from "../sessions/importPipeline";
 import type { AgentManager } from "../pi/AgentManager";
 import type { AppLogger } from "../logging/AppLogger";
+import { perfEnd, perfStart } from "../perf";
 
 interface SessionHandlerDeps {
 	projectStore: ProjectStore;
@@ -22,10 +23,14 @@ export function registerSessionHandlers(deps: SessionHandlerDeps) {
 	const { projectStore, sessionScanner, importPipeline, agentManager, appLogger } = deps;
 
 	ipcMain.handle(ipcChannels.sessionsList, async (_event, projectId?: string) => {
+		const t0 = perfStart("sessions:list");
 		try {
 			const project = projectId ? projectStore.get(projectId) : undefined;
-			return await sessionScanner.list(project?.path);
+			const result = await sessionScanner.list(project?.path);
+			perfEnd("sessions:list", t0, { projectId, files: result.length });
+			return result;
 		} catch (error) {
+			perfEnd("sessions:list", t0, { projectId, error: true });
 			// 会话列表是核心加载路径，失败时记录错误便于诊断，同时保留 rejection 供 renderer 提示用户。
 			void appLogger.error("session", "Failed to list sessions", { projectId, error });
 			throw error;

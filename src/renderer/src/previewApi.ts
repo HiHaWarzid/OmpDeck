@@ -4,6 +4,7 @@ import type {
 	AgentTab,
 	AppSettings,
 	ChatMessage,
+	AgentMessagesDelta,
 	FileTreeNode,
 	Project,
 	SessionSummary,
@@ -691,6 +692,7 @@ export function createPreviewApi(): PiDesktopApi {
 		},
 		agents: {
 			list: async () => getAgents(),
+			getMessages: async () => getMessages(),
 			create: async () => getAgents()[0],
 			rename: async (agentId, name) => {
 				const agent =
@@ -770,12 +772,9 @@ export function createPreviewApi(): PiDesktopApi {
 			onState: noop,
 			onFocusTarget: noop,
 			onMessages: ((
-				callback: (payload: {
-					agentId: string;
-					messages: ChatMessage[];
-				}) => void,
+				callback: (payload: AgentMessagesDelta) => void,
 			) => {
-				setTimeout(() => callback({ agentId: "preview-agent", messages: getMessages() }), 0);
+				setTimeout(() => callback({ agentId: "preview-agent", replaceFrom: 0, messages: getMessages() }), 0);
 				return () => undefined;
 			}) as any,
 			onLog: noop,
@@ -787,6 +786,9 @@ export function createPreviewApi(): PiDesktopApi {
 			sendUiResponse: async () => undefined,
 			onTrustRequest: noop,
 			respondTrustRequest: async () => undefined,
+		},
+		perf: {
+			enabled: false,
 		},
 		pet: {
 			onState: noop,

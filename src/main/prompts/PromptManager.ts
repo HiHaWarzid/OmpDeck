@@ -1,7 +1,7 @@
 import { shell } from "electron";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { join, basename, sep } from "node:path";
 import { homedir } from "node:os";
 import type {
 	CreatePiPromptTemplateInput,
@@ -171,6 +171,15 @@ when appropriate. If unsure whether a skill is needed, follow the rule:
  */
 export class PromptManager {
 	private promptsDir: string;
+	/**
+	 * 模板文件内容缓存：以 (mtimeMs + size) 为指纹，文件未变化时 list() 不再整读 .md。
+	 * 创建/编辑/重命名都会改变 mtime 或路径，天然失效；删除的文件在下次扫描目录时修剪。
+	 * 模板数量通常个位数，内存占用可忽略。
+	 */
+	private readonly fileCache = new Map<
+		string,
+		{ version: { mtimeMs: number; size: number }; summary: PiPromptTemplateSummary }
+	>();
 
 	constructor(home?: string) {
 		this.promptsDir = join(home ?? homedir(), ".omp", "agent", "prompts");
@@ -185,31 +194,64 @@ export class PromptManager {
 		return this.promptsDir;
 	}
 
-	async list(): Promise<PiPromptTemplateListResult> {
-		await mkdir(this.promptsDir, { recursive: true });
-		const entries = await readdir(this.promptsDir).catch(() => []);
-		const templates: PiPromptTemplateSummary[] = [];
+	/**
+	 * 读取单个模板文件并解析摘要；命中 (mtimeMs, size) 指纹缓存时直接复用，
+	 * 避免重复 list 调用对未变化文件做整读 + frontmatter 解析。
+	 */
+	private async readTemplateFile(
+		fullPath: string,
+		name: string,
+		scope: "global" | "project",
+	): Promise<PiPromptTemplateSummary | null> {
+		const info = await stat(fullPath).catch(() => null);
+		if (!info) return null;
+		const version = { mtimeMs: info.mtimeMs, size: info.size };
+		const cached = this.fileCache.get(fullPath);
+		if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
+			return cached.summary;
+		}
+		const raw = await readFile(fullPath, "utf8").catch(() => "");
+		if (!raw) return null;
+		const frontmatter = this.parseFrontmatter(raw);
+		const description = frontmatter.description ?? raw.split(/\r?\n/).find((line) => line.trim()) ?? "";
+		const summary: PiPromptTemplateSummary = {
+			name,
+			path: fullPath,
+			description: description.replace(/^["']|["']$/g, "").trim(),
+			content: raw,
+			userCreated: true,
+			scope,
+		};
+		this.fileCache.set(fullPath, { version, summary });
+		return summary;
+	}
 
+	/** 扫描一个模板目录；顺带修剪该目录下已删除文件的缓存条目。 */
+	private async scanDir(dir: string, scope: "global" | "project"): Promise<PiPromptTemplateSummary[]> {
+		const entries = await readdir(dir).catch(() => []);
+		const templates: PiPromptTemplateSummary[] = [];
+		const seenPaths = new Set<string>();
 		for (const entry of entries) {
 			if (!entry.endsWith(".md")) continue;
 			if (entry.endsWith(".d.md")) continue;
-			const fullPath = join(this.promptsDir, entry);
-			const raw = await readFile(fullPath, "utf8").catch(() => "");
-			if (!raw) continue;
-
+			const fullPath = join(dir, entry);
+			seenPaths.add(fullPath);
 			const name = basename(entry, ".md");
-			const frontmatter = this.parseFrontmatter(raw);
-			const description = frontmatter.description ?? raw.split(/\r?\n/).find((line) => line.trim()) ?? "";
-
-			templates.push({
-				name,
-				path: fullPath,
-				description: description.replace(/^["']|["']$/g, "").trim(),
-				content: raw,
-				userCreated: true,
-				scope: "global",
-			});
+			const summary = await this.readTemplateFile(fullPath, name, scope);
+			if (summary) templates.push(summary);
 		}
+		const dirPrefix = `${dir}${sep}`;
+		for (const key of this.fileCache.keys()) {
+			if (key.startsWith(dirPrefix) && !seenPaths.has(key)) {
+				this.fileCache.delete(key);
+			}
+		}
+		return templates;
+	}
+
+	async list(): Promise<PiPromptTemplateListResult> {
+		await mkdir(this.promptsDir, { recursive: true });
+		const templates = await this.scanDir(this.promptsDir, "global");
 
 		// 合并内置推荐模板（同名不覆盖用户已有模板）
 		const userNames = new Set(templates.map((t) => t.name));
@@ -260,27 +302,7 @@ export class PromptManager {
 	/** 扫描项目 .omp/prompts/ 目录下的模板 */
 	async listByProject(projectPath: string): Promise<PiPromptTemplateListResult> {
 		const projectPromptsDir = join(projectPath, ".omp", "prompts");
-		const entries = await readdir(projectPromptsDir).catch(() => []);
-		const templates: PiPromptTemplateSummary[] = [];
-		for (const entry of entries) {
-			if (!entry.endsWith(".md")) continue;
-			if (entry.endsWith(".d.md")) continue;
-			const fullPath = join(projectPromptsDir, entry);
-			const raw = await readFile(fullPath, "utf8").catch(() => "");
-			if (!raw) continue;
-			const name = basename(entry, ".md");
-			const frontmatter = this.parseFrontmatter(raw);
-			const description = frontmatter.description ?? raw.split(/\r?\n/).find((line) => line.trim()) ?? "";
-
-			templates.push({
-				name,
-				path: fullPath,
-				description: description.replace(/^["']|["']$/g, "").trim(),
-				content: raw,
-				userCreated: true,
-				scope: "project",
-			});
-		}
+		const templates = await this.scanDir(projectPromptsDir, "project");
 		templates.sort((a, b) => a.name.localeCompare(b.name));
 		return { templates, globalDir: projectPromptsDir };
 	}

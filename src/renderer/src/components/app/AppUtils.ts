@@ -165,6 +165,47 @@ export function sameAgentRunForRender(previous: AgentRunItem, next: AgentRunItem
 	});
 }
 
+/**
+ * 顶层渲染条目（agent-run / 独立消息 / 理论上的 thinking、tool 组）的内容相等比较，
+ * 供 MessageListContent 的 memo 比较器使用：对象每次由 groupToolMessages 重建，
+ * 必须按内容比较而不是引用，未变化的 run 才能跳过重渲染。
+ */
+export function sameRenderMessageForRender(previous: RenderMessage, next: RenderMessage): boolean {
+	if (previous.kind !== next.kind) return false;
+	switch (previous.kind) {
+		case "agent-run":
+			return next.kind === "agent-run" && sameAgentRunForRender(previous, next);
+		case "message":
+			return next.kind === "message" && sameChatMessageForRender(previous.message, next.message);
+		case "thinking-group":
+			return (
+				next.kind === "thinking-group" &&
+				previous.id === next.id &&
+				previous.text === next.text &&
+				previous.startedAt === next.startedAt &&
+				previous.endedAt === next.endedAt
+			);
+		case "tool-group":
+			return (
+				next.kind === "tool-group" &&
+				previous.id === next.id &&
+				previous.messages.length === next.messages.length &&
+				previous.messages.every((message, messageIndex) =>
+					sameChatMessageForRender(message, next.messages[messageIndex]),
+				)
+			);
+	}
+}
+
+/** 顶层条目列表的内容相等比较（长度 + 逐条内容）。 */
+export function sameRenderMessageListForRender(
+	previous: RenderMessage[],
+	next: RenderMessage[],
+): boolean {
+	if (previous.length !== next.length) return false;
+	return previous.every((item, index) => sameRenderMessageForRender(item, next[index]));
+}
+
 export function getMultiSelectImageCaptureIds(
 	items: RenderMessage[],
 	selectedIds: Set<string>,

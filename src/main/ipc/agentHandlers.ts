@@ -27,6 +27,9 @@ export function registerAgentHandlers(deps: AgentHandlerDeps) {
 	const { agentManager, terminalManager, appLogger, getFeishuBridge } = deps;
 
 	ipcMain.handle(ipcChannels.agentsList, () => agentManager.list());
+	ipcMain.handle(ipcChannels.agentsGetMessages, (_event, agentId: string) =>
+		agentManager.getMessages(agentId),
+	);
 
 	ipcMain.handle(ipcChannels.agentsCreate, async (_event, input: CreateAgentInput) => {
 		void appLogger.info("agent", "Agent create IPC received", {

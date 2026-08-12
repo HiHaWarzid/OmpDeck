@@ -2,6 +2,7 @@ import type { PiDesktopApi } from "../../preload";
 import type {
 	AgentTab,
 	ChatMessage,
+	AgentMessagesDelta,
 	SendPromptInput,
 	SendPromptResult,
 } from "../../shared/types";
@@ -20,7 +21,9 @@ let connected = false;
 let polling = false;
 let pollTimer: number | undefined;
 const stateListeners = new Set<(tabs: AgentTab[]) => void>();
-const messageListeners = new Set<(payload: { agentId: string; messages: ChatMessage[] }) => void>();
+// 浏览器模式走 WebService 全量状态轮询：每次推送都是完整 messages，按全量基线（replaceFrom: 0）发送，
+// 与主进程的增量推送契约（AgentMessagesDelta）对齐。
+const messageListeners = new Set<(payload: AgentMessagesDelta) => void>();
 let lastMessages = new Map<string, string>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -71,7 +74,7 @@ async function refreshState() {
 		const key = JSON.stringify(messages);
 		if (lastMessages.get(agentId) === key) continue;
 		lastMessages.set(agentId, key);
-		for (const listener of messageListeners) listener({ agentId, messages });
+		for (const listener of messageListeners) listener({ agentId, replaceFrom: 0, messages });
 	}
 	return state;
 }

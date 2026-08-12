@@ -7,6 +7,7 @@ import { ipcChannels } from "../../shared/ipc";
 import type { CreatePiPromptTemplateInput } from "../../shared/types";
 import type { PromptManager } from "../prompts/PromptManager";
 import type { AppLogger } from "../logging/AppLogger";
+import { perfEnd, perfStart } from "../perf";
 
 interface PromptHandlerDeps {
 	promptManager: PromptManager;
@@ -16,7 +17,12 @@ interface PromptHandlerDeps {
 export function registerPromptHandlers(deps: PromptHandlerDeps) {
 	const { promptManager, appLogger } = deps;
 
-	ipcMain.handle(ipcChannels.promptsList, () => promptManager.list());
+	ipcMain.handle(ipcChannels.promptsList, async () => {
+		const t0 = perfStart("prompts:list");
+		const result = await promptManager.list();
+		perfEnd("prompts:list", t0, { templates: result.templates.length });
+		return result;
+	});
 	ipcMain.handle(ipcChannels.promptsCreate, async (_event, input: CreatePiPromptTemplateInput) => {
 		const result = await promptManager.create(input);
 		void appLogger.info("prompt", "Prompt template created", { name: input.name });

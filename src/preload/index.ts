@@ -77,6 +77,7 @@ import type {
 	TerminalExitEvent,
 	TerminalTab,
 	ThinkingUpdate,
+	AgentMessagesDelta,
 } from "../shared/types";
 
 /**
@@ -882,6 +883,8 @@ const api = {
 	agents: {
 		list: () =>
 			ipcRenderer.invoke(ipcChannels.agentsList) as Promise<AgentTab[]>,
+		getMessages: (agentId: string) =>
+			ipcRenderer.invoke(ipcChannels.agentsGetMessages, agentId) as Promise<ChatMessage[]>,
 		create: (input: CreateAgentInput) =>
 			ipcRenderer.invoke(ipcChannels.agentsCreate, input) as Promise<AgentTab>,
 		rename: (agentId: string, name: string) =>
@@ -999,7 +1002,7 @@ const api = {
 		onFocusTarget: (callback: (target: { agentId: string }) => void) =>
 			subscribe(ipcChannels.petFocusAgentTarget, callback),
 		onMessages: (
-			callback: (payload: { agentId: string; messages: ChatMessage[] }) => void,
+			callback: (payload: AgentMessagesDelta) => void,
 		) => subscribe(ipcChannels.agentsMessage, callback),
 		onLog: (callback: (payload: { agentId: string; text: string }) => void) =>
 			subscribe(ipcChannels.agentsLog, callback),
@@ -1211,6 +1214,11 @@ const api = {
 		},
 	},
 
+	// ===== 性能诊断 =====
+	perf: {
+		/** PIDECK_PERF=1 时渲染层开启帧间隔/渲染耗时诊断（见 utils/perfStats.ts） */
+		enabled: process.env.PIDECK_PERF === "1",
+	},
 	// ===== 内置浏览器 =====
 	browser: {
 		/** 在系统默认浏览器中打开外部链接。
