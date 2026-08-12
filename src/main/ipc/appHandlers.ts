@@ -37,6 +37,8 @@ interface AppHandlerDeps {
 	// 可变状态 getter/setter
 	getMainWindow: () => BrowserWindow | null;
 	setIsQuitting: (value: boolean) => void;
+	/** 重启前释放版本级单实例锁，避免新实例被旧实例的锁挡掉 */
+	releaseSingleInstanceLock: () => void;
 	getPetSystem: () => PetSystem | null;
 	getWebServiceManager: () => WebServiceManager | undefined;
 	// 顶层函数 dep（定义留在 index.ts）
@@ -55,6 +57,7 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		updateManager,
 		getMainWindow,
 		setIsQuitting,
+		releaseSingleInstanceLock,
 		getPetSystem,
 		getWebServiceManager,
 		openExternalUrl,
@@ -126,11 +129,18 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 	ipcMain.handle(ipcChannels.appRestart, async () => {
 		// 标记为退出状态，避免 closeToTray 阻止重启
 		setIsQuitting(true);
-		// 停止所有 Agent 和服务
-		await getWebServiceManager()?.stop();
-		terminalManager?.closeAll();
-		agentManager?.stopAll();
-		// 重启应用
+		// 停止所有 Agent 和服务。清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
+		try {
+			await getWebServiceManager()?.stop();
+			terminalManager?.closeAll();
+			agentManager?.stopAll();
+		} catch (error) {
+			void appLogger.error("app", "Cleanup before restart failed, continuing anyway", error);
+		}
+		// 先释放单实例锁再 relaunch：新实例启动时旧实例仍持有锁（锁内 PID 存活判定），
+		// 会被当成"同版本二次启动"而写 .focus 后立即退出，导致重启变成退出、应用不再回来。
+		// 旧实例随后 will-quit 的 dispose 是幂等的，读到新实例 PID 不会误删新锁。
+		releaseSingleInstanceLock?.();
 		app.relaunch();
 		app.quit();
 	});

@@ -130,7 +130,7 @@ let previewSettings: AppSettings = {
 	piEnvironmentChecked: true,
 	enableGitManagement: true,
 	gitCommitMessagePrompt: "",
-	closeToTray: true,
+	closeToTray: false,
 	singleInstance: true,
 	enableNotifications: true,
 	// showThinking 由 pi agent 的 hideThinkingBlock 控制，运行时从主进程加载

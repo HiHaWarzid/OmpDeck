@@ -1297,7 +1297,7 @@ export function App() {
     piEnvironmentChecked: false,
     enableGitManagement: true,
     gitCommitMessagePrompt: "",
-    closeToTray: true,
+    closeToTray: false,
     singleInstance: true,
     enableNotifications: true,
     // showThinking 由 pi agent 的 hideThinkingBlock 控制，启动后从主进程加载的真实值会覆盖此处

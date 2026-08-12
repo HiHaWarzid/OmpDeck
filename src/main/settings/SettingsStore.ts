@@ -105,7 +105,9 @@ Gitmoji 对应关系：
 2. 第一行简要说明修改的模块和做了什么
 3. 后续用 - 列出具体变更点
 4. 直接输出 commit 消息，不要解释`,
-  closeToTray: true,
+  // 默认关闭「关闭到托盘」：多数用户点击窗口 X 的预期是应用完全退出（含桌面宠物、后台进程）。
+  // 需要常驻托盘的场景（如宠物持续监控 agent）由用户在设置-开发里显式开启。
+  closeToTray: false,
   // 默认单实例：托盘隐藏后再次点击快捷方式会唤起原窗口，而不是再开一个进程
   singleInstance: true,
   enableNotifications: true,

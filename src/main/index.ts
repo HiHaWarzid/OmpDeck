@@ -787,6 +787,8 @@ function registerIpc() {
 		setIsQuitting: (value: boolean) => {
 			isQuitting = value;
 		},
+		// 重启前主动让出单实例锁，保证 relaunch 的新实例能拿到主实例身份
+		releaseSingleInstanceLock: () => versionSingleInstance.dispose(),
 		getPetSystem: () => petSystem,
 		getWebServiceManager: () => webServiceManager,
 		openExternalUrl,
