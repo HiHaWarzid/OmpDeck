@@ -995,16 +995,42 @@ function SettingsModalContent(props: SettingsModalProps) {
 												className={"pi-status-dot " + (props.piStatus?.installed ? "online" : "offline")}
 											/>
 											<div className="setting-pi-status-text">
-												<strong>omp CLI</strong>
-												<span>
-													{props.piStatus
-														? props.piStatus.installed
-															? t("settings.foundPi", {
-																	version: props.piStatus.version ?? "omp",
-																})
-															: t("settings.piMissing")
-														: t("settings.piCliAvailable")}
-												</span>
+												<div className="setting-pi-status-title">
+													<strong>omp CLI</strong>
+													{/* 检测状态与版本状态放在标题同行，小字号弱化，避免与路径信息抢行 */}
+													<span className="setting-pi-status-version">
+														{props.piStatus
+															? props.piStatus.installed
+																? t("settings.foundPi", {
+																		version: props.piStatus.version ?? "omp",
+																	})
+																: t("settings.piMissing")
+															: t("settings.piCliAvailable")}
+														{/* 版本状态并入同一行：当前版本即「已找到」的版本，只补充最新状态；有更新时显示目标版本，无更新时直接给结论 */}
+														{props.piUpdateCheck &&
+															(props.piUpdateCheck.currentVersion || props.piUpdateCheck.latestVersion) && (
+																<>
+																	{" · "}
+																	{props.piUpdateCheck.hasUpdate ? (
+																		<span className="setting-status warning">
+																			{t("settings.piUpdateTo", {
+																				latest: props.piUpdateCheck.latestVersion ?? "?",
+																			})}
+																		</span>
+																	) : (
+																		<span className="setting-status success">
+																			{t("settings.piUpToDate")}
+																		</span>
+																	)}
+																	{props.piUpdateCheck.error && (
+																		<span className="setting-status error">
+																			{props.piUpdateCheck.error}
+																		</span>
+																	)}
+																</>
+															)}
+													</span>
+												</div>
 												{piPath && (
 													<span className="setting-path">
 														{piPath}
@@ -1051,22 +1077,6 @@ function SettingsModalContent(props: SettingsModalProps) {
 											</Button>
 										</div>
 									</div>
-									{props.piUpdateCheck &&
-										(props.piUpdateCheck.currentVersion || props.piUpdateCheck.latestVersion) && (
-											<div className="setting-update-versions">
-												<span className={"setting-status " + (props.piUpdateCheck.hasUpdate ? "warning" : "success")}>
-													{t("settings.piUpdateStatus", {
-														current: props.piUpdateCheck.currentVersion ?? "?",
-														latest: props.piUpdateCheck.latestVersion ?? "?",
-													})}
-												</span>
-												{props.piUpdateCheck.error && (
-													<span className="setting-status error">
-														{props.piUpdateCheck.error}
-													</span>
-												)}
-											</div>
-										)}
 									{props.piUpdateResult && (
 										<pre className="setting-update-output">
 											{props.piUpdateResult.command}
@@ -1176,52 +1186,60 @@ function SettingsModalContent(props: SettingsModalProps) {
 
 									<hr className="setting-divider" />
 
-									{/* 自定义 Pi 路径 */}
+									{/* 自定义 Pi 路径：操作按钮与输入框同行，提示与校验结果同列，压缩垂直空间 */}
 									<div className="setting-pi-path-panel">
-										<TextField
-											className="setting-field"
-											label={t("settings.customPiPath")}
-											value={props.customPiPath}
-											placeholder={
-												piPath ||
-												"D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
-											}
-											description={t("settings.customPiPathHint")}
-											disabled={props.customPathValidating}
-											onChange={props.onCustomPathChange}
-										/>
-										<div className="setting-pi-path-actions">
-											<Button
-												onClick={props.onValidateCustomPath}
-												disabled={!props.customPiPath.trim() || props.customPathValidating}
-											>
-												{props.customPathValidating
-													? t("settings.validating")
-													: t("settings.validatePiPath")}
-											</Button>
-											<Button
-												onClick={props.onClearCustomPath}
-												disabled={!props.settings.customPiPath || props.customPathValidating}
-											>
-												{t("settings.clearCustomPiPath")}
-											</Button>
+										<div className="setting-pi-path-row">
+											<TextField
+												className="setting-field"
+												label={t("settings.customPiPath")}
+												value={props.customPiPath}
+												placeholder={
+													piPath ||
+													"D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
+												}
+												disabled={props.customPathValidating}
+												onChange={props.onCustomPathChange}
+											/>
+											<div className="setting-pi-path-actions">
+												<Button
+													buttonSize="sm"
+													onClick={props.onValidateCustomPath}
+													disabled={!props.customPiPath.trim() || props.customPathValidating}
+												>
+													{props.customPathValidating
+														? t("settings.validating")
+														: t("settings.validatePiPath")}
+												</Button>
+												<Button
+													buttonSize="sm"
+													onClick={props.onClearCustomPath}
+													disabled={!props.settings.customPiPath || props.customPathValidating}
+												>
+													{t("settings.clearCustomPiPath")}
+												</Button>
+											</div>
 										</div>
-										{props.customPathResult && (
-											<small className={`setting-status ${props.customPathResult.installed ? "success" : "error"}`}>
-												{props.customPathResult.installed
-													? t("settings.validatePassed", {
-															value:
-																props.customPathResult.command ??
-																props.customPathResult.version ??
-																"omp",
-														})
-													: t("settings.validateFailed", {
-															error:
-																props.customPathResult.error ??
-																t("environment.unableToRun"),
-														})}
+										<div className="setting-pi-path-hint">
+											<small className="ui-field-description">
+												{t("settings.customPiPathHint")}
 											</small>
-										)}
+											{props.customPathResult && (
+												<small className={`setting-status ${props.customPathResult.installed ? "success" : "error"}`}>
+													{props.customPathResult.installed
+														? t("settings.validatePassed", {
+																value:
+																	props.customPathResult.command ??
+																	props.customPathResult.version ??
+																	"omp",
+															})
+														: t("settings.validateFailed", {
+																error:
+																	props.customPathResult.error ??
+																	t("environment.unableToRun"),
+															})}
+												</small>
+											)}
+										</div>
 									</div>
 
 									<hr className="setting-divider" />

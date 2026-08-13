@@ -1371,6 +1371,20 @@ export function App() {
   const [customPathValidating, setCustomPathValidating] = useState(false);
   const [customPathResult, setCustomPathResult] =
     useState<PiInstallStatus | null>(null);
+  /** 用户是否手动编辑/清除过自定义路径；置位后检测结果不再自动填充输入框 */
+  const customPathTouchedRef = useRef(false);
+  // 检测到 omp 且用户未编辑、无已保存路径时，把检测路径作为输入框初始值；
+  // 否则 placeholder 里显示的检测路径容易让人误以为已填内容（校验/清除按钮却因空值禁用）。
+  useEffect(() => {
+    if (
+      !customPathTouchedRef.current &&
+      !customPiPath &&
+      piStatus?.installed &&
+      piStatus.command
+    ) {
+      setCustomPiPath(piStatus.command);
+    }
+  }, [piStatus, customPiPath]);
   /** npm 可用性检测 */
   const [npmAvailable, setNpmAvailable] = useState<boolean | null>(null);
   const [npmVersion, setNpmVersion] = useState<string | undefined>(undefined);
@@ -2191,6 +2205,8 @@ export function App() {
     void api.settings.get().then((next) => {
       setSettings(next);
       setCustomPiPath(next.customPiPath ?? "");
+      // 已有已保存路径时不自动填充；为空时允许检测结果填充输入框初始值
+      customPathTouchedRef.current = Boolean(next.customPiPath);
       // settings.json 为展开状态的权威来源（dev 强杀后 localStorage 可能丢写入）
       if (
         !expandedSidebarFromSettingsRef.current &&
@@ -3418,6 +3434,8 @@ export function App() {
   }
 
   async function clearCustomPiPath() {
+    // 用户明确清除：标记为已触碰，避免后续检测结果自动回填
+    customPathTouchedRef.current = true;
     const updated = await api.settings.update({ customPiPath: "" });
     setSettings(updated);
     setCustomPiPath("");
@@ -9582,6 +9600,7 @@ export function App() {
           customPathValidating={customPathValidating}
           customPathResult={customPathResult}
           onCustomPathChange={(path) => {
+            customPathTouchedRef.current = true;
             setCustomPiPath(path);
             setCustomPathResult(null);
           }}
@@ -9694,6 +9713,7 @@ export function App() {
           piUpdateCheck={piUpdateCheck}
           piUpdateResult={piUpdateResult}
           onCustomPathChange={(path) => {
+            customPathTouchedRef.current = true;
             setCustomPiPath(path);
             setCustomPathResult(null);
           }}

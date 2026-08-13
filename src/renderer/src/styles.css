@@ -12223,15 +12223,6 @@ body.is-composer-resizing .composer-resize-handle::after {
 }
 
 /* 更新命令输出 */
-.setting-update-versions {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin: var(--space-1) 0 var(--space-2);
-}
-.setting-update-versions .setting-status {
-  margin-top: 0;
-}
 .setting-update-output {
   max-height: min(360px, 45vh);
   margin: var(--space-2) 0 var(--space-3);
@@ -12289,18 +12280,47 @@ body.is-composer-resizing .composer-resize-handle::after {
   line-height: 1.5;
 }
 
-/* pi 路径管理面板 */
+/* pi 路径管理面板：输入框与操作按钮同行，提示与校验结果同列 */
 .setting-pi-path-panel {
   margin: 4px 0 8px;
 }
-.setting-pi-path-panel .setting-field {
+.setting-pi-path-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+.setting-pi-path-row .setting-field {
+  flex: 1 1 auto;
+  min-width: 0;
   margin-top: 0;
+}
+/* label 行高定型，供按钮列 margin-top 精确对齐输入框 */
+.setting-pi-path-row .setting-field .ui-field-label {
+  line-height: var(--line-height-control);
 }
 .setting-pi-path-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
+  gap: var(--space-2);
+  align-self: flex-start;
+  /* 按钮顶部与输入框顶部对齐：label 行高 + grid gap */
+  margin-top: calc(var(--line-height-control) + var(--space-2));
+}
+/* 按钮高度与输入框（control-height-lg）对齐，视觉上属于同一行控件 */
+.setting-pi-path-actions .ui-button {
+  min-height: var(--control-height-lg);
+}
+.setting-pi-path-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px var(--space-3);
+  margin-top: var(--space-1);
+}
+/* 状态文本用等宽字体，行高与描述文案一致并垂直居中，避免字体基线差异导致错位 */
+.setting-pi-path-hint .setting-status {
+  margin-top: 0;
+  line-height: var(--line-height-caption);
 }
 .setting-pi-wsl-panel {
   margin: 4px 0 8px;
@@ -12381,13 +12401,13 @@ body.is-composer-resizing .composer-resize-handle::after {
   font-size: var(--font-size-control);
 }
 
-/* Pi CLI 状态指示器 */
+/* Pi CLI 状态指示器：内容已压缩为标题+路径两行，缩小高度并垂直居中 */
 .setting-pi-status {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 52px;
+  min-height: 44px;
   margin: 6px 0;
 }
 .setting-pi-status-indicator {
@@ -12425,6 +12445,17 @@ body.is-composer-resizing .composer-resize-handle::after {
 .setting-pi-status-text > span {
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
+  line-height: 1.4;
+}
+/* omp CLI 标题与检测/版本状态同行：状态小字弱化，与标题拉开距离 */
+.setting-pi-status-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+.setting-pi-status-version {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
   line-height: 1.4;
 }
 .setting-pi-status-text .setting-path {
