@@ -3313,21 +3313,16 @@ export function RespondingIndicator(props: {
 	thinking?: string;
 	showThinking?: boolean;
 	isExecutingTool?: boolean;
-	executingToolName?: string;
 	isStreaming?: boolean;
 }) {
-	const { isExecutingTool, executingToolName, isStreaming, thinking, showThinking } = props;
+	const { isExecutingTool, isStreaming, thinking, showThinking } = props;
 
 	let kind: "executing" | "responding" | "waiting";
 	let label: string;
 
 	if (isExecutingTool) {
-		// omp 的 toolcall 事件携带真实工具名；显示具体工具让用户知道 agent 在做什么
 		kind = "executing";
-		label =
-			executingToolName && executingToolName !== "tool"
-				? t("thinking.executingWithName", { name: executingToolName })
-				: t("thinking.executing");
+		label = t("thinking.executing");
 	} else if ((showThinking && thinking && thinking.length > 0) || isStreaming) {
 		// 有思考文本或流式回答中统一显示“正在回应”
 		kind = "responding";

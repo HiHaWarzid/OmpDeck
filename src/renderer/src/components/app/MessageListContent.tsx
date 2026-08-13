@@ -36,7 +36,6 @@ export type MessageListContentProps = {
 	activeThinking?: string;
 	thinkingStartedAt?: number;
 	isExecutingTool?: boolean;
-	executingToolName?: string;
 	isStreaming?: boolean;
 	/** 正在取消 ask 响应（发送 cancelled 期间），隐藏响应指示器 */
 	cancellingUi: boolean;
@@ -79,7 +78,6 @@ export const MessageListContent = memo(
 			activeThinking,
 			thinkingStartedAt,
 			isExecutingTool,
-			executingToolName,
 			isStreaming,
 			cancellingUi,
 			activeUiAskRequestId,
@@ -227,7 +225,6 @@ export const MessageListContent = memo(
 						thinking={activeThinking}
 						showThinking={showThinking}
 						isExecutingTool={isExecutingTool}
-						executingToolName={executingToolName}
 						isStreaming={isStreaming}
 					/>
 				)}
@@ -244,7 +241,6 @@ export const MessageListContent = memo(
 		previous.activeThinking === next.activeThinking &&
 		previous.thinkingStartedAt === next.thinkingStartedAt &&
 		previous.isExecutingTool === next.isExecutingTool &&
-		previous.executingToolName === next.executingToolName &&
 		previous.isStreaming === next.isStreaming &&
 		previous.cancellingUi === next.cancellingUi &&
 		previous.activeUiAskRequestId === next.activeUiAskRequestId &&

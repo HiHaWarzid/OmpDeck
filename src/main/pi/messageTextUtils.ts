@@ -78,12 +78,10 @@ export function truncateForDetail(text: unknown): string {
 	);
 }
 
-/** 从 toolResult.content（数组或字符串形式）中提取文本，拼接为单个字符串。 */
+/** 从 toolResult.content（数组形式）中提取文本，拼接为单个字符串。 */
 export function extractToolResultText(result: unknown): string {
 	if (!result || typeof result !== "object") return "";
 	const content = (result as Record<string, unknown>).content;
-	// omp 的 toolResult.content 可能是字符串（bash 输出等），数组形式为 {type,text} 列表
-	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
 		.map((item) => (typeof (item as Record<string, unknown>)?.text === "string" ? (item as Record<string, unknown>).text as string : ""))

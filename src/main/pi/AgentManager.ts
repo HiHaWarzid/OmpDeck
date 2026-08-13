@@ -1346,14 +1346,7 @@ export class AgentManager {
 		]);
 		const state = stateResponse.data as any;
 		const stats = statsResponse.data as any;
-		// omp/pi 的 get_state.model 可能是对象 {id,name,provider}，也可能是纯字符串 id；
-		// 兼容两种形态，避免信息条模型名缺失。
-		const model =
-			typeof state?.model === "string"
-				? { id: state.model, name: state.model, provider: state?.provider }
-				: state?.model;
-		// get_session_stats 的上下文用量字段命名兼容（pi: contextUsage / omp: context_usage）。
-		const contextUsage = stats?.contextUsage ?? stats?.context_usage;
+		const model = state?.model;
 		const tokens = stats?.tokens;
 		const inputTokens = this.pickNumber(
 			tokens?.input,
@@ -1403,7 +1396,7 @@ export class AgentManager {
 			modelName: model?.name ?? model?.id,
 			provider: model?.provider,
 			modelId: model?.id,
-			thinkingLevel: state?.thinkingLevel ?? state?.thinking_level,
+			thinkingLevel: state?.thinkingLevel,
 			isStreaming: state?.isStreaming,
 			isCompacting:
 				state?.isCompacting ||
@@ -1413,9 +1406,9 @@ export class AgentManager {
 			isExecutingTool: !!runtime.toolExecuting,
 			executingToolName: runtime.toolExecuting ?? undefined,
 			toolStateSequence: runtime.toolStateSequence,
-			contextTokens: contextUsage?.tokens,
-			contextWindow: contextUsage?.contextWindow ?? model?.contextWindow,
-			contextPercent: contextUsage?.percent,
+			contextTokens: stats?.contextUsage?.tokens,
+			contextWindow: stats?.contextUsage?.contextWindow ?? model?.contextWindow,
+			contextPercent: stats?.contextUsage?.percent,
 			inputTokens,
 			outputTokens,
 			cacheRead,
@@ -2707,9 +2700,6 @@ export class AgentManager {
 			runtime.activeToolCalls.clear();
 			runtime.toolExecuting = null;
 			this.emitState();
-			// 一轮新回答开始：omp 此时已选定实际模型/思考级别，立即推送完整运行态，
-			// 让左下角模型信息条及时更新（否则要等到工具边沿或 agent_settled 才刷新）。
-			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "message_start" && typed.message?.role === "assistant") {
@@ -2719,8 +2709,6 @@ export class AgentManager {
 			}
 			this.beginAssistantMessage(runtime);
 			this.upsertAssistantMessage(runtime, typed.message);
-			// 兜底刷新：auto-retry 等场景 agent_start 后模型可能在 message_start 时才最终确定。
-			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "auto_retry_start") {
@@ -2795,9 +2783,6 @@ export class AgentManager {
 		if (typed.type === "agent_end") {
 			// agent_end 只表示一次底层 run 结束；Pi 之后仍可能执行自动重试、自动压缩，
 			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
-			// omp 的工具结果没有独立事件（无 tool_execution_end），随 agent_end.messages
-			// 的 toolResult 角色消息到达；在 toolMessageIds 清空之前把输出回填进工具卡片。
-			this.completeToolResultsFromMessages(runtime, typed);
 			runtime.activeAssistantMessageId = undefined;
 			runtime.toolMessageIds.clear();
 			// agent 异常结束时（如 API 返回 400、模型报错等），将错误提示写入会话，避免用户看到空白。
@@ -3352,75 +3337,6 @@ export class AgentManager {
 			this.flushMessageEmit(runtime);
 			runtime.activeAssistantMessageId = undefined;
 		}
-
-		if (eventType === "toolcall_start" || eventType === "toolcall_delta") {
-			// omp 没有 tool_execution_start/end 独立事件，工具调用以 message_update.toolcall_*
-			// 上报（实测 17.2.15：toolcall_start/toolcall_delta/toolcall_end，带 toolCall.id/name/arguments）。
-			// 不处理会导致工具执行期间 UI 没有任何状态驱动——左下角长时间停留在「正在回应」。
-			// 优先使用真实 toolCall.id（与 agent_end.messages 的 toolResult 消息同 id，结果可回填）；
-			// start 阶段拿不到时回退 contentIndex（start/end 同槽位配对，保证 end 清得掉）。
-			const toolCall = (assistantEvent.toolCall ?? undefined) as
-				| { id?: string; name?: string; arguments?: unknown }
-				| undefined;
-			const content = (partialMessage as { content?: unknown } | undefined)?.content;
-			const callElement = Array.isArray(content)
-				? (content as Array<Record<string, unknown>>).find(
-						(c) => c?.type === "toolCall" || c?.type === "tool_call",
-					)
-				: undefined;
-			const toolName = String(toolCall?.name ?? callElement?.name ?? "tool");
-			const toolCallId = String(
-				toolCall?.id ??
-					(typeof callElement?.id === "string" ? callElement.id : undefined) ??
-					assistantEvent.contentIndex ??
-					"0",
-			);
-			const toolState = updateActiveToolCalls(runtime.activeToolCalls, {
-				type: "start",
-				toolCallId,
-				toolName,
-			});
-			this.applyActiveToolCallState(runtime, toolState);
-			// 以工具卡片展示工具调用（运行中），与 tool_execution_start 路径共用同一消息通道
-			this.upsertToolMessage(
-				runtime,
-				{
-					toolName,
-					toolCallId,
-					args: toolCall?.arguments ?? callElement?.arguments,
-				},
-				"running",
-			);
-			this.upsertAssistantMessage(runtime, partialMessage);
-			return;
-		}
-
-		if (eventType === "toolcall_end") {
-			const toolCall = (assistantEvent.toolCall ?? undefined) as
-				| { id?: string; name?: string; arguments?: unknown }
-				| undefined;
-			const toolCallId = String(
-				toolCall?.id ?? assistantEvent.contentIndex ?? "0",
-			);
-			const toolState = updateActiveToolCalls(runtime.activeToolCalls, {
-				type: "end",
-				toolCallId,
-			});
-			this.applyActiveToolCallState(runtime, toolState);
-			this.upsertToolMessage(
-				runtime,
-				{
-					toolName: toolCall?.name ?? "tool",
-					toolCallId,
-					args: toolCall?.arguments,
-				},
-				"done",
-			);
-			// 工具结束是终态，立即 flush 让工具卡片的完成状态及时可见
-			this.flushMessageEmit(runtime);
-			this.upsertAssistantMessage(runtime, partialMessage);
-			return;
-		}
 	}
 
 	private beginAssistantMessage(runtime: AgentRuntime) {
@@ -3584,58 +3500,6 @@ export class AgentManager {
 		}
 		// 没找到 todo 工具消息，保持空快照
 		runtime.currentTodos = [];
-	}
-
-	/**
-	 * omp 的工具结果没有独立事件（无 tool_execution_end），随 agent_end.messages
-	 * 的 toolResult 角色消息到达。在此把输出/错误回填进 toolcall 事件创建的卡片。
-	 * 必须在 toolMessageIds.clear() 之前调用；找不到对应卡片（如直发工具）时跳过。
-	 */
-	private completeToolResultsFromMessages(
-		runtime: AgentRuntime,
-		event: Record<string, unknown>,
-	) {
-		const agentMessages = Array.isArray(event.messages) ? event.messages : [];
-		let touched = false;
-		for (const raw of agentMessages) {
-			if (!raw || typeof raw !== "object") continue;
-			const m = raw as Record<string, unknown>;
-			if (m.role !== "toolResult") continue;
-			const toolCallId = String(m.toolCallId ?? m.id ?? "");
-			if (!toolCallId) continue;
-			const messageId = runtime.toolMessageIds.get(toolCallId);
-			if (!messageId) continue;
-			const existing = runtime.messages.find((message) => message.id === messageId);
-			if (!existing) continue;
-			const isError = m.isError === true;
-			const content = m.content;
-			const output =
-				typeof content === "string" ? content : extractToolResultText({ content });
-			// detailText 是展开态正文，toolcall_end 时固化的是无结果版本；
-			// 回填 result 的同时用最新 args/result 重建，保证卡片展开能看到输出。
-			const argsRaw = existing.meta?.args;
-			const args =
-				typeof argsRaw === "string" && argsRaw.length > 0 ? argsRaw : undefined;
-			const rebuiltDetail = formatToolDetail(
-				String(existing.meta?.toolName ?? "tool"),
-				args,
-				output ? { content: output } : undefined,
-				isError,
-			);
-			existing.meta = {
-				...existing.meta,
-				...(output ? { result: output } : {}),
-				isError,
-				status: "done",
-				detailText: rebuiltDetail,
-			};
-			existing.text = `${isError ? "✗" : "✓"} ${String(existing.meta?.toolName ?? "tool")}`;
-			this.markMessageDirty(runtime, existing);
-			touched = true;
-		}
-		if (touched) {
-			this.flushMessageEmit(runtime);
-		}
 	}
 
 	private upsertToolMessage(
