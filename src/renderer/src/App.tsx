@@ -2632,6 +2632,7 @@ export function App() {
       if (!agent) return;
       setActiveProjectId(agent.projectId);
       setActiveAgentId(agent.id);
+      ensureAgentMessagesLoaded(agent.id);
     });
     return off;
   }, []);
@@ -3943,6 +3944,29 @@ export function App() {
     }
   }
 
+  /**
+   * 确保选中 agent 的消息已加载。
+   * agent 重启/恢复后历史消息由主进程后台加载（get_messages 可能耗时数秒），
+   * 期间渲染层的 messagesByAgent 为空——此时点击该 agent 聊天区空白，
+   * 直到发送消息触发增量推送、失同步自愈拉全量，历史才“瞬间出现”。
+   * 选中时主动拉一次；若主进程仍在后台加载，本次可能拿到空/部分结果，
+   * 加载完成后的全量基线（replaceFrom=0）会兜底整体替换。
+   */
+  function ensureAgentMessagesLoaded(agentId: string) {
+    if (messagesByAgent[agentId]) return;
+    const seqAtRequest = messageDeltaSeqRef.current[agentId] ?? 0;
+    void api.agents
+      .getMessages(agentId)
+      .then((messages) => {
+        // 拉取期间有更新的 delta 到达时，增量合并路径负责更新，这里不覆盖；
+        // 用户已切走也不写入。
+        if (messageDeltaSeqRef.current[agentId] !== seqAtRequest) return;
+        if (activeAgentIdRef.current !== agentId) return;
+        setMessagesByAgent((current) => ({ ...current, [agentId]: messages }));
+      })
+      .catch(() => undefined);
+  }
+
   async function openSidebarSession(
     projectId: string,
     session: SessionSummary,
@@ -3956,6 +3980,7 @@ export function App() {
       // 已启动的子会话仍复用父会话下的原行；点击它应直接切回 Agent，不能再退回 Viewer 后重复走启动交接。
       setActiveProjectId(projectId);
       setActiveAgentId(existingAgent.id);
+      ensureAgentMessagesLoaded(existingAgent.id);
       setAutoScroll(true);
       autoScrollRef.current = true;
       return;
@@ -6936,6 +6961,7 @@ export function App() {
                             if (subagentAgent) {
                               setActiveProjectId(subagentAgent.projectId);
                               setActiveAgentId(subagentAgent.id);
+                              ensureAgentMessagesLoaded(subagentAgent.id);
                               return;
                             }
                             void openSidebarSession(project.id, subagent);
@@ -7074,6 +7100,7 @@ export function App() {
                           onClick={() => {
                             setActiveProjectId(project.id);
                             setActiveAgentId(agent.id);
+                            ensureAgentMessagesLoaded(agent.id);
                           }}
                         >
                           <span className="agent-node-marker" aria-hidden="true" />
@@ -7380,7 +7407,7 @@ export function App() {
                                     setAgentRpcLogging((prev) => { const next = new Map(prev); next.set(agent.id, logging); return next; });
                                     setAgentMenu({ x: event.clientX, y: event.clientY, agent });
                                   }}
-                                  onClick={() => { setActiveProjectId(agent.projectId); setActiveAgentId(agent.id); }}
+                                  onClick={() => { setActiveProjectId(agent.projectId); setActiveAgentId(agent.id); ensureAgentMessagesLoaded(agent.id); }}
                                 >
                                   <span className="agent-node-marker" aria-hidden="true" />
                                   <div className="conversation-body">
