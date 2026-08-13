@@ -1,4 +1,5 @@
 import type { ChatMessage } from "../../shared/types";
+import { extractResultDetails } from "../../shared/todo";
 import { extractMessageText } from "./messageContent";
 import { takeActiveEntryId } from "./sessionEntryIds";
 import {
@@ -155,6 +156,10 @@ export function convertAgentMessages(
 						...(durationMs !== undefined ? { durationMs } : {}),
 						args: truncateForDetail(safeJson(historicalCall?.args)),
 						result: truncateForDetail(extractToolResultText(result) || safeJson(result)),
+						// omp todo 等工具的结构化快照（details.phases）需保留，渲染层据此重建 todo 列表
+						...(extractResultDetails(result) !== undefined
+							? { details: extractResultDetails(result) }
+							: {}),
 						isError,
 						detailText,
 						...(askCard ? { _askCard: askCard } : {}),

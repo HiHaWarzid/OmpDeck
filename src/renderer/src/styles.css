@@ -8465,6 +8465,22 @@ body.is-composer-resizing .composer-resize-handle::after {
   text-decoration: line-through;
   text-decoration-color: var(--color-text-tertiary);
 }
+/* omp todo 的阶段分组标题：小字号弱化，与任务行区分 */
+.todo-write-phase-head {
+  margin: var(--space-2) 0 2px;
+  padding-left: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.todo-write-phase-head:first-child {
+  margin-top: 0;
+}
+/* 分组内任务行缩进，与阶段标题形成层级 */
+.todo-write-phase-head + .todo-write-line .todo-write-line-text {
+  padding-left: var(--space-1);
+}
 .todo-write-line--in_progress .todo-write-line-text {
   font-weight: 600;
   color: var(--color-text-primary);

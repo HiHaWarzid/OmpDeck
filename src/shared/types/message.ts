@@ -78,6 +78,8 @@ export type TodoItem = {
 	status: TodoStatus;
 	/** 进行时短语，模型在 in_progress 项上填写，用于折叠态摘要。 */
 	activeForm?: string;
+	/** 所属阶段名（omp todo 的 phase 结构），用于分组展示；无分组时为 undefined。 */
+	phase?: string;
 };
 
 /**

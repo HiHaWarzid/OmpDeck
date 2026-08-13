@@ -103,7 +103,8 @@ function loadAgentManager() {
 		return sandbox.exports;
 	}
 
-	// 依赖顺序：sessionEntryIds <- messageTextUtils <- askQuestionCard <- messageTimeline <- sessionJsonl；streamGate 独立。
+	// 依赖顺序：todo（共享解析，无运行时依赖）<- sessionEntryIds <- messageTextUtils <- askQuestionCard <- messageTimeline <- sessionJsonl；streamGate 独立。
+	registry["../../shared/todo"] = loadModule("src/shared/todo.ts", "todo.ts");
 	registry["./sessionEntryIds"] = loadModule("src/main/pi/sessionEntryIds.ts", "sessionEntryIds.ts");
 	registry["./messageTextUtils"] = loadModule("src/main/pi/messageTextUtils.ts", "messageTextUtils.ts");
 	registry["./askQuestionCard"] = loadModule("src/main/pi/askQuestionCard.ts", "askQuestionCard.ts");

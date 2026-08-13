@@ -142,6 +142,7 @@ import type {
 	TodoStatus,
 	WidgetLineItem,
 } from "../../../../shared/types";
+import { extractTodoItems, isTodoWriteToolName } from "../../../../shared/todo";
 import { parseRichInputChips, unwrapFileChipPath, type RichInputChip } from "./RichInput";
 import removeMarkdown from "remove-markdown";
 /** 复用 petdex 标准网格规格，在主设置面板里为宠物选择器渲染单格动画预览 */
@@ -2224,44 +2225,14 @@ function getToolKindLabel(toolName: string): string {
 	return "";
 }
 
-/** 识别 TodoWrite 工具（兼容 todo_write / TodoWrite 命名变体，大小写不敏感）。 */
-function isTodoWriteTool(toolName: string): boolean {
-	const key = (toolName ?? "").toLowerCase();
-	return key === "todowrite" || key === "todo_write";
-}
+/** 识别 todo 写入类工具（兼容 omp 原生 "todo" 及 TodoWrite/todo_write 命名变体）。 */
+const isTodoWrite = isTodoWriteToolName;
 
 /**
- * 从工具消息的 meta.args 解析 TodoWrite 入参的 todos 数组。
- * meta.args 在实时和历史路径里都是 JSON 字符串（truncateForDetail(safeJson(args))），
- * MAX_TOOL_RESULT_CHARS=8000 对 todo 清单足够，不会触发截断。
- * 解析失败或结构不合法时返回空数组。
+ * 从工具消息 meta 解析 todo 列表。
+ * 优先 omp 的结构化快照（meta.details.phases），回退 TodoWrite 风格入参（meta.args.todos）。
+ * 实现见 shared/todo.ts，主进程与渲染层共用同一套归一化逻辑。
  */
-function parseTodoItemsFromArgs(meta: Record<string, unknown> | undefined): TodoItem[] {
-	const argsRaw = meta?.args;
-	if (typeof argsRaw !== "string") return [];
-	try {
-		const parsed = JSON.parse(argsRaw) as { todos?: unknown };
-		if (!Array.isArray(parsed.todos)) return [];
-		const items: TodoItem[] = [];
-		for (const item of parsed.todos) {
-			if (!item || typeof item !== "object") continue;
-			const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
-			if (typeof obj.content !== "string" || !obj.content) continue;
-			const status: TodoStatus =
-				obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
-					? obj.status
-					: "pending";
-			items.push({
-				content: obj.content,
-				status,
-				...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
-			});
-		}
-		return items;
-	} catch {
-		return [];
-	}
-}
 
 /**
  * 计算 todo 列表的进度摘要：已完成数/总数 + 当前 in_progress 项的摘要文本。
@@ -2278,8 +2249,7 @@ function summarizeTodoProgress(items: TodoItem[]): { done: number; total: number
 }
 
 /** 渲染 TodoWrite 展开态清单的单行：三态图标 + content，in_progress 加粗。 */
-function renderTodoLine(item: TodoItem, index: number): ReactNode {
-	const icon =
+function renderTodoLine(item: TodoItem, key: React.Key): ReactNode {	const icon =
 		item.status === "completed" ? (
 			<Check size={13} strokeWidth={2.4} className="todo-line-icon todo-line-icon--done" aria-label={t("todo.statusCompleted")} />
 		) : item.status === "in_progress" ? (
@@ -2289,7 +2259,7 @@ function renderTodoLine(item: TodoItem, index: number): ReactNode {
 		);
 	return (
 		<li
-			key={index}
+			key={key}
 			className={`todo-write-line todo-write-line--${item.status}`}
 			title={item.content}
 		>
@@ -2297,6 +2267,30 @@ function renderTodoLine(item: TodoItem, index: number): ReactNode {
 			<span className="todo-write-line-text">{item.content}</span>
 		</li>
 	);
+}
+
+/**
+ * 渲染 todo 列表（按 phase 分组）。
+ * omp 的 todo 快照带 phase 分组：每组先渲染阶段标题行，再渲染任务行；
+ * 无 phase 的项（TodoWrite 风格）直接平铺。
+ */
+function renderTodoGroups(items: TodoItem[]): ReactNode[] {
+	const nodes: ReactNode[] = [];
+	let currentPhase: string | undefined;
+	let groupIndex = -1;
+	items.forEach((item, idx) => {
+		if (item.phase !== currentPhase) {
+			currentPhase = item.phase;
+			groupIndex++;
+			nodes.push(
+				<li key={`phase-${groupIndex}`} className="todo-write-phase-head">
+					{currentPhase}
+				</li>,
+			);
+		}
+		nodes.push(renderTodoLine(item, `${groupIndex}-${idx}`));
+	});
+	return nodes;
 }
 
 /** 单个工具调用卡片：trigger 行（图标+工具名+副标题+状态+耗时）+ 展开后详情。 */
@@ -2320,9 +2314,9 @@ export const ToolCard = memo(function ToolCard(props: {
 	const tone = getToolTone(props.message);
 	const kindLabel = getToolKindLabel(toolName);
 	const diffTarget = getToolDiffTarget(props.message);
-	// TodoWrite 特化：从 meta.args 解析 todos 数组，派生进度摘要并隐藏无意义的耗时
-	const isTodoWrite = isTodoWriteTool(toolName);
-	const todoItems = isTodoWrite ? parseTodoItemsFromArgs(props.message.meta) : [];
+	// TodoWrite 特化：从 meta 解析 todos（omp details.phases 快照优先），派生进度摘要并隐藏无意义的耗时
+	const isTodoWrite = isTodoWriteToolName(toolName);
+	const todoItems = isTodoWrite ? extractTodoItems(props.message.meta) : [];
 	const todoSummary = isTodoWrite ? summarizeTodoProgress(todoItems) : null;
 	// 折叠态 subtitle：TodoWrite 用进度摘要（{done}/{total} · activeForm），其它工具走原 subtitle
 	const subtitle = isTodoWrite && todoSummary
@@ -2563,7 +2557,7 @@ const statusLabel =
 						</div>
 					) : isTodoWrite && todoItems.length > 0 ? (
 						<ol className="todo-write-list">
-							{todoItems.map((item, idx) => renderTodoLine(item, idx))}
+							{renderTodoGroups(todoItems)}
 						</ol>
 					) : (
 						<pre className="tool-card-detail">{detailText}</pre>

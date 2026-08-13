@@ -20,6 +20,12 @@ import type {
 	WidgetLineItem,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import {
+	extractResultDetails,
+	isTodoWriteToolName,
+	normalizeTodoItems,
+	normalizeTodoSnapshot,
+} from "../../shared/todo";
 import { PiProcess } from "./PiProcess";
 import type { RpcResponse } from "./PiRpcClient";
 import { formatBashToolMessage } from "./bashResult";
@@ -3374,42 +3380,30 @@ export class AgentManager {
 	}
 
 	/**
-	 * 识别 TodoWrite 工具（大小写不敏感，兼容 todo_write / TodoWrite 命名变体）。
+	 * 识别 todo 写入类工具（大小写不敏感）。
+	 * omp 原生工具名为 "todo"；TodoWrite / todo_write 为其它 harness 命名变体。
 	 * 只匹配写入工具，不匹配 todo_list / todo_get 等只读查询——它们不更新 todo 列表。
 	 */
 	private isTodoWriteTool(toolName: string): boolean {
-		const key = (toolName ?? "").toLowerCase();
-		return key === "todowrite" || key === "todo_write";
+		return isTodoWriteToolName(toolName);
 	}
 
 	/**
-	 * 从 TodoWrite 工具入参提取 todos 并派生 currentTodos 快照，同时 emit setWidget
-	 * 驱动渲染层的持久 TODO widget。直接从 event.args.todos（对象）取值，避免反解 argsMeta。
+	 * 从 todo 工具结果/入参提取 todos 并派生 currentTodos 快照，同时 emit setWidget
+	 * 驱动渲染层的持久 TODO widget。
+	 * 优先 omp 的结构化快照（event.result.details.phases，含 phase 分组），
+	 * 回退 TodoWrite 风格入参（event.args.todos）。
 	 */
 	private deriveAndEmitTodos(runtime: AgentRuntime, event: Record<string, any>) {
-		const args = event.args;
-		if (!args || typeof args !== "object") return;
-		const todos = (args as { todos?: unknown }).todos;
-		if (!Array.isArray(todos)) return;
-		// 只保留结构合法的项，过滤掉模型偶发的畸形数据
-		const normalized: TodoItem[] = [];
-		for (const item of todos) {
-			if (!item || typeof item !== "object") continue;
-			const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
-			if (typeof obj.content !== "string" || !obj.content) continue;
-			const status = obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
-				? obj.status
-				: "pending";
-			normalized.push({
-				content: obj.content,
-				status,
-				...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
-			});
+		// omp：结果快照是权威数据（模型可能只传增量 op，args 不含完整清单）
+		let normalized = normalizeTodoSnapshot(extractResultDetails(event.result));
+		if (normalized.length === 0) {
+			normalized = normalizeTodoItems((event.args as { todos?: unknown } | undefined)?.todos);
 		}
 		runtime.currentTodos = normalized;
 		// 复用 setWidget 通道推送结构化 widgetLines，渲染层按联合类型收窄渲染
 		const widgetLines: WidgetLineItem[] = normalized.map((t) => ({
-			content: t.content,
+			content: t.phase ? `${t.phase}：${t.content}` : t.content,
 			status: t.status,
 			...(t.activeForm ? { activeForm: t.activeForm } : {}),
 		}));
@@ -3425,9 +3419,9 @@ export class AgentManager {
 
 	/**
 	 * 会话恢复后从历史工具消息重建 currentTodos 快照。
-	 * 反向扫描该 agent 的工具消息，取最后一条 TodoWrite 的 meta.args.todos。
-	 * args 在历史路径里是 truncateForDetail(safeJson(args)) 存储的 JSON 字符串，
-	 * MAX_TOOL_RESULT_CHARS=8000 对 todo 清单足够（通常几百到一两千字符，不触发截断）。
+	 * 反向扫描该 agent 的工具消息，取最后一条 todo 工具消息的快照。
+	 * 优先 meta.details（omp result.details.phases，主进程已保存为对象），
+	 * 回退 meta.args.todos（TodoWrite 风格，JSON 字符串）。
 	 */
 	private rebuildTodosFromHistory(runtime: AgentRuntime) {
 		for (let i = runtime.messages.length - 1; i >= 0; i--) {
@@ -3435,54 +3429,42 @@ export class AgentManager {
 			if (msg.role !== "tool") continue;
 			const toolName = msg.meta?.toolName;
 			if (typeof toolName !== "string" || !this.isTodoWriteTool(toolName)) continue;
-			const argsRaw = msg.meta?.args;
-			if (typeof argsRaw !== "string") {
-				runtime.currentTodos = [];
-				return;
-			}
-			try {
-				const parsed = JSON.parse(argsRaw) as { todos?: unknown };
-				if (Array.isArray(parsed.todos)) {
-					// 复用 deriveAndEmitTodos 的归一化逻辑，但不 emit（loadMessages 后渲染层会全量刷新）
-					const normalized: TodoItem[] = [];
-					for (const item of parsed.todos) {
-						if (!item || typeof item !== "object") continue;
-						const obj = item as { content?: unknown; status?: unknown; activeForm?: unknown };
-						if (typeof obj.content !== "string" || !obj.content) continue;
-						const status = obj.status === "pending" || obj.status === "in_progress" || obj.status === "completed"
-							? obj.status
-							: "pending";
-						normalized.push({
-							content: obj.content,
-							status,
-							...(typeof obj.activeForm === "string" && obj.activeForm ? { activeForm: obj.activeForm } : {}),
-						});
-					}
-					runtime.currentTodos = normalized;
-					// 重建后也推送一次 widget，让渲染层立即显示
-					const widgetLines: WidgetLineItem[] = normalized.map((t) => ({
-						content: t.content,
-						status: t.status,
-						...(t.activeForm ? { activeForm: t.activeForm } : {}),
-					}));
-					this.emit(ipcChannels.agentsUiRequest, {
-						agentId: runtime.tab.id,
-						requestId: `todo-rebuild-${Date.now()}`,
-						method: "setWidget",
-						title: "",
-						widgetKey: "pi-deck-todo",
-						widgetLines,
-					});
-				} else {
+			const fromDetails = normalizeTodoSnapshot(msg.meta?.details);
+			if (fromDetails.length > 0) {
+				runtime.currentTodos = fromDetails;
+			} else {
+				const argsRaw = msg.meta?.args;
+				if (typeof argsRaw !== "string") {
 					runtime.currentTodos = [];
+					return;
 				}
-				return;
-			} catch {
-				runtime.currentTodos = [];
-				return;
+				try {
+					const parsed = JSON.parse(argsRaw) as { todos?: unknown };
+					runtime.currentTodos = Array.isArray(parsed.todos)
+						? normalizeTodoItems(parsed.todos)
+						: [];
+				} catch {
+					runtime.currentTodos = [];
+					return;
+				}
 			}
+			// 重建后也推送一次 widget，让渲染层立即显示
+			const widgetLines: WidgetLineItem[] = runtime.currentTodos.map((t) => ({
+				content: t.phase ? `${t.phase}：${t.content}` : t.content,
+				status: t.status,
+				...(t.activeForm ? { activeForm: t.activeForm } : {}),
+			}));
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId: runtime.tab.id,
+				requestId: `todo-rebuild-${Date.now()}`,
+				method: "setWidget",
+				title: "",
+				widgetKey: "pi-deck-todo",
+				widgetLines,
+			});
+			return;
 		}
-		// 没找到 TodoWrite 工具消息，保持空快照
+		// 没找到 todo 工具消息，保持空快照
 		runtime.currentTodos = [];
 	}
 
@@ -3526,6 +3508,9 @@ export class AgentManager {
 		// args 可能来自 event.args（对象）或 existing.meta.args（已序列化的 JSON 字符串）。
 		// 如果是后者（如 tool_execution_end 不带 args），直接复用已有字符串避免 double encoding。
 		const argsMeta = typeof args === "string" ? args : truncateForDetail(safeJson(args));
+		// omp 等工具的结构化结果快照（todo 的 details.phases）以对象形式保存，
+		// 供工具卡渲染与历史恢复解析；extractToolResultText 只保留文本会丢失该信息。
+		const resultDetails = extractResultDetails(result);
 		// 提取 ask_question 详情用于渲染提问卡片；支持批量（questions 数组）和单问题两种格式。
 		// pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装）
 		const askDetails = extractAskQuestionDetails(toolName, result, args);
@@ -3538,6 +3523,7 @@ export class AgentManager {
 			...(durationMs !== undefined ? { durationMs } : {}),
 			args: argsMeta,
 			result: truncateForDetail(extractToolResultText(result) || safeJson(result)),
+			...(resultDetails !== undefined ? { details: resultDetails } : {}),
 			isError,
 			detailText,
 			// originalContent 不再存储到消息中（full file 会使会话元数据体积过大）。
