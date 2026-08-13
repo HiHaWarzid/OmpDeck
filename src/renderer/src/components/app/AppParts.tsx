@@ -97,6 +97,7 @@ import {
 	Share,
 	SquarePen,
 	UserPen,
+	ListTodo,
 	// 会话 fork：从该用户消息切出新会话（对应 pi /fork），忙碌时不展示。
 	GitFork,
 	FoldVertical,
@@ -2073,7 +2074,7 @@ function toolIcon(toolName: string): ReactNode {
 	if (key.includes("glob") || key.includes("list") || key.includes("ls")) return <Folder size={15} />;
 	if (key.includes("task") || key.includes("subagent") || key.includes("agent")) return <Network size={15} />;
 	if (key.includes("web") || key.includes("fetch")) return <Globe2 size={15} />;
-	if (key.includes("todo")) return <Check size={15} />;
+	if (key.includes("todo")) return <ListTodo size={15} />;
 	return <Wrench size={15} />;
 }
 
@@ -2251,7 +2252,9 @@ function summarizeTodoProgress(items: TodoItem[]): { done: number; total: number
 /** 渲染 TodoWrite 展开态清单的单行：三态图标 + content，in_progress 加粗。 */
 function renderTodoLine(item: TodoItem, key: React.Key): ReactNode {	const icon =
 		item.status === "completed" ? (
-			<Check size={13} strokeWidth={2.4} className="todo-line-icon todo-line-icon--done" aria-label={t("todo.statusCompleted")} />
+			// Check 图形瘦窄（占 SVG 约 2/3 宽），放大并配合固定槽位居中，
+			// 使"图形右缘→文字"间距与 Circle/CircleDot 一致。
+			<Check size={15} strokeWidth={2.6} className="todo-line-icon todo-line-icon--done" aria-label={t("todo.statusCompleted")} />
 		) : item.status === "in_progress" ? (
 			<CircleDot size={13} strokeWidth={2.2} className="todo-line-icon todo-line-icon--active" aria-label={t("todo.statusInProgress")} />
 		) : (
@@ -2270,27 +2273,12 @@ function renderTodoLine(item: TodoItem, key: React.Key): ReactNode {	const icon 
 }
 
 /**
- * 渲染 todo 列表（按 phase 分组）。
- * omp 的 todo 快照带 phase 分组：每组先渲染阶段标题行，再渲染任务行；
- * 无 phase 的项（TodoWrite 风格）直接平铺。
+ * 渲染 todo 列表（保持 phase 分组顺序）。
+ * omp 的 todo 快照带 phase 分组；分组标题不再展示（用户要求精简），
+ * 任务行按原分组顺序平铺，无 phase 的项（TodoWrite 风格）同样直接平铺。
  */
 function renderTodoGroups(items: TodoItem[]): ReactNode[] {
-	const nodes: ReactNode[] = [];
-	let currentPhase: string | undefined;
-	let groupIndex = -1;
-	items.forEach((item, idx) => {
-		if (item.phase !== currentPhase) {
-			currentPhase = item.phase;
-			groupIndex++;
-			nodes.push(
-				<li key={`phase-${groupIndex}`} className="todo-write-phase-head">
-					{currentPhase}
-				</li>,
-			);
-		}
-		nodes.push(renderTodoLine(item, `${groupIndex}-${idx}`));
-	});
-	return nodes;
+	return items.map((item, idx) => renderTodoLine(item, String(idx)));
 }
 
 /** 单个工具调用卡片：trigger 行（图标+工具名+副标题+状态+耗时）+ 展开后详情。 */
@@ -2307,9 +2295,13 @@ export const ToolCard = memo(function ToolCard(props: {
 	defaultOpen?: boolean;
 	onDiffFile?: DiffFileHandler;
 }) {
-	const [expanded, setExpanded] = useState(props.defaultOpen ?? false);
-	const status = getToolStatus(props.message);
 	const toolName = getToolName(props.message);
+	// TodoWrite 默认展开：todo 列表是执行进度的主视图，折叠态只留一行进度摘要不够直观；
+	// 其它工具保持默认折叠，避免消息流被工具详情占满。
+	const [expanded, setExpanded] = useState(
+		() => props.defaultOpen ?? isTodoWriteToolName(toolName),
+	);
+	const status = getToolStatus(props.message);
 	const detailText = getToolDetailText(props.message);
 	const tone = getToolTone(props.message);
 	const kindLabel = getToolKindLabel(toolName);
