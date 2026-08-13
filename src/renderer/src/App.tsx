@@ -1553,8 +1553,15 @@ export function App() {
     loadPromptHistory();
   }, []);
 
-  // Agent 关闭后清除对应历史命令
+  // Agent 关闭后清除对应历史命令。
+  // 挂载初期 agents 尚未从主进程同步（displayAgents 为空），此时不能裁剪：
+  // 否则会把 loadPromptHistory 刚从 localStorage 恢复的记录误删并回写空对象，
+  // 渲染层重载（agent id 不变、依赖 localStorage 恢复历史）时上下键导航就丢了。
+  // 用 agentsLoadedOnceRef 记录“agent 列表至少加载过一次”，之后才允许按列表裁剪。
+  const agentsLoadedOnceRef = useRef(false);
   useEffect(() => {
+    if (displayAgents.length > 0) agentsLoadedOnceRef.current = true;
+    if (!agentsLoadedOnceRef.current) return;
     const currentIds = new Set(displayAgents.map(a => a.id));
     let changed = false;
     for (const id of Object.keys(promptHistoryRef.current)) {
@@ -2311,18 +2318,25 @@ export function App() {
       );
     });
     // 首次加载/重启后加载会话时，从全量消息重建 prompt history（幂等，只执行一次）。
+    // 注意：加载占位（“正在加载历史会话…”）也以 replaceFrom=0 全量基线先到达，
+    // 其中只有 system 消息、没有用户消息——若此时就设置 inited 标记，真实历史基线
+    // 到达时会被幂等保护挡住，导致重启后打开历史会话时上下键导航没有记录。
+    // 因此只对包含用户消息的基线设置 inited 标记；空/占位基线直接跳过，等真实基线。
+    // “!” 开头的 bash 命令与 sendPrompt 的保存路径保持一致，不进历史记录。
     const rebuildPromptHistory = (agentId: string, messages: ChatMessage[]) => {
       if (promptHistoryInitedRef.current.has(agentId)) return;
-      promptHistoryInitedRef.current.add(agentId);
       const userMessages = messages
-        .filter((m) => m.role === "user" && m.text?.trim())
+        .filter(
+          (m) =>
+            m.role === "user" &&
+            m.text?.trim() &&
+            !m.text.trim().startsWith("!"),
+        )
         .map((m) => m.text.trim());
-      if (userMessages.length > 0) {
-        // 反向排列：最新的在前
-        promptHistoryRef.current[agentId] = userMessages.reverse().slice(0, 50);
-      } else {
-        delete promptHistoryRef.current[agentId];
-      }
+      if (userMessages.length === 0) return;
+      promptHistoryInitedRef.current.add(agentId);
+      // 反向排列：最新的在前
+      promptHistoryRef.current[agentId] = userMessages.reverse().slice(0, 50);
       savePromptHistory();
     };
 
