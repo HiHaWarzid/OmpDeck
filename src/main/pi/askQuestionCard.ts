@@ -1,13 +1,19 @@
 /**
- * ask_question 工具卡片解析 -- 把 pi 的 ask_question 工具调用结果转换为前端 ToolCard 用的 _askCard。
+ * ask_question 工具卡片解析 -- 把 pi 的 ask_question / omp 的 ask 工具调用结果转换为前端 ToolCard 用的 _askCard。
  *
- * 从 messageTimeline 提取的纯函数模块，聚焦 ask_question 专属逻辑：
+ * 从 messageTimeline 提取的纯函数模块，聚焦 ask 专属逻辑：
  *   - tryParseBatchAskEnvelope: 识别扩展塞入 input title 的批量问卷 JSON envelope
- *   - extractAskQuestionDetails: 从 toolResult/args 中提取 ask_question 详情
+ *   - extractAskQuestionDetails: 从 toolResult/args 中提取 ask 详情
  *   - buildAskCard: 把 details 转成 _askCard 结构，处理 aborted 状态
  *
  * 依赖方向：无外部依赖，纯函数。
  */
+
+/** 识别 ask 提问类工具：omp 原生名为 "ask"，ask_question 为其它 harness 命名。 */
+function isAskTool(toolName: string): boolean {
+	const key = (toolName ?? "").toLowerCase();
+	return key === "ask" || key === "ask_question";
+}
 
 /**
  * 识别批量 ask_question envelope：扩展把 questions JSON 塞进 input 的 title，
@@ -33,20 +39,82 @@ export function tryParseBatchAskEnvelope(title: string): {
 }
 
 /**
- * 从 ask_question 工具调用的 result/args 中提取问题详情。
+ * omp ask 单题结果映射：details {question, options, multi, selectedOptions, customInput, note, timedOut}
+ * 答案由 selectedOptions + customInput 拼接，空答案视为未回答（或 timedOut）。
+ */
+function buildOmpSingleAsk(details: Record<string, unknown>): Record<string, unknown> {
+	const parts = [
+		...(Array.isArray(details.selectedOptions) ? details.selectedOptions : []),
+		...(typeof details.customInput === "string" && details.customInput ? [details.customInput] : []),
+	].filter(Boolean);
+	const answerValue = parts.length > 0 ? parts.join("、") : null;
+	const timedOut = details.timedOut === true;
+	return {
+		question: details.question,
+		type: details.multi === true ? "multi" : "select",
+		options: details.options,
+		answer: answerValue,
+		answered: !timedOut && answerValue !== null,
+		answerLabel: answerValue != null ? answerValue : undefined,
+	};
+}
+
+/**
+ * omp ask 批量结果映射：details {results: [{id, question, options, multi, selectedOptions, customInput, note, timedOut}]}
+ * 转成 PiDeck 批量结构 {questions, answers}，答案同样由 selectedOptions + customInput 拼接。
+ */
+function buildOmpBatchAsk(results: unknown[]): Record<string, unknown> {
+	const questions: Array<Record<string, unknown>> = [];
+	const answers: Array<Record<string, unknown>> = [];
+	for (const raw of results) {
+		if (!raw || typeof raw !== "object") continue;
+		const r = raw as Record<string, unknown>;
+		const id = typeof r.id === "string" && r.id ? r.id : String(r.question ?? `q${questions.length + 1}`);
+		questions.push({
+			id,
+			question: String(r.question ?? ""),
+			type: r.multi === true ? "multi" : "select",
+			options: r.options,
+		});
+		const parts = [
+			...(Array.isArray(r.selectedOptions) ? r.selectedOptions : []),
+			...(typeof r.customInput === "string" && r.customInput ? [r.customInput] : []),
+		].filter(Boolean);
+		const value = parts.length > 0 ? parts.join("、") : null;
+		answers.push({
+			id,
+			value,
+			...(value != null ? { label: value } : {}),
+		});
+	}
+	return { questions, answers, cancelled: false };
+}
+
+/**
+ * 从 ask 工具调用的 result/args 中提取问题详情。
  * pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装），
  * 也可能从 args.questions 提取（当 result 只有 answer 字符串时）。
+ * omp 的 ask 工具结果字段与 ask_question 不同（selectedOptions/customInput/results），
+ * 在此统一映射为 PiDeck 结构。
  */
 export function extractAskQuestionDetails(
 	toolName: string,
 	result: unknown,
 	args: unknown,
 ): Record<string, unknown> | undefined {
-	if (toolName !== "ask_question") return undefined;
+	if (!isAskTool(toolName)) return undefined;
 
 	if (result && typeof result === "object") {
 		const r = result as Record<string, unknown>;
 		const rDetails = r.details as Record<string, unknown> | undefined;
+		// omp ask 单题：question + options 数组（含空选项的多选/输入题）
+		if (rDetails && typeof rDetails.question === "string" && Array.isArray(rDetails.options)) {
+			return buildOmpSingleAsk(rDetails);
+		}
+		// omp ask 批量：results 数组
+		if (rDetails && Array.isArray(rDetails.results) && rDetails.results.length > 0) {
+			return buildOmpBatchAsk(rDetails.results);
+		}
 		if (rDetails?.question || Array.isArray(rDetails?.answers) || Array.isArray(rDetails?.questions)) {
 			return rDetails;
 		}

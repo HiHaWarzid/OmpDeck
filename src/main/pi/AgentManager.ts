@@ -103,11 +103,12 @@ export class AgentManager {
 	/** 流式 emit 合并窗口（毫秒）。50ms 兼顾流畅度与传输量，肉眼几乎无延迟。 */
 	private static readonly MESSAGE_FLUSH_INTERVAL_MS = 50;
 	/**
-	 * agent_end 后等待 agent_settled 的超时时间（毫秒）。
-	 * 如果 Pi 在此时间内未发送 agent_settled，桌面端将主动查询 get_state 并尝试恢复 idle。
-	 * 这补偿了 Pi 在某些边缘情况下不发送 agent_settled 导致动画永久卡住的问题。
+	 * agent_end / 压缩完成后到最终空闲检查的延迟（毫秒）。
+	 * 旧 pi 有 agent_settled 事件可立即恢复 idle；omp 没有该事件，用短延迟 +
+	 * get_state 校验（isStreaming/isCompacting/pendingMessageCount）确认无后续工作。
+	 * 延迟过短会频繁查询 get_state，过长则 agent 完成后 UI 长时间停在 running。
 	 */
-	private static readonly AGENT_SETTLED_TIMEOUT_MS = 5000;
+	private static readonly AGENT_SETTLED_TIMEOUT_MS = 1200;
 	/**
 	 * 超过该大小的历史会话跳过 get_messages RPC，改为直接从 JSONL 文件尾部读取最近 N 条消息。
 	 * pi 当前不支持 limit/cursor，40MB JSONL 会以单行大 JSON 返回，主进程 JSON.parse 会短暂冻结整个应用。
@@ -720,6 +721,11 @@ export class AgentManager {
 				: undefined;
 			const preserveMessagesAfter = Date.now();
 			if (messagesPromise) {
+				// 加载占位：get_messages 可能耗时十几秒，期间给用户明确的加载反馈，
+				// 避免聊天区空白看起来像卡死。加载成功后的全量基线会整体替换掉占位
+				// （mergeHistoryWithPreservedMessages 显式剔除 historyLoading 消息）；
+				// 加载失败时下方 catch 会把占位转成错误提示。
+				this.addMessage(runtime, "system", "正在加载历史会话…", { historyLoading: true });
 				void this.loadMessages(id, true, messagesPromise, { preserveMessagesAfter })
 					.catch(() =>
 						new Promise<void>((resolve) => setTimeout(resolve, 800))
@@ -751,6 +757,8 @@ export class AgentManager {
 						});
 					});
 			} else if (input.sessionPath) {
+				// 文件直读同样可能较慢（大文件），与 RPC 分支一致插入加载占位。
+				this.addMessage(runtime, "system", "正在加载历史会话…", { historyLoading: true });
 				void this.loadMessages(
 					id,
 					true,
@@ -1020,6 +1028,25 @@ export class AgentManager {
 				excludeFromContext,
 			});
 			this.addMessage(runtime, "tool", toolMessage.text, toolMessage.meta);
+			// omp 的 RPC bash 不把输出写入会话上下文（实测 get_messages 为空，且 handler 忽略 excludeFromContext）。
+			// 旧 pi 依赖 excludeFromContext 字段由 pi 写上下文；omp 下需宿主把 ! 命令的输出显式发回，
+			// 否则「!命令 → 执行并将输出发送给 LLM」的语义丢失。!!（excludeFromContext）保持只展示。
+			if (!excludeFromContext && output) {
+				void runtime.process.client
+					.request(
+						{
+							type: "prompt",
+							message: `Command: ${command}\nOutput:\n${output}`,
+						},
+						this.settingsStore.get().rpcTimeout,
+					)
+					.catch((error) => {
+						void this.appLogger?.error("agent", "Failed to send bash output to LLM", {
+							agentId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			}
 		}
 		return { accepted: true };
 	} catch (error) {
@@ -2643,10 +2670,10 @@ export class AgentManager {
 		// 对一个已不存在的 runtime 改状态只会造成内存泄漏与 UI 串台。
 		if (!runtime) return;
 
-		// 扩展/RPC 调用 setSessionName 后 Pi 会发 session_info_changed；
+		// 扩展/RPC 调用 setSessionName 后 Pi 发 session_info_changed（旧 pi）/ session_info_update（omp）事件；
 		// 同步到 tab.title，使侧边栏与手动 rename 路径看到同一标题。
 		// 忽略空 name，避免把已有标题抹掉。
-		if (typed.type === "session_info_changed") {
+		if (typed.type === "session_info_changed" || typed.type === "session_info_update") {
 			const name =
 				typeof typed.name === "string"
 					? typed.name.replace(/\s+/g, " ").trim()
@@ -2663,6 +2690,10 @@ export class AgentManager {
 			// 2) 推进 stream generation，解封流式闸门（唯一合法解封点）
 			runtime.recentlyAborted = false;
 			this.openAgentStream(runtime);
+			if (runtime.settleCheckTimer) {
+				clearTimeout(runtime.settleCheckTimer);
+				runtime.settleCheckTimer = undefined;
+			}
 			runtime.tab.status = "running";
 			runtime.activeAssistantMessageId = undefined;
 			runtime.toolMessageIds.clear();
@@ -2707,9 +2738,9 @@ export class AgentManager {
 			}
 		}
 
-		// 自动/手动压缩事件（pi 在自动或手动压缩完成后会发出这些事件），
+		// 自动/手动压缩事件（pi 发 compaction_start/end，omp 发 auto_compaction_start/end），
 		// 用于记录压缩耗时和结果，便于排查压缩性能问题。
-		if (typed.type === "compaction_start") {
+		if (typed.type === "compaction_start" || typed.type === "auto_compaction_start") {
 			runtime.rpcCompacting = true;
 			// 用户已主动中止或出错时不重新激活 running 状态
 			if (!runtime.recentlyAborted && runtime.tab.status !== "error") {
@@ -2724,7 +2755,7 @@ export class AgentManager {
 				reason: typed.reason,
 			});
 		}
-		if (typed.type === "compaction_end") {
+		if (typed.type === "compaction_end" || typed.type === "auto_compaction_end") {
 			runtime.rpcCompacting = false;
 			// compaction 会向 session JSONL 写入新的边界记录；立即重载消息，
 			// 避免前端仍展示压缩前分支，下一轮继续对话时看起来像“断在旧会话”。
@@ -2732,9 +2763,11 @@ export class AgentManager {
 			// 用户已主动中止或出错时不重新激活 running 状态
 			if (!runtime.recentlyAborted && runtime.tab.status !== "error") {
 				// compaction_end 之后 Pi 仍可能因 overflow retry 或 queued follow-up 自动继续。
-				// 只有 agent_settled 才表示不会再自动发起下一轮，不能在这里提前 idle。
+				// omp 没有 agent_settled 事件，压缩完成后再调度一次最终空闲检查（get_state 校验）。
 				runtime.tab.status = "running";
 			}
+			// omp 的压缩完成后不再有 settled 事件：重新调度空闲检查，避免 UI 停在 running
+			this.scheduleSettleCheck(runtime, agentId);
 			this.emitState();
 			void this.emitRuntimeState(agentId);
 			void this.appLogger?.info("agent", "Compaction ended", {
@@ -2815,22 +2848,23 @@ export class AgentManager {
 			// 但不要把它当作最终空闲信号，最终状态由 agent_settled 处理。
 			void this.emitRuntimeState(agentId);
 
-			// 兜底：如果 Pi 由于某些边缘情况未发送 agent_settled，
+			// 兜底：omp 没有 agent_settled 事件（旧 pi 才有），
 			// 定时查询 get_state 确认是否已无工作可做，避免 UI 动画永久卡住。
-			// agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
-			const settledTimer = setTimeout(() => {
-				void this.markIdleIfPiReportsNoWork(agentId);
-			}, AgentManager.AGENT_SETTLED_TIMEOUT_MS);
-			settledTimer.unref?.();
+			// 压缩完成后会重新调度；agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
+			this.scheduleSettleCheck(runtime, agentId);
 		}
 
 		if (typed.type === "agent_settled") {
-			// agent_settled 是 Pi 的最终稳定点。
+			// agent_settled 是旧 pi 的最终稳定点（omp 无此事件，走 scheduleSettleCheck 兜底）。
 			// 通知 stream gate：abort 对应的 settled 已到。
 			// 若 settled 前已有 agent_start（用户立刻重发），此处才真正解封；
 			// 若还没有新 start，则保持封印，防止 settled 后残留 delta 复活旧气泡。
 			this.noteAgentAbortSettled(runtime);
 			runtime.recentlyAborted = false;
+			if (runtime.settleCheckTimer) {
+				clearTimeout(runtime.settleCheckTimer);
+				runtime.settleCheckTimer = undefined;
+			}
 			if (runtime.tab.status !== "error" && runtime.tab.status !== "closed") {
 				// agent_settled 是 Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry
 				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
@@ -3711,6 +3745,21 @@ export class AgentManager {
 		timer.unref?.();
 	}
 
+	/**
+	 * 调度一次最终空闲检查（omp 没有 agent_settled 事件）。
+	 * agent_end / auto_compaction_end 后调用；延迟后通过 get_state 校验
+	 * （isStreaming/isCompacting/pendingMessageCount）确认 pi 已无工作才置 idle，
+	 * 因此提前检查不会误判压缩中或 queued follow-up 为完成。
+	 */
+	private scheduleSettleCheck(runtime: AgentRuntime, agentId: string) {
+		clearTimeout(runtime.settleCheckTimer);
+		runtime.settleCheckTimer = setTimeout(() => {
+			runtime.settleCheckTimer = undefined;
+			void this.markIdleIfPiReportsNoWork(agentId);
+		}, AgentManager.AGENT_SETTLED_TIMEOUT_MS);
+		runtime.settleCheckTimer.unref?.();
+	}
+
 	private async markIdleIfPiReportsNoWork(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime || runtime.tab.status !== "running") return;
@@ -3728,8 +3777,11 @@ export class AgentManager {
 			isStreaming?: boolean;
 			isCompacting?: boolean;
 			pendingMessageCount?: number;
+			queuedMessageCount?: number;
 		};
-		if (state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0) return;
+		// omp 返回 queuedMessageCount，旧 pi 用 pendingMessageCount：两者都读，任一非零都视为仍有排队消息
+		const queued = (state.pendingMessageCount ?? 0) + (state.queuedMessageCount ?? 0);
+		if (state.isStreaming || state.isCompacting || queued > 0) return;
 
 		runtime.tab.status = "idle";
 		runtime.streamingThinking = "";
@@ -3962,6 +4014,8 @@ type AgentRuntime = {
 	// abort 流式闸门（按 generation 封印残留 delta）
 	streamGate: StreamGateState;
 	abortSettledFallbackTimer?: NodeJS.Timeout;
+	/** omp 无 agent_settled 事件时的最终空闲检查定时器（agent_end/压缩结束后调度） */
+	settleCheckTimer?: NodeJS.Timeout;
 
 	// 消息 emit 节流
 	messageFlushTimer?: NodeJS.Timeout;
