@@ -67,7 +67,7 @@ function loadConfigManager() {
 
 test("preserves POSIX WSL trust keys under Windows path semantics", async () => {
 	const { ConfigManager, getContent, writes } = loadConfigManager();
-	const manager = new ConfigManager("C:\\PiDeck\\config");
+	const manager = new ConfigManager("C:\\OmpDeck\\config");
 
 	await manager.ensureTrustedDirectory("/root/ba_cli/");
 	assert.deepEqual(JSON.parse(getContent()), { "/root/ba_cli": true });
@@ -79,12 +79,12 @@ test("preserves POSIX WSL trust keys under Windows path semantics", async () => 
 		"/root/ba_cli/private": false,
 	});
 	assert.equal(await manager.getProjectTrustDecision("/root/ba_cli/private/nested"), false);
-	assert.equal(writes.every((write) => write.filePath === "C:\\PiDeck\\config\\trust.json"), true);
+	assert.equal(writes.every((write) => write.filePath === "C:\\OmpDeck\\config\\trust.json"), true);
 });
 
 test("retains case-insensitive matching for native Windows trust keys", async () => {
 	const { ConfigManager } = loadConfigManager();
-	const manager = new ConfigManager("C:\\PiDeck\\config");
+	const manager = new ConfigManager("C:\\OmpDeck\\config");
 
 	await manager.setProjectTrustDecision("C:\\Repo", true);
 	assert.equal(await manager.getProjectTrustDecision("c:\\repo\\child"), true);

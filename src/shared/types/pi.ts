@@ -74,7 +74,7 @@ export type PiExtensionSummary = {
 	path?: string;
 	/** 非 npm/git 安装的本地文件扩展，通过文件系统自动发现 */
 	scope: "user" | "project" | "unknown";
-	/** PiDeck 内置扩展，不可卸载 */
+	/** OmpDeck 内置扩展，不可卸载 */
 	builtIn?: boolean;
 	/** 是否启用（未在 disabledExtensions 列表中） */
 	enabled?: boolean;

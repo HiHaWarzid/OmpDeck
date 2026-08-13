@@ -1,4 +1,4 @@
-# PiDeck
+# OmpDeck
 
 [中文文档](README.md) · [English](README.en.md) · [LinuxDO 友链](https://linux.do)
 
@@ -17,11 +17,11 @@
 
 ---
 
-**PiDeck** is an open-source pi desktop workbench for managing pi Agent sessions across local project folders, with import support for local Codex and Claude sessions so you can browse and restore them in one place. Built with Electron + TypeScript, it provides multi-project workspace management, AI session history, Git integration, built-in terminal, visual config management, and plugin extensions—so local AI coding assistants stay consistent, traceable, and configurable across projects.
+**OmpDeck** is an open-source pi desktop workbench for managing pi Agent sessions across local project folders, with import support for local Codex and Claude sessions so you can browse and restore them in one place. Built with Electron + TypeScript, it provides multi-project workspace management, AI session history, Git integration, built-in terminal, visual config management, and plugin extensions—so local AI coding assistants stay consistent, traceable, and configurable across projects.
 
 **Who it's for:** Developers who want to manage multiple local-project AI coding assistant sessions from a desktop app, review session history and Git status in one place, and configure pi through visual editors instead of raw JSON files.
 
-`PiDeck` is **not** a fork of pi. It is a lightweight Electron shell that orchestrates multiple `pi --mode rpc` processes, providing a native desktop UI for projects, sessions, conversations, configuration, and tool orchestration — all powered by pi's native agent capabilities.
+`OmpDeck` is **not** a fork of pi. It is a lightweight Electron shell that orchestrates multiple `pi --mode rpc` processes, providing a native desktop UI for projects, sessions, conversations, configuration, and tool orchestration — all powered by pi's native agent capabilities.
 
 ---
 
@@ -68,9 +68,9 @@
 | **Slash Commands & `!` Shell** | Built-in slash command suggestions (`/reload`, `/compact`, `/session`, …) and `!command` / `!!command` for inline shell execution directly in the chat composer. |
 | **Embedded Terminal Dock** | Agent-scoped terminal tabs with PowerShell/cmd/sh fallback, multiple tabs, theme switching, height resizing, right-click selection copy, and close-all confirmation. |
 | **Session Management** | Create sessions, browse inline project history, restore historical sessions, rename, copy, export HTML, delete history, and close agents from the sidebar or context menus. |
-| **Session Import** | Import local Codex and Claude sessions from the project context menu, then browse or restore them as PiDeck history sessions. |
+| **Session Import** | Import local Codex and Claude sessions from the project context menu, then browse or restore them as OmpDeck history sessions. |
 | **Git Integration** | Real-time branch display with local + remote branch selector, branch count badge, switching support, and branch creation. |
-| **LAN Web Service** | Start a local web service from Settings so devices on the same network can open PiDeck through the host IP and port. |
+| **LAN Web Service** | Start a local web service from Settings so devices on the same network can open OmpDeck through the host IP and port. |
 | **Session Activity View** | Thinking notes, tool calls, and answer updates are grouped into a compact flow with expandable/copyable details and clear status or exit-code labels. |
 | **Built-in Browser Preview** | Right-drawer browser with tabs, URL bar, fullscreen mode, and PC/mobile/tablet viewport presets for checking web pages alongside the conversation. |
 | **Session File Summary** | Completed agent runs show a compact list of modified file names and changed line counts; more than three files can be expanded. |
@@ -111,7 +111,7 @@ Project file tree with Git status indicators, `@` file reference suggestions in 
 ## Architecture
 
 ```txt
-PiDeck
+OmpDeck
 ├─ Electron Main Process
 │  ├─ Project record management
 │  ├─ Spawns pi --mode rpc processes
@@ -163,16 +163,16 @@ pi --mode rpc
 
 Prebuilt packages for **Windows**, **macOS**, and **Linux** are published from tagged releases:
 
-👉 **[GitHub Releases](https://github.com/ayuayue/PiDeck/releases)**
+👉 **[GitHub Releases](https://github.com/HiHaWarzid/OmpDeck/releases)**
 
-> PiDeck requires the `pi` CLI to be installed separately and available in your system `PATH`.
+> OmpDeck requires the `pi` CLI to be installed separately and available in your system `PATH`.
 
 ---
 
 ## Quick Start (from Source)
 
 ```bash
-git clone https://github.com/ayuayue/PiDeck.git
+git clone https://github.com/HiHaWarzid/OmpDeck.git
 cd pi-desktop
 npm install
 npm run make-icon
@@ -241,13 +241,13 @@ See [CHANGELOG.md](CHANGELOG.md) (English) or [CHANGELOG.zh-CN.md](CHANGELOG.zh-
 
 ## Contributors
 
-Thank you to everyone who has contributed to PiDeck! See the full list in [CONTRIBUTORS.en.md](CONTRIBUTORS.en.md).
+Thank you to everyone who has contributed to OmpDeck! See the full list in [CONTRIBUTORS.en.md](CONTRIBUTORS.en.md).
 
 ---
 
 ## QQ Community
 
-Join the PiDeck QQ group for discussion and feedback:
+Join the OmpDeck QQ group for discussion and feedback:
 
 **1026218644**
 

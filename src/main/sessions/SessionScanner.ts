@@ -352,7 +352,7 @@ export class SessionScanner {
    * 加载该会话（/resume 中也不可见，见 #114）。pi 原生 /rename 的做法是末尾追加
    * {type:"session_info", id, parentId, timestamp, name}，读取时取最后一条。
    *
-   * 顺带剔除旧版 PiDeck 写入的 sessionName 私有行，修复已被破坏的会话文件。
+   * 顺带剔除旧版应用写入的 sessionName 私有行，修复已被破坏的会话文件。
    * 支持 WSL 路径。
    */
   async rename(filePath: string, newName: string): Promise<void> {
@@ -368,7 +368,7 @@ export class SessionScanner {
    * parentId 指向追加前最后一条带 id 的记录（没有则 null，由 pi 视为新根）。
    * 会话树靠 parentId 串联，指向最后一片叶子可保持链条完整。
    *
-   * 同时剔除旧版 PiDeck 的 {"sessionName":...} 私有行（无 type 字段）：pi 无法识别，
+   * 同时剔除旧版应用的 {"sessionName":...} 私有行（无 type 字段）：pi 无法识别，
    * 位于文件头时会破坏首行校验导致整个会话无法加载（#114 的存量受损文件）。
    */
   private appendSessionInfoLine(raw: string, name: string, extra?: Record<string, unknown>): string {
@@ -725,7 +725,7 @@ export class SessionScanner {
 
   /**
    * 快速校验文件是否为 Pi Agent 会话 JSONL（非备份/导出/重命名残留）。
-   * 真实会话的首行通常是 `type: session`；兼容 PiDeck 重命名后前置的 sessionName 元数据，
+   * 真实会话的首行通常是 `type: session`；兼容旧版应用重命名后前置的 sessionName 元数据，
    * 但要求随后仍出现 type 字段，不能只凭任意 JSON 对象误判为父会话。
    */
   private async isSessionFile(filePath: string, signal?: AbortSignal): Promise<boolean> {
@@ -923,7 +923,7 @@ export class SessionScanner {
     }
 
     // 会话名优先级与 pi getSessionName 一致：最后一条 session_info 为准；
-    // 旧版 PiDeck 的 sessionName 私有行及其他字段仅作降级回退。
+    // 旧版应用的 sessionName 私有行及其他字段仅作降级回退。
     let inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
 
     // omp/pi 子代理会话常没有显式标题（title 为空），且首条消息都是 task 工具的固定前缀

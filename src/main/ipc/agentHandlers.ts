@@ -90,7 +90,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps) {
 		const sessionChatId = bridgeConnected ? bridge.getSessionChatId(input.agentId) : undefined;
 		let agentInstruction: string | undefined;
 		const buildFeishuActionInstruction = (chatId?: string) => [
-			"当前会话已连接飞书聊天。严禁调用 lark-cli、飞书 IM API 或搜索群聊来发送文件；不要询问 chat_id。需要把本地文件发到当前飞书聊天时，最终回答末尾独立一行写 [SEND_FILE:本地文件路径]，PiDeck 会按当前会话绑定自动上传。",
+			"当前会话已连接飞书聊天。严禁调用 lark-cli、飞书 IM API 或搜索群聊来发送文件；不要询问 chat_id。需要把本地文件发到当前飞书聊天时，最终回答末尾独立一行写 [SEND_FILE:本地文件路径]，OmpDeck 会按当前会话绑定自动上传。",
 			chatId ? `当前绑定的飞书 chat_id: ${chatId}。这是只读上下文，用于确认当前会话绑定；发送文件仍必须用 [SEND_FILE:本地文件路径]。` : undefined,
 		].filter(Boolean).join("\n");
 

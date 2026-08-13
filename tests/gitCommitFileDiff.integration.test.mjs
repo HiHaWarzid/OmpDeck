@@ -48,7 +48,7 @@ before(() => {
   ({ GitService } = require(join(buildDir, "main/git/GitService.js")));
 
   git("init");
-  git("config", "user.name", "PiDeck Test");
+  git("config", "user.name", "OmpDeck Test");
   git("config", "user.email", "test@example.com");
 });
 

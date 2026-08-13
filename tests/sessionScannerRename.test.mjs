@@ -164,15 +164,15 @@ test("rename appends a pi-native session_info entry and keeps the header first (
 	}
 });
 
-test("rename heals legacy PiDeck sessionName head lines that broke pi loading (#114)", async () => {
+test("rename heals legacy OmpDeck sessionName head lines that broke pi loading (#114)", async () => {
 	const home = mkdtempSync(join(tmpdir(), "pideck-rename-heal-"));
 	try {
 		const { SessionScanner } = loadSessionScanner(home);
 		const scanner = new SessionScanner();
 		const file = join(home, "session-b.jsonl");
-		// 旧版 PiDeck 的破坏产物：头部前置无 type 的 sessionName 私有行
+		// 旧版应用的破坏产物：头部前置无 type 的 sessionName 私有行
 		writeSession(file, [
-			{ sessionName: "Old PiDeck name", ts: 1700000000000 },
+			{ sessionName: "Old app name", ts: 1700000000000 },
 			...healthySession,
 		]);
 		assert.notEqual(firstParseableEntry(readLines(file))?.type, "session");
@@ -204,7 +204,7 @@ test("repeated rename keeps the file flat and the latest name authoritative", as
 		const infoCount = lines.filter((line) => line.includes('"session_info"')).length;
 		assert.equal(infoCount, 2);
 		assert.equal(piSessionName(lines), "second");
-		// PiDeck 摘要同样以最后一条 session_info 为准
+		// OmpDeck 摘要同样以最后一条 session_info 为准
 		const summary = await scanner["readSummary"](file);
 		assert.equal(summary?.name, "second");
 	} finally {

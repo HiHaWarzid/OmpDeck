@@ -294,10 +294,10 @@ export function registerGitHandlers(deps: GitHandlerDeps) {
 			cwd: project.path,
 			env: {
 				...process.env,
-				GIT_AUTHOR_NAME: "PiDeck",
-				GIT_AUTHOR_EMAIL: "pideck@local",
-				GIT_COMMITTER_NAME: "PiDeck",
-				GIT_COMMITTER_EMAIL: "pideck@local",
+				GIT_AUTHOR_NAME: "OmpDeck",
+				GIT_AUTHOR_EMAIL: "ompdeck@local",
+				GIT_COMMITTER_NAME: "OmpDeck",
+				GIT_COMMITTER_EMAIL: "ompdeck@local",
 			},
 		});
 	});

@@ -7,7 +7,7 @@ export type ComposerEnterIntent = "ignore" | "newline" | "send";
 
 import type { ComposerAgentMode } from "@shared/types";
 
-export const PI_DECK_PLAN_MODE_MARKER = "__PI_DECK_PLAN_MODE__";
+export const OMP_DECK_PLAN_MODE_MARKER = "__PI_DECK_PLAN_MODE__";
 
 export type ComposerPromptSubmission = {
 	/** 用户在 OmpDeck 时间线里看到的原始消息，不能包含桌面端内部控制标记。 */
@@ -18,7 +18,7 @@ export type ComposerPromptSubmission = {
 
 /**
  * 构造发送给主进程的 composer 快照。
- * Plan 模式依赖 PiDeck 内置 extension 在 pi 的 input 事件里识别隐藏标记；
+ * Plan 模式依赖 OmpDeck 内置 extension 在 pi 的 input 事件里识别隐藏标记；
  * 用户可见消息保持原文，避免会话时间线出现实现细节或控制 token。
  */
 /**
@@ -197,7 +197,7 @@ export function buildComposerPromptSubmission(
 	return {
 		message,
 		agentMessage: [
-			PI_DECK_PLAN_MODE_MARKER,
+			OMP_DECK_PLAN_MODE_MARKER,
 			visibleInstruction,
 			"",
 			"请先只做只读分析，不要修改文件。最后必须输出以 `Plan:` 开头的编号计划，格式如下：",

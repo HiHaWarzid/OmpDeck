@@ -43,7 +43,7 @@ test("builds Feishu model picker card grouped by provider", () => {
 	});
 });
 
-test("parses only PiDeck model switch card actions", () => {
+test("parses only OmpDeck model switch card actions", () => {
 	const { parseModelActionValue } = loadModelCardModule();
 
 	assert.deepEqual(JSON.parse(JSON.stringify(parseModelActionValue({ action: "pideck.set_model", provider: "openai", modelId: "gpt-4o" }))), {

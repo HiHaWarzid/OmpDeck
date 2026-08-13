@@ -39,7 +39,7 @@ test("renderer bot list never receives stored app secrets", () => {
 	assert.match(listBots, /appSecret: ""/);
 });
 
-test("bound Feishu sessions tell the agent to use PiDeck SEND_FILE markers instead of asking for chat_id", () => {
+test("bound Feishu sessions tell the agent to use OmpDeck SEND_FILE markers instead of asking for chat_id", () => {
 	const source = agentHandlersSource();
 	const handler = source.match(/ipcMain\.handle\(ipcChannels\.agentsPrompt,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
 	const boundBranch = handler.match(/\} else if \(hasFeishuBinding\) \{[\s\S]*?\n\t\t\}/)?.[0] ?? "";

@@ -1,4 +1,4 @@
-# PiDeck
+# OmpDeck
 
 [English](README.en.md) · [LinuxDO 友链](https://linux.do)
 
@@ -20,11 +20,11 @@
 
 ---
 
-**PiDeck** 是一个开源的Pi桌面工作台，用于在本地项目目录中统一管理 pi Agent 会话，并支持导入 Codex、Claude 本地会话以便统一浏览和恢复。基于 Electron + TypeScript 构建，提供多项目工作区、AI 会话管理、Git 集成、内置终端、模型配置和插件扩展能力，让本地 AI 编码助手在多项目环境中保持统一、可追溯、可配置。
+**OmpDeck** 是一个开源的Pi桌面工作台，用于在本地项目目录中统一管理 pi Agent 会话，并支持导入 Codex、Claude 本地会话以便统一浏览和恢复。基于 Electron + TypeScript 构建，提供多项目工作区、AI 会话管理、Git 集成、内置终端、模型配置和插件扩展能力，让本地 AI 编码助手在多项目环境中保持统一、可追溯、可配置。
 
 **适合谁用：** 希望在桌面端同时管理多个本地项目的 AI 编程助手会话、需要统一查看会话历史与 Git 状态、并希望以图形化方式管理 pi 配置的开发者。
 
-`PiDeck` **不是** pi 的分支。它是一个轻量 Electron 外壳，通过启动多个 `pi --mode rpc` 进程，将项目管理、会话管理、对话界面、配置管理和工具编排整合到一个原生桌面应用中——所有 Agent 能力由 pi 原生提供。
+`OmpDeck` **不是** pi 的分支。它是一个轻量 Electron 外壳，通过启动多个 `pi --mode rpc` 进程，将项目管理、会话管理、对话界面、配置管理和工具编排整合到一个原生桌面应用中——所有 Agent 能力由 pi 原生提供。
 
 ---
 
@@ -71,7 +71,7 @@
 | **斜线命令 & `!` Shell** | 内置斜线命令建议（`/compact`、`/session` 等），支持 `!command` / `!!command` 在聊天输入框直接执行 Shell 命令。 |
 | **内嵌终端 Dock** | 当前 Agent 绑定独立终端 tab，支持 PowerShell/cmd/sh fallback、多 tab、主题切换、拖拽高度、右键复制选区和关闭确认。 |
 | **会话管理** | 新建会话、项目内联历史、恢复历史会话、重命名、复制、导出 HTML、删除历史会话和关闭 Agent——通过侧边栏或右键菜单即可完成。 |
-| **会话导入** | 项目右键可导入 Codex 和 Claude 本地会话，转换为 PiDeck 历史会话后继续浏览和恢复。 |
+| **会话导入** | 项目右键可导入 Codex 和 Claude 本地会话，转换为 OmpDeck 历史会话后继续浏览和恢复。 |
 | **Git 集成** | 实时显示当前分支，支持本地 + 远程分支选择器、分支数量徽章、分支切换和新建分支。 |
 | **局域网 Web 服务** | 可在设置中启动本机 Web 服务，局域网设备可通过电脑 IP 和端口访问。 |
 | **会话活动轨迹** | 思考、工具调用和回答片段按流程聚合展示，工具详情可展开复制，状态和退出码清晰标识。 |
@@ -116,7 +116,7 @@ Markdown 渲染 + 流式输出、活动轨迹、工具调用详情、回答级�
 ## 架构设计
 
 ```txt
-PiDeck
+OmpDeck
 ├─ Electron 主进程
 │  ├─ 管理项目记录
 │  ├─ 启动 pi --mode rpc 进程
@@ -168,16 +168,16 @@ pi --mode rpc
 
 **Windows**、**macOS**、**Linux** 平台的预构建安装包在 GitHub Release 中发布：
 
-👉 **[GitHub Releases](https://github.com/ayuayue/PiDeck/releases)**
+👉 **[GitHub Releases](https://github.com/HiHaWarzid/OmpDeck/releases)**
 
-> PiDeck 需要单独安装 `pi` CLI 并确保其加入系统 `PATH`。
+> OmpDeck 需要单独安装 `pi` CLI 并确保其加入系统 `PATH`。
 
 ---
 
 ## 快速开始（从源码运行）
 
 ```bash
-git clone https://github.com/ayuayue/PiDeck.git
+git clone https://github.com/HiHaWarzid/OmpDeck.git
 cd pi-desktop
 npm install
 npm run make-icon
@@ -246,13 +246,13 @@ src/
 
 ## 贡献者
 
-感谢所有为 PiDeck 做出贡献的人！完整名单请查看 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
+感谢所有为 OmpDeck 做出贡献的人！完整名单请查看 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
 
 ---
 
 ## QQ 交流群
 
-欢迎加入 PiDeck QQ 群进行交流、反馈和讨论：
+欢迎加入 OmpDeck QQ 群进行交流、反馈和讨论：
 
 **1026218644**
 

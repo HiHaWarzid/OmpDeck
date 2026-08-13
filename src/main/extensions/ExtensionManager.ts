@@ -14,8 +14,8 @@ type SettingsProvider = () => AppSettings;
 /** OmpDeck 内置扩展列表（已全部移除，omp 提供原生能力替代） */
 export const BUILT_IN_EXTENSIONS = [] as const;
 
-/** ensurePiDeckExtension 的校准结果，供启动任务汇总日志。 */
-export type PiDeckExtensionSyncResult =
+/** ensureOmpDeckExtension 的校准结果，供启动任务汇总日志。 */
+export type OmpDeckExtensionSyncResult =
 	| "installed"
 	| "updated"
 	| "unchanged"
@@ -57,9 +57,9 @@ export class ExtensionManager {
 		private readonly locator: PiLocator,
 		private readonly getSettings: SettingsProvider,
 		/** 获取 OmpDeck 桌面设置 */
-		private readonly getPiDeckSettings: () => AppSettings,
+		private readonly getOmpDeckSettings: () => AppSettings,
 		/** 保存 OmpDeck 桌面设置的部分更新 */
-		private readonly patchPiDeckSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>,
+		private readonly patchOmpDeckSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>,
 		/** 应用日志器，用于部署/校准过程记录 */
 		private readonly appLogger?: AppLogger,
 	) {}
@@ -105,7 +105,7 @@ export class ExtensionManager {
 			failed: [],
 		};
 
-		const removedBuiltIn = new Set(this.getPiDeckSettings().removedBuiltInExtensions ?? []);
+		const removedBuiltIn = new Set(this.getOmpDeckSettings().removedBuiltInExtensions ?? []);
 
 		// 并行校准：磁盘 IO 为主，互不依赖
 		await Promise.all(
@@ -164,7 +164,7 @@ export class ExtensionManager {
 	/**
 	 * 确保单个内置扩展文件存在于目标目录。
 	 * - 目标不存在 → 安装
-	 * - 内容不一致（老版本/用户手改）→ 覆盖为 PiDeck 当前版本
+	 * - 内容不一致（老版本/用户手改）→ 覆盖为 OmpDeck 当前版本
 	 * - 内容一致 → 跳过写盘
 	 *
 	 * 供 restoreBuiltIn IPC handler 在用户「恢复」内置扩展时调用，
@@ -173,7 +173,7 @@ export class ExtensionManager {
 	async ensureExtension(
 		extensionName: string,
 		homeDir: string,
-	): Promise<PiDeckExtensionSyncResult> {
+	): Promise<OmpDeckExtensionSyncResult> {
 		const extensionsDir = join(homeDir, ".omp", "agent", "extensions");
 		const targetPath = join(extensionsDir, extensionName);
 
@@ -197,7 +197,7 @@ export class ExtensionManager {
 			return "unchanged";
 		}
 
-		const action: PiDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
+		const action: OmpDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
 		await mkdir(extensionsDir, { recursive: true });
 		await writeFile(targetPath, sourceContent, "utf-8");
 		void this.appLogger?.info("extension", `Built-in extension ${action}`, {
@@ -285,7 +285,7 @@ export class ExtensionManager {
 		}
 
 		// 通过 OmpDeck 桌面设置标记内置扩展移除状态
-		const removedBuiltIn = new Set(this.getPiDeckSettings().removedBuiltInExtensions ?? []);
+		const removedBuiltIn = new Set(this.getOmpDeckSettings().removedBuiltInExtensions ?? []);
 		for (const ext of merged) {
 			ext.enabled = !(ext.builtIn && removedBuiltIn.has(ext.source));
 		}
@@ -408,7 +408,7 @@ export class ExtensionManager {
 	 * 「移除」内置扩展：写入 OmpDeck 设置跳过自动部署，并删除用户目录中的扩展文件。
 	 * 必须删文件：pi 会自动加载 ~/.omp/agent/extensions 下的 .ts，仅改设置无法阻止加载，
 	 * 与同名三方工具（如 npm:@juicesharp/rpiv-todo 的 todo）会直接冲突导致 RPC 启动失败。
-	 * 恢复时由 ensurePiDeckExtension 从 resources 重新部署。
+	 * 恢复时由 ensureOmpDeckExtension 从 resources 重新部署。
 	 */
 	async removeBuiltIn(source: string): Promise<void> {
 		const normalized = source.trim();
@@ -420,11 +420,11 @@ export class ExtensionManager {
 
 	/**
 	 * 恢复已移除的内置扩展：从 OmpDeck 设置中移除记录，下次启动自动部署。
-	 * 实际文件由调用方 ensurePiDeckExtension 写回。
+	 * 实际文件由调用方 ensureOmpDeckExtension 写回。
 	 */
 	async restoreBuiltIn(source: string): Promise<void> {
 		const normalized = source.trim();
-		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
+		const current = this.getOmpDeckSettings().removedBuiltInExtensions ?? [];
 		const next = current.filter((s) => s !== normalized);
 		if (next.length === current.length) return;
 		await this.saveRemovedBuiltIn(next);
@@ -440,7 +440,7 @@ export class ExtensionManager {
 		if (!normalized.startsWith("pi-deck-")) {
 			throw new Error("只能操作内置扩展");
 		}
-		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
+		const current = this.getOmpDeckSettings().removedBuiltInExtensions ?? [];
 		if (!current.includes(normalized)) {
 			await this.saveRemovedBuiltIn([...current, normalized]);
 		}
@@ -464,7 +464,7 @@ export class ExtensionManager {
 	}
 
 	private async saveRemovedBuiltIn(removedList: string[]): Promise<void> {
-		await this.patchPiDeckSettings({ removedBuiltInExtensions: removedList });
+		await this.patchOmpDeckSettings({ removedBuiltInExtensions: removedList });
 	}
 
 	async install(source: string): Promise<string> {

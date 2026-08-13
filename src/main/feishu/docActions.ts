@@ -21,7 +21,7 @@ export function stripFeishuActionMarkers(text: string): string {
  * 清洗同步到飞书的 assistant 正文：
  * - 去掉 <thinking> 标签块
  * - 去掉残留的 SEND_FILE/CREATE_DOC 动作标记
- * - 去掉 PiDeck 内部能力提示与宿主注入说明
+ * - 去掉 OmpDeck 内部能力提示与宿主注入说明
  * 只保留用户可见的最终回复。
  */
 /** 宿主注入给模型的内部指令边界（不应对用户展示）。 */

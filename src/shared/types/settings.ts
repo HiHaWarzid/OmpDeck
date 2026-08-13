@@ -41,7 +41,7 @@ export type AppSettings = {
 	closeToTray: boolean;
 	/**
 	 * 单实例模式：再次打开应用时复用已有窗口（托盘隐藏也会唤起）。
-	 * 默认 true；关闭后允许同时跑多个 PiDeck 进程。
+	 * 默认 true；关闭后允许同时跑多个 OmpDeck 进程。
 	 */
 	singleInstance: boolean;
 	/** 会话结束时发送系统通知 */
@@ -53,7 +53,7 @@ export type AppSettings = {
 	/**
 	 * Electron Chromium 渲染进程沙箱（与 pi Agent 无关）。
 	 * false（默认）：关闭沙箱，兼容 Windows 安全软件/旧 GPU 驱动；
-	 * true：启用 Chromium 沙箱，需重启 PiDeck 后生效。
+	 * true：启用 Chromium 沙箱，需重启 OmpDeck 后生效。
 	 */
 	electronChromiumSandbox: boolean;
 	/** 是否给 pi agent 子进程注入代理环境变量，不影响 desktop 自身网络请求 */
@@ -142,7 +142,7 @@ export type AppSettings = {
 	fontFamilyMonoCustom: string;
 
 	// ── 更新检测 ──
-	/** 是否禁用版本更新检测（PiDeck + Pi CLI），默认 false 表示正常检测；
+	/** 是否禁用版本更新检测（OmpDeck + Pi CLI），默认 false 表示正常检测；
 	 *  开启后自动跳过启动和定时检测，设置页中检测按钮也禁用。 */
 	disableUpdateCheck: boolean;
 

@@ -311,7 +311,7 @@ test("handles orphan, fork, rename and imported-session compatibility without fa
 		const importedFile = join(piDir, "codex-parent", "import-run", "run-0", "session.jsonl");
 
 		writeSession(orphanFile, session("subagent-worker-orphan-run-0", projectPath));
-		// PiDeck rename prepends sessionName; the original generated session_info remains authoritative.
+		// OmpDeck rename prepends sessionName; the original generated session_info remains authoritative.
 		writeSession(renamedChildFile, [
 			{ sessionName: "Renamed child", cwd: projectPath },
 			...session("subagent-worker-old-run-0", projectPath),

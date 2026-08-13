@@ -79,13 +79,13 @@ test("keeps normal composer submissions visible without hidden agent instruction
 	assert.equal(submission.agentMessage, undefined);
 });
 
-test("wraps plan composer submissions with the hidden PiDeck plan marker", () => {
-	const { buildComposerPromptSubmission, PI_DECK_PLAN_MODE_MARKER } = loadComposerBehaviorModule();
+test("wraps plan composer submissions with the hidden OmpDeck plan marker", () => {
+	const { buildComposerPromptSubmission, OMP_DECK_PLAN_MODE_MARKER } = loadComposerBehaviorModule();
 
 	const submission = buildComposerPromptSubmission("Inspect first", "plan");
 
 	assert.equal(submission.message, "Inspect first");
-	assert.match(submission.agentMessage, new RegExp(`^${PI_DECK_PLAN_MODE_MARKER}\\n`));
+	assert.match(submission.agentMessage, new RegExp(`^${OMP_DECK_PLAN_MODE_MARKER}\\n`));
 	assert.match(submission.agentMessage, /Inspect first/);
 	assert.match(submission.agentMessage, /Plan:/);
 });

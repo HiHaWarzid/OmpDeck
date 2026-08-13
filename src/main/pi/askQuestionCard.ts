@@ -61,7 +61,7 @@ function buildOmpSingleAsk(details: Record<string, unknown>): Record<string, unk
 
 /**
  * omp ask 批量结果映射：details {results: [{id, question, options, multi, selectedOptions, customInput, note, timedOut}]}
- * 转成 PiDeck 批量结构 {questions, answers}，答案同样由 selectedOptions + customInput 拼接。
+ * 转成 OmpDeck 批量结构 {questions, answers}，答案同样由 selectedOptions + customInput 拼接。
  */
 function buildOmpBatchAsk(results: unknown[]): Record<string, unknown> {
 	const questions: Array<Record<string, unknown>> = [];
@@ -95,7 +95,7 @@ function buildOmpBatchAsk(results: unknown[]): Record<string, unknown> {
  * pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装），
  * 也可能从 args.questions 提取（当 result 只有 answer 字符串时）。
  * omp 的 ask 工具结果字段与 ask_question 不同（selectedOptions/customInput/results），
- * 在此统一映射为 PiDeck 结构。
+ * 在此统一映射为 OmpDeck 结构。
  */
 export function extractAskQuestionDetails(
 	toolName: string,
