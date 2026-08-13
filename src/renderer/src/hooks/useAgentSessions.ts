@@ -236,6 +236,15 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		if (sessionRefreshRunningRef.current.has(projectId)) {
 			// 无论来源是周期同步还是用户操作，都必须在当前快照完成后补扫一次。
 			sessionRefreshPendingRef.current.add(projectId);
+			if (!silent) {
+				// 点击触发的刷新撞上已有扫描（如周期同步）时也给出加载反馈：
+				// 否则“点了没反应”，扫描完成后列表才突然出现。
+				// loading 由实际完成的那次扫描在 finally 无条件收尾（见下）。
+				setSessionLoadingByProject((current) => ({
+					...current,
+					[projectId]: true,
+				}));
+			}
 			return;
 		}
 		const request = (sessionRequestByProjectRef.current[projectId] ?? 0) + 1;
@@ -282,16 +291,19 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		} finally {
 			if (sessionRequestByProjectRef.current[projectId] === request) {
 				sessionRefreshRunningRef.current.delete(projectId);
+				// loading 无条件收尾：可能由被 pending 吞掉的用户点击设置，
+				// 而实际完成的是 silent 扫描（其 finally 原本不清 loading）——
+				// 若不在此收尾，加载行会永久旋转。
 				if (!silent) {
 					const elapsed = Date.now() - loadingStart;
 					if (elapsed < MIN_LOADING_MS) {
 						await new Promise<void>((resolve) => setTimeout(resolve, MIN_LOADING_MS - elapsed));
 					}
-					setSessionLoadingByProject((current) => ({
-						...current,
-						[projectId]: false,
-					}));
 				}
+				setSessionLoadingByProject((current) => ({
+					...current,
+					[projectId]: false,
+				}));
 				if (sessionRefreshPendingRef.current.delete(projectId)) {
 					// 忙碌期间错过的 tick 只补扫一次，避免并发，同时覆盖"子会话刚好在请求快照后落盘"的边界。
 					void refreshProjectSessions(projectId, true).catch(() => undefined);

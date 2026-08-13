@@ -6663,14 +6663,23 @@ export function App() {
                     el.classList.add('click-animating');
                     setTimeout(() => el.classList.remove('click-animating'), 400);
 
-                    // 点击项目行：切换展开/折叠；首次展开未加载会话时顺带拉列表。
-                    // 历史会话尚未加载时点击永远只做「展开 + 加载」，不允许折叠：
-                    // 慢扫描期间的第二击若把行折回，会造成“点了没反应、要多点几次”的观感。
-                    // 想折叠请点行首折叠图标。
+                    // 点击项目行：普通项目始终「打开」（展开 + 确保加载），收起走行首箭头。
+                    // 展开集合从 localStorage 恢复，项目默认就是展开态——若行点击仍是 toggle，
+                    // 用户第一次点击会把已展开的项目收起（历史消失），第二次点击才展开显示，
+                    // 表现为“需要点击两次才能看到历史记录”。
                     const hasLoadedSessions = project.id in sessionsByProject;
-                    if (!hasLoadedSessions && !projectIsChat) {
+                    if (!projectIsChat) {
+                      const wasCollapsed = isCollapsed;
                       setProjectSidebarExpanded(project.id, true);
-                      void refreshProjectSessions(project.id).catch(() => undefined);
+                      // 折叠→展开时刷新保证最新；已展开但从未加载成功时补拉列表；
+                      // 已加载但列表为空也刷新一次（上次扫描可能异常，避免空列表卡死）。
+                      if (
+                        wasCollapsed ||
+                        !hasLoadedSessions ||
+                        (sessionsByProject[project.id]?.length ?? 0) === 0
+                      ) {
+                        void refreshProjectSessions(project.id).catch(() => undefined);
+                      }
                     } else {
                       const wasCollapsed = isCollapsed;
                       setProjectSidebarExpanded(project.id);

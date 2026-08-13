@@ -26,7 +26,7 @@ test("queues every refresh collision instead of dropping user-triggered refreshe
   const block = refreshProjectSessionsBlock();
   assert.match(
     block,
-    /if \(sessionRefreshRunningRef\.current\.has\(projectId\)\) \{[\s\S]*?sessionRefreshPendingRef\.current\.add\(projectId\);\s*return;/,
+    /if \(sessionRefreshRunningRef\.current\.has\(projectId\)\) \{[\s\S]*?sessionRefreshPendingRef\.current\.add\(projectId\);\s*if \(!silent\) \{[\s\S]*?setSessionLoadingByProject[\s\S]*?\}\s*return;/,
   );
   assert.doesNotMatch(block, /if \(silent\) sessionRefreshPendingRef\.current\.add\(projectId\)/);
   assert.match(block, /if \(sessionRefreshPendingRef\.current\.delete\(projectId\)\)/);
