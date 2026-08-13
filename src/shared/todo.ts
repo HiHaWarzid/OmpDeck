@@ -99,5 +99,12 @@ export function extractTodoItems(meta: Record<string, unknown> | undefined): Tod
 /** 从工具结果对象提取 details 字段（omp todo 的状态快照所在）。 */
 export function extractResultDetails(result: unknown): unknown {
 	if (!result || typeof result !== "object") return undefined;
-	return (result as Record<string, unknown>).details;
+	const typed = result as Record<string, unknown>;
+	const details = typed.details;
+	if (details !== undefined) return details;
+	// omp 的 tool_execution_end.result 直接就是 todo 快照（{op, phases, storage}），
+	// 没有 details 包装；形似快照（含 phases/todos 数组）时整体返回，让
+	// normalizeTodoSnapshot 解析。普通工具结果（{content: [...]} 等）不受影响。
+	if (Array.isArray(typed.phases) || Array.isArray(typed.todos)) return result;
+	return undefined;
 }

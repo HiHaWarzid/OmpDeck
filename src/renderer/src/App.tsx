@@ -5625,6 +5625,11 @@ export function App() {
         agentMode,
         templateDescription,
       );
+      // 发送成功后主动拉一次最新运行态：omp 可能因路由/回退选用不同模型，
+      // 信息条应在回答开始时就显示实际模型，而不是等主进程事件或下一次工具边沿。
+      if (!isPendingAgentId(agentId)) {
+        void refreshRuntimeState(agentId);
+      }
       return true;
     } catch (error) {
       if (error instanceof PromptDeliveryUnknownError) {

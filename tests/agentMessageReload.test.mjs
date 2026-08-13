@@ -37,6 +37,31 @@ test("selecting an agent pulls its messages when the cache is empty (restart gap
   );
 });
 
+test("agent run start refreshes runtime state so the model chip stays current", () => {
+  // 一轮新回答开始（agent_start / message_start）时立即推送完整运行态，
+  // 左下角模型信息条及时显示 omp 实际选用的模型，而不是等到工具边沿。
+  assert.match(
+    manager,
+    /if \(typed\.type === "agent_start"\) \{[\s\S]*?this\.emitState\(\);\s*\/\/ 一轮新回答开始[\s\S]*?void this\.emitRuntimeState\(agentId\);/,
+  );
+  assert.match(
+    manager,
+    /if \(typed\.type === "message_start" && typed\.message\?\.role === "assistant"\) \{[\s\S]*?void this\.emitRuntimeState\(agentId\);/,
+  );
+});
+
+test("runtime state parses both omp and pi field shapes", () => {
+  // get_state 的 model 可能是对象或字符串；thinkingLevel/contextUsage 字段命名兼容。
+  assert.match(manager, /typeof state\?\.model === "string"/);
+  assert.match(manager, /state\?\.thinkingLevel \?\? state\?\.thinking_level/);
+  assert.match(manager, /stats\?\.contextUsage \?\? stats\?\.context_usage/);
+});
+
+test("sending a prompt proactively refreshes the runtime state", () => {
+  // 渲染层发送成功后主动拉最新运行态，不依赖主进程事件时序。
+  assert.match(app, /void refreshRuntimeState\(agentId\);/);
+});
+
 test("history load placeholder keeps the chat visible during background load", () => {
   // 大会话 get_messages 可能耗时十几秒：加载期间必须推送一条 historyLoading 占位
   // 消息给用户反馈，失败时占位转错误提示，成功基线剔除占位。
