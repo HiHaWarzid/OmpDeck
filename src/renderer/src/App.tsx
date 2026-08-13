@@ -7821,6 +7821,7 @@ export function App() {
               activeThinking={activeThinking}
               thinkingStartedAt={activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined}
               isExecutingTool={activeRuntimeState?.isExecutingTool}
+              executingToolName={activeRuntimeState?.executingToolName}
               isStreaming={activeRuntimeState?.isStreaming}
               cancellingUi={cancellingUi}
               activeUiAskRequestId={activeUiAsk?.requestId}
