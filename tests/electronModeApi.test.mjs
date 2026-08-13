@@ -8,6 +8,8 @@ const petWindowSource = readFileSync("src/main/pet/PetWindow.ts", "utf8");
 const preloadPathSource = readFileSync("src/main/preloadPath.ts", "utf8");
 const preloadSource = readFileSync("src/preload/index.ts", "utf8");
 const ipcSource = readFileSync("src/shared/ipc.ts", "utf8");
+// preloadReady/preloadError IPC 处理已从 src/main/index.ts 拆到独立的 app 处理器模块。
+const appHandlersSource = readFileSync("src/main/ipc/appHandlers.ts", "utf8");
 
 test("Electron renderer does not fall back to preview browser API when preload is missing", () => {
 	assert.match(appSource, /isElectronRuntime/);
@@ -48,8 +50,8 @@ test("main window logs configured preload file and preload reports initializatio
 	assert.match(mainSource, /Main window preload failed/);
 	assert.match(mainSource, /webContents\.on\("preload-error"/);
 	assert.match(petWindowSource, /preparePreloadPath\(sourcePreloadPath, "pet-preload\.js"\)/);
-	assert.match(mainSource, /ipcMain\.on\(ipcChannels\.preloadReady/);
-	assert.match(mainSource, /ipcMain\.on\(ipcChannels\.preloadError/);
+	assert.match(appHandlersSource, /ipcMain\.on\(ipcChannels\.preloadReady/);
+	assert.match(appHandlersSource, /ipcMain\.on\(ipcChannels\.preloadError/);
 	assert.match(preloadSource, /ipcChannels\.preloadReady/);
 	assert.match(preloadSource, /ipcChannels\.preloadError/);
 	assert.match(preloadSource, /contextBridge\.exposeInMainWorld\("piDesktop", api\)/);

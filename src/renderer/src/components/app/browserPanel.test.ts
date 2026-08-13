@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test } from "vitest";
 
 /**
  * 测试 BrowserPanel 的订阅机制外部行为。

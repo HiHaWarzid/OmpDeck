@@ -4,6 +4,8 @@ import test from "node:test";
 
 const mainSource = readFileSync("src/main/pi/AgentManager.ts", "utf8");
 const indexSource = readFileSync("src/main/index.ts", "utf8");
+const agentHandlersSource = readFileSync("src/main/ipc/agentHandlers.ts", "utf8");
+const logHandlersSource = readFileSync("src/main/ipc/logHandlers.ts", "utf8");
 const preloadSource = readFileSync("src/preload/index.ts", "utf8");
 const ipcSource = readFileSync("src/shared/ipc.ts", "utf8");
 const appSource = readFileSync("src/renderer/src/App.tsx", "utf8");
@@ -12,9 +14,10 @@ const rendererMainSource = readFileSync("src/renderer/src/main.tsx", "utf8");
 test("agent startup writes diagnostics across renderer IPC and pi launch boundaries", () => {
 	assert.match(ipcSource, /rendererLog:\s*"renderer:log"/);
 	assert.match(preloadSource, /rendererLog:\s*\(\s*level: AppLogLevel,\s*scope: string,\s*message: string,\s*detail\?: unknown,/);
-	assert.match(indexSource, /ipcChannels\.rendererLog/);
-	assert.match(indexSource, /Agent create IPC received/);
-	assert.match(indexSource, /Agent create IPC completed/);
+	// Agent create IPC 处理器与 rendererLog 通道已从 index.ts 拆到 src/main/ipc/ 下
+	assert.match(logHandlersSource, /ipcChannels\.rendererLog/);
+	assert.match(agentHandlersSource, /Agent create IPC received/);
+	assert.match(agentHandlersSource, /Agent create IPC completed/);
 	assert.match(mainSource, /Agent create requested/);
 	assert.match(mainSource, /Agent ensure trusted directory start/);
 	assert.match(mainSource, /Agent ensure trusted directory completed/);
@@ -37,7 +40,7 @@ test("renderer startup reports bootstrap mount and global errors", () => {
 });
 
 test("agent create IPC and process handlers keep structured crash diagnostics", () => {
-	assert.match(indexSource, /Agent create IPC failed/);
+	assert.match(agentHandlersSource, /Agent create IPC failed/);
 	assert.match(indexSource, /Child process gone/);
 	assert.match(indexSource, /platform: process\.platform/);
 	assert.match(mainSource, /attachPiProcessLifecycle/);

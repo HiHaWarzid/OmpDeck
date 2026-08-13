@@ -549,10 +549,10 @@ export function App() {
   const {
     agents, pendingAgents, activeAgentId, activeAgentByProject,
     messagesByAgent, runtimeStateByAgent, sessions, sessionsByProject,
-    sessionLoadingByProject,
+    sessionLoadingByProject, sessionErrorByProject,
     setAgents, setPendingAgents, setActiveAgentId, setActiveAgentByProject,
     setMessagesByAgent, setRuntimeStateByAgent, setSessions,
-    setSessionsByProject, setSessionLoadingByProject,
+    setSessionsByProject, setSessionLoadingByProject, setSessionErrorByProject,
     agentsRef, activeAgentIdRef, pendingAgentsRef, runtimeStateByAgentRef,
     agentStatusByAgentRef, sessionRequestByProjectRef, sessionRefreshRunningRef,
     sessionRefreshPendingRef, displayAgentsRef,
@@ -1472,6 +1472,11 @@ export function App() {
         if (panel === "files" || panel === "git" || panel === "browser") {
           lastToolDrawerRef.current = panel;
         }
+        if (panel === "sessions") {
+          // 恢复历史会话面板时同步归属项目：下方 freshness effect 依赖它按当前项目刷新列表，
+          // 否则恢复路径会展示上一个项目的残留数据（删除/复制等操作也会落到错误的项目）。
+          setSessionsProjectId(projectId);
+        }
         setDrawer(panel);
         setDrawerCollapsed(false);
       } else {
@@ -1506,6 +1511,16 @@ export function App() {
       if (saved?.panel === "git") saveDrawerState(activeProjectId, null, false);
     }
   }, [activeProjectId, loadDrawerState, saveDrawerState, settings.enableGitManagement]);
+
+  // 历史会话面板激活时总是拉取最新列表：抽屉面板会随项目从 localStorage 恢复，
+  // 若只在显式打开时刷新，恢复路径会展示上一个项目的残留列表或空列表（表现为“点了没反应”）。
+  useEffect(() => {
+    if (drawer === "sessions" && !drawerCollapsed && sessionsProjectId) {
+      void refreshSessions(sessionsProjectId);
+    }
+    // refreshSessions 每次渲染都是新函数；只需在面板/项目切换时触发。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawer, drawerCollapsed, sessionsProjectId]);
 
   // 当活跃 Agent 切换或绑定列表变更时，加载该 Agent 指定的飞书 Bot
   // 绑定变更后同步刷新，确保配置页断开关联后已连接状态正确反映。
@@ -6648,9 +6663,12 @@ export function App() {
                     el.classList.add('click-animating');
                     setTimeout(() => el.classList.remove('click-animating'), 400);
 
-                    // 点击项目行：切换展开/折叠；首次展开未加载会话时顺带拉列表
+                    // 点击项目行：切换展开/折叠；首次展开未加载会话时顺带拉列表。
+                    // 历史会话尚未加载时点击永远只做「展开 + 加载」，不允许折叠：
+                    // 慢扫描期间的第二击若把行折回，会造成“点了没反应、要多点几次”的观感。
+                    // 想折叠请点行首折叠图标。
                     const hasLoadedSessions = project.id in sessionsByProject;
-                    if (!hasLoadedSessions && !projectIsChat && isCollapsed) {
+                    if (!hasLoadedSessions && !projectIsChat) {
                       setProjectSidebarExpanded(project.id, true);
                       void refreshProjectSessions(project.id).catch(() => undefined);
                     } else {
@@ -6818,6 +6836,40 @@ export function App() {
                   </div>
                   );
                 })()}
+                {/* 历史会话加载中/失败状态行：慢扫描或失败时提供可见反馈与重试入口，
+                    避免首次点击后长时间无反馈，用户误以为“没反应”而反复点击。 */}
+                {!isCollapsed &&
+                  projectSessionsLoading &&
+                  projectDisplay.visibleChildren.length === 0 &&
+                  projectDisplay.hiddenChildCount === 0 &&
+                  !(project.worktreeEnabled && collapsedWorktrees.has(`main:${project.id}`)) && (
+                  <div className="session-card sidebar-session-status">
+                    <div className="sidebar-session-status-row">
+                      <span className="conversation-loading" aria-hidden="true" />
+                      <span>{t("app.projectSessionsLoading")}</span>
+                    </div>
+                  </div>
+                )}
+                {!isCollapsed &&
+                  !projectSessionsLoading &&
+                  sessionErrorByProject[project.id] &&
+                  projectDisplay.visibleChildren.length === 0 &&
+                  projectDisplay.hiddenChildCount === 0 &&
+                  !(project.worktreeEnabled && collapsedWorktrees.has(`main:${project.id}`)) && (
+                  <div className="session-card sidebar-session-status">
+                    <div className="sidebar-session-status-row error">
+                      <span className="sidebar-session-error-text">
+                        {t("app.projectSessionsLoadFailed")}
+                      </span>
+                      <button
+                        className="sidebar-session-retry"
+                        onClick={() => void refreshProjectSessions(project.id).catch(() => undefined)}
+                      >
+                        {t("common.refresh")}
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {!isCollapsed &&
                   (projectDisplay.visibleChildren.length > 0 ||
                     projectDisplay.hiddenChildCount > 0) &&

@@ -16,7 +16,10 @@ function loadModule(sourcePath) {
       esModuleInterop: true,
     },
   });
-  const sandbox = { exports: {}, module: { exports: {} }, require };
+  // CJS 语义下 exports 与 module.exports 初始指向同一对象；TS 转译的 `exports.foo = ...`
+  // 写到前者，必须共享同一引用才能读回。
+  const moduleExports = {};
+  const sandbox = { exports: moduleExports, module: { exports: moduleExports }, require };
   vm.runInNewContext(outputText, sandbox, { filename: sourcePath });
   return sandbox.module.exports;
 }

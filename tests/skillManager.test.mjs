@@ -50,7 +50,8 @@ async function createSkillFile(path, name, description = `${name} description`) 
 }
 
 async function createSkillRoot(home) {
-	const globalSkills = join(home, ".pi", "agent", "skills");
+	// SkillManager.buildLocations 当前扫描 ~/.omp/agent/skills（历史实现为 ~/.pi/agent/skills）
+	const globalSkills = join(home, ".omp", "agent", "skills");
 	await mkdir(globalSkills, { recursive: true });
 	return globalSkills;
 }

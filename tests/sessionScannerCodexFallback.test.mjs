@@ -18,6 +18,9 @@ function loadTranspiledModule(filePath, overrides = new Map()) {
 		},
 	});
 	const sandbox = {
+		AbortController,
+		AbortSignal,
+		Buffer,
 		clearTimeout,
 		exports: {},
 		process,
@@ -61,8 +64,16 @@ function loadSessionScanner(homePath) {
 		new Map([["electron", { app: { getPath: () => homePath } }]]),
 	);
 	const wslPaths = loadTranspiledModule("src/main/wsl/WslPaths.ts");
+	const localFileAdapter = loadTranspiledModule("src/main/fs/adapters/localFileAdapter.ts");
+	const wslFileAdapter = loadTranspiledModule("src/main/fs/adapters/wslFileAdapter.ts");
+	const subagentParentInference = loadTranspiledModule("src/main/sessions/subagentParentInference.ts");
 	const sandbox = {
+		AbortController,
+		AbortSignal,
+		Buffer,
+		clearTimeout,
 		exports: {},
+		setTimeout,
 		require: (id) => {
 			if (id === "electron") {
 				return { app: { getPath: () => homePath } };
@@ -71,6 +82,9 @@ function loadSessionScanner(homePath) {
 			if (id === "../pi/messageContent") return messageContent;
 			if (id === "./sessionSummaryCache") return sessionSummaryCache;
 			if (id === "../wsl/WslPaths") return wslPaths;
+			if (id === "../fs/adapters/localFileAdapter") return localFileAdapter;
+			if (id === "../fs/adapters/wslFileAdapter") return wslFileAdapter;
+			if (id === "./subagentParentInference") return subagentParentInference;
 			return require(id);
 		},
 	};
@@ -84,7 +98,7 @@ test("backfills Codex subagent metadata for sessions imported before grouping fi
 	const home = mkdtempSync(join(tmpdir(), "pideck-session-scanner-"));
 	try {
 		const projectPath = "/repo/project";
-		const piDir = join(home, ".pi", "agent", "sessions", "--repo-project--");
+		const piDir = join(home, ".omp", "agent", "sessions", "--repo-project--");
 		const codexDir = join(home, ".codex", "sessions", "2026", "06", "30");
 		mkdirSync(piDir, { recursive: true });
 		mkdirSync(codexDir, { recursive: true });

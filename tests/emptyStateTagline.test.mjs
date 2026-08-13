@@ -11,34 +11,29 @@ function cssRule(selector) {
   return matches.at(-1)?.[1] ?? "";
 }
 
-test("empty state shows the pi agent ownership tagline with branded yours", () => {
+test("empty state shows the agent ownership tagline with branded accent", () => {
+  // 品牌文案已从 i18n 键改为硬编码「A coding agent with the IDE wired in.」，
+  // 强调色从 empty-tagline-yours 类改为内联 oklch 色（与 i18n app.emptyTaglineNew 同文案）。
   assert.match(parts, /className="empty-tagline"/);
-  assert.match(parts, /t\("app\.emptyTaglineLine1"\)/);
-  assert.match(parts, /t\("app\.emptyTaglineLine2Prefix"\)/);
-  assert.match(parts, /className="empty-tagline-yours"/);
-  assert.match(parts, /t\("app\.emptyTaglineYours"\)/);
+  assert.match(parts, />A coding agent<\/span>/);
+  assert.match(parts, />with the <\/span>/);
+  assert.match(parts, /IDE wired in\.<\/span>/);
+  assert.match(parts, /color: "oklch\(0\.29 0\.11 346\.85 \/ 1\)"/);
   assert.doesNotMatch(parts, /<h2>\{t\("app\.startAgent"\)\}<\/h2>/);
   assert.doesNotMatch(parts, /<p>\{t\("app\.emptyGuide"\)\}<\/p>/);
-  assert.match(parts, /width="66"[\s\S]*height="66"/);
+  assert.match(parts, /width="168"[\s\S]*height="168"/);
 
-  assert.match(i18n, /"app\.emptyTaglineLine1": "There are many agent harnesses"/);
-  assert.match(i18n, /"app\.emptyTaglineLine2Prefix": "but this one is "/);
-  assert.match(i18n, /"app\.emptyTaglineYours": "yours"/);
+  assert.match(i18n, /"app\.emptyTaglineNew": "A coding agent\\nwith the IDE wired in\."/);
 
-  const logo = cssRule("\\.empty-logo");
   const button = cssRule("\\.empty-state button");
   const tagline = cssRule("\\.empty-tagline");
-  const yours = cssRule("\\.empty-tagline-yours");
 
-  assert.match(logo, /width:\s*118px;[\s\S]*height:\s*118px;/);
-  assert.match(button, /min-width:\s*148px;[\s\S]*height:\s*46px;/);
+  assert.match(button, /min-width:\s*118px;[\s\S]*height:\s*40px;/);
   assert.match(styles, /--color-accent-soft:\s*#eaf6ed;/i);
-  assert.match(button, /background:\s*var\(--color-accent-soft\);[\s\S]*font-size:\s*var\(--font-size-brand\);/);
   assert.match(button, /color:\s*var\(--color-accent-strong\);/);
   assert.match(button, /font-family:\s*var\(--font-family-base\);/);
-  assert.match(button, /font-weight:\s*650;/);
-  assert.match(button, /letter-spacing:\s*0\.01em;/);
-  assert.match(button, /border-radius:\s*var\(--radius-pill\);/);
+  assert.match(button, /font-weight:\s*600;/);
+  assert.match(button, /letter-spacing:\s*0;/);
+  assert.match(button, /border-radius:\s*var\(--radius-md\);/);
   assert.match(tagline, /font-family:\s*var\(--font-family-brand\)/);
-  assert.match(yours, /color:\s*var\(--color-brand-green\)/);
 });

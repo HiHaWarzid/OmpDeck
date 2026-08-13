@@ -16,8 +16,10 @@ test("terminal dock combines a short grid transition with composited motion", ()
   assert.ok(chatPane, "chat pane styles must exist");
   assert.match(chatPane, /transition:\s*grid-template-rows 120ms/);
   assert.ok(terminalDock, "terminal dock styles must exist");
-  assert.match(terminalDock, /will-change:\s*transform;/);
-  assert.match(terminalDock, /transition:\s*transform/);
+  // 合成动画由 transform transition 承担（will-change 提示已移除），
+  // 180ms 缓动与 grid 轨道过渡解耦，避免退出时布局抖动。
+  assert.match(terminalDock, /transition:\s*transform 180ms/);
+  assert.match(terminalDock, /cubic-bezier\(0\.22, 1, 0\.36, 1\)/);
   assert.match(styles, /\.terminal-dock\[data-motion-state="hidden"\][\s\S]*?translate3d\(0, 100%, 0\)/);
 });
 

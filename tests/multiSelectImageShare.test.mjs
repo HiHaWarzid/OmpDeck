@@ -12,7 +12,13 @@ function loadAppUtils() {
       target: ts.ScriptTarget.ES2022,
     },
   });
-  const sandbox = { exports: {}, location: { href: "file:///Users/test/app" } };
+  // AppUtils 唯一的运行时导入是 ./RichInput（其余为 type-only，转译后消除）；
+  // 被测的 getMultiSelectImageCaptureIds 不依赖 formatFilePathRef，用最小 stub 即可。
+  const require = (id) => {
+    if (id === "./RichInput") return { formatFilePathRef: () => "" };
+    throw new Error(`unexpected import in AppUtils: ${id}`);
+  };
+  const sandbox = { exports: {}, require, location: { href: "file:///Users/test/app" } };
   vm.runInNewContext(outputText, sandbox, { filename: "AppUtils.ts" });
   return sandbox.exports;
 }

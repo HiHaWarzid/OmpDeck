@@ -18,6 +18,9 @@ function loadTranspiledModule(filePath, overrides = new Map()) {
 		},
 	});
 	const sandbox = {
+		AbortController,
+		AbortSignal,
+		Buffer,
 		clearTimeout,
 		exports: {},
 		process,
@@ -59,6 +62,9 @@ function loadSessionScanner(homePath) {
 		new Map([["electron", { app: { getPath: () => homePath } }]]),
 	);
 	const wslPaths = loadTranspiledModule("src/main/wsl/WslPaths.ts");
+	const localFileAdapter = loadTranspiledModule("src/main/fs/adapters/localFileAdapter.ts");
+	const wslFileAdapter = loadTranspiledModule("src/main/fs/adapters/wslFileAdapter.ts");
+	const subagentParentInference = loadTranspiledModule("src/main/sessions/subagentParentInference.ts");
 	const sandbox = {
 		AbortController,
 		AbortSignal,
@@ -79,6 +85,9 @@ function loadSessionScanner(homePath) {
 			if (id === "../pi/messageContent") return messageContent;
 			if (id === "./sessionSummaryCache") return sessionSummaryCache;
 			if (id === "../wsl/WslPaths") return wslPaths;
+			if (id === "../fs/adapters/localFileAdapter") return localFileAdapter;
+			if (id === "../fs/adapters/wslFileAdapter") return wslFileAdapter;
+			if (id === "./subagentParentInference") return subagentParentInference;
 			return require(id);
 		},
 	};

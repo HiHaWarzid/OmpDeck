@@ -44,6 +44,11 @@ function loadModule(mockProcess = {}) {
 			if (id === "../preloadPath") {
 				return { preparePreloadPath: async (sourcePath) => sourcePath };
 			}
+			if (id === "../settings/SettingsStore") {
+				// PetWindow 仅用 readElectronChromiumSandboxPreference 读取 Chromium
+				// sandbox 开关；探测逻辑不依赖其返回值，最小 stub 即可。
+				return { readElectronChromiumSandboxPreference: () => true };
+			}
 			return require(id);
 		},
 	};

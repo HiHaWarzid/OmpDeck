@@ -8,6 +8,22 @@ import vm from "node:vm";
 
 const require = createRequire(import.meta.url);
 
+// ConfigManager 顶部从 ./baseUrlPath 解构导入（src/main/config/baseUrlPath.ts）。
+// 该模块无内部依赖，直接转译注入；测试文件自身的 require 会把 "./baseUrlPath"
+// 解析到 tests/ 目录，必须显式提供。
+function loadBaseUrlPath() {
+	const source = readFileSync("src/main/config/baseUrlPath.ts", "utf8");
+	const { outputText } = ts.transpileModule(source, {
+		compilerOptions: {
+			module: ts.ModuleKind.CommonJS,
+			target: ts.ScriptTarget.ES2022,
+		},
+	});
+	const sandbox = { exports: {} };
+	vm.runInNewContext(outputText, sandbox, { filename: "baseUrlPath.ts" });
+	return sandbox.exports;
+}
+
 function loadConfigManager() {
 	let content;
 	const writes = [];
@@ -25,6 +41,7 @@ function loadConfigManager() {
 		process: { ...process, platform: "win32" },
 		setTimeout,
 		require: (id) => {
+			if (id === "./baseUrlPath") return loadBaseUrlPath();
 			if (id === "node:fs/promises") {
 				return {
 					mkdir: async () => {},

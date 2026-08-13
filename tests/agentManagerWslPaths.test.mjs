@@ -110,6 +110,9 @@ function loadAgentManager() {
 	registry["./messageTimeline"] = loadModule("src/main/pi/messageTimeline.ts", "messageTimeline.ts");
 	registry["./streamGate"] = loadModule("src/main/pi/streamGate.ts", "streamGate.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
+	// AgentManager 引入 ../perf（src/main/perf.ts，纯诊断模块，无内部依赖）；
+	// 测试文件自身的 require 会把 "../perf" 解析到仓库根目录，必须显式注入。
+	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return { ...agentManagerExports, calls, wslPaths };

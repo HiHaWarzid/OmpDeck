@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { afterAll, beforeAll, test } from "vitest";
 
 import type { ChatMessage } from "../../shared/types";
 import { SessionJsonl } from "./sessionJsonl";
@@ -28,10 +28,10 @@ function toJsonl(entries: unknown[]): string {
 
 let tmpRoot: string;
 
-test.before(async () => {
+beforeAll(async () => {
 	tmpRoot = await mkdtemp(join(tmpdir(), "sessionJsonl-"));
 });
-test.after(async () => {
+afterAll(async () => {
 	await rm(tmpRoot, { recursive: true, force: true });
 });
 

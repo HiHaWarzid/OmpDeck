@@ -39,13 +39,17 @@ test("drawer keeps its content mounted through the layout transition", () => {
     /const drawerContentPanel = drawer && !drawerCollapsed \? drawer : renderedDrawer;/,
   );
   assert.match(app, /drawer && !drawerCollapsed \? drawerWidth : 0/);
-  assert.match(app, /drawer && !drawerCollapsed \? 260 : 0/);
+  // 抽屉宽度改为可拖拽的 drawerWidth 状态（默认 320），不再硬编码 260。
+  assert.match(app, /const \[drawerWidth, setDrawerWidth\] = useState\(320\);/);
 });
 
 test("file rows use the integer control line-height token", () => {
   const fileRow = cssRule("\\.file-node-row");
 
   assert.ok(fileRow, "file row styles must exist");
-  assert.match(fileRow, /line-height:\s*var\(--line-height-control\)/);
+  // 行高与 26px 固定行高对齐为整数，不再用 var(--line-height-control)（该 token 仍存在，
+  // 但文件行按固定像素行高渲染）。
+  assert.match(fileRow, /height:\s*26px;/);
+  assert.match(fileRow, /line-height:\s*26px;/);
   assert.doesNotMatch(fileRow, /line-height:\s*1\.28/);
 });

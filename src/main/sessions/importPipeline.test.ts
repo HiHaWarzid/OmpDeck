@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test } from "vitest";
 
 import { ImportPipeline } from "./importPipeline";
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "./importPipeline";

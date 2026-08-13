@@ -10,7 +10,7 @@ export function withFeishuDocActionHint(message: string): string {
 }
 
 export function stripFeishuDocActionHint(text: string): string {
-	return text.replace(/\n{0,2}\[PiDeck 飞书能力\][\s\S]*$/, "").trim();
+	return text.replace(/\n{0,2}\[OmpDeck 飞书能力\][\s\S]*$/, "").trim();
 }
 
 export function stripFeishuActionMarkers(text: string): string {

@@ -23,7 +23,7 @@ test("detects Feishu doc intent from user message", () => {
 	const { wantsFeishuDoc } = loadDocActionsModule();
 
 	assert.equal(wantsFeishuDoc("普通聊天消息"), undefined);
-	assert.equal(wantsFeishuDoc("帮我做飞书文档"), "Pi Agent 文档");
+	assert.equal(wantsFeishuDoc("帮我做飞书文档"), "omp Agent 文档");
 	assert.equal(wantsFeishuDoc("整理这些内容，标题叫 今日新闻，做飞书文档"), "今日新闻");
 	assert.equal(wantsFeishuDoc("创建文档"), undefined);
 	assert.ok(wantsFeishuDoc("写一个飞书文档总结本周工作"));

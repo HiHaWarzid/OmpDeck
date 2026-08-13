@@ -5,10 +5,12 @@ import test from "node:test";
 const source = readFileSync("src/main/index.ts", "utf8");
 
 test("main window has load and timeout fallbacks for showing the hidden window", () => {
-	assert.match(source, /function showMainWindowOnce\(/);
-	assert.match(source, /mainWindow\.once\("ready-to-show", showMainWindowOnce\)/);
-	assert.match(source, /mainWindow\.webContents\.once\("did-finish-load", showMainWindowOnce\)/);
-	assert.match(source, /setTimeout\(showMainWindowOnce, 3000\)/);
+	// 当前实现：showMainWindowOnce 接受触发来源字符串；ready-to-show 正常路径、
+	// did-finish-load 后 800ms 宽限、以及 3s 绝对兜底三路汇合，保证隐藏窗口必定出现。
+	assert.match(source, /function showMainWindowOnce\(source: string\)/);
+	assert.match(source, /mainWindow\.once\("ready-to-show", \(\) => \{[\s\S]*?showMainWindowOnce\("ready-to-show"\);/);
+	assert.match(source, /mainWindow\.webContents\.once\("did-finish-load", \(\) => \{[\s\S]*?setTimeout\(\(\) => showMainWindowOnce\("did-finish-load\+800ms"\), 800\);/);
+	assert.match(source, /setTimeout\(\(\) => showMainWindowOnce\("timeout-3s"\), 3000\)/);
 });
 
 test("main window records renderer load diagnostics", () => {
@@ -35,5 +37,5 @@ test("linux display workaround opens the main window without hidden pre-map", ()
 	// 启动尺寸统一走 applyStartupWindowMode：隐藏态先 maximize 减少首帧跳动，
 	// XWayland 兼容层下 showMainWindowImmediately=true 则跳过预映射直接 show。
 	assert.match(source, /applyStartupWindowMode\(\s*mainWindow,\s*startupWindowMode,\s*showMainWindowImmediately,?\s*\)/s);
-	assert.match(source, /if \(showMainWindowImmediately\) \{\s*showMainWindowOnce\(\);\s*\}/s);
+	assert.match(source, /if \(showMainWindowImmediately\) \{\s*showMainWindowOnce\("immediate"\);\s*\}/s);
 });

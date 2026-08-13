@@ -1719,6 +1719,50 @@ body.is-resizing .wechat-shell {
   animation: spin 0.75s linear infinite;
   flex-shrink: 0;
 }
+/* 侧栏历史会话加载中/失败状态行：慢扫描或失败时提供可见反馈与重试入口，
+   避免首次点击后长时间无反馈，用户误以为“没反应”而反复点击。 */
+.sidebar-session-status {
+  padding: 6px 10px 8px 30px;
+}
+.sidebar-session-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.sidebar-session-status-row .conversation-loading {
+  flex: none;
+}
+.sidebar-session-status-row.error {
+  color: var(--color-danger);
+}
+.sidebar-session-error-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-session-retry {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-accent);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.sidebar-session-retry:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-strong);
+}
+.sidebar-session-retry:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
 .conversation-body {
   min-width: 0;
 }

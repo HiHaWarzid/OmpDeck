@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, vi } from "vitest";
+
+// UpdateManager 模块顶层 import 了 electron（app/net/shell），
+// vitest node 环境无法解析真实 electron 二进制导出；被测纯函数并不调用它们，
+// 这里只 stub 导出让模块链接通过。
+vi.mock("electron", () => ({ app: {}, net: {}, shell: {}, BrowserWindow: {} }));
 
 import {
 	normalizeVersion,

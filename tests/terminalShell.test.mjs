@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
 import ts from "typescript";
 import vm from "node:vm";
+
+const require = createRequire(import.meta.url);
 
 function plain(value) {
 	return JSON.parse(JSON.stringify(value));
@@ -26,6 +29,10 @@ function loadTerminalSessionManagerModule() {
 			if (name === "node-pty") return {};
 			if (name === "node:crypto") return { randomUUID: () => "id" };
 			if (name === "../../shared/ipc") return { ipcChannels: {} };
+			// 当前实现额外引入 node:child_process(execSync) 与 node:fs(existsSync)
+			// 做 Git Bash / WSL 探测；stub 掉使候选列表保持确定性的三个固定项。
+			if (name === "node:child_process") return { execSync: () => { throw new Error("stubbed: skip wsl detection"); } };
+			if (name === "node:fs") return { existsSync: () => false };
 			return require(name);
 		},
 	};

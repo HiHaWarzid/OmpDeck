@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
-const mainSource = () => readFileSync("src/main/index.ts", "utf8");
+// IPC handlers 已从 src/main/index.ts 迁移到 src/main/ipc/*Handlers.ts：
+// - feishuBotConfig / feishuSessionBotSet → feishuHandlers.ts
+// - agentsPrompt → agentHandlers.ts
+const feishuHandlersSource = () => readFileSync("src/main/ipc/feishuHandlers.ts", "utf8");
+const agentHandlersSource = () => readFileSync("src/main/ipc/agentHandlers.ts", "utf8");
 const bridgeSource = () => readFileSync("src/main/feishu/FeishuBridge.ts", "utf8");
 const configSource = () => readFileSync("src/main/feishu/FeishuConfig.ts", "utf8");
 
@@ -15,16 +19,18 @@ test("FeishuBridge.start propagates startup failure to IPC callers", () => {
 });
 
 test("updating a saved bot only hot-updates the active bridge for that bot", () => {
-	const source = mainSource();
+	const source = feishuHandlersSource();
 	const handler = source.match(/ipcMain\.handle\(ipcChannels\.feishuBotConfig,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
-	assert.match(handler, /feishuBridge\.getStatus\(\)\.botId === botId/);
+	// 热更新守卫：仅当被更新的 Bot 正是当前在线 bridge 的 Bot 时才 apply。
+	assert.match(handler, /bridge\.getStatus\(\)\.botId === botId/);
 });
 
 test("assigning a session bot refuses to bind through a different active bot", () => {
-	const source = mainSource();
+	const source = feishuHandlersSource();
 	const handler = source.match(/ipcMain\.handle\(ipcChannels\.feishuSessionBotSet,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
 	assert.match(handler, /status\.botId !== botId/);
-	assert.doesNotMatch(handler, /setSessionBotId\(agentId, botId \?\? undefined\);[\s\S]*?status\.botId !== botId/);
+	// 映射写入必须发生在 bot 校验之后（校验失败不能写入 session-bot 映射）。
+	assert.doesNotMatch(handler, /setSessionBotId\(agentId, botId\);[\s\S]*?status\.botId !== botId/);
 });
 
 test("renderer bot list never receives stored app secrets", () => {
@@ -34,7 +40,7 @@ test("renderer bot list never receives stored app secrets", () => {
 });
 
 test("bound Feishu sessions tell the agent to use PiDeck SEND_FILE markers instead of asking for chat_id", () => {
-	const source = mainSource();
+	const source = agentHandlersSource();
 	const handler = source.match(/ipcMain\.handle\(ipcChannels\.agentsPrompt,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
 	const boundBranch = handler.match(/\} else if \(hasFeishuBinding\) \{[\s\S]*?\n\t\t\}/)?.[0] ?? "";
 	assert.match(boundBranch, /agentInstruction =/);
@@ -43,7 +49,7 @@ test("bound Feishu sessions tell the agent to use PiDeck SEND_FILE markers inste
 });
 
 test("bound Feishu sessions pass the current chat_id into the agent context", () => {
-	const main = mainSource();
+	const main = agentHandlersSource();
 	const bridge = bridgeSource();
 	assert.match(bridge, /getSessionChatId\(agentId: string\): string \| undefined/);
 	const handler = main.match(/ipcMain\.handle\(ipcChannels\.agentsPrompt,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
@@ -119,7 +125,7 @@ test("Feishu-origin runs do not also trigger local session mirror sync", () => {
 });
 
 test("agentsPrompt intercepts Feishu file-send requests before sending them to the agent", () => {
-	const source = mainSource();
+	const source = agentHandlersSource();
 	const handler = source.match(/ipcMain\.handle\(ipcChannels\.agentsPrompt,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
 	const sendIndex = handler.indexOf("bridge.sendFileForSession(input.agentId");
 	const promptIndex = handler.indexOf("agentManager.sendPrompt(");

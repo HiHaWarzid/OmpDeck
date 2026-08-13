@@ -42,8 +42,14 @@ test("sidebar child cards use fixed workspace row dimensions", () => {
 
   assert.ok(childRows, "sidebar child card styles must exist");
   assert.match(childRows, /width:\s*100%;/);
-  assert.match(childRows, /height:\s*var\(--control-height-md\);/);
-  assert.match(childRows, /padding:\s*var\(--space-1\) var\(--space-2\);/);
+  // 固定 32px 控制高度改为 min-height，标题较长时行可自然增高
+  assert.match(childRows, /height:\s*auto;/);
+  assert.match(childRows, /min-height:\s*var\(--control-height-md\);/);
+  // 左侧 padding 略收（标题更靠左，右侧留给状态圆点）
+  assert.match(
+    childRows,
+    /padding:\s*var\(--space-1\) var\(--space-2\) var\(--space-1\) var\(--space-1\);/,
+  );
 });
 
 test("sidebar child titles use an ellipsis when clipped", () => {
@@ -56,27 +62,33 @@ test("sidebar child titles use an ellipsis when clipped", () => {
 });
 
 test("sidebar agent statuses use compact color-coded card badges", () => {
-  const indicator = styles.match(/\.agent-status-indicator \{([\s\S]*?)\n\}/)?.[1];
+  // 状态样式改为 16x16 圆点容器 + 8px 内圆点：状态色写在 dot 的 background，
+  // 不再渲染带文字/边框的小徽章。
+  const indicator = styles.match(/(?:^|\n)\.agent-status-indicator \{([\s\S]*?)\n\}/)?.[1];
 
   assert.ok(indicator, "sidebar status indicator styles must exist");
-  assert.match(indicator, /height:\s*var\(--space-5\);/);
-  assert.match(indicator, /padding:\s*0 var\(--space-1\);/);
-  assert.match(indicator, /font-size:\s*var\(--font-size-micro\);/);
-  assert.match(indicator, /border:\s*1px solid var\(--color-border-subtle\);/);
+  assert.match(indicator, /width:\s*16px;/);
+  assert.match(indicator, /height:\s*16px;/);
+  assert.match(indicator, /padding:\s*0;/);
 
-  for (const [status, color] of [
-    ["idle", "info"],
-    ["running", "accent"],
-    ["starting", "warning"],
-    ["error", "danger"],
+  const dot = styles.match(/(?:^|\n)\.agent-status-dot \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(dot, "sidebar status dot styles must exist");
+  assert.match(dot, /width:\s*8px;/);
+  assert.match(dot, /height:\s*8px;/);
+  assert.match(dot, /border-radius:\s*50%;/);
+
+  for (const [status, distinct] of [
+    ["idle", /background:\s*color-mix\(in srgb, var\(--color-brand-blue\) 65%, transparent\);/],
+    ["running", /background:\s*#eab308;/],
+    ["starting", /border:\s*1\.5px solid var\(--color-text-tertiary\);/],
+    ["error", /background:\s*var\(--color-danger\);/],
   ]) {
     const state = styles.match(
-      new RegExp(`\\.agent-status-indicator\\.status-${status} \\{([\\s\\S]*?)\\n\\}`),
+      new RegExp(`\\.agent-status-indicator\\.status-${status} \\.agent-status-dot \\{([\\s\\S]*?)\\n\\}`),
     )?.[1];
 
     assert.ok(state, `${status} status styles must exist`);
-    assert.match(state, new RegExp(`color:\\s*var\\(--color-${color}\\);`));
-    assert.match(state, /border-color:/);
+    assert.match(state, distinct);
   }
 });
 

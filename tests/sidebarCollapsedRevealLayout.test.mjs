@@ -13,8 +13,10 @@ test("collapsed sidebar reveal does not override the v3 conversation list layout
     css,
     /\.chat-list-pane\.v3-braun \.sidebar-body \.conversation-list \{[\s\S]*?display: flex;/,
   );
+  // 折叠态 hover/focus 展开机制（.list-collapsed:not(.list-hover-suppressed)）已移除：
+  // 折叠时整个 sidebar-body 显式隐藏，不再有展开覆盖会话列表布局的规则。
   assert.match(
     css,
-    /\.list-collapsed:not\(\.list-hover-suppressed\) \.chat-list-pane\.v3-braun:focus-within \{/,
+    /\.list-collapsed \.chat-list-pane\.v3-braun \.sidebar-body \{\s*display: none !important;/,
   );
 });

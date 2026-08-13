@@ -111,18 +111,54 @@ export class SessionScanner {
     return filePath.startsWith("/") && !/^[A-Za-z]:/.test(filePath);
   }
 
+  /** 进行中的原始扫描（按扫描根共享）：并发 list() 合并为同一轮扫描。 */
+  private readonly listInFlightByKey = new Map<string, Promise<SessionSummary[]>>();
+
   async list(projectPath?: string): Promise<SessionSummary[]> {
     // 匹配用路径：WSL 模式下转 /mnt/...，与会话 JSONL 内 cwd 对齐。
     const normalizedProjectPath = projectPath && this.wslConfig
       ? toWslLinuxPath(projectPath, this.wslConfig)
       : projectPath;
+
+    // 扫描根 = 默认全局 sessions + 项目/全局 sessionDir（如 <project>/.omp/sessions）。
+    // pi/omp 配置 sessionDir 后不再写 encoded-cwd 子目录，必须额外扫该路径。
+    const scanRoots = await this.resolveScanRoots(projectPath, normalizedProjectPath);
+
+    // 原始扫描结果与项目无关（项目归属在共享结果之上逐调用方过滤），因此快速连点、
+    // 周期同步、多项目同时展开会合并为同一轮扫描：慢扫描时后到的请求直接复用
+    // 进行中的结果，而不是叠加多轮全量扫描互相拖慢，最终谁也拿不到列表。
+    const summaries = await this.scanShared(scanRoots);
+
+    if (!normalizedProjectPath) return summaries;
+    // 异步 isSameProject 过滤（自定义 sessionDir 下的文件也会按 cwd/路径归属判断）
+    const matched = await this.filterByProject(summaries, normalizedProjectPath);
+    return summaries.filter((_, i) => matched[i]);
+  }
+
+  /**
+   * 按扫描根共享进行中的原始扫描（不按项目过滤，排序已完成）。
+   * 只有扫描根不同的并发调用（如不同项目配置了不同 sessionDir）才会各自扫描。
+   */
+  private scanShared(scanRoots: string[]): Promise<SessionSummary[]> {
+    const key = scanRoots.map((root) => this.normalize(root)).join("\n");
+    const inFlight = this.listInFlightByKey.get(key);
+    if (inFlight) return inFlight;
+    const scan = this.scanOnce(scanRoots).finally(() => {
+      // 只清理自己注册的条目：期间可能有新调用注册了同 key 的新一轮扫描。
+      if (this.listInFlightByKey.get(key) === scan) this.listInFlightByKey.delete(key);
+    });
+    this.listInFlightByKey.set(key, scan);
+    return scan;
+  }
+
+  private async scanOnce(scanRoots: string[]): Promise<SessionSummary[]> {
     // WSL 扫描会启动大量外部命令；整体 watchdog 必须早于 renderer 超时，
     // 这样超时会真正终止底层 wsl.exe，而不是只释放前端锁后继续堆积扫描。
     const controller = this.wslConfig ? new AbortController() : null;
     const signal = controller?.signal;
     const scanTimer = controller
       ? setTimeout(() => controller.abort(new Error("Session scan timed out")), this.scanTimeoutMs)
-      : null;
+      : undefined;
     const rethrowAbort = <T>(fallback: T) => (error: unknown): T => {
       if (signal?.aborted) throw signal.reason ?? error;
       return fallback;
@@ -131,10 +167,6 @@ export class SessionScanner {
     try {
       // 重启后先恢复磁盘摘要缓存，避免全量重读 JSONL。
       await this.summaryCache.ensureLoaded();
-
-      // 扫描根 = 默认全局 sessions + 项目/全局 sessionDir（如 <project>/.omp/sessions）。
-      // pi/omp 配置 sessionDir 后不再写 encoded-cwd 子目录，必须额外扫该路径。
-      const scanRoots = await this.resolveScanRoots(projectPath, normalizedProjectPath);
       this.activeScanRoots = scanRoots;
 
       // WSL 模式 vs 本地模式：互斥扫描，不会同时展示两个环境的会话。
@@ -161,23 +193,32 @@ export class SessionScanner {
       ));
       signal?.throwIfAborted();
 
-      const validSummaries = summaries.filter((summary): summary is SessionSummary => Boolean(summary));
+      return summaries
+        .filter((summary): summary is SessionSummary => Boolean(summary))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+    } finally {
+      clearTimeout(scanTimer);
+    }
+  }
 
-      if (!normalizedProjectPath) {
-        return validSummaries.sort((a, b) => b.updatedAt - a.updatedAt);
-      }
-      // 异步 isSameProject 过滤（自定义 sessionDir 下的文件也会按 cwd/路径归属判断）
+  /**
+   * 在共享扫描结果上按项目归属过滤；WSL 下同样受 watchdog 约束，
+   * 避免过滤阶段的文件读取（父目录会话内容校验）无界等待。
+   */
+  private async filterByProject(summaries: SessionSummary[], projectPath: string): Promise<boolean[]> {
+    const controller = this.wslConfig ? new AbortController() : null;
+    const signal = controller?.signal;
+    const scanTimer = controller
+      ? setTimeout(() => controller.abort(new Error("Session scan timed out")), this.scanTimeoutMs)
+      : undefined;
+    try {
       const matched = await Promise.all(
-        validSummaries.map(summary => this.isSameProject(summary, normalizedProjectPath, signal))
+        summaries.map(summary => this.isSameProject(summary, projectPath, signal))
       );
       signal?.throwIfAborted();
-      const filtered = validSummaries
-        .filter((_, i) => matched[i])
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-      const childCount = filtered.filter(s => s.parentSessionPath).length;
-      return filtered;
+      return matched;
     } finally {
-      if (scanTimer) clearTimeout(scanTimer);
+      clearTimeout(scanTimer);
     }
   }
 

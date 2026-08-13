@@ -71,6 +71,10 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const [sessionLoadingByProject, setSessionLoadingByProject] = useState<
 		Record<string, boolean>
 	>({});
+	/** 项目会话列表加载失败信息（非静默刷新）：驱动侧栏错误行与重试入口，成功时清除。 */
+	const [sessionErrorByProject, setSessionErrorByProject] = useState<
+		Record<string, string>
+	>({});
 	const [runtimeStateByAgent, setRuntimeStateByAgent] = useState<
 		Record<string, AgentRuntimeState>
 	>({});
@@ -90,6 +94,8 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const sessionRequestByProjectRef = useRef<Record<string, number>>({});
 	const sessionRefreshRunningRef = useRef<Set<string>>(new Set());
 	const sessionRefreshPendingRef = useRef<Set<string>>(new Set());
+	/** sessions 抽屉列表的请求序号（按项目）：快速切换项目时丢弃旧项目的慢响应，避免抽屉展示上一个项目的残留列表。 */
+	const sessionListSeqRef = useRef<Record<string, number>>({});
 
 	// ===== Computed =====
 	const displayAgents = useMemo(() => {
@@ -179,17 +185,37 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	// ===== 会话加载 =====
 
 	/**
+	 * 拉取会话列表（带超时保护）。
+	 * 超时 ≠ 扫描失败：renderer 超时只是放弃等待，主进程扫描可能仍在继续。
+	 * 用户主动触发的刷新在超时后重试一次——主进程按扫描根共享进行中的扫描，
+	 * 重试通常能在原扫描完成后立即返回，避免“点了没反应”而反复点击叠加更多扫描。
+	 */
+	async function listSessionsWithRetry(projectId: string | undefined, silent: boolean): Promise<SessionSummary[]> {
+		const timeoutMsg = t("app.sessionRefreshTimeout");
+		try {
+			return await withTimeout(api.sessions.list(projectId), SESSION_REFRESH_TIMEOUT_MS, timeoutMsg);
+		} catch (error) {
+			// 只有超时才值得重试：主进程扫描仍在继续，第二次请求会与进行中的扫描共享结果。
+			if (!silent && error instanceof Error && error.message === timeoutMsg) {
+				return await withTimeout(api.sessions.list(projectId), SESSION_REFRESH_TIMEOUT_MS, timeoutMsg);
+			}
+			throw error;
+		}
+	}
+
+	/**
 	 * 刷新活跃项目的会话列表（用于 sessions state，非按项目分组的 sessionsByProject）。
 	 * silent=true 用于删除/重命名/复制等操作后的静默刷新：失败时保留旧列表且不弹错误提示，
 	 * 避免与操作自身的成功提示叠加成矛盾通知；错误统一在此捕获，杜绝调用点产生未捕获 rejection。
 	 */
 	async function refreshSessions(projectId = activeProjectId, silent = false) {
+		// 按项目编号请求：快速切换项目时，旧项目的慢响应不能覆盖当前抽屉列表。
+		const key = projectId ?? "";
+		const request = (sessionListSeqRef.current[key] ?? 0) + 1;
+		sessionListSeqRef.current[key] = request;
 		try {
-			const next = await withTimeout(
-				api.sessions.list(projectId),
-				SESSION_REFRESH_TIMEOUT_MS,
-				t("app.sessionRefreshTimeout"),
-			);
+			const next = await listSessionsWithRetry(projectId, silent);
+			if (sessionListSeqRef.current[key] !== request) return;
 			setSessions([...next].sort((a, b) => b.updatedAt - a.updatedAt));
 		} catch (error) {
 			if (!silent) {
@@ -226,11 +252,7 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		}
 		try {
-			const next = await withTimeout(
-				api.sessions.list(projectId),
-				SESSION_REFRESH_TIMEOUT_MS,
-				t("app.sessionRefreshTimeout"),
-			);
+			const next = await listSessionsWithRetry(projectId, silent);
 			if (sessionRequestByProjectRef.current[projectId] !== request) return next;
 			const sorted = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
 			setSessionsByProject((current) => {
@@ -238,9 +260,25 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 				if (sameSessionSummaryList(previous, sorted)) return current;
 				return { ...current, [projectId]: sorted };
 			});
+			// 任意来源的成功都清除错误标记，让侧栏错误行/重试入口消失。
+			setSessionErrorByProject((current) => {
+				if (!(projectId in current)) return current;
+				const next = { ...current };
+				delete next[projectId];
+				return next;
+			});
 			// 通知 App.tsx 更新侧栏可见子项数等 UI 状态（hook 不直接操作 UI state）。
 			onSessionsByProjectChanged?.(projectId, sorted);
 			return sorted;
+		} catch (error) {
+			// 失败不向调用方抛错：调用点多用 void/.catch 忽略，这里统一兜底，
+			// 由 sessionErrorByProject 驱动侧栏错误行与重试按钮。
+			if (!silent) {
+				const msg = error instanceof Error ? error.message : String(error);
+				setSessionErrorByProject((current) => ({ ...current, [projectId]: msg }));
+				showNotice(`${t("app.sessionLoadFailed")}: ${msg}`, 4000, "error");
+			}
+			return undefined;
 		} finally {
 			if (sessionRequestByProjectRef.current[projectId] === request) {
 				sessionRefreshRunningRef.current.delete(projectId);
@@ -273,6 +311,7 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		sessions,
 		sessionsByProject,
 		sessionLoadingByProject,
+		sessionErrorByProject,
 		// setters
 		setAgents,
 		setPendingAgents,
@@ -283,6 +322,7 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		setSessions,
 		setSessionsByProject,
 		setSessionLoadingByProject,
+		setSessionErrorByProject,
 		// refs
 		agentsRef,
 		activeAgentIdRef,

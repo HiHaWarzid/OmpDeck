@@ -34,11 +34,14 @@ function loadTerminalDockStateModule() {
 
 test("resolves owner: agent wins over project", () => {
 	const { resolveTerminalOwner, terminalOwnerKey } = loadTerminalDockStateModule();
-	assert.deepEqual(resolveTerminalOwner("a1", "p1"), { kind: "agent", id: "a1" });
-	assert.deepEqual(resolveTerminalOwner(undefined, "p1"), {
-		kind: "project",
-		id: "p1",
-	});
+	// resolveTerminalOwner 在 vm 上下文里创建对象字面量，跨 realm 的 deepStrictEqual
+	// 会因原型不同报 "same structure but not reference-equal"，这里逐字段断言。
+	const agentOwner = resolveTerminalOwner("a1", "p1");
+	assert.equal(agentOwner?.kind, "agent");
+	assert.equal(agentOwner?.id, "a1");
+	const projectOwner = resolveTerminalOwner(undefined, "p1");
+	assert.equal(projectOwner?.kind, "project");
+	assert.equal(projectOwner?.id, "p1");
 	assert.equal(resolveTerminalOwner(undefined, undefined), undefined);
 	assert.equal(terminalOwnerKey({ kind: "agent", id: "a1" }), "agent:a1");
 	assert.equal(terminalOwnerKey({ kind: "project", id: "p1" }), "project:p1");
