@@ -7,6 +7,7 @@ import {
 	net,
 } from "electron";
 import { join, resolve } from "node:path";
+import { connect } from "node:net";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { is } from "@electron-toolkit/utils";
 import { PetSystem, type PetSystemDeps } from "./pet";
@@ -514,9 +515,14 @@ async function createWindow() {
 	});
 	const createdWindow = mainWindow;
 	let hasShownMainWindow = false;
-	function showMainWindowOnce() {
+	function showMainWindowOnce(source: string) {
 		if (createdWindow.isDestroyed() || hasShownMainWindow) return;
 		hasShownMainWindow = true;
+		void appLogger.info("app", "Main window shown", {
+			source,
+			url: createdWindow.webContents.getURL(),
+			readyState: createdWindow.webContents.isLoading() ? "loading" : "loaded",
+		});
 		createdWindow.show();
 		createdWindow.focus();
 		// 向开发者工具输出启动信息
@@ -537,6 +543,11 @@ async function createWindow() {
 	});
 	mainWindow.webContents.on("did-start-loading", () => {
 		void appLogger.info("app", "Main window load started", {
+			url: mainWindow?.webContents.getURL(),
+		});
+	});
+	mainWindow.webContents.on("did-stop-loading", () => {
+		void appLogger.info("app", "Main window load stopped", {
 			url: mainWindow?.webContents.getURL(),
 		});
 	});
@@ -628,11 +639,24 @@ async function createWindow() {
 		},
 	);
 
-	mainWindow.once("ready-to-show", showMainWindowOnce);
-	mainWindow.webContents.once("did-finish-load", showMainWindowOnce);
-	setTimeout(showMainWindowOnce, 3000);
+	mainWindow.once("ready-to-show", () => {
+		// 即使窗口已由其他门控显示也记录：用于诊断 hidden 窗口首帧渲染
+		// （ready-to-show）是否晚于 did-finish-load / 兜底。
+		void appLogger.info("app", "Main window ready-to-show", {
+			alreadyShown: hasShownMainWindow,
+			url: mainWindow?.webContents.getURL(),
+		});
+		showMainWindowOnce("ready-to-show");
+	});
+	// did-finish-load 后若首帧（ready-to-show）尚未触发，再宽限 800ms 等合成器出帧，
+	// 避免窗口显示在首帧前露出纯色空白；宽限到点仍未出帧则先显示（兜底，不能永不显示）。
+	// 正常路径下 ready-to-show 先触发，这里只是保险。
+	mainWindow.webContents.once("did-finish-load", () => {
+		setTimeout(() => showMainWindowOnce("did-finish-load+800ms"), 800);
+	});
+	setTimeout(() => showMainWindowOnce("timeout-3s"), 3000);
 	if (showMainWindowImmediately) {
-		showMainWindowOnce();
+		showMainWindowOnce("immediate");
 	}
 
 	// 关闭窗口时根据设置决定：隐藏到托盘还是正常退出
@@ -706,9 +730,19 @@ async function createWindow() {
 	// 显示无视觉闪烁），窗口出现时 boot-overlay 已渲染完成，启动画面与 React 之间
 	// 只有 boot-overlay 自身的淡出过渡，全程无整页切换。
 	if (devRendererUrl) {
-		void mainWindow.loadURL(devRendererUrl).catch((error) => {
-			void appLogger.error("app", "Main renderer load failed", { error });
-		});
+		// 重启（app.relaunch）后 vite 已被 electron-vite CLI 带走，直接 loadURL 会
+		// 白等一次连接失败；先短超时探测，不通则直接走构建产物。
+		const reachable = await devServerReachable(devRendererUrl);
+		if (reachable) {
+			void mainWindow.loadURL(devRendererUrl).catch((error) => {
+				void appLogger.error("app", "Main renderer load failed", { error });
+			});
+		} else {
+			void appLogger.warn("app", "Dev server unreachable, loading built renderer", {
+				url: devRendererUrl,
+			});
+			void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
+		}
 	} else {
 		void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
 	}
@@ -716,6 +750,26 @@ async function createWindow() {
 
 function shouldUseDevRendererUrl() {
 	return is.dev && !app.isPackaged && Boolean(process.env.ELECTRON_RENDERER_URL);
+}
+
+/**
+ * 探测 dev server 是否可达。重启应用（app.relaunch）时 electron-vite CLI 已随旧实例
+ * 退出并把 vite 一起杀掉，直接 loadURL(dev) 会白等一次连接失败（数百 ms ~ 秒级）。
+ * 先做短超时 TCP 探测：不通则直接加载构建产物，跳过失败的导航尝试。
+ */
+function devServerReachable(url: string, timeoutMs = 300): Promise<boolean> {
+	const { promise, resolve: settle } = Promise.withResolvers<boolean>();
+	const { hostname, port } = new URL(url);
+	const socket = connect({ host: hostname, port: Number(port) });
+	socket.setTimeout(timeoutMs);
+	const done = (result: boolean) => {
+		socket.destroy();
+		settle(result);
+	};
+	socket.once("connect", () => done(true));
+	socket.once("error", () => done(false));
+	socket.once("timeout", () => done(false));
+	return promise;
 }
 
 function shouldShowMainWindowImmediately() {

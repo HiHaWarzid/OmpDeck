@@ -83,8 +83,12 @@ ReactDOM.createRoot(rootElement).render(
  *
  * 最小展示时长 MIN_BOOT_MS：防止"加载页秒没"——React 挂载极快时读条几乎不可见，
  * 给读条留出存在感；若真实启动本来就慢（已超过该时长），则立即淡出不额外拖慢。
+ *
+ * 计时起点：窗口首次可见（visibilitychange → visible），而非脚本执行时刻。
+ * 主进程用 ready-to-show 门控显示窗口，hidden 启动（如 dev 重启回退构建产物）时
+ * 脚本可能在窗口显示前几百 ms 就执行完，从脚本起算会把加载页压缩到一闪而过。
  */
-const MIN_BOOT_MS = 800;
+const MIN_BOOT_MS = 850;
 const bootMountedAt = performance.now();
 
 requestAnimationFrame(() => {
@@ -99,15 +103,31 @@ requestAnimationFrame(() => {
     removed = true;
     overlay.remove();
   };
-
-  // 已展示时长不足最小展示时长时，推迟到满足后再淡出。
-  const remaining = Math.max(0, MIN_BOOT_MS - (performance.now() - bootMountedAt));
-  window.setTimeout(() => {
+  const startFadeOut = () => {
     overlay.classList.add("fade-out");
 
     // 过渡结束后从 DOM 移除覆盖层，释放层级上下文
     overlay.addEventListener("transitionend", removeOverlay, { once: true });
     // 兜底：某些环境下 transitionend 可能不触发
     window.setTimeout(removeOverlay, 700);
-  }, remaining);
+  };
+  // 已展示时长不足最小展示时长时，推迟到满足后再淡出。
+  const scheduleFadeOut = (from: number) => {
+    const remaining = Math.max(0, MIN_BOOT_MS - (performance.now() - from));
+    window.setTimeout(startFadeOut, remaining);
+  };
+
+  if (document.visibilityState === "hidden") {
+    // 窗口尚未显示：从首次可见那一刻起算最小展示时长。
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (document.visibilityState !== "visible") return;
+        scheduleFadeOut(performance.now());
+      },
+      { once: true },
+    );
+  } else {
+    scheduleFadeOut(bootMountedAt);
+  }
 });
