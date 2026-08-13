@@ -1346,7 +1346,13 @@ export class AgentManager {
 		]);
 		const state = stateResponse.data as any;
 		const stats = statsResponse.data as any;
-		const model = state?.model;
+		// omp 的 get_state.model 是对象（{id,name,provider,...}），旧 pi 可能是字符串模型名。
+		// 字符串时包成对象，下游 model?.name / model?.id 统一读取。
+		const model =
+			typeof state?.model === "string"
+				? { name: state.model }
+				: state?.model;
+		const contextUsage = stats?.contextUsage ?? stats?.context_usage;
 		const tokens = stats?.tokens;
 		const inputTokens = this.pickNumber(
 			tokens?.input,
@@ -1396,7 +1402,7 @@ export class AgentManager {
 			modelName: model?.name ?? model?.id,
 			provider: model?.provider,
 			modelId: model?.id,
-			thinkingLevel: state?.thinkingLevel,
+			thinkingLevel: state?.thinkingLevel ?? state?.thinking_level,
 			isStreaming: state?.isStreaming,
 			isCompacting:
 				state?.isCompacting ||
@@ -1406,9 +1412,9 @@ export class AgentManager {
 			isExecutingTool: !!runtime.toolExecuting,
 			executingToolName: runtime.toolExecuting ?? undefined,
 			toolStateSequence: runtime.toolStateSequence,
-			contextTokens: stats?.contextUsage?.tokens,
-			contextWindow: stats?.contextUsage?.contextWindow ?? model?.contextWindow,
-			contextPercent: stats?.contextUsage?.percent,
+			contextTokens: contextUsage?.tokens,
+			contextWindow: contextUsage?.contextWindow ?? model?.contextWindow,
+			contextPercent: contextUsage?.percent,
 			inputTokens,
 			outputTokens,
 			cacheRead,
@@ -2700,6 +2706,9 @@ export class AgentManager {
 			runtime.activeToolCalls.clear();
 			runtime.toolExecuting = null;
 			this.emitState();
+			// 一轮新回答开始：立即推送完整运行态，模型信息条及时显示 omp 实际选用的模型
+			//（可能因路由/回退与上次不同），而不是等 get_state 轮询或工具边沿。
+			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "message_start" && typed.message?.role === "assistant") {
@@ -2709,6 +2718,8 @@ export class AgentManager {
 			}
 			this.beginAssistantMessage(runtime);
 			this.upsertAssistantMessage(runtime, typed.message);
+			// 首条 assistant 消息到达时再补发一次运行态：覆盖 agent_start 与 get_state 之间的空窗
+			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "auto_retry_start") {
