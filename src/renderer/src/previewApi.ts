@@ -13,6 +13,16 @@ import type {
 	TerminalTab,
 } from "../../shared/types";
 import { t } from "./i18n";
+import { createMockApiBase } from "./mockApiBase";
+import { mergeApiOverrides, type NamespaceOverrides } from "../../shared/apiMerge";
+
+/**
+ * 预览模式（非 Electron）假实现：mock 基座 + 罐头数据覆盖层。
+ *
+ * 覆盖层只保留「返回具体值 / 有副作用」的成员；void 契约成员与纯 subscribe
+ * 成员由基座兜底（async () => undefined / () => () => undefined）。
+ * 成员签名以 PiDesktopApi 编译期校验，表变更漏成员时以 undefined 暴露（防漂移）。
+ */
 
 const now = Date.now();
 
@@ -190,719 +200,633 @@ let previewSettings: AppSettings = {
 	piRpcNoSkills: false,
 };
 
-export function createPreviewApi(): PiDesktopApi {
-	const noop = (() => () => undefined) as any;
-	const createTerminalTab = async (agentId: string, shell?: string, cwd?: string) => {
-		const shellName = shell ?? "powershell";
-		const displayName = shellName === "git-bash" ? "Git Bash" : shellName === "bash" ? "bash" : shellName === "cmd" ? "cmd" : "PowerShell";
-		const tab: TerminalTab = {
-			id: `preview-terminal-${terminalTabs.length + 1}`,
-			agentId,
-			title: `${displayName} ${terminalTabs.length + 1}`,
-			cwd: "C:/Users/14012/preview-project",
-			shell: "powershell",
-			createdAt: Date.now(),
-		};
-		terminalTabs.push(tab);
-		setTimeout(() => {
-			for (const listener of terminalDataListeners) {
-				listener({
-					tabId: tab.id,
-					data: "Windows PowerShell\r\nPS C:\\\\Users\\\\14012\\\\preview-project> ",
-				});
-			}
-		}, 0);
-		return tab;
+/** 预览终端：创建 tab 后异步推送欢迎输出，模拟主进程 pty 数据流。 */
+function createPreviewTerminalTab(agentId: string, shell?: string, cwd?: string): Promise<TerminalTab> {
+	const shellName = shell ?? "powershell";
+	const displayName = shellName === "git-bash" ? "Git Bash" : shellName === "bash" ? "bash" : shellName === "cmd" ? "cmd" : "PowerShell";
+	const tab: TerminalTab = {
+		id: `preview-terminal-${terminalTabs.length + 1}`,
+		agentId,
+		title: `${displayName} ${terminalTabs.length + 1}`,
+		cwd: "C:/Users/14012/preview-project",
+		shell: "powershell",
+		createdAt: Date.now(),
 	};
-	return {
-		editors: {
-			list: async () => [],
-			redetect: async () => ({ ...previewSettings }),
-			update: async (_editorId, patch) => {
-				previewSettings = {
-					...previewSettings,
-					externalEditors: {
-						...previewSettings.externalEditors,
-						[_editorId]: {
-							...previewSettings.externalEditors[_editorId],
-							...patch,
-							updatedAt: Date.now(),
-						},
+	terminalTabs.push(tab);
+	setTimeout(() => {
+		for (const listener of terminalDataListeners) {
+			listener({
+				tabId: tab.id,
+				data: "Windows PowerShell\r\nPS C:\\\\Users\\\\14012\\\\preview-project> ",
+			});
+		}
+	}, 0);
+	return Promise.resolve(tab);
+}
+
+const previewOverrides: NamespaceOverrides = {
+	editors: {
+		list: async () => [],
+		redetect: async () => ({ ...previewSettings }),
+		update: async (_editorId, patch) => {
+			previewSettings = {
+				...previewSettings,
+				externalEditors: {
+					...previewSettings.externalEditors,
+					[_editorId]: {
+						...previewSettings.externalEditors[_editorId],
+						...patch,
+						updatedAt: Date.now(),
 					},
-				};
-				return { ...previewSettings };
-			},
-			chooseExecutable: async () => null,
-			openProject: async () => undefined,
+				},
+			};
+			return { ...previewSettings };
 		},
-		projects: {
-			list: async () => projects,
-			add: async () => projects[0],
-			remove: async () => projects,
-			reorder: async (projectIds) => {
-				projects.sort((a, b) => projectIds.indexOf(a.id) - projectIds.indexOf(b.id));
-				return projects;
-			},
-			onChanged: noop,
-			listRoot: async () => projects,
-			listWorktreeChildren: async () => [],
-			toggleWorktreeEnabled: async () => projects[0],
-			chooseChatPath: async () => null,
-			setChatPath: async () => projects[0],
-			listModels: async () => [],
+		chooseExecutable: async () => null,
+	},
+	projects: {
+		list: async () => projects,
+		add: async () => projects[0],
+		remove: async () => projects,
+		reorder: async (projectIds) => {
+			projects.sort((a, b) => projectIds.indexOf(a.id) - projectIds.indexOf(b.id));
+			return projects;
 		},
-		projectResources: {
-			list: async () => ({ skills: [], extensions: [] }),
-			createSkill: async (input) => ({
-				id: `project-pi:${input.name}`,
-				name: input.name,
-				description: input.description,
-				path: `C:/Users/preview/project/.omp/skills/${input.name}/SKILL.md`,
-				dir: `C:/Users/preview/project/.omp/skills/${input.name}`,
-				sourceId: "project-pi" as const,
-				sourceLabel: ".omp/skills",
-				type: "directory" as const,
-				enabled: true,
-				valid: true,
-				warnings: [],
-			}),
-			deleteSkill: async () => undefined,
-			deleteExtension: async () => undefined,
-			toggleExtension: async () => undefined,
-			renameSkill: async (_projectId, _skillPath, newName) => ({
-				id: `project-pi:${newName}`,
-				name: newName,
-				description: "",
-				path: `C:/Users/preview/project/.omp/skills/${newName}/SKILL.md`,
-				dir: `C:/Users/preview/project/.omp/skills/${newName}`,
-				sourceId: "project-pi" as const,
-				sourceLabel: ".omp/skills",
-				type: "directory" as const,
-				enabled: true,
-				valid: true,
-				warnings: [],
-			}),
+		listRoot: async () => projects,
+		listWorktreeChildren: async () => [],
+		toggleWorktreeEnabled: async () => projects[0],
+		chooseChatPath: async () => null,
+		setChatPath: async () => projects[0],
+		listModels: async () => [],
+	},
+	projectResources: {
+		list: async () => ({ skills: [], extensions: [] }),
+		createSkill: async (input) => ({
+			id: `project-pi:${input.name}`,
+			name: input.name,
+			description: input.description,
+			path: `C:/Users/preview/project/.omp/skills/${input.name}/SKILL.md`,
+			dir: `C:/Users/preview/project/.omp/skills/${input.name}`,
+			sourceId: "project-pi" as const,
+			sourceLabel: ".omp/skills",
+			type: "directory" as const,
+			enabled: true,
+			valid: true,
+			warnings: [],
+		}),
+		renameSkill: async (_projectId, _skillPath, newName) => ({
+			id: `project-pi:${newName}`,
+			name: newName,
+			description: "",
+			path: `C:/Users/preview/project/.omp/skills/${newName}/SKILL.md`,
+			dir: `C:/Users/preview/project/.omp/skills/${newName}`,
+			sourceId: "project-pi" as const,
+			sourceLabel: ".omp/skills",
+			type: "directory" as const,
+			enabled: true,
+			valid: true,
+			warnings: [],
+		}),
 		toggleSkill: async (_projectId, _skillPath, enabled) => ({
-				id: "project-pi:preview-toggle",
-				name: "preview-skill",
-				description: "",
-				path: "C:/Users/preview/project/.omp/skills/preview-skill/SKILL.md",
-				dir: "C:/Users/preview/project/.omp/skills/preview-skill",
-				sourceId: "project-pi" as const,
-				sourceLabel: ".omp/skills",
-				type: "directory" as const,
-				enabled,
-				valid: true,
-				warnings: [],
-			}),
-		},
-		files: {
-			list: async () => files,
-			open: async () => undefined,
-			showInFolder: async () => undefined,
-			readContent: async () => "",
-			readBase64: async () => "",
-			writeContent: async () => undefined,
-			delete: async () => undefined,
-			copy: async () => [],
-			move: async () => [],
-			rename: async () => "",
-			create: async () => "",
-			getPathForFile: () => "",
-			getClipboardPaths: () => [],
-		},
-		sessions: {
-			list: async () => getSessions(),
-			rename: async () => undefined,
-			copy: async (_projectId, filePath) => ({
-				cancelled: false,
-				sessionPath: `${filePath}-copy`,
-			}),
-			exportHtml: async () => ({ path: "preview-session.html" }),
-			delete: async () => undefined,
-			// 预览模式下返回固定 mock 数据，真实环境由主进程从 JSONL 文件读取
-			readMessages: async () => [
-				{ role: "user", content: "Preview user message", timestamp: Date.now() - 60000 },
-				{ role: "assistant", content: "Preview assistant response", timestamp: Date.now() - 30000 },
-			],
-			readSessionMeta: async () => ({}),
-			// 预览模式无主进程：返回固定 mock 用户消息
-			readUserPrompts: async () => ["Preview user message"],
-			readChatMessages: async () => [],
-			// 预览模式无主进程：完整输出按需读取直接返回空文本
-			readMessageFullText: async () => ({ text: "" }),
-		},
-		codexSessions: {
-			scan: async () => [],
-			import: async () => ({ results: [], imported: 0, failed: 0 }),
-		},
-		claudeSessions: {
-			scan: async () => [],
-			import: async () => ({ results: [], imported: 0, failed: 0 }),
-		},
-		openCodeSessions: {
-			scan: async () => [],
-			import: async () => ({ results: [], imported: 0, failed: 0 }),
-		},
-		git: {
-			branches: async () => ({ current: "main", branches: ["main", "dev"] }),
-			checkout: async (_projectId, branch) => ({
-				current: branch,
-				branches: ["main", "dev"],
-			}),
-			createBranch: async (_projectId, branchName) => ({
-				current: branchName,
-				branches: ["main", "dev", branchName],
-			}),
-			// 预览环境无真实 Git，返回空原始内容，差异左侧显示为空。
-			originalContent: async () => "",
-			worktreeList: async () => [],
-			worktreeCreate: async (_projectId, branchName) => ({
-				path: `/tmp/worktree/${branchName}`,
-				branch: branchName,
-			}),
-			worktreeRemove: async () => true,
-				commitLog: async () => [],
-				refs: async () => [],
-				branchCompare: async () => ({ files: [], ahead: 0, behind: 0 }),
-				commitDetail: async () => null,
-				commitFileDiff: async () => null,
-				diffFileBetween: async () => "",
-				status: async () => ({ merge: [], index: [], workingTree: [], untracked: [] }),
-				workspaceFileDiff: async () => null,
-				stage: async () => {},
-				unstage: async () => {},
-				discard: async () => {},
-				commit: async () => {},
-				cherryPick: async () => {},
-				revert: async () => {},
-				reset: async () => {},
-				dropCommit: async () => {},
-				generateCommitMessage: async () => "",
-				init: async () => {},
-				push: async () => {},
-				pull: async () => {},
-				fetch: async () => {},
-		},
-		logs: {
-			list: async () => [],
-			clear: async () => undefined,
-			openFolder: async () => undefined,
-			getSize: async () => 0,
-		},
-		rpcLogs: {
-			getSize: async () => 0,
-			get: async () => [],
-			clear: async () => undefined,
-			setLogging: async () => false,
-			getLogging: async () => false,
-			openFile: async () => undefined,
-		},
-		pi: {
-			check: async () => ({
+			id: "project-pi:preview-toggle",
+			name: "preview-skill",
+			description: "",
+			path: "C:/Users/preview/project/.omp/skills/preview-skill/SKILL.md",
+			dir: "C:/Users/preview/project/.omp/skills/preview-skill",
+			sourceId: "project-pi" as const,
+			sourceLabel: ".omp/skills",
+			type: "directory" as const,
+			enabled,
+			valid: true,
+			warnings: [],
+		}),
+	},
+	files: {
+		list: async () => files,
+		readContent: async () => "",
+		readBase64: async () => "",
+		copy: async () => [],
+		move: async () => [],
+		rename: async () => "",
+		create: async () => "",
+		getPathForFile: () => "",
+		getClipboardPaths: () => [],
+	},
+	sessions: {
+		list: async () => getSessions(),
+		copy: async (_projectId, filePath) => ({
+			cancelled: false,
+			sessionPath: `${filePath}-copy`,
+		}),
+		exportHtml: async () => ({ path: "preview-session.html" }),
+		// 预览模式下返回固定 mock 数据，真实环境由主进程从 JSONL 文件读取
+		readMessages: async () => [
+			{ role: "user", content: "Preview user message", timestamp: Date.now() - 60000 },
+			{ role: "assistant", content: "Preview assistant response", timestamp: Date.now() - 30000 },
+		],
+		readSessionMeta: async () => ({}),
+		// 预览模式无主进程：返回固定 mock 用户消息
+		readUserPrompts: async () => ["Preview user message"],
+		readChatMessages: async () => [],
+		// 预览模式无主进程：完整输出按需读取直接返回空文本
+		readMessageFullText: async () => ({ text: "" }),
+	},
+	codexSessions: {
+		scan: async () => [],
+		import: async () => ({ results: [], imported: 0, failed: 0 }),
+	},
+	claudeSessions: {
+		scan: async () => [],
+		import: async () => ({ results: [], imported: 0, failed: 0 }),
+	},
+	openCodeSessions: {
+		scan: async () => [],
+		import: async () => ({ results: [], imported: 0, failed: 0 }),
+	},
+	git: {
+		branches: async () => ({ current: "main", branches: ["main", "dev"] }),
+		checkout: async (_projectId, branch) => ({
+			current: branch,
+			branches: ["main", "dev"],
+		}),
+		createBranch: async (_projectId, branchName) => ({
+			current: branchName,
+			branches: ["main", "dev", branchName],
+		}),
+		// 预览环境无真实 Git，返回空原始内容，差异左侧显示为空。
+		originalContent: async () => "",
+		worktreeList: async () => [],
+		worktreeCreate: async (_projectId, branchName) => ({
+			path: `/tmp/worktree/${branchName}`,
+			branch: branchName,
+		}),
+		worktreeRemove: async () => true,
+		commitLog: async () => [],
+		refs: async () => [],
+		branchCompare: async () => ({ files: [], ahead: 0, behind: 0 }),
+		commitDetail: async () => null,
+		commitFileDiff: async () => null,
+		diffFileBetween: async () => "",
+		status: async () => ({ merge: [], index: [], workingTree: [], untracked: [] }),
+		workspaceFileDiff: async () => null,
+		generateCommitMessage: async () => "",
+	},
+	logs: {
+		list: async () => [],
+		getSize: async () => 0,
+	},
+	rpcLogs: {
+		getSize: async () => 0,
+		get: async () => [],
+		setLogging: async () => false,
+		getLogging: async () => false,
+	},
+	pi: {
+		check: async () => ({
+			installed: true,
+			command: "omp",
+			version: "preview",
+			searchedDirs: [],
+		}),
+		checkCustom: async (_path) => ({
+			installed: true,
+			command: _path,
+			version: "preview",
+			searchedDirs: [],
+		}),
+		checkUpdate: async () => ({
+			currentVersion: "preview",
+			latestVersion: "preview",
+			hasUpdate: false,
+		}),
+		update: async () => ({
+			command: "omp update omp --no-approve",
+			output: "Preview mode: omp update output",
+			updated: false,
+		}),
+		execInstall: async (_command) => ({
+			success: true,
+			exitCode: 0,
+			stdout: "preview: exec install output",
+			stderr: "",
+		}),
+		checkNpm: async () => ({
+			available: true,
+			version: "preview",
+		}),
+	},
+	wsl: {
+		listDistros: async () => ["Ubuntu", "Debian"],
+		validateConnection: async (_distro, _user) => ({
+			ok: true,
+			whoami: "preview",
+			piVersion: "preview",
+			error: "",
+		}),
+	},
+	app: {
+		info: async () => ({
+			version: "preview",
+			releasesUrl: "https://github.com/HiHaWarzid/OmpDeck",
+			platform: "win32" as NodeJS.Platform,
+			homeDir: "C:/Users/preview",
+		}),
+		preferredSystemLanguages: async () => navigator.languages?.length ? [...navigator.languages] : [navigator.language],
+		checkUpdate: async () => ({
+			currentVersion: "preview",
+			latestVersion: "preview",
+			hasUpdate: false,
+			releaseName: "preview",
+			releaseNotes: "",
+			releaseUrl: "https://github.com/HiHaWarzid/OmpDeck",
+			assets: [],
+		}),
+		downloadUpdate: async (asset) => ({
+			filePath: asset.name,
+			assetName: asset.name,
+		}),
+		feedbackEnvironment: async () => ({
+			appVersion: "preview",
+			platform: "win32",
+			arch: "x64",
+			electronVersion: "preview",
+			chromeVersion: "preview",
+			nodeVersion: "preview",
+			pi: {
 				installed: true,
 				command: "omp",
 				version: "preview",
 				searchedDirs: [],
-			}),
-			checkCustom: async (_path) => ({
-				installed: true,
-				command: _path,
-				version: "preview",
-				searchedDirs: [],
-			}),
-			checkUpdate: async () => ({
-				currentVersion: "preview",
-				latestVersion: "preview",
-				hasUpdate: false,
-			}),
-			update: async () => ({
-				command: "omp update omp --no-approve",
-				output: "Preview mode: omp update output",
-				updated: false,
-			}),
-			execInstall: async (_command) => ({
-				success: true,
-				exitCode: 0,
-				stdout: "preview: exec install output",
-				stderr: "",
-			}),
-			checkNpm: async () => ({
-				available: true,
-				version: "preview",
-			}),
+			},
+		}),
+		visionTest: async () => ({ ok: true, models: [] }),
+		rendererLog: async (level, scope, message, detail) => {
+			console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
+				`[${scope}] ${message}`,
+				detail,
+			);
 		},
-		wsl: {
-			listDistros: async () => ["Ubuntu", "Debian"],
-			validateConnection: async (_distro, _user) => ({
-				ok: true,
-				whoami: "preview",
-				piVersion: "preview",
-				error: "",
-			}),
-		},
-		app: {
-			info: async () => ({
-				version: "preview",
-				releasesUrl: "https://github.com/HiHaWarzid/OmpDeck",
-				platform: "win32" as NodeJS.Platform,
-				homeDir: "C:/Users/preview",
-			}),
-			preferredSystemLanguages: async () => navigator.languages?.length ? [...navigator.languages] : [navigator.language],
-			checkUpdate: async () => ({
-				currentVersion: "preview",
-				latestVersion: "preview",
-				hasUpdate: false,
-				releaseName: "preview",
-				releaseNotes: "",
-				releaseUrl: "https://github.com/HiHaWarzid/OmpDeck",
-				assets: [],
-			}),
-			downloadUpdate: async (asset) => ({
-				filePath: asset.name,
-				assetName: asset.name,
-			}),
-			installUpdate: async () => undefined,
-			onUpdateProgress: () => () => undefined,
-			onOpenInBrowser: () => () => undefined,
-			feedbackEnvironment: async () => ({
-				appVersion: "preview",
-				platform: "win32",
-				arch: "x64",
-				electronVersion: "preview",
-				chromeVersion: "preview",
-				nodeVersion: "preview",
-				pi: {
-					installed: true,
-					command: "omp",
-					version: "preview",
-					searchedDirs: [],
+		toggleAlwaysOnTopWindow: async () => false,
+		toggleDevTools: async () => false,
+	},
+	skills: {
+		list: async () => ({
+			locations: [
+				{
+					id: "pi-global" as const,
+					label: "~/.omp/agent/skills",
+					path: "C:/Users/preview/.omp/agent/skills",
+					rootMarkdownEnabled: true,
 				},
-			}),
-			openExternal: async () => undefined,
-			restart: async () => undefined,
-			visionTest: async () => ({ ok: true, models: [] }),
-			rendererLog: async (level, scope, message, detail) => {
-				console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
-					`[${scope}] ${message}`,
-					detail,
-				);
-			},
-			minimizeWindow: async () => undefined,
-			toggleMaximizeWindow: async () => undefined,
-			toggleAlwaysOnTopWindow: async () => false,
-			closeWindow: async () => undefined,
-			toggleDevTools: async () => false,
-		},
-		skills: {
-			list: async () => ({
-				locations: [
-					{
-						id: "pi-global" as const,
-						label: "~/.omp/agent/skills",
-						path: "C:/Users/preview/.omp/agent/skills",
-						rootMarkdownEnabled: true,
-					},
-				],
-				skills: [],
-			}),
-			create: async (input) => ({
-				id: `pi-global:${input.name}`,
-				name: input.name,
-				description: input.description,
-				path: `C:/Users/preview/.omp/agent/skills/${input.name}/SKILL.md`,
-				dir: `C:/Users/preview/.omp/agent/skills/${input.name}`,
-				sourceId: input.locationId,
-				sourceLabel: "~/.omp/agent/skills",
-				type: "directory" as const,
-				enabled: true,
-				valid: true,
-				warnings: [],
-			}),
-			toggle: async (path, enabled) => ({
-				id: `pi-global:${path}`,
-				name: "preview-skill",
-				description: "Preview skill",
-				path,
-				dir: path.replace(/[/\\]SKILL\.md$/, ""),
-				sourceId: "pi-global" as const,
-				sourceLabel: "~/.omp/agent/skills",
-				type: "directory" as const,
-				enabled,
-				valid: true,
-				warnings: [],
-			}),
-			delete: async () => undefined,
-			openFolder: async () => undefined,
-			rename: async (_skillPath, newName) => ({
-				id: `pi-global:preview/${newName}/SKILL.md`,
-				name: newName,
-				description: "Preview skill",
-				path: `C:/Users/preview/.omp/agent/skills/${newName}/SKILL.md`,
-				dir: `C:/Users/preview/.omp/agent/skills/${newName}`,
-				sourceId: "pi-global" as const,
-				sourceLabel: "~/.omp/agent/skills",
-				type: "directory" as const,
-				enabled: true,
-				valid: true,
-				warnings: [],
-			}),
-		},
-		extensions: {
-			list: async (_forceRefresh = false) => ({
-				extensions: [
-					{
-						id: "user:npm:preview-extension",
-						source: "npm:preview-extension",
-						path: "C:/Users/preview/.omp/agent/npm/node_modules/preview-extension",
-						scope: "user" as const,
-					},
-				],
-				raw: "User packages:\n  npm:preview-extension\n    C:/Users/preview/.omp/agent/npm/node_modules/preview-extension\n",
-			}),
-			uninstall: async () => undefined,
-			install: async (_source: string) => "",
-			removeBuiltIn: async () => undefined,
-			restoreBuiltIn: async () => undefined,
-			update: async () => ({
-				command: "omp update --extensions --no-approve",
-				output: "Preview mode: extensions update output",
-				updated: false,
-			}),
-		},
-		prompts: {
-			list: async () => ({ templates: [], globalDir: "C:/Users/preview/.omp/agent/prompts" }),
-			create: async (input) => ({
-				name: input.name,
-				path: `C:/Users/preview/.omp/agent/prompts/${input.name}.md`,
-				description: input.description,
-				content: `---\ndescription: ${input.description}\n---\n`,
-				userCreated: true,
-			}),
-			delete: async () => undefined,
-			openFolder: async () => undefined,
-			edit: async (_filePath, _content?) => "---\ndescription: Preview\n---\n\nPreview content",
-			listByProject: async () => ({ templates: [], globalDir: "" }),
-			createInProject: async (_projectPath, input) => ({
-				name: input.name,
-				path: `project://${_projectPath}/.omp/prompts/${input.name}.md`,
-				description: input.description,
-				content: `---\ndescription: ${input.description}\n---\n`,
-				userCreated: true,
-				scope: "project",
-			}),
-			deleteFromProject: async () => undefined,
-			rename: async (_oldName, newName) => ({
-				name: newName,
-				path: `C:/Users/preview/.omp/agent/prompts/${newName}.md`,
-				description: "Renamed prompt",
-				content: `---\ndescription: Renamed prompt\n---\n`,
-				userCreated: true,
-			}),
-			renameInProject: async (_projectPath, _oldName, newName) => ({
-				name: newName,
-				path: `project://${_projectPath}/.omp/prompts/${newName}.md`,
-				description: "Renamed project prompt",
-				content: `---\ndescription: Renamed project prompt\n---\n`,
-				userCreated: true,
-				scope: "project",
-			}),
-		},
-		promptStore: {
-			search: async (_query, _opts) => ({ query: _query ?? "", count: 0, prompts: [] }),
-			get: async (_id) => ({ id: _id, title: "", description: "", content: "", type: "TEXT", author: "", category: "", tags: [], votes: 0, createdAt: "" }),
-			import: async (data) => ({
-				name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
-				path: `C:/Users/preview/.omp/agent/prompts/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}.md`,
-				description: data.description,
-				content: data.content,
-				userCreated: true,
-			}),
-		},
-		yaoPrompts: {
-			list: async () => ({ categories: [], prompts: [], repoPath: "" }),
-			detail: async () => ({ title: "", description: "", promptContent: "", fullContent: "" }),
-			import: async (_slug, _category) => ({
-				name: _slug,
-				path: `C:/Users/preview/.omp/agent/prompts/${_slug}.md`,
-				description: "Preview import",
-				content: "Preview content",
-				userCreated: true,
-			}),
-		},
-		skillStore: {
-			search: async () => ({ query: "", count: 0, prompts: [] }),
-			import: async (data, _locationId) => ({
-				name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
-				path: `C:/Users/preview/.omp/agent/skills/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}/SKILL.md`,
-				description: data.description,
-				enabled: true,
-				valid: true,
-				warnings: [],
-				id: `pi-global:preview`,
-				dir: "",
-				sourceId: "pi-global",
-				sourceLabel: "Preview",
-				type: "directory",
-			}),
-		},
-		skillHub: {
-			search: async () => ({ query: "", total: 0, items: [] }),
-			detail: async () => null,
-			install: async (slug) => ({ success: true, slug, installDir: "", message: "Preview install" }),
-		},
-		settings: {
-			get: async (): Promise<AppSettings> => ({ ...previewSettings }),
-			update: async (patch): Promise<AppSettings> => {
-				previewSettings = { ...previewSettings, ...patch };
-				return { ...previewSettings };
-			},
-			testPiProxy: async () => ({
-				success: true,
-				url: "https://api.openai.com/v1/models",
-				elapsedMs: 120,
-				statusCode: 401,
-				message: t("preview.proxyOk"),
-			}),
-			onApplyWindow: noop,
-		},
-		config: {
-			getModels: async () => ({
-				raw: '{"providers":{}}',
-				parsed: { providers: {} },
-			}),
-			getAuth: async () => ({ raw: "{}", parsed: {} }),
-			getSettings: async () => ({ raw: "{}", parsed: {} }),
-			getTrust: async () => ({ raw: "{}", parsed: {} }),
-			saveModels: async () => ({ valid: true }),
-			saveAuth: async () => ({ valid: true }),
-			saveSettings: async () => ({ valid: true }),
-			setDefaultModel: async () => ({ valid: true }),
-			saveRaw: async () => ({ valid: true }),
-			export: async () =>
-				JSON.stringify({
-					version: 1,
-					exportedAt: new Date().toISOString(),
-					files: { "models.json": {}, "auth.json": {}, "settings.json": {} },
-				}),
-			import: async () => ({ valid: true }),
-			fetchModels: async () => ({
-				success: true,
-				models: [
-					{ id: "gpt-4o", name: "GPT-4o" },
-					{ id: "gpt-4o-mini", name: "GPT-4o Mini" },
-				],
-			}),
-			testProvider: async () => ({
-				success: true,
-				model: "gpt-4o-mini",
-				snippet: "Hello! How can I help you today?",
-				tokens: { input: 8, output: 7 },
-				latencyMs: 320,
-				requestUrl: "https://api.openai.com/v1/chat/completions",
-				requestBody: '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}],"max_tokens":10}',
-			}),
-		},
-		agents: {
-			list: async () => getAgents(),
-			getMessages: async () => getMessages(),
-			create: async () => getAgents()[0],
-			rename: async (agentId, name) => {
-				const agent =
-					getAgents().find((item) => item.id === agentId) ?? getAgents()[0];
-				previewAgentTitle = name;
-				agent.title = previewAgentTitle;
-				return agent;
-			},
-			stop: async () => undefined,
-			prompt: async () => ({ accepted: true }),
-			abort: async () => undefined,
-			notifyAsk: async () => undefined,
-			exportHtml: async () => ({ path: "preview.html" }),
-			getForkMessages: async () => [
-				{ entryId: "preview-user-1", text: "Preview prompt" },
 			],
-			forkSession: async () => ({ text: "Preview prompt", cancelled: false }),
-			cloneSession: async () => ({ cancelled: false }),
-			switchSession: async () => ({ cancelled: false }),
-			reload: async () => undefined,
-			restart: async (agentId: string) => ({
-				id: agentId,
-				projectId: "preview",
-				cwd: "/preview",
-				title: previewAgentTitle ?? t("preview.agentTitle"),
-				status: "idle" as const,
-				createdAt: Date.now(),
-			}),
-			compact: async () => ({
-				modelName: "Preview GPT",
-				provider: "preview",
-				modelId: "preview",
-				thinkingLevel: "low",
-				contextPercent: 5,
-				contextTokens: 5000,
-				contextWindow: 100000,
-				cacheTotal: 53000000,
-			}),
-			runtimeState: async () => ({
-				modelName: "Preview GPT",
-				provider: "preview",
-				modelId: "preview",
-				thinkingLevel: "low",
-				contextPercent: 12,
-				contextTokens: 12000,
-				contextWindow: 100000,
-				cacheTotal: 53000000,
-			}),
-			cycleModel: async () => ({
-				modelName: "Preview GPT",
-				thinkingLevel: "low",
-			}),
-			availableModels: async () => [
-				{ id: "preview", name: "Preview GPT", provider: "preview" },
+			skills: [],
+		}),
+		create: async (input) => ({
+			id: `pi-global:${input.name}`,
+			name: input.name,
+			description: input.description,
+			path: `C:/Users/preview/.omp/agent/skills/${input.name}/SKILL.md`,
+			dir: `C:/Users/preview/.omp/agent/skills/${input.name}`,
+			sourceId: input.locationId,
+			sourceLabel: "~/.omp/agent/skills",
+			type: "directory" as const,
+			enabled: true,
+			valid: true,
+			warnings: [],
+		}),
+		toggle: async (path, enabled) => ({
+			id: `pi-global:${path}`,
+			name: "preview-skill",
+			description: "Preview skill",
+			path,
+			dir: path.replace(/[/\\]SKILL\.md$/, ""),
+			sourceId: "pi-global" as const,
+			sourceLabel: "~/.omp/agent/skills",
+			type: "directory" as const,
+			enabled,
+			valid: true,
+			warnings: [],
+		}),
+		rename: async (_skillPath, newName) => ({
+			id: `pi-global:preview/${newName}/SKILL.md`,
+			name: newName,
+			description: "Preview skill",
+			path: `C:/Users/preview/.omp/agent/skills/${newName}/SKILL.md`,
+			dir: `C:/Users/preview/.omp/agent/skills/${newName}`,
+			sourceId: "pi-global" as const,
+			sourceLabel: "~/.omp/agent/skills",
+			type: "directory" as const,
+			enabled: true,
+			valid: true,
+			warnings: [],
+		}),
+	},
+	extensions: {
+		list: async (_forceRefresh = false) => ({
+			extensions: [
+				{
+					id: "user:npm:preview-extension",
+					source: "npm:preview-extension",
+					path: "C:/Users/preview/.omp/agent/npm/node_modules/preview-extension",
+					scope: "user" as const,
+				},
 			],
-			setModel: async () => ({
-				modelName: "Preview GPT",
-				thinkingLevel: "low",
+			raw: "User packages:\n  npm:preview-extension\n    C:/Users/preview/.omp/agent/npm/node_modules/preview-extension\n",
+		}),
+		install: async (_source: string) => "",
+		update: async () => ({
+			command: "omp update --extensions --no-approve",
+			output: "Preview mode: extensions update output",
+			updated: false,
+		}),
+	},
+	prompts: {
+		list: async () => ({ templates: [], globalDir: "C:/Users/preview/.omp/agent/prompts" }),
+		create: async (input) => ({
+			name: input.name,
+			path: `C:/Users/preview/.omp/agent/prompts/${input.name}.md`,
+			description: input.description,
+			content: `---\ndescription: ${input.description}\n---\n`,
+			userCreated: true,
+		}),
+		edit: async (_filePath, _content?) => "---\ndescription: Preview\n---\n\nPreview content",
+		listByProject: async () => ({ templates: [], globalDir: "" }),
+		createInProject: async (_projectPath, input) => ({
+			name: input.name,
+			path: `project://${_projectPath}/.omp/prompts/${input.name}.md`,
+			description: input.description,
+			content: `---\ndescription: ${input.description}\n---\n`,
+			userCreated: true,
+			scope: "project",
+		}),
+		rename: async (_oldName, newName) => ({
+			name: newName,
+			path: `C:/Users/preview/.omp/agent/prompts/${newName}.md`,
+			description: "Renamed prompt",
+			content: `---\ndescription: Renamed prompt\n---\n`,
+			userCreated: true,
+		}),
+		renameInProject: async (_projectPath, _oldName, newName) => ({
+			name: newName,
+			path: `project://${_projectPath}/.omp/prompts/${newName}.md`,
+			description: "Renamed project prompt",
+			content: `---\ndescription: Renamed project prompt\n---\n`,
+			userCreated: true,
+			scope: "project",
+		}),
+	},
+	promptStore: {
+		search: async (_query, _opts) => ({ query: _query ?? "", count: 0, prompts: [] }),
+		get: async (_id) => ({ id: _id, title: "", description: "", content: "", type: "TEXT", author: "", category: "", tags: [], votes: 0, createdAt: "" }),
+		import: async (data) => ({
+			name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
+			path: `C:/Users/preview/.omp/agent/prompts/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}.md`,
+			description: data.description,
+			content: data.content,
+			userCreated: true,
+		}),
+	},
+	yaoPrompts: {
+		list: async () => ({ categories: [], prompts: [], repoPath: "" }),
+		detail: async () => ({ title: "", description: "", promptContent: "", fullContent: "" }),
+		import: async (_slug, _category) => ({
+			name: _slug,
+			path: `C:/Users/preview/.omp/agent/prompts/${_slug}.md`,
+			description: "Preview import",
+			content: "Preview content",
+			userCreated: true,
+		}),
+	},
+	skillStore: {
+		search: async () => ({ query: "", count: 0, prompts: [] }),
+		import: async (data, _locationId) => ({
+			name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
+			path: `C:/Users/preview/.omp/agent/skills/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}/SKILL.md`,
+			description: data.description,
+			enabled: true,
+			valid: true,
+			warnings: [],
+			id: `pi-global:preview`,
+			dir: "",
+			sourceId: "pi-global",
+			sourceLabel: "Preview",
+			type: "directory",
+		}),
+	},
+	skillHub: {
+		search: async () => ({ query: "", total: 0, items: [] }),
+		detail: async () => null,
+		install: async (slug) => ({ success: true, slug, installDir: "", message: "Preview install" }),
+	},
+	settings: {
+		get: async (): Promise<AppSettings> => ({ ...previewSettings }),
+		update: async (patch): Promise<AppSettings> => {
+			previewSettings = { ...previewSettings, ...patch };
+			return { ...previewSettings };
+		},
+		testPiProxy: async () => ({
+			success: true,
+			url: "https://api.openai.com/v1/models",
+			elapsedMs: 120,
+			statusCode: 401,
+			message: t("preview.proxyOk"),
+		}),
+	},
+	config: {
+		getModels: async () => ({
+			raw: '{"providers":{}}',
+			parsed: { providers: {} },
+		}),
+		getAuth: async () => ({ raw: "{}", parsed: {} }),
+		getSettings: async () => ({ raw: "{}", parsed: {} }),
+		getTrust: async () => ({ raw: "{}", parsed: {} }),
+		saveModels: async () => ({ valid: true }),
+		saveAuth: async () => ({ valid: true }),
+		saveSettings: async () => ({ valid: true }),
+		setDefaultModel: async () => ({ valid: true }),
+		saveRaw: async () => ({ valid: true }),
+		export: async () =>
+			JSON.stringify({
+				version: 1,
+				exportedAt: new Date().toISOString(),
+				files: { "models.json": {}, "auth.json": {}, "settings.json": {} },
 			}),
-			refreshModels: async () => ({
-				modelName: "Preview GPT",
-				thinkingLevel: "low",
-			}),
-			cycleThinking: async () => ({
-				modelName: "Preview GPT",
-				thinkingLevel: "medium",
-			}),
-			setThinking: async (_agentId, level) => ({
-				modelName: "Preview GPT",
-				thinkingLevel: level,
-			}),
-			commands: async () => [
-				{ name: "reload", description: "Reload runtime", source: "builtin" },
+		import: async () => ({ valid: true }),
+		fetchModels: async () => ({
+			success: true,
+			models: [
+				{ id: "gpt-4o", name: "GPT-4o" },
+				{ id: "gpt-4o-mini", name: "GPT-4o Mini" },
 			],
-			editMessage: async () => undefined,
-			deleteMessage: async () => undefined,
-			prepareResend: async () => ({ text: "Preview prompt" }),
-			onState: noop,
-			onFocusTarget: noop,
-			onMessages: ((
-				callback: (payload: AgentMessagesDelta) => void,
-			) => {
-				setTimeout(() => callback({ agentId: "preview-agent", replaceFrom: 0, messages: getMessages() }), 0);
-				return () => undefined;
-			}) as any,
-			onLog: noop,
-			onThinking: noop,
-			onNotice: noop,
-			onRpcLog: noop,
-			onRuntimeState: noop,
-			onUiRequest: noop,
-			sendUiResponse: async () => undefined,
-			onTrustRequest: noop,
-			respondTrustRequest: async () => undefined,
+		}),
+		testProvider: async () => ({
+			success: true,
+			model: "gpt-4o-mini",
+			snippet: "Hello! How can I help you today?",
+			tokens: { input: 8, output: 7 },
+			latencyMs: 320,
+			requestUrl: "https://api.openai.com/v1/chat/completions",
+			requestBody: '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hi"}],"max_tokens":10}',
+		}),
+	},
+	agents: {
+		list: async () => getAgents(),
+		getMessages: async () => getMessages(),
+		create: async () => getAgents()[0],
+		rename: async (agentId, name) => {
+			const agent =
+				getAgents().find((item) => item.id === agentId) ?? getAgents()[0];
+			previewAgentTitle = name;
+			agent.title = previewAgentTitle;
+			return agent;
 		},
-		perf: {
-			enabled: false,
-		},
-		pet: {
-			onState: noop,
-			list: async () => [
+		prompt: async () => ({ accepted: true }),
+		exportHtml: async () => ({ path: "preview.html" }),
+		getForkMessages: async () => [
+			{ entryId: "preview-user-1", text: "Preview prompt" },
+		],
+		forkSession: async () => ({ text: "Preview prompt", cancelled: false }),
+		cloneSession: async () => ({ cancelled: false }),
+		switchSession: async () => ({ cancelled: false }),
+		restart: async (agentId: string) => ({
+			id: agentId,
+			projectId: "preview",
+			cwd: "/preview",
+			title: previewAgentTitle ?? t("preview.agentTitle"),
+			status: "idle" as const,
+			createdAt: Date.now(),
+		}),
+		compact: async () => ({
+			modelName: "Preview GPT",
+			provider: "preview",
+			modelId: "preview",
+			thinkingLevel: "low",
+			contextPercent: 5,
+			contextTokens: 5000,
+			contextWindow: 100000,
+			cacheTotal: 53000000,
+		}),
+		runtimeState: async () => ({
+			modelName: "Preview GPT",
+			provider: "preview",
+			modelId: "preview",
+			thinkingLevel: "low",
+			contextPercent: 12,
+			contextTokens: 12000,
+			contextWindow: 100000,
+			cacheTotal: 53000000,
+		}),
+		cycleModel: async () => ({
+			modelName: "Preview GPT",
+			thinkingLevel: "low",
+		}),
+		availableModels: async () => [
+			{ id: "preview", name: "Preview GPT", provider: "preview" },
+		],
+		setModel: async () => ({
+			modelName: "Preview GPT",
+			thinkingLevel: "low",
+		}),
+		refreshModels: async () => ({
+			modelName: "Preview GPT",
+			thinkingLevel: "low",
+		}),
+		cycleThinking: async () => ({
+			modelName: "Preview GPT",
+			thinkingLevel: "medium",
+		}),
+		setThinking: async (_agentId, level) => ({
+			modelName: "Preview GPT",
+			thinkingLevel: level,
+		}),
+		commands: async () => [
+			{ name: "reload", description: "Reload runtime", source: "builtin" },
+		],
+		prepareResend: async () => ({ text: "Preview prompt" }),
+		// 预览模式无主进程：订阅后异步推送一条示例消息，模拟消息流
+		onMessages: ((callback: (payload: AgentMessagesDelta) => void) => {
+			setTimeout(() => callback({ agentId: "preview-agent", replaceFrom: 0, messages: getMessages() }), 0);
+			return () => undefined;
+		}) as (callback: (payload: AgentMessagesDelta) => void) => () => void,
+	},
+	perf: {
+		enabled: false,
+	},
+	pet: {
+		list: async () => [
 			{ id: "clawd", displayName: "Clawd", source: "builtin", spritesheetUrl: "" },
 		],
-			setEnabled: async () => undefined,
-			setId: async () => undefined,
-			moveWindow: async () => undefined,
-			moveBy: async () => undefined,
-			ready: () => undefined,
-			contextMenu: async () => undefined,
-			focusAgent: async () => undefined,
-			onSprite: noop,
-			onNotify: noop,
-			setPreviewMode: async () => undefined,
-			onPreviewMode: noop,
-			onCaps: noop,
-			testNotify: async () => undefined,
-			tease: async () => undefined,
-			setDragging: async () => undefined,
-			getCurrent: async () => ({ id: "clawd", displayName: "Clawd", source: "builtin", spritesheetUrl: "" }),
+		getCurrent: async () => ({ id: "clawd", displayName: "Clawd", source: "builtin", spritesheetUrl: "" }),
+	},
+	terminal: {
+		list: async (agentId) =>
+			terminalTabs.filter((tab) => tab.agentId === agentId),
+		ensure: async (agentId, cwd) => {
+			const existing = terminalTabs.filter((tab) => tab.agentId === agentId);
+			if (existing.length > 0) return existing;
+			return [await createPreviewTerminalTab(agentId, undefined, cwd)];
 		},
-		terminal: {
-			list: async (agentId) =>
-				terminalTabs.filter((tab) => tab.agentId === agentId),
-			ensure: async (agentId, cwd) => {
-				const existing = terminalTabs.filter((tab) => tab.agentId === agentId);
-				if (existing.length > 0) return existing;
-				return [await createTerminalTab(agentId, undefined, cwd)];
-			},
-			create: createTerminalTab,
-			input: async (tabId, data) => {
-				for (const listener of terminalDataListeners) {
-					listener({ tabId, data });
-				}
-			},
-			resize: async () => undefined,
-			close: async (tabId) => {
-				const index = terminalTabs.findIndex((tab) => tab.id === tabId);
-				if (index >= 0) terminalTabs.splice(index, 1);
-			},
-			onData: (callback) => {
-				terminalDataListeners.add(callback);
-				return () => {
-					terminalDataListeners.delete(callback);
-				};
-			},
-			onExit: (callback) => {
-				terminalExitListeners.add(callback);
-				return () => {
-					terminalExitListeners.delete(callback);
-				};
-			},
-			shells: async () => [
-				{ shell: "powershell", label: "PowerShell", available: true },
-				{ shell: "pwsh", label: "pwsh", available: true },
-				{ shell: "cmd", label: "cmd", available: true },
-			],
+		create: createPreviewTerminalTab,
+		input: async (tabId, data) => {
+			for (const listener of terminalDataListeners) {
+				listener({ tabId, data });
+			}
 		},
-		feishu: {
-			connect: async () => ({ success: true, message: "预览模式" }),
-			connectTemp: async () => ({ success: false, message: "预览模式不支持" }),
-			disconnect: async () => ({ success: true }),
-			connectByBot: async () => ({ success: false, message: "预览模式不支持" }),
-			statusRequest: async () => ({ status: "disconnected" as const, activeBindings: 0 }),
-			onStatus: () => () => {},
-			botsList: async () => [],
-			botAdd: async () => ({ success: false, error: "预览模式不支持" }),
-			botRemove: async () => false,
-			botConfig: async () => undefined,
-			botSecret: async () => "",
-			testConnection: async () => ({ success: false, message: "预览模式不支持" }),
-			bindingsList: async () => [],
-			bindingRemove: async () => false,
-			bindingUpdate: async () => undefined,
-			onMessages: () => () => {},
-			onBindingsChanged: () => () => {},
-			onBotsChanged: () => () => {},
-			onWhoamiResult: () => () => {},
-			sessionBotGet: async () => null,
-			sessionBotSet: async () => ({ success: true }),
+		close: async (tabId) => {
+			const index = terminalTabs.findIndex((tab) => tab.id === tabId);
+			if (index >= 0) terminalTabs.splice(index, 1);
 		},
-		dialog: {
-			pickFiles: async () => [],
+		onData: (callback) => {
+			terminalDataListeners.add(callback);
+			return () => {
+				terminalDataListeners.delete(callback);
+			};
 		},
-		browser: {
-			openExternal: async () => {},
+		onExit: (callback) => {
+			terminalExitListeners.add(callback);
+			return () => {
+				terminalExitListeners.delete(callback);
+			};
 		},
-		scratchPad: {
-			list: async () => [],
-			create: async () => ({ id: "", name: "", path: "", createdAt: 0, updatedAt: 0 }),
-			delete: async () => {},
-			load: async () => ({ content: "", lastEditedAt: 0, cursorPosition: 0 }),
-			save: async () => {},
-			export: async () => false,
-		},
+		shells: async () => [
+			{ shell: "powershell", label: "PowerShell", available: true },
+			{ shell: "pwsh", label: "pwsh", available: true },
+			{ shell: "cmd", label: "cmd", available: true },
+		],
+	},
+	feishu: {
+		connect: async () => ({ success: true, message: "预览模式" }),
+		connectTemp: async () => ({ success: false, message: "预览模式不支持" }),
+		disconnect: async () => ({ success: true }),
+		connectByBot: async () => ({ success: false, message: "预览模式不支持" }),
+		statusRequest: async () => ({ status: "disconnected" as const, activeBindings: 0 }),
+		botsList: async () => [],
+		botAdd: async () => ({ success: false, error: "预览模式不支持" }),
+		botRemove: async () => false,
+		botConfig: async () => undefined,
+		botSecret: async () => "",
+		testConnection: async () => ({ success: false, message: "预览模式不支持" }),
+		bindingsList: async () => [],
+		bindingRemove: async () => false,
+		bindingUpdate: async () => undefined,
+		sessionBotGet: async () => null,
+		sessionBotSet: async () => ({ success: true }),
+	},
+	dialog: {
+		pickFiles: async () => [],
+	},
+	scratchPad: {
+		list: async () => [],
+		create: async () => ({ id: "", name: "", path: "", createdAt: 0, updatedAt: 0 }),
+		load: async () => ({ content: "", lastEditedAt: 0, cursorPosition: 0 }),
+		export: async () => false,
+	},
+};
 
-		clipboard: {
-			writeText: async (_text: string) => {},
-		},
-	};
+/**
+ * 预览模式假实现 = mock 基座（void 契约成员兜底）+ 罐头数据覆盖层。
+ * 与 browserApi 共用同一基座；覆盖层成员签名以 PiDesktopApi 编译期校验。
+ */
+export function createPreviewApi(): PiDesktopApi {
+	return mergeApiOverrides(createMockApiBase(), previewOverrides);
 }
