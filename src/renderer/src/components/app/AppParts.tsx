@@ -3275,16 +3275,16 @@ export const BatchAskInlineBar = memo(function BatchAskInlineBar(props: {
 	);
 });
 
-/** 思考过程折叠卡片：默认收起为单行（deepseek-harness 模式），展开后显示完整推理文本。 */
+/** 思考过程卡片：默认展开显示完整推理文本（与 TodoWrite 一致），可手动折叠。 */
 export const ThinkingBlock = memo(function ThinkingBlock(props: {
 	text: string;
 	startedAt?: number;
 	endedAt?: number;
 	showThinking?: boolean;
 }) {
-	// 默认折叠为一行：流式中显示最新行（带扫光动画），结束后显示第一行并静止；
-	// 点击标题行展开全文。对应 deepseek-harness 的思考折叠体验，避免长推理占满消息流。
-	const [expanded, setExpanded] = useState(false);
+	// 默认展开：用户要求思考与 todo 卡片一致，直接展示完整推理；
+	// 点击标题行可折叠为单行摘要。流式期间同样展开，推理过程实时可见。
+	const [expanded, setExpanded] = useState(true);
 	// 流式思考进行中（有起点、未正常结束）时每秒刷新计时
 	const [, setTick] = useState(0);
 	useEffect(() => {
