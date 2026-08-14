@@ -13,11 +13,18 @@ const log = (msg: string) => {
 type TerminalRuntime = {
 	tab: TerminalTab;
 	pty: pty.IPty;
-	buffer: string;
+	/** 回放缓冲分片：追加 O(1)，超过上限才合并截断，避免高频输出下每块 O(n) 整串拷贝 */
+	parts: string[];
+	partsLength: number;
+	/** 待广播到渲染进程的输出分片（合并窗口内累积，到期一次发完） */
+	pendingParts: string[];
+	flushTimer: NodeJS.Timeout | null;
 };
 
 type Emit = (channel: string, payload: unknown) => void;
 const MAX_TERMINAL_REPLAY_BUFFER = 200_000;
+/** PTY 输出合并窗口：构建日志等高吞吐输出时把每块一次 IPC 合并成窗口内一次，降低跨进程序列化次数 */
+const TERMINAL_FLUSH_WINDOW_MS = 16;
 type TerminalShellCandidate = {
 	shell: TerminalShell;
 	command: string;
@@ -103,6 +110,7 @@ function dedupeShellCandidates(candidates: TerminalShellCandidate[]) {
 
 export class TerminalSessionManager {
 	private readonly runtimes = new Map<string, Map<string, TerminalRuntime>>();
+	private shellCandidatesCache: TerminalShellCandidate[] | null = null;
 
 	constructor(
 		private readonly getCwd: (agentId: string) => string,
@@ -149,16 +157,33 @@ export class TerminalSessionManager {
 			shell: spawned.shell,
 			createdAt: Date.now(),
 		};
-		const runtime: TerminalRuntime = { tab, pty: spawned.pty, buffer: "" };
+		const runtime: TerminalRuntime = {
+			tab,
+			pty: spawned.pty,
+			parts: [],
+			partsLength: 0,
+			pendingParts: [],
+			flushTimer: null,
+		};
 		runtimes.set(id, runtime);
 
 		spawned.pty.onData((data) => {
 			this.appendBuffer(runtime, data);
-			this.emit(ipcChannels.terminalData, { tabId: id, data });
+			// 同一 tab 的 PTY 块在短窗口内合并为一次 IPC；单定时器保证块序不颠倒。
+			runtime.pendingParts.push(data);
+			if (runtime.flushTimer == null) {
+				runtime.flushTimer = setTimeout(() => {
+					runtime.flushTimer = null;
+					this.flushPending(runtime);
+				}, TERMINAL_FLUSH_WINDOW_MS);
+				runtime.flushTimer.unref?.();
+			}
 		});
 		spawned.pty.onExit((event) => {
 			tab.exited = true;
 			tab.exitCode = event.exitCode;
+			// 退出前把合并窗口内的残留输出刷完，保证回放内容完整
+			this.flushPending(runtime);
 			const exitText = `\r\n[process exited${event.exitCode != null ? ` with code ${event.exitCode}` : ""}]\r\n`;
 			this.appendBuffer(runtime, exitText);
 			this.emit(ipcChannels.terminalExit, {
@@ -186,6 +211,7 @@ export class TerminalSessionManager {
 	close(tabId: string) {
 		const found = this.findRuntime(tabId);
 		if (!found) return;
+		this.flushPending(found.runtime);
 		found.runtime.pty.kill();
 		found.tabs.delete(tabId);
 		if (found.tabs.size === 0) this.runtimes.delete(found.runtime.tab.agentId);
@@ -195,6 +221,7 @@ export class TerminalSessionManager {
 		const tabs = this.runtimes.get(agentId);
 		if (!tabs) return;
 		for (const runtime of tabs.values()) {
+			this.flushPending(runtime);
 			runtime.pty.kill();
 		}
 		this.runtimes.delete(agentId);
@@ -231,17 +258,42 @@ export class TerminalSessionManager {
 	private snapshot(runtime: TerminalRuntime): TerminalTab {
 		return {
 			...runtime.tab,
-			buffer: runtime.buffer,
+			buffer: this.getBuffer(runtime),
 		};
+	}
+
+	private getBuffer(runtime: TerminalRuntime): string {
+		// 分片不足两个时直接返回（含已合并的单片），避免高频输出路径的 join 开销。
+		if (runtime.parts.length <= 1) return runtime.parts[0] ?? "";
+		const joined = runtime.parts.join("");
+		runtime.parts = [joined];
+		return joined;
 	}
 
 	private appendBuffer(runtime: TerminalRuntime, data: string) {
 		// Renderer 会在切换项目/agent 时卸载 TerminalDock；主进程保留有限回放，
 		// 切回来才能重建 xterm scrollback，同时用字符上限避免长期终端占用过多内存。
-		runtime.buffer = `${runtime.buffer}${data}`;
-		if (runtime.buffer.length > MAX_TERMINAL_REPLAY_BUFFER) {
-			runtime.buffer = runtime.buffer.slice(-MAX_TERMINAL_REPLAY_BUFFER);
+		// 分片追加 O(1)；仅当总量超过上限时才合并截断一次，避免高频输出下整串拷贝 O(n²)。
+		runtime.parts.push(data);
+		runtime.partsLength += data.length;
+		if (runtime.partsLength > MAX_TERMINAL_REPLAY_BUFFER) {
+			const joined = runtime.parts.join("");
+			const tail = joined.slice(-MAX_TERMINAL_REPLAY_BUFFER);
+			runtime.parts = [tail];
+			runtime.partsLength = tail.length;
 		}
+	}
+
+	/** 合并窗口到期：把累积的 PTY 输出一次性广播给渲染进程。 */
+	private flushPending(runtime: TerminalRuntime) {
+		if (runtime.flushTimer != null) {
+			clearTimeout(runtime.flushTimer);
+			runtime.flushTimer = null;
+		}
+		if (runtime.pendingParts.length === 0) return;
+		const chunk = runtime.pendingParts.join("");
+		runtime.pendingParts = [];
+		this.emit(ipcChannels.terminalData, { tabId: runtime.tab.id, data: chunk });
 	}
 
 	private spawnShell(cwd: string, preferredShell?: TerminalShell): { shell: TerminalShell; pty: pty.IPty } {
@@ -282,7 +334,12 @@ export class TerminalSessionManager {
 	}
 
 	private shellCandidates(): TerminalShellCandidate[] {
-		return getTerminalShellCandidates(process.platform, process.env);
+		// 进程运行期间平台与 PATH 不变；缓存探测结果，避免每次创建终端/列出 shell
+		// 都 execSync("where wsl.exe") 同步阻塞主进程（最坏 3s 超时）。
+		if (this.shellCandidatesCache == null) {
+			this.shellCandidatesCache = getTerminalShellCandidates(process.platform, process.env);
+		}
+		return this.shellCandidatesCache;
 	}
 
 	private displayShell(shell: TerminalShell) {

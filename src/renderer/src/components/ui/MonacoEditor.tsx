@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useCallback, useMemo } from "react";
 import { Editor } from "@monaco-editor/react";
 import { setupMonaco } from "../../utils/monacoSetup";
 
@@ -30,10 +30,34 @@ export const MonacoEditor = memo(function MonacoEditor({
 	height = "100%",
 	readOnly = false,
 }: MonacoEditorProps) {
-	const theme =
-		document.documentElement.getAttribute("data-theme") === "dark"
-			? "vs-dark"
-			: "vs";
+	// options/onChange/theme 引用稳定化：父组件重渲染（如流式 setState）时
+	// 不再重建对象击穿 memo，Editor 内部避免不必要的 options diff 与重绑定。
+	const theme = useMemo(
+		() =>
+			document.documentElement.getAttribute("data-theme") === "dark"
+				? "vs-dark"
+				: "vs",
+		[],
+	);
+	const options = useMemo(
+		() => ({
+			minimap: { enabled: false },
+			lineNumbers: "on" as const,
+			folding: true,
+			fontSize: 13,
+			padding: { top: 10, bottom: 10 },
+			scrollBeyondLastLine: false,
+			wordWrap: "on" as const,
+			tabSize: 2,
+			insertSpaces: true,
+			readOnly,
+		}),
+		[readOnly],
+	);
+	const handleChange = useCallback(
+		(val: string | undefined) => onChange?.(val ?? ""),
+		[onChange],
+	);
 
 	return (
 		<Editor
@@ -42,19 +66,8 @@ export const MonacoEditor = memo(function MonacoEditor({
 			language={language}
 			value={value}
 			theme={theme}
-			onChange={(val) => onChange?.(val ?? "")}
-			options={{
-				minimap: { enabled: false },
-				lineNumbers: "on",
-				folding: true,
-				fontSize: 13,
-				padding: { top: 10, bottom: 10 },
-				scrollBeyondLastLine: false,
-				wordWrap: "on",
-				tabSize: 2,
-				insertSpaces: true,
-				readOnly,
-			}}
+			onChange={handleChange}
+			options={options}
 		/>
 	);
 });

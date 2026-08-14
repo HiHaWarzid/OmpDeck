@@ -190,7 +190,6 @@ export const ipcChannels = {
 	agentsSetThinking: "agents:set-thinking",
 	agentsState: "agents:state",
 	projectsListModels: "projects:list-models",
-	agentsEvent: "agents:event",
 	agentsMessage: "agents:message",
 	agentsLog: "agents:log",
 	/** 渲染层主动拉取某 agent 的完整消息（增量推送失同步时自愈用，见 App.onMessages） */

@@ -26,9 +26,22 @@ export class GitService {
 	private readonly statusCache = new Map<string, { expiresAt: number; promise: Promise<GitResourceGroups> }>();
 	private static readonly GIT_STATUS_TTL_MS = 500;
 
+	/**
+	 * git:branches 冷却缓存：getBranches 每次 spawn 2 个 git 子进程且原实现无缓存，
+	 * App 每 10s 轮询 + 工作区/侧栏 chip 展示会重复触发。TTL 5s：面板轮询间隔内的
+	 * 重复请求直接命中，分支变更（checkout/createBranch）主动失效。
+	 */
+	private readonly branchesCache = new Map<string, { expiresAt: number; value: GitBranchInfo }>();
+	private static readonly GIT_BRANCHES_TTL_MS = 5_000;
+
 	/** 工作区被修改后调用：清除该项目的 status 冷却缓存，下次请求强制重新 spawn git。 */
 	invalidateStatusCache(cwd: string): void {
 		this.statusCache.delete(cwd);
+	}
+
+	/** 分支变更后调用：清除 branches 冷却缓存，保证下次请求重新读取真实分支列表。 */
+	private invalidateBranchesCache(cwd: string): void {
+		this.branchesCache.delete(cwd);
 	}
 
 	private estimateCommitDetailBytes(detail: CommitDetail): number {
@@ -106,6 +119,11 @@ export class GitService {
 	}
 
 	async getBranches(cwd: string): Promise<GitBranchInfo> {
+		const now = Date.now();
+		const cached = this.branchesCache.get(cwd);
+		if (cached && cached.expiresAt > now) {
+			return cached.value;
+		}
 		try {
 			// 获取当前分支和所有本地分支（不包含远程分支）
 			const [{ stdout: currentRaw }, { stdout: localRaw }] = await Promise.all([
@@ -124,7 +142,9 @@ export class GitService {
 				? [current, ...branches.filter((b) => b !== current)]
 				: branches;
 
-			return { current, branches: sorted };
+			const value: GitBranchInfo = { current, branches: sorted };
+			this.branchesCache.set(cwd, { expiresAt: now + GitService.GIT_BRANCHES_TTL_MS, value });
+			return value;
 		} catch {
 			// 非 Git 目录或未安装 git 时只返回空信息，UI 可以降级展示为 no git。
 			return { current: null, branches: [] };
@@ -133,6 +153,7 @@ export class GitService {
 
 	async checkout(cwd: string, branch: string): Promise<GitBranchInfo> {
 		this.invalidateStatusCache(cwd);
+		this.invalidateBranchesCache(cwd);
 		try {
 			if (!branch || branch.startsWith("-")) throw new Error("Invalid branch name");
 			const fullRef = `refs/heads/${branch}`;
@@ -155,6 +176,7 @@ export class GitService {
 		if (!branchName || branchName.startsWith("-")) throw new Error("Invalid branch name");
 		await execFileAsync("git", ["check-ref-format", `refs/heads/${branchName}`], { cwd });
 		this.invalidateStatusCache(cwd);
+		this.invalidateBranchesCache(cwd);
 		await execFileAsync("git", ["checkout", "-b", branchName], { cwd });
 		return this.getBranches(cwd);
 	}

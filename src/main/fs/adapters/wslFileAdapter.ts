@@ -29,6 +29,14 @@ export class WslFileAdapter implements FileAdapter {
 	private readonly wslExePath: string;
 	private readonly wslShell: boolean;
 	private readonly exec: typeof execFile;
+	/**
+	 * stat 结果短 TTL 缓存：每次 stat 都要 spawn 一个 wsl.exe 子进程（Windows 上
+	 * 100~300ms）；SessionScanner 每轮扫描对每个会话文件 stat 一次，展开 + 手动刷新
+	 * 叠加时同一文件会在一两秒内重复查询。写操作（write/rm/copy）主动失效对应路径，
+	 * 避免指纹缓存拿到过期 mtime 而漏读变更文件。
+	 */
+	private readonly statCache = new Map<string, { at: number; value: FileVersion }>();
+	private static readonly STAT_CACHE_TTL_MS = 2_000;
 
 	constructor(options: WslFileAdapterOptions) {
 		this.distro = options.distro;
@@ -78,6 +86,7 @@ export class WslFileAdapter implements FileAdapter {
 	}
 
 	async write(path: string, content: string): Promise<void> {
+		this.statCache.delete(path);
 		// 使用 tee 写入，避免 heredoc 中的特殊字符问题
 		await new Promise<void>((resolve, reject) => {
 			const proc = this.exec(
@@ -93,12 +102,18 @@ export class WslFileAdapter implements FileAdapter {
 	}
 
 	async stat(path: string, signal?: AbortSignal): Promise<FileVersion> {
+		const cached = this.statCache.get(path);
+		if (cached && Date.now() - cached.at < WslFileAdapter.STAT_CACHE_TTL_MS) {
+			return cached.value;
+		}
 		const { stdout } = await this.run(
 			[...this.baseArgs("stat"), "-c", "%Y %s", path],
 			{ timeout: 5_000, signal },
 		);
 		const [mtimeSeconds, size] = stdout.trim().split(/\s+/).map(Number);
-		return { mtimeMs: mtimeSeconds * 1000, size };
+		const value: FileVersion = { mtimeMs: mtimeSeconds * 1000, size };
+		this.statCache.set(path, { at: Date.now(), value });
+		return value;
 	}
 
 	async exists(path: string, signal?: AbortSignal): Promise<boolean> {
@@ -123,15 +138,19 @@ export class WslFileAdapter implements FileAdapter {
 	}
 
 	async rm(path: string): Promise<void> {
+		this.statCache.delete(path);
 		await this.run([...this.baseArgs("rm"), path], { timeout: 5_000 });
 	}
 
 	async rmDir(path: string): Promise<void> {
+		this.statCache.delete(path);
 		// 静默：失败不阻塞调用方（与 SessionScanner 原 deleteWslSiblingDir 一致）
 		await this.run([...this.baseArgs("rm"), "-rf", path], { timeout: 10_000 }).catch(() => {});
 	}
 
 	async copy(src: string, dst: string): Promise<void> {
+		this.statCache.delete(src);
+		this.statCache.delete(dst);
 		await this.run([...this.baseArgs("cp"), src, dst], { timeout: 5_000 });
 	}
 

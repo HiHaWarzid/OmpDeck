@@ -60,18 +60,32 @@ export function readPetEnabledPreference(): boolean {
  * 桌面端 showThinking 语义：true=显示，false=隐藏。
  * 映射：showThinking = !hideThinkingBlock
  * 若 pi agent 文件不存在或 hideThinkingBlock 未设置，返回 undefined。
+ *
+ * 该文件只由 pi CLI 进程写入，桌面进程只读；短 TTL 缓存消除高频路径
+ * （git diff 点击、创建 agent、发送 prompt 等都会调 get()）上的同步读盘 +
+ * JSON.parse，外部变更仍在秒级内可见。
  */
+const PI_AGENT_SETTINGS_TTL_MS = 1_500;
+let piShowThinkingCache: { value: boolean | undefined; at: number } | null = null;
+
 function readPiAgentShowThinking(): boolean | undefined {
+	const now = Date.now();
+	if (piShowThinkingCache && now - piShowThinkingCache.at < PI_AGENT_SETTINGS_TTL_MS) {
+		return piShowThinkingCache.value;
+	}
+	let value: boolean | undefined;
 	try {
 		const agentRaw = readFileSync(piAgentSettingsPath(), "utf8");
 		const agentSettings = JSON.parse(agentRaw) as Record<string, unknown>;
 		if (typeof agentSettings.hideThinkingBlock === "boolean") {
-			return !agentSettings.hideThinkingBlock;
+			value = !agentSettings.hideThinkingBlock;
 		}
 	} catch {
 		// 文件不存在或解析失败，静默忽略
+		value = undefined;
 	}
-	return undefined;
+	piShowThinkingCache = { value, at: now };
+	return value;
 }
 
 const defaultSettings: AppSettings = {
@@ -173,6 +187,8 @@ Gitmoji 对应关系：
 export class SettingsStore {
   private readonly filePath = desktopSettingsPath();
   private settings: AppSettings = { ...defaultSettings };
+  /** 上次 get() 返回的快照：设置未变化时复用同一引用，下游 setState 可跳过重渲染 */
+  private lastGetResult: AppSettings | null = null;
 
   async load() {
     try {
@@ -199,22 +215,29 @@ export class SettingsStore {
     // 该信号比旧 settings 更可信,可修正用户从安装版/旧版本迁移后残留的 installed 记录。
     await this.detectAndSaveInstallationType();
     this.applyMenu();
+    this.lastGetResult = null;
     return this.get();
   }
 
   get() {
-    // showThinking 由 pi agent 的 hideThinkingBlock 动态决定，每次 get() 都重新读取
+    // showThinking 由 pi agent 的 hideThinkingBlock 动态决定（带秒级 TTL 缓存，见上）
     const computed = readPiAgentShowThinking();
-    if (computed !== undefined) {
-      return { ...this.settings, showThinking: computed };
+    const showThinking = computed !== undefined ? computed : this.settings.showThinking;
+    if (this.lastGetResult?.showThinking === showThinking) {
+      return this.lastGetResult;
     }
-    return { ...this.settings };
+    this.lastGetResult =
+      computed !== undefined
+        ? { ...this.settings, showThinking: computed }
+        : { ...this.settings };
+    return this.lastGetResult;
   }
 
   async update(patch: Partial<AppSettings>) {
     // showThinking 完全由 pi agent 的 hideThinkingBlock 控制，不允许通过桌面设置修改
     const { showThinking: _, ...safePatch } = patch;
     this.settings = { ...this.settings, ...safePatch };
+    this.lastGetResult = null;
     await this.save();
     this.applyMenu();
     return this.get();

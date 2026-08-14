@@ -123,6 +123,14 @@ export class AgentManager {
 	private static readonly ABORT_SETTLED_FALLBACK_MS = 1500;
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
 	private readonly pendingTrustRequests = new Map<string, { resolve: (choice: ProjectTrustChoice) => void }>();
+	/**
+	 * emitRuntimeState 并发合并：工具密集循环（tool_start/end 交替）每个边沿都会
+	 * 触发一次 get_state + get_session_stats RPC 与文件尾部读取；同一时刻只允许
+	 * 一个在途请求，期间到达的新请求只标记 pending，在途请求完成后补发一次最新状态
+	 * （latest-wins，中间态对渲染层无意义）。
+	 */
+	private readonly runtimeStateInFlight = new Set<string>();
+	private readonly runtimeStatePending = new Set<string>();
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -1455,6 +1463,14 @@ export class AgentManager {
 	}
 
 	private async emitRuntimeState(agentId: string) {
+		// 在途合并：请求进行中再来新请求只标记 pending，完成后再补发一次最新状态。
+		// 工具边沿（tool_execution_start/end）已由 emitToolRuntimeTransition 同步推送，
+		// 完整状态的中间版本晚到/合并都不会丢失工具真值（toolStateSequence 兜底）。
+		if (this.runtimeStateInFlight.has(agentId)) {
+			this.runtimeStatePending.add(agentId);
+			return;
+		}
+		this.runtimeStateInFlight.add(agentId);
 		try {
 			const state = await this.getRuntimeState(agentId);
 			const runtime = this.agents.get(agentId);
@@ -1467,6 +1483,12 @@ export class AgentManager {
 			this.emit(ipcChannels.agentsRuntimeState, { agentId, state });
 		} catch {
 			// 运行态刷新失败不影响主流程；下一次轮询或事件会继续同步。
+		} finally {
+			this.runtimeStateInFlight.delete(agentId);
+			// 期间又有新请求：以最新状态补发一次（最多一轮，不再递归叠加）
+			if (this.runtimeStatePending.delete(agentId)) {
+				void this.emitRuntimeState(agentId);
+			}
 		}
 	}
 
@@ -2406,6 +2428,12 @@ export class AgentManager {
 			);
 		});
 		piProcess.on("rpc-log", (entry: { direction: string; data: unknown }) => {
+			// 渲染层的实时 RPC 控制台与文件日志共用同一个 per-agent 开关
+			//（renderer 的 onRpcLog 处理器在开关关闭时直接丢弃，见 App.tsx）。
+			// 开关关闭时主进程不再构造 logEntry 也不发 IPC：每条进出 RPC 消息
+			// 都省去 randomUUID + 对象构造 + 结构化克隆序列化（流式期每 token 一次）。
+			const rt = this.agents.get(agentId);
+			if (!rt?.rpcLogging) return;
 			try {
 				const data = entry.data as Record<string, any>;
 				let summary: string;
@@ -2438,10 +2466,7 @@ export class AgentManager {
 					time: Date.now(),
 				};
 				this.emit(ipcChannels.agentsRpcLog, logEntry);
-				const rt = this.agents.get(agentId);
-				if (rt?.rpcLogging) {
-					this.rpcLogger?.push(logEntry);
-				}
+				this.rpcLogger?.push(logEntry);
 			} catch (error) {
 				void this.appLogger?.warn("agent", "rpc-log handler failed", {
 					agentId,
@@ -2659,7 +2684,9 @@ export class AgentManager {
 		for (const listener of this.localEventListeners) {
 			try { listener(agentId, event); } catch {}
 		}
-		this.emit(ipcChannels.agentsEvent, { agentId, event });
+		// 不向渲染进程广播原始事件：agents:event 通道无任何订阅者（preload 未暴露），
+		// 每条 text_delta 都携带全量 partialMessage，跨进程结构化克隆纯属浪费；
+		// 渲染层所需信息已由 agents:message / agents:thinking / agents:runtime-state 覆盖。
 
 		if (!event || typeof event !== "object") return;
 		const typed = event as Record<string, any>;

@@ -62,6 +62,21 @@ function loadAgentManager() {
 			return { size: 128 };
 		},
 	};
+	// SessionJsonl.readTailLines 走 open→stat→read→close 的文件句柄路径；
+	// 用 readFile 的同款桩内容构造内存句柄，保持 calls.readFile 记录语义不变。
+	fsPromises.open = async (filePath, mode) => {
+		const content = await fsPromises.readFile(filePath, mode);
+		const buf = Buffer.from(content, "utf8");
+		return {
+			stat: async () => ({ size: buf.length }),
+			read: async (target, offset, length, position) => {
+				const chunk = buf.subarray(position, Math.min(position + length, buf.length));
+				chunk.copy(target, offset);
+				return { bytesRead: chunk.length };
+			},
+			close: async () => {},
+		};
+	};
 	class LatestByKeyEmitter {
 		push() {}
 		flush() {}

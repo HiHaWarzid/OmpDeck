@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, copyFile, unlink } from "node:fs/promises";
+import { readFile, writeFile, readdir, copyFile, unlink, open } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 
@@ -74,6 +74,11 @@ const BACKUP_SUFFIX = ".edit-backup";
 /** 最多保留的最近备份数量，超出时删除最旧。 */
 const MAX_BACKUPS = 3;
 
+/** 尾部读取初始窗口：大会话只需读末尾 ~1MB 即可覆盖最近几十轮对话。 */
+const TAIL_READ_INITIAL_BYTES = 1024 * 1024;
+/** 尾部读取总窗口上限：单行 JSON（巨型工具结果）超过此值时不再扩展。 */
+const TAIL_READ_MAX_BYTES = 16 * 1024 * 1024;
+
 export class SessionJsonl {
 	private readonly deps: SessionJsonlDeps;
 	constructor(deps: SessionJsonlDeps) {
@@ -84,12 +89,58 @@ export class SessionJsonl {
 		return this.deps.resolveHostPath(sessionPath);
 	}
 
+	/**
+	 * 从 JSONL 文件尾部读取最近若干完整行（含文件末尾未换行的残行，与旧整文件 split 行为一致）。
+	 * 窗口不足时按 2x 向前扩展，直到收集够 minLines 或到达文件头 / 达到 maxBytes 上限。
+	 * 窗口首行若从字节中部开始（UTF-8 多字节字符可能被截断），整行丢弃——该行必然不是
+	 * 我们需要的尾部最近行，且避免了解码损坏。
+	 */
+	private async readTailLines(
+		hostPath: string,
+		minLines: number,
+		maxBytes: number,
+	): Promise<string[]> {
+		const handle = await open(hostPath, "r");
+		try {
+			const { size } = await handle.stat();
+			if (size === 0) return [];
+			const limit = Math.min(size, maxBytes);
+			let readSize = Math.min(TAIL_READ_INITIAL_BYTES, limit);
+			for (;;) {
+				const start = size - readSize;
+				const buffer = Buffer.alloc(readSize);
+				await handle.read(buffer, 0, readSize, start);
+				const text = buffer.toString("utf8");
+				const firstLf = text.indexOf("\n");
+				// 窗口内首个换行之前的部分可能跨窗口边界（不完整行），丢弃；
+				// 整个文件就是一个超长行时（start===0），它就是唯一且完整的行。
+				const completeFrom = firstLf === -1 ? (start === 0 ? 0 : -1) : firstLf + 1;
+				if (completeFrom >= 0) {
+					const lines = text.slice(completeFrom).split("\n");
+					// 已确认完整的行数（最后一段可能残，不计数）
+					const completeCount = lines.length - 1;
+					if (start === 0 || completeCount >= minLines || readSize >= limit) {
+						return lines.map((line) => line.trim()).filter(Boolean);
+					}
+				}
+				const nextSize = Math.min(readSize * 2, limit);
+				if (nextSize <= readSize) return [];
+				readSize = nextSize;
+			}
+		} finally {
+			await handle.close();
+		}
+	}
+
 	// ── 读取 ───────────────────────────────────────────────
 
 	/**
 	 * 大会话兜底：直接从历史会话 JSONL 文件尾部读取最近 maxTurns 轮对话的消息条目。
 	 * 用于绕过 get_messages RPC 的整文件 JSON 传输瓶颈，避免大会话加载导致界面冻结。
 	 * 返回兼容 RpcResponse 格式的对象，可复用 loadMessages 的消息处理管线。
+	 *
+	 * 旧实现整文件 readFile + 逐行 JSON.parse（40MB 级会话每次加载都全量解析）；
+	 * 现在只读尾部窗口（默认 1MB，按需扩展），解析最近几十轮所需的行数即可。
 	 */
 	async readRecentMessages(
 		sessionPath: string,
@@ -97,9 +148,10 @@ export class SessionJsonl {
 	): Promise<RpcResponse> {
 		const t0 = Date.now();
 		const hostPath = this.resolve(sessionPath);
-		let content: string;
+		let lines: string[];
 		try {
-			content = await readFile(hostPath, "utf8");
+			// 每轮对话至少需要 user + assistant 两行；按 8 行/轮预留工具消息余量
+			lines = await this.readTailLines(hostPath, maxTurns * 8 + 8, TAIL_READ_MAX_BYTES);
 		} catch (error) {
 			void this.deps.logger?.warn("agent", "Failed to read session file for recent messages", {
 				sessionPath,
@@ -108,7 +160,6 @@ export class SessionJsonl {
 			throw error;
 		}
 
-		const lines = content.split("\n");
 		const messageEntries: unknown[] = [];
 
 		for (const line of lines) {
@@ -129,7 +180,7 @@ export class SessionJsonl {
 
 		void this.deps.logger?.info("agent", "Recent messages read from session file", {
 			sessionPath,
-			totalLines: lines.length,
+			windowLines: lines.length,
 			messageEntries: messageEntries.length,
 			trimmedTurns: maxTurns,
 			trimmedMessages: trimmed.length,
@@ -148,13 +199,14 @@ export class SessionJsonl {
 	 * 计算会话文件中最后一条 assistant 消息的 cache hit rate（百分比）。
 	 * 从文件尾部向前扫描，命中第一条带 usage 的 assistant 消息即返回；
 	 * 无可用数据（文件不可读 / 无 assistant / promptTokens 为 0）时返回 undefined。
+	 * 只读尾部窗口（最近几十行足够定位最后一条 assistant），
+	 * 避免每次运行态刷新都整文件读入解析（工具边沿会高频触发）。
 	 */
 	async getLatestCacheMessageHitRate(
 		sessionPath: string,
 	): Promise<number | undefined> {
 		try {
-			const raw = await readFile(this.resolve(sessionPath), "utf8");
-			const lines = raw.split(/\r?\n/);
+			const lines = await this.readTailLines(this.resolve(sessionPath), 32, TAIL_READ_MAX_BYTES);
 			// 从后往前遍历，找到最后一条 assistant 消息
 			for (let i = lines.length - 1; i >= 0; i--) {
 				const line = lines[i].trim();

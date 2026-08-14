@@ -83,6 +83,7 @@ import {
   isSidebarSessionRowActive,
   normalizeSessionPathForCompare,
   type PendingAgentTab,
+  type ProjectAgentSessionDisplay,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
 import { mergeAgentRuntimeState } from "./utils/agentRuntimeState";
@@ -270,6 +271,14 @@ const SIDEBAR_PROJECT_CHILD_PAGE_SIZE = 5;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
 // 共享空数组：侧栏按 projectId 查 agents 时作为默认值，避免每次 .get() miss 都新建 []。
 const EMPTY_AGENTS: AgentTab[] = Object.freeze([]) as unknown as AgentTab[];
+// 侧栏派生表查不到项目时的兜底空值（正常情况下 memo 覆盖全部 filteredProjects）。
+const EMPTY_SESSIONS: SessionSummary[] = Object.freeze([]) as unknown as SessionSummary[];
+const EMPTY_PROJECT_DISPLAY: ProjectAgentSessionDisplay = Object.freeze({
+  children: [],
+  visibleChildren: [],
+  hiddenChildCount: 0,
+  piSubagentsByParent: new Map(),
+});
 
 
 
@@ -2207,6 +2216,51 @@ export function App() {
     }
     return map;
   }, [displayAgents]);
+  /**
+   * 侧栏每个项目行的派生数据（搜索/来源过滤 + 会话分组排序）。
+   * 流式/思考/击键期间 App 以 ~20Hz 重渲染；若在渲染体内联计算，每个项目行都要
+   * 做 O(sessions+agents) 的过滤与排序（大项目会话数百条）。这里按输入依赖 memo，
+   * 重渲染时退化为 O(1) 查表；输入未变则跳过全部计算。
+   */
+  const sidebarProjectDisplayByProject = useMemo(() => {
+    const projectSearch = search.trim();
+    const result: Record<string, { sessions: SessionSummary[]; display: ProjectAgentSessionDisplay }> = {};
+    for (const project of filteredProjects) {
+      const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
+      const projectSessions = ((projectSearch
+        ? (sessionsByProject[project.id] ?? []).filter((session) =>
+            matches(
+              `${session.name ?? ""}${session.preview}${session.filePath}`,
+              projectSearch,
+            ),
+          )
+        : (sessionsByProject[project.id] ?? [])).filter((session) => {
+          const filter = sessionSourceFilter[project.id] ?? null;
+          return filter === null
+            ? true
+            : filter.has(session.source ?? "pi");
+        }));
+      const visibleChildCount =
+        visibleProjectChildCountByProject[project.id] ??
+        SIDEBAR_PROJECT_CHILD_PAGE_SIZE;
+      result[project.id] = {
+        sessions: projectSessions,
+        display: getProjectAgentSessionDisplay({
+          agents: projectAgents,
+          sessions: projectSessions,
+          visibleChildCount,
+        }),
+      };
+    }
+    return result;
+  }, [
+    filteredProjects,
+    sessionsByProject,
+    filteredAgentsByProject,
+    search,
+    sessionSourceFilter,
+    visibleProjectChildCountByProject,
+  ]);
   const canReorderProjects = search.trim().length === 0;
   // 增量推送代数计数器：每应用一个 agents:message delta 递增，失同步自愈的全量拉取
   // 结果只在没有更新的 delta 到达时生效（见 onMessages），避免旧基线覆盖新消息。
@@ -6635,28 +6689,11 @@ export function App() {
             const canDragProject = canReorderProjects && !projectIsChat;
             const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
             const allProjectAgents = displayAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
-            const projectSearch = search.trim();
-            const projectSessions = ((projectSearch
-              ? (sessionsByProject[project.id] ?? []).filter((session) =>
-                  matches(
-                    `${session.name ?? ""}${session.preview}${session.filePath}`,
-                    projectSearch,
-                  ),
-                )
-              : (sessionsByProject[project.id] ?? [])).filter((session) => {
-              	const filter = sessionSourceFilter[project.id] ?? null;
-              	return filter === null
-              		? true
-              		: filter.has(session.source ?? "pi");
-              }));
-            const visibleChildCount =
-              visibleProjectChildCountByProject[project.id] ??
-              SIDEBAR_PROJECT_CHILD_PAGE_SIZE;
-            const projectDisplay = getProjectAgentSessionDisplay({
-              agents: projectAgents,
-              sessions: projectSessions,
-              visibleChildCount,
-            });
+            // 搜索/来源过滤 + 分组排序已由 sidebarProjectDisplayByProject 按依赖 memo，
+            // 此处 O(1) 查表，避免流式重渲染时逐项目重算。
+            const projectDerived = sidebarProjectDisplayByProject[project.id];
+            const projectSessions = projectDerived?.sessions ?? EMPTY_SESSIONS;
+            const projectDisplay = projectDerived?.display ?? EMPTY_PROJECT_DISPLAY;
             const projectSessionsLoading = Boolean(
               sessionLoadingByProject[project.id],
             );
