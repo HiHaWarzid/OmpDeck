@@ -119,7 +119,7 @@ describe("IPC 注册奇偶校验", () => {
 	const registered = new Map<string, string>(); // channel → "ns.member"
 	for (const map of moduleMaps) {
 		for (const [ns, members] of Object.entries(map)) {
-			for (const [member, handler] of Object.entries(members as Record<string, unknown>)) {
+			for (const [member] of Object.entries(members as Record<string, unknown>)) {
 				const key = `${ns}.${member}`;
 				const entry = (ipcTable as Record<string, Record<string, IpcOpEntry>>)[ns]?.[member];
 				expect(entry, `${key} 必须在通道表中`).toBeDefined();

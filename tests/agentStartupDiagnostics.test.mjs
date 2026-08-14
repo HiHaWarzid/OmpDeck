@@ -6,7 +6,6 @@ const mainSource = readFileSync("src/main/pi/AgentManager.ts", "utf8");
 const indexSource = readFileSync("src/main/index.ts", "utf8");
 const agentHandlersSource = readFileSync("src/main/ipc/agentHandlers.ts", "utf8");
 const logHandlersSource = readFileSync("src/main/ipc/logHandlers.ts", "utf8");
-const preloadSource = readFileSync("src/preload/index.ts", "utf8");
 const apiSource = readFileSync("src/shared/api.ts", "utf8");
 const ipcSource = readFileSync("src/shared/ipc.ts", "utf8");
 const appSource = readFileSync("src/renderer/src/App.tsx", "utf8");
