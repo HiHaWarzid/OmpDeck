@@ -341,6 +341,12 @@ const api = {
 			ipcRenderer.invoke(ipcChannels.sessionsReadMessages, filePath) as Promise<
 				Array<{ role: string; content: string; timestamp: number }>
 			>,
+		readUserPrompts: (filePath: string, maxCount?: number) =>
+			ipcRenderer.invoke(
+				ipcChannels.sessionsReadUserPrompts,
+				filePath,
+				maxCount,
+			) as Promise<string[]>,
 		readSessionMeta: (filePath: string) =>
 			ipcRenderer.invoke(ipcChannels.sessionsReadMeta, filePath) as Promise<{
 				provider?: string;

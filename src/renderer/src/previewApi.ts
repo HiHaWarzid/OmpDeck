@@ -326,6 +326,8 @@ export function createPreviewApi(): PiDesktopApi {
 				{ role: "assistant", content: "Preview assistant response", timestamp: Date.now() - 30000 },
 			],
 			readSessionMeta: async () => ({}),
+			// 预览模式无主进程：返回固定 mock 用户消息
+			readUserPrompts: async () => ["Preview user message"],
 			readChatMessages: async () => [],
 			// 预览模式无主进程：完整输出按需读取直接返回空文本
 			readMessageFullText: async () => ({ text: "" }),

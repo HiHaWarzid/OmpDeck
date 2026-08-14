@@ -43,6 +43,7 @@ export const ipcChannels = {
 	sessionsExportHtml: "sessions:export-html",
 	sessionsDelete: "sessions:delete",
 	sessionsReadMessages: "sessions:read-messages",
+	sessionsReadUserPrompts: "sessions:read-user-prompts",
 	sessionsReadMeta: "sessions:read-meta",
 	sessionsReadChatMessages: "sessions:read-chat-messages",
 	sessionsReadMessageFullText: "sessions:read-message-full-text",

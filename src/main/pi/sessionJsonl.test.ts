@@ -201,6 +201,49 @@ test("readRecentMessages rethrows on unreadable file", async () => {
 	await assert.rejects(() => sj.readRecentMessages(join(tmpRoot, "does-not-exist.jsonl"), 40));
 });
 
+// ── readRecentUserPrompts ───────────────────────────────
+
+test("readRecentUserPrompts returns newest-first user texts, skipping other roles", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "prompts-"));
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([
+			{ id: "c1", type: "compaction", summary: "s" },
+			{ id: "u1", type: "message", message: { role: "user", content: [{ type: "text", text: "第一个问题" }] } },
+			{ id: "a1", type: "message", message: { role: "assistant", content: "回答一" } },
+			{ id: "t1", type: "message", message: { role: "toolResult", content: "输出" } },
+			{ id: "u2", type: "message", message: { role: "user", content: "第二个问题" } },
+			{ id: "u3", type: "message", message: { role: "user", content: [{ type: "text", text: "第三个问题" }] } },
+		]),
+		"utf8",
+	);
+	const prompts = await sj.readRecentUserPrompts(sessionPath, 10);
+	assert.deepEqual(prompts, ["第三个问题", "第二个问题", "第一个问题"]);
+});
+
+test("readRecentUserPrompts caps by maxCount and skips empty user text", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "prompts-cap-"));
+	const sessionPath = join(dir, "session.jsonl");
+	const entries: unknown[] = [];
+	for (let i = 0; i < 20; i++) {
+		entries.push({ id: `u${i}`, type: "message", message: { role: "user", content: `q${i}` } });
+	}
+	entries.push({ id: "empty", type: "message", message: { role: "user", content: "" } });
+	await writeFile(sessionPath, toJsonl(entries), "utf8");
+
+	// maxCount=5：只返回最近 5 条，空文本被跳过
+	const prompts = await sj.readRecentUserPrompts(sessionPath, 5);
+	assert.deepEqual(prompts, ["q19", "q18", "q17", "q16", "q15"]);
+});
+
+test("readRecentUserPrompts rethrows on unreadable file", async () => {
+	const sj = makeSessionJsonl();
+	await assert.rejects(() => sj.readRecentUserPrompts(join(tmpRoot, "does-not-exist.jsonl"), 40));
+});
+
 // ── getLatestCacheMessageHitRate ─────────────────────────
 
 test("getLatestCacheMessageHitRate computes percentage from last assistant usage", async () => {

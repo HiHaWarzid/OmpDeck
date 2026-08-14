@@ -196,6 +196,46 @@ export class SessionJsonl {
 	}
 
 	/**
+	 * 从会话文件尾部读取最近的用户消息文本（最新在前，最多 maxCount 条）。
+	 * 渲染层用它补全上下键导航的 prompt history：大会话只向渲染层推送最近窗口
+	 * （readRecentMessages 的 30 轮），仅靠消息基线重建会缺失更早的发送记录。
+	 * 与 readRecentMessages 共用尾部窗口策略（不整文件解析），单行解析失败跳过；
+	 * 纯文本提取，不转换消息对象，比 readMessages/readChatMessages 轻量得多。
+	 */
+	async readRecentUserPrompts(sessionPath: string, maxCount: number): Promise<string[]> {
+		const t0 = Date.now();
+		const limit = Math.min(Math.max(1, maxCount | 0), 500);
+		const hostPath = this.resolve(sessionPath);
+		// 每轮对话至少 user + assistant 两行，按 8 行/轮预留工具消息余量
+		const lines = await this.readTailLines(hostPath, limit * 8 + 8, TAIL_READ_MAX_BYTES);
+		const prompts: string[] = [];
+		// 文件行序为旧→新，倒序扫描即可拿到最新在前的用户文本，收集够即停
+		for (let i = lines.length - 1; i >= 0 && prompts.length < limit; i--) {
+			const line = lines[i].trim();
+			if (!line) continue;
+			try {
+				const entry = JSON.parse(line) as {
+					type?: unknown;
+					message?: { role?: unknown; content?: unknown };
+				};
+				if (entry.type === "message" && entry.message?.role === "user") {
+					const text = extractMessageText(entry.message.content)?.trim();
+					if (text) prompts.push(text);
+				}
+			} catch {
+				// 单行解析失败（如写入中的残行）跳过，不影响后续行
+			}
+		}
+		void this.deps.logger?.info("agent", "Recent user prompts read from session file", {
+			sessionPath,
+			windowLines: lines.length,
+			prompts: prompts.length,
+			readMs: Date.now() - t0,
+		});
+		return prompts;
+	}
+
+	/**
 	 * 按 entryId 定位读取单条消息的文本内容（「查看完整输出」的历史回退路径）。
 	 * 仅按需触发（截断卡片展开时），顺序扫描 + 单行 parse，不做整文件解析；
 	 * 找不到 entryId 时返回 null（调用方据此回退运行时内存缓存或报错）。

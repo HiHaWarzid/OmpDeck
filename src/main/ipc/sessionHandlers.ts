@@ -64,6 +64,13 @@ export function registerSessionHandlers(deps: SessionHandlerDeps) {
 	ipcMain.handle(ipcChannels.sessionsReadMessages, async (_event, filePath: string) => {
 		return sessionScanner.readMessages(filePath);
 	});
+	// 提取会话文件里最近的用户消息文本（最新在前），供渲染层补全上下键 prompt history。
+	// 与 readMessages 不同：只读文件尾部窗口 + 纯文本提取，大会话也不会整文件解析。
+	ipcMain.handle(
+		ipcChannels.sessionsReadUserPrompts,
+		async (_event, filePath: string, maxCount: number) =>
+			agentManager.readSessionUserPrompts(filePath, maxCount),
+	);
 	ipcMain.handle(ipcChannels.sessionsReadMeta, async (_event, filePath: string) => {
 		return sessionScanner.readSessionMeta(filePath);
 	});

@@ -1140,9 +1140,36 @@ export function App() {
   const [openCodeImportRunning, setOpenCodeImportRunning] = useState(false);
   const [openCodeImportReport, setOpenCodeImportReport] =
     useState<OpenCodeImportReport | null>(null);
-  // 历史命令：按 agent 隔离。通过 localStorage 持久化，重启后可恢复上下方向键导航的历史。
-  // promptHistoryRef 在首次挂载时从 localStorage 恢复，每次会话重新加载时清空当前 agent 的旧记录。
+  // 历史命令：按会话隔离，通过 localStorage 持久化，重启后可恢复上下方向键导航的历史。
+  // 键优先用 sessionPath（跨重启/重开稳定，agentId 是每次打开随机生成的 UUID，跨重启无意义），
+  // 匿名会话没有 sessionPath 时退回 agentId。promptHistoryRef 在首次挂载时从 localStorage 恢复。
   const PROMPT_HISTORY_STORAGE_KEY = "pid:prompt-history";
+  /** 上下键导航的历史条数上限：发送保存、消息基线重建、会话文件补全统一使用。 */
+  const PROMPT_HISTORY_LIMIT = 100;
+  /** 会话路径键一定包含路径分隔符；agentId（UUID / pending-*）永不含分隔符。 */
+  function isSessionPathKey(key: string): boolean {
+    return key.includes("/") || key.includes("\\");
+  }
+  /** 按 agent 解析历史记录的稳定键：优先 sessionPath，否则退回 agentId。 */
+  function historyKeyForAgentId(agentId: string): string {
+    const agent = displayAgentsRef.current.find((a) => a.id === agentId);
+    return agent?.sessionPath ?? agentId;
+  }
+  /**
+   * 合并两份“最新在前、各自去重”的历史列表：incoming 是权威较新来源放前面，
+   * existing（持久化/发送记录）补充更早的条目；按文本去重（与发送路径一致）。
+   */
+  function mergePromptHistory(existing: string[] | undefined, incoming: string[]): string[] {
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const text of [...incoming, ...(existing ?? [])]) {
+      const trimmed = text.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      merged.push(trimmed);
+    }
+    return merged.slice(0, PROMPT_HISTORY_LIMIT);
+  }
   function savePromptHistory() {
     try {
       localStorage.setItem(PROMPT_HISTORY_STORAGE_KEY, JSON.stringify(promptHistoryRef.current));
@@ -1156,6 +1183,57 @@ export function App() {
       if (raw) promptHistoryRef.current = JSON.parse(raw) as Record<string, string[]>;
     } catch {
       // localStorage 不可用时忽略
+    }
+  }
+
+  // 首次加载/重启后加载会话时，从全量消息重建 prompt history（按历史键幂等，只执行一次）。
+  // 加载占位（“正在加载历史会话…”，仅 system 消息）也以 replaceFrom=0 基线先到达——
+  // 若此时设置 inited 标记，真实历史基线到达时会被幂等保护挡住，重启后打开历史会话
+  // 上下键导航会没有记录。因此只对包含用户消息的基线设置标记；空/占位基线直接跳过。
+  // “!” 开头的 bash 命令与 sendPrompt 保存路径保持一致，不进历史记录。
+  // 注意：主进程对大会话只推送最近窗口（文件尾部 30 轮），窗口外的更早发送记录
+  // 由 refreshPromptHistoryFromFile 从会话文件直接补全，保证“之前发送过的对话”完整。
+  function rebuildPromptHistory(agentId: string, messages: ChatMessage[]) {
+    const key = historyKeyForAgentId(agentId);
+    if (promptHistoryInitedRef.current.has(key)) return;
+    const userMessages = messages
+      .filter(
+        (m) =>
+          m.role === "user" &&
+          m.text?.trim() &&
+          !m.text.trim().startsWith("!"),
+      )
+      .map((m) => m.text.trim());
+    if (userMessages.length === 0) return;
+    promptHistoryInitedRef.current.add(key);
+    promptHistoryRef.current[key] = mergePromptHistory(
+      promptHistoryRef.current[key],
+      userMessages.reverse(),
+    );
+    savePromptHistory();
+    // 窗口只覆盖最近消息；异步从会话文件提取完整用户消息文本补全更早记录，不阻塞导航。
+    void refreshPromptHistoryFromFile(key, agentId);
+  }
+
+  // 从会话 JSONL 提取最近 PROMPT_HISTORY_LIMIT 条用户消息文本（最新在前），与当前记录合并。
+  // 文件结果是更早记录的权威来源；读取期间用户新发送的消息已写入 ref，
+  // 合并以 ref 当前值为基准追加缺失的旧条目，不会覆盖新发送的内容。
+  async function refreshPromptHistoryFromFile(key: string, agentId: string) {
+    const agent = displayAgentsRef.current.find((a) => a.id === agentId);
+    if (!agent?.sessionPath) return;
+    try {
+      const filePrompts = await api.sessions.readUserPrompts(
+        agent.sessionPath,
+        PROMPT_HISTORY_LIMIT,
+      );
+      if (filePrompts.length === 0) return;
+      promptHistoryRef.current[key] = mergePromptHistory(
+        promptHistoryRef.current[key],
+        filePrompts,
+      );
+      savePromptHistory();
+    } catch {
+      // 文件读取失败静默降级：消息窗口基线已提供最近记录
     }
   }
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -1600,6 +1678,8 @@ export function App() {
   // 否则会把 loadPromptHistory 刚从 localStorage 恢复的记录误删并回写空对象，
   // 渲染层重载（agent id 不变、依赖 localStorage 恢复历史）时上下键导航就丢了。
   // 用 agentsLoadedOnceRef 记录“agent 列表至少加载过一次”，之后才允许按列表裁剪。
+  // 会话路径键（sessionPath 形态）跨重启/重开稳定：即使 agent 关闭也保留，
+  // 重新打开同一会话时记录直接可用；只裁剪按 agentId 键存的记录（匿名会话）。
   const agentsLoadedOnceRef = useRef(false);
   useEffect(() => {
     if (displayAgents.length > 0) agentsLoadedOnceRef.current = true;
@@ -1607,6 +1687,7 @@ export function App() {
     const currentIds = new Set(displayAgents.map(a => a.id));
     let changed = false;
     for (const id of Object.keys(promptHistoryRef.current)) {
+      if (isSessionPathKey(id)) continue;
       if (!currentIds.has(id)) {
         delete promptHistoryRef.current[id];
         changed = true;
@@ -2404,28 +2485,8 @@ export function App() {
         migrateAgentRecord(current, pendingReplacementById, draftIds),
       );
     });
-    // 首次加载/重启后加载会话时，从全量消息重建 prompt history（幂等，只执行一次）。
-    // 注意：加载占位（“正在加载历史会话…”）也以 replaceFrom=0 全量基线先到达，
-    // 其中只有 system 消息、没有用户消息——若此时就设置 inited 标记，真实历史基线
-    // 到达时会被幂等保护挡住，导致重启后打开历史会话时上下键导航没有记录。
-    // 因此只对包含用户消息的基线设置 inited 标记；空/占位基线直接跳过，等真实基线。
-    // “!” 开头的 bash 命令与 sendPrompt 的保存路径保持一致，不进历史记录。
-    const rebuildPromptHistory = (agentId: string, messages: ChatMessage[]) => {
-      if (promptHistoryInitedRef.current.has(agentId)) return;
-      const userMessages = messages
-        .filter(
-          (m) =>
-            m.role === "user" &&
-            m.text?.trim() &&
-            !m.text.trim().startsWith("!"),
-        )
-        .map((m) => m.text.trim());
-      if (userMessages.length === 0) return;
-      promptHistoryInitedRef.current.add(agentId);
-      // 反向排列：最新的在前
-      promptHistoryRef.current[agentId] = userMessages.reverse().slice(0, 50);
-      savePromptHistory();
-    };
+    // rebuildPromptHistory 为组件级函数（见上方定义）：onMessages 仅负责在
+    // 全量基线/失同步自愈时调用它重建 prompt history，并异步从会话文件补全更早记录。
 
     // 优化:历史会话加载时消息更新频繁,只在消息真正变化时 update state,避免不必要的重渲染导致输入卡顿
     // 主进程走增量推送（AgentMessagesDelta）：流式期间每条 text_delta 只发尾部变更，
@@ -4084,6 +4145,8 @@ export function App() {
         if (messageDeltaSeqRef.current[agentId] !== seqAtRequest) return;
         if (activeAgentIdRef.current !== agentId) return;
         setMessagesByAgent((current) => ({ ...current, [agentId]: messages }));
+        // 渲染层重载后主进程不会重推基线，手动拉取的消息同样用于重建 prompt history
+        rebuildPromptHistory(agentId, messages);
       })
       .catch(() => undefined);
   }
@@ -5238,8 +5301,9 @@ export function App() {
       cursorPos,
     );
 
-    // 当前 Agent 的历史记录
-    const agentHistory = promptHistoryRef.current[activeAgentIdRef.current ?? ''] ?? [];
+    // 当前 Agent 的历史记录（按会话路径键读取，跨重启/重开稳定）
+    const agentHistory =
+      promptHistoryRef.current[historyKeyForAgentId(activeAgentIdRef.current ?? '')] ?? [];
 
     if (event.key === "ArrowUp" && isFirstLine && agentHistory.length > 0) {
       event.preventDefault();
@@ -5478,12 +5542,12 @@ export function App() {
       return;
     }
 
-    // 保存到当前 Agent 的历史记录（持久化到 localStorage，重启后可恢复）
+    // 保存到当前 Agent 的历史记录（按会话路径键持久化到 localStorage，重启后可恢复）
     if (message.trim() && !message.startsWith("!")) {
-      const agentId = targetAgentId;
-      const prev = promptHistoryRef.current[agentId] ?? [];
+      const key = historyKeyForAgentId(targetAgentId);
+      const prev = promptHistoryRef.current[key] ?? [];
       const filtered = prev.filter(cmd => cmd !== message.trim());
-      promptHistoryRef.current[agentId] = [message.trim(), ...filtered].slice(0, 50);
+      promptHistoryRef.current[key] = [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT);
       savePromptHistory();
     }
 
@@ -5611,11 +5675,12 @@ export function App() {
     if (scrollTimeline) scrollTimeline.scrollTo({ top: scrollTimeline.scrollHeight, behavior: "instant" });
     setPrompt("");
     setAttachedImages([]);
-    // 保存到当前 Agent 的历史记录（与 sendPrompt 保持一致）
+    // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
     if (message.trim() && !message.startsWith("!")) {
-      const prev = promptHistoryRef.current[targetAgentId] ?? [];
+      const key = historyKeyForAgentId(targetAgentId);
+      const prev = promptHistoryRef.current[key] ?? [];
       const filtered = prev.filter(cmd => cmd !== message.trim());
-      promptHistoryRef.current[targetAgentId] = [message.trim(), ...filtered].slice(0, 50);
+      promptHistoryRef.current[key] = [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT);
       savePromptHistory();
     }
     // 重置历史导航状态
@@ -8647,7 +8712,8 @@ export function App() {
                 }
                 // 如果正在历史导航,检测到用户手动编辑内容则退出历史模式
                 if (historyNavigating) {
-                  const agentHistory = promptHistoryRef.current[activeAgentId ?? ''] ?? [];
+                  const agentHistory =
+                    promptHistoryRef.current[historyKeyForAgentId(activeAgentId ?? '')] ?? [];
                   const currentHistoryCommand = agentHistory[historyIndex];
                   if (newValue !== currentHistoryCommand) {
                     setHistoryIndex(-1);

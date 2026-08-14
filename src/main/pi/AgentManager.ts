@@ -313,6 +313,15 @@ export class AgentManager {
 		return this.requireRuntime(agentId).tab.cwd;
 	}
 
+	/**
+	 * 从会话文件提取最近的用户消息文本（最新在前），供渲染层补全上下键 prompt history。
+	 * 大会话只向渲染层推送最近窗口（readRecentMessages 30 轮），窗口外的更早发送记录
+	 * 只有直接读会话文件才能拿到；路径为协议路径，由 sessionJsonl 的 resolveHostPath 转换。
+	 */
+	async readSessionUserPrompts(filePath: string, maxCount: number): Promise<string[]> {
+		return this.sessionJsonl.readRecentUserPrompts(filePath, maxCount);
+	}
+
 	async loadMessages(
 		agentId: string,
 		skipEntries = false,
