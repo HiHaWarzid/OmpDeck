@@ -830,70 +830,67 @@ async function autoConnectFeishu() {
 }
 
 function registerIpc() {
-	// ===== 已提取到 src/main/ipc/ 的命名空间 =====
-	registerSkillHandlers({ skillManager, appLogger });
-	registerTerminalHandlers({ terminalManager, appLogger });
-	registerExtensionHandlers({
-		extensionManager,
-		appLogger,
-		getActiveWslEnvironment: () => activeWslEnvironment,
-	});
-	registerPromptHandlers({ promptManager, appLogger });
-	registerScratchPadHandlers({ appLogger });
-	registerStoreHandlers({ promptManager, skillManager, xuePromptManager, appLogger });
-	registerProjectHandlers({
-		projectStore,
-		projectResourceManager,
-		settingsStore,
-		appLogger,
-		agentManager,
-		gitService,
-		worktreeService,
-		getMainWindow: () => mainWindow,
-		getActiveWslEnvironment: () => activeWslEnvironment,
-		syncWslEnvironment,
-	});
-	registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger });
-	// ===== HandlerMap 模块（表驱动注册，通道名/协议取自通道表）=====
-	registerIpcHandlers({
-		...registerLogHandlers({ appLogger, rpcLogger }),
-		...registerEditorHandlers({
+	// 全部 HandlerMap 模块统一走表驱动注册（通道名/协议取自通道表，命名空间跨模块自动合并）
+	registerIpcHandlers(
+		registerLogHandlers({ appLogger, rpcLogger }),
+		registerSkillHandlers({ skillManager, appLogger }),
+		registerTerminalHandlers({ terminalManager, appLogger }),
+		registerExtensionHandlers({
+			extensionManager,
+			appLogger,
+			getActiveWslEnvironment: () => activeWslEnvironment,
+		}),
+		registerEditorHandlers({ settingsStore, appLogger, getMainWindow: () => mainWindow }),
+		registerPromptHandlers({ promptManager, appLogger }),
+		registerScratchPadHandlers({ appLogger }),
+		registerStoreHandlers({ promptManager, skillManager, xuePromptManager, appLogger }),
+		registerProjectHandlers({
+			projectStore,
+			projectResourceManager,
 			settingsStore,
 			appLogger,
+			agentManager,
+			gitService,
+			worktreeService,
+			getMainWindow: () => mainWindow,
+			getActiveWslEnvironment: () => activeWslEnvironment,
+			syncWslEnvironment,
+		}),
+		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
+		registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger }),
+		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
+		registerConfigHandlers({ configManager, agentManager, appLogger }),
+		registerClipboardHandlers(),
+		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
+		registerAgentHandlers({
+			agentManager,
+			terminalManager,
+			appLogger,
+			getFeishuBridge: () => feishuBridge,
 			getMainWindow: () => mainWindow,
 		}),
-		...registerClipboardHandlers(),
-		...registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
-	});
-	registerAgentHandlers({
-		agentManager,
-		terminalManager,
-		appLogger,
-		getFeishuBridge: () => feishuBridge,
-		getMainWindow: () => mainWindow,
-	});
-	registerAppHandlers({
-		appLogger,
-		settingsStore,
-		agentManager,
-		terminalManager,
-		piLocator,
-		updateManager,
-		getMainWindow: () => mainWindow,
-		setIsQuitting: (value: boolean) => {
-			isQuitting = value;
-		},
-		// 重启前主动让出单实例锁，保证 relaunch 的新实例能拿到主实例身份
-		releaseSingleInstanceLock: () => versionSingleInstance.dispose(),
-		// 托盘菜单与设置 IPC 共用同一重启语义
-		restartApp,
-		getPetSystem: () => petSystem,
-		getWebServiceManager: () => webServiceManager,
-		openExternalUrl,
-		syncWslEnvironment,
-		applyNativeThemeSource,
-	});
-
+		registerAppHandlers({
+			appLogger,
+			settingsStore,
+			agentManager,
+			terminalManager,
+			piLocator,
+			updateManager,
+			getMainWindow: () => mainWindow,
+			setIsQuitting: (value: boolean) => {
+				isQuitting = value;
+			},
+			// 重启前主动让出单实例锁，保证 relaunch 的新实例能拿到主实例身份
+			releaseSingleInstanceLock: () => versionSingleInstance.dispose(),
+			// 托盘菜单与设置 IPC 共用同一重启语义
+			restartApp,
+			getPetSystem: () => petSystem,
+			getWebServiceManager: () => webServiceManager,
+			openExternalUrl,
+			syncWslEnvironment,
+			applyNativeThemeSource,
+		}),
+	);
 }
 
 function sendTelemetryHeartbeat() {

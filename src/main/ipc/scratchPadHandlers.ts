@@ -2,10 +2,11 @@
  * Scratch Pad（草稿本）IPC handler：list/create/delete/load/save/export。
  * 草稿存放于 userData/drafts 目录，首次访问时若存在旧 scratch-pad.md 则自动迁移。
  */
-import { app, dialog, ipcMain } from "electron";
+import { app, dialog } from "electron";
 import { basename, join } from "node:path";
 import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { ipcChannels } from "../../shared/ipc";
+import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import type { PiDesktopApi } from "../../shared/api";
 import type { DraftMeta, ScratchPadData } from "../../shared/types";
 import type { AppLogger } from "../logging/AppLogger";
 
@@ -13,7 +14,11 @@ interface ScratchPadHandlerDeps {
 	appLogger: AppLogger;
 }
 
-export function registerScratchPadHandlers(deps: ScratchPadHandlerDeps) {
+type ScratchPadHandlerMaps = {
+	scratchPad: IpcHandlerMap<typeof ipcTable.scratchPad, PiDesktopApi["scratchPad"]>;
+};
+
+export function registerScratchPadHandlers(deps: ScratchPadHandlerDeps): ScratchPadHandlerMaps {
 	const { appLogger } = deps;
 	const draftsDir = join(app.getPath("userData"), "drafts");
 
@@ -45,93 +50,94 @@ export function registerScratchPadHandlers(deps: ScratchPadHandlerDeps) {
 		return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}-${String(now.getSeconds()).padStart(2, "0")}.md`;
 	}
 
-	/** 列出所有草稿，按更新时间降序排列 */
-	ipcMain.handle(ipcChannels.scratchPadList, async (): Promise<DraftMeta[]> => {
-		await ensureDraftsDir();
-		const files = await readdir(draftsDir);
-		const mdFiles = files.filter((f) => f.endsWith(".md"));
-		const drafts = await Promise.all(
-			mdFiles.map(async (f) => {
-				const fullPath = join(draftsDir, f);
+	return {
+		scratchPad: {
+			/** 列出所有草稿，按更新时间降序排列 */
+			list: async (): Promise<DraftMeta[]> => {
+				await ensureDraftsDir();
+				const files = await readdir(draftsDir);
+				const mdFiles = files.filter((f) => f.endsWith(".md"));
+				const drafts = await Promise.all(
+					mdFiles.map(async (f) => {
+						const fullPath = join(draftsDir, f);
+						try {
+							const s = await stat(fullPath);
+							return {
+								id: f.replace(/\.md$/, ""),
+								name: f.replace(/\.md$/, ""),
+								path: fullPath,
+								createdAt: s.birthtimeMs,
+								updatedAt: s.mtimeMs,
+							};
+						} catch {
+							return null;
+						}
+					}),
+				);
+				return drafts
+					.filter((d): d is NonNullable<typeof d> => d !== null)
+					.sort((a, b) => b.updatedAt - a.updatedAt);
+			},
+
+			/** 创建新草稿，默认文件名为当前时间 */
+			create: async (): Promise<DraftMeta> => {
+				await ensureDraftsDir();
+				const name = generateDraftName();
+				const fullPath = join(draftsDir, name);
+				await writeFile(fullPath, "", "utf8");
+				const s = await stat(fullPath);
+				void appLogger.info("scratchPad", "draft created", { path: fullPath });
+				return {
+					id: name.replace(/\.md$/, ""),
+					name: name.replace(/\.md$/, ""),
+					path: fullPath,
+					createdAt: s.birthtimeMs,
+					updatedAt: s.mtimeMs,
+				};
+			},
+
+			/** 删除指定草稿 */
+			delete: async (_event, draftPath: string): Promise<void> => {
+				await rm(draftPath);
+				void appLogger.info("scratchPad", "draft deleted", { path: draftPath });
+			},
+
+			/** 加载指定草稿内容，path 为空时返回空内容 */
+			load: async (_event, draftPath?: string): Promise<ScratchPadData> => {
+				if (!draftPath) return { content: "", lastEditedAt: 0, cursorPosition: 0 };
 				try {
-					const s = await stat(fullPath);
-					return {
-						id: f.replace(/\.md$/, ""),
-						name: f.replace(/\.md$/, ""),
-						path: fullPath,
-						createdAt: s.birthtimeMs,
-						updatedAt: s.mtimeMs,
-					};
+					const content = await readFile(draftPath, "utf8");
+					const fileStat = await stat(draftPath);
+					return { content, lastEditedAt: fileStat.mtimeMs, cursorPosition: 0 };
 				} catch {
-					return null;
+					return { content: "", lastEditedAt: 0, cursorPosition: 0 };
 				}
-			}),
-		);
-		return drafts
-			.filter((d): d is NonNullable<typeof d> => d !== null)
-			.sort((a, b) => b.updatedAt - a.updatedAt);
-	});
+			},
 
-	/** 创建新草稿，默认文件名为当前时间 */
-	ipcMain.handle(ipcChannels.scratchPadCreate, async (): Promise<DraftMeta> => {
-		await ensureDraftsDir();
-		const name = generateDraftName();
-		const fullPath = join(draftsDir, name);
-		await writeFile(fullPath, "", "utf8");
-		const s = await stat(fullPath);
-		void appLogger.info("scratchPad", "draft created", { path: fullPath });
-		return {
-			id: name.replace(/\.md$/, ""),
-			name: name.replace(/\.md$/, ""),
-			path: fullPath,
-			createdAt: s.birthtimeMs,
-			updatedAt: s.mtimeMs,
-		};
-	});
+			/** 保存内容到指定草稿 */
+			save: async (_event, draftPath: string, content: string, cursorPosition: number) => {
+				await ensureDraftsDir();
+				await writeFile(draftPath, content, "utf8");
+				void appLogger.info("scratchPad", "saved", {
+					path: draftPath,
+					bytes: Buffer.byteLength(content, "utf8"),
+					cursorPosition,
+				});
+			},
 
-	/** 删除指定草稿 */
-	ipcMain.handle(ipcChannels.scratchPadDelete, async (_event, draftPath: string): Promise<void> => {
-		await rm(draftPath);
-		void appLogger.info("scratchPad", "draft deleted", { path: draftPath });
-	});
-
-	/** 加载指定草稿内容，path 为空时返回空内容 */
-	ipcMain.handle(ipcChannels.scratchPadLoad, async (_event, draftPath?: string): Promise<ScratchPadData> => {
-		if (!draftPath) return { content: "", lastEditedAt: 0, cursorPosition: 0 };
-		try {
-			const content = await readFile(draftPath, "utf8");
-			const fileStat = await stat(draftPath);
-			return { content, lastEditedAt: fileStat.mtimeMs, cursorPosition: 0 };
-		} catch {
-			return { content: "", lastEditedAt: 0, cursorPosition: 0 };
-		}
-	});
-
-	/** 保存内容到指定草稿 */
-	ipcMain.handle(
-		ipcChannels.scratchPadSave,
-		async (_event, draftPath: string, content: string, cursorPosition: number) => {
-			await ensureDraftsDir();
-			await writeFile(draftPath, content, "utf8");
-			void appLogger.info("scratchPad", "saved", {
-				path: draftPath,
-				bytes: Buffer.byteLength(content, "utf8"),
-				cursorPosition,
-			});
+			/** 导出指定草稿到用户选择的路径 */
+			export: async (_event, draftPath?: string) => {
+				if (!draftPath) return false;
+				const suggestedName = basename(draftPath);
+				const { canceled, filePath } = await dialog.showSaveDialog({
+					defaultPath: suggestedName,
+					filters: [{ name: "Markdown", extensions: ["md"] }],
+				});
+				if (canceled || !filePath) return false;
+				const content = await readFile(draftPath, "utf8");
+				await writeFile(filePath, content, "utf8");
+				return true;
+			},
 		},
-	);
-
-	/** 导出指定草稿到用户选择的路径 */
-	ipcMain.handle(ipcChannels.scratchPadExport, async (_event, draftPath?: string) => {
-		if (!draftPath) return false;
-		const suggestedName = basename(draftPath);
-		const { canceled, filePath } = await dialog.showSaveDialog({
-			defaultPath: suggestedName,
-			filters: [{ name: "Markdown", extensions: ["md"] }],
-		});
-		if (canceled || !filePath) return false;
-		const content = await readFile(draftPath, "utf8");
-		await writeFile(filePath, content, "utf8");
-		return true;
-	});
+	};
 }

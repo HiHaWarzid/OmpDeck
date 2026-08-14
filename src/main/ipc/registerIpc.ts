@@ -7,13 +7,23 @@ import { ipcTable, type IpcOpEntry } from "../../shared/ipc";
  * - invoke → ipcMain.handle
  * - send / sendSync → ipcMain.on（sendSync 的 handler 用 event.returnValue 同步回写）
  * 表里查不到条目的成员直接抛错——防止表外裸注册绕过通道表。
+ *
+ * 接受多个模块的 map 并按命名空间深合并：同一命名空间可能被多个模块分担
+ * （如 app.rendererLog 在 logHandlers、app 其余在 appHandlers），合并时逐成员覆盖。
  */
 export type IpcHandlerFn = (...args: never[]) => unknown;
 export type IpcHandlerMaps = Record<string, Record<string, IpcHandlerFn>>;
 
-export function registerIpcHandlers(maps: IpcHandlerMaps): void {
+export function registerIpcHandlers(...maps: IpcHandlerMaps[]): void {
+	const merged: IpcHandlerMaps = {};
+	for (const map of maps) {
+		for (const [namespace, members] of Object.entries(map)) {
+			merged[namespace] = { ...(merged[namespace] ?? {}), ...members };
+		}
+	}
+
 	const table = ipcTable as Record<string, Record<string, IpcOpEntry>>;
-	for (const [namespace, map] of Object.entries(maps)) {
+	for (const [namespace, map] of Object.entries(merged)) {
 		for (const [member, handler] of Object.entries(map)) {
 			const entry = table[namespace]?.[member];
 			if (!entry?.channel) {

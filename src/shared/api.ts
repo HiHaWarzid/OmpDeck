@@ -20,6 +20,7 @@ import type {
 	AppSettings,
 	AppUpdateDownloadProgress,
 	AppUpdateDownloadResult,
+	AppUpdateAsset,
 	AppUpdateInfo,
 	AvailableModel,
 	BranchDiffResult,
@@ -245,7 +246,7 @@ export interface AppApi {
 	info: () => Promise<AppInfo>;
 	preferredSystemLanguages: () => Promise<string[]>;
 	checkUpdate: () => Promise<AppUpdateInfo>;
-	downloadUpdate: (asset: { name: string; url: string }) => Promise<AppUpdateDownloadResult>;
+	downloadUpdate: (asset: AppUpdateAsset) => Promise<AppUpdateDownloadResult>;
 	installUpdate: (filePath: string) => Promise<void>;
 	onUpdateProgress: (callback: (progress: AppUpdateDownloadProgress) => void) => () => void;
 	feedbackEnvironment: () => Promise<FeedbackEnvironment>;
@@ -291,7 +292,7 @@ export interface PromptStoreApi {
 
 export interface SkillStoreApi {
 	search: (query: string) => Promise<PromptStoreSearchResult>;
-	import: (item: PromptStoreItem, locationId?: string) => Promise<PiSkillSummary>;
+	import: (item: PromptStoreItem, locationId?: "pi-global" | "agents-global") => Promise<PiSkillSummary>;
 }
 
 /** SkillHub（api.skillhub.cn） */

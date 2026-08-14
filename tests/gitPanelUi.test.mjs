@@ -208,7 +208,7 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(app, /label: `\$\{diff\.path\.split[\s\S]*?\$\{commit\.shortHash\}/);
     assert.match(app, /<FileDiffViewer[\s\S]*?displayMode="drawer"[\s\S]*?gitDrawerDiff\.originalContent/);
     assert.match(api, /commitFileDiff:/);
-    assert.match(gitHandlers, /gitCommitFileDiff/);
+    assert.match(gitHandlers, /commitFileDiff: async/);
     assert.match(gitService, /async getCommitFileDiff/);
     assert.match(gitService, /detail\.commit\.parents\[0\]/);
     assert.match(gitService, /4b825dc642cb6eb9a060e54bf8d69288fbee4904/);
@@ -235,7 +235,7 @@ describe("Git panel VS Code Source Control contract", () => {
     const commitOpen = app.match(/async function openCommitFileDiff[\s\S]*?async function refreshSessionHistory/)?.[0] ?? "";
     assert.doesNotMatch(commitOpen, /setDrawer\(null\)/);
     assert.match(api, /workspaceFileDiff:/);
-    assert.match(gitHandlers, /gitWorkspaceFileDiff/);
+    assert.match(gitHandlers, /workspaceFileDiff: async/);
     assert.match(gitService, /async getWorkspaceFileDiff/);
     assert.match(gitService, /group === "untracked"/);
     assert.match(gitService, /group === "index"/);
@@ -268,7 +268,7 @@ describe("Git panel VS Code Source Control contract", () => {
 
   test("wires single-file discard through the narrow IPC boundary", () => {
     assert.match(api, /discard: \(projectId: string, group: "workingTree" \| "untracked", filePath: string\)/);
-    assert.match(gitHandlers, /ipcChannels\.gitDiscard/);
+    assert.match(gitHandlers, /discard: async/);
     assert.match(gitService, /async discardFile/);
     assert.match(gitService, /"--literal-pathspecs", "add"/);
     assert.match(gitService, /"--literal-pathspecs", "restore", "--staged"/);

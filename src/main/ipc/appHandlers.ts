@@ -8,9 +8,13 @@
  * - 更新流程：updateManager（UpdateManager 实例）封装检查/下载/安装
  * - 顶层函数：openExternalUrl / syncWslEnvironment / applyNativeThemeSource 作为函数 dep 传入
  * - applyDesktopProxy / testPiProxy 是独立模块，直接 import
+ *
+ * preloadReady / preloadError 是 mainOnly 通道（不在 ipcTable 命名空间里），
+ * 由本模块直接 ipcMain.on 注册，不走 registerIpcHandlers。
  */
 import { app, ipcMain, type BrowserWindow } from "electron";
-import { ipcChannels } from "../../shared/ipc";
+import { ipcChannels, ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import type { PiDesktopApi } from "../../shared/api";
 import type {
 	AppSettings,
 	AppUpdateAsset,
@@ -49,17 +53,22 @@ interface AppHandlerDeps {
 	applyNativeThemeSource: (settings: AppSettings) => void;
 }
 
-export function registerAppHandlers(deps: AppHandlerDeps) {
+type AppHandlerMaps = {
+	// rendererLog 由 logHandlers 注册
+	app: Omit<IpcHandlerMap<typeof ipcTable.app, PiDesktopApi["app"]>, "rendererLog">;
+	rpcLogs: Pick<IpcHandlerMap<typeof ipcTable.rpcLogs, PiDesktopApi["rpcLogs"]>, "setLogging" | "getLogging">;
+	// onApplyWindow 是 subscribe（主进程推送），不注册 handler
+	settings: Omit<IpcHandlerMap<typeof ipcTable.settings, PiDesktopApi["settings"]>, "onApplyWindow">;
+};
+
+export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 	const {
 		appLogger,
 		settingsStore,
 		agentManager,
-		terminalManager,
 		piLocator,
 		updateManager,
 		getMainWindow,
-		setIsQuitting,
-		releaseSingleInstanceLock,
 		getPetSystem,
 		getWebServiceManager,
 		openExternalUrl,
@@ -68,31 +77,201 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		restartApp,
 	} = deps;
 
-	ipcMain.handle(ipcChannels.appInfo, () => ({
-		version: app.getVersion(),
-		releasesUrl: RELEASES_URL,
-		platform: process.platform,
-	}));
-	ipcMain.handle(ipcChannels.appPreferredSystemLanguages, () => {
-		// Renderer navigator.language can reflect Chromium launch flags or a stale browser locale.
-		// Electron exposes the OS preference order directly; use it for the "follow system" setting.
-		try {
-			return app.getPreferredSystemLanguages();
-		} catch {
-			return [];
-		}
-	});
-	ipcMain.handle(ipcChannels.appCheckUpdate, () =>
-		updateManager.checkForAppUpdate(settingsStore.get().installationType),
-	);
-	ipcMain.handle(
-		ipcChannels.appDownloadUpdate,
-		async (_event, asset: AppUpdateAsset) => updateManager.downloadUpdateAsset(asset),
-	);
-	ipcMain.handle(
-		ipcChannels.appInstallUpdate,
-		async (_event, filePath: string) => updateManager.installDownloadedUpdate(filePath),
-	);
+	return {
+		app: {
+			info: async () => ({
+				version: app.getVersion(),
+				releasesUrl: RELEASES_URL,
+				platform: process.platform,
+				// 扩展读取本地文件（如 memory-store.json）依赖 home 目录
+				homeDir: app.getPath("home"),
+			}),
+			preferredSystemLanguages: async () => {
+				// Renderer navigator.language can reflect Chromium launch flags or a stale browser locale.
+				// Electron exposes the OS preference order directly; use it for the "follow system" setting.
+				try {
+					return app.getPreferredSystemLanguages();
+				} catch {
+					return [];
+				}
+			},
+			checkUpdate: async () =>
+				updateManager.checkForAppUpdate(settingsStore.get().installationType),
+			downloadUpdate: async (_event, asset: AppUpdateAsset) => updateManager.downloadUpdateAsset(asset),
+			installUpdate: async (_event, filePath: string) => updateManager.installDownloadedUpdate(filePath),
+			feedbackEnvironment: async () => {
+				// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
+				const pi = await piLocator.check();
+				return {
+					appVersion: app.getVersion(),
+					platform: process.platform,
+					arch: process.arch,
+					electronVersion: process.versions.electron ?? "",
+					chromeVersion: process.versions.chrome ?? "",
+					nodeVersion: process.versions.node,
+					pi,
+				};
+			},
+			openExternal: async (_event, url: string, forceSystem?: boolean) => {
+				// 外部链接统一经主进程打开，避免 renderer 直接依赖 shell 权限，并遵守用户设置的打开方式。
+				// forceSystem 为 true 时绕过 linkOpenMode 检查，始终用系统默认浏览器。
+				await openExternalUrl(url, forceSystem);
+			},
+			restart: async () => {
+				// 统一清理 + relaunch；清理失败不能拦住重启，否则应用会卡死在"点了没反应"
+				restartApp();
+			},
+			minimizeWindow: async () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return;
+				win.minimize();
+			},
+			toggleMaximizeWindow: async () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return;
+				if (win.isMaximized()) win.unmaximize();
+				else win.maximize();
+			},
+			toggleAlwaysOnTopWindow: async () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return false;
+				const next = !win.isAlwaysOnTop();
+				// floating 适合工具型桌面窗口；跨平台由 Electron 映射到各系统的置顶层级。
+				win.setAlwaysOnTop(next, "floating");
+				return next;
+			},
+			closeWindow: async () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return;
+				win.close();
+			},
+			toggleDevTools: async () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return false;
+				if (win.webContents.isDevToolsOpened()) {
+					win.webContents.closeDevTools();
+					return false;
+				}
+				win.webContents.openDevTools({ mode: "detach" });
+				return true;
+			},
+			visionTest: async (_event, config: unknown) => {
+				// 视觉桥连通性测试：GET {baseUrl}/models 验证端点与 API key（入参校验在边界）。
+				const c = config as {
+					baseUrl?: unknown;
+					apiKey?: unknown;
+				} | null;
+				const baseUrl = typeof c?.baseUrl === "string" ? c.baseUrl.trim().replace(/\/+$/, "") : "";
+				const apiKey = typeof c?.apiKey === "string" ? c.apiKey.trim() : "";
+				if (!baseUrl || !apiKey) {
+					return { ok: false, error: "请先填写端点与 API Key" };
+				}
+				try {
+					const controller = new AbortController();
+					const timer = setTimeout(() => controller.abort(), 15_000);
+					try {
+						const response = await fetch(`${baseUrl}/models`, {
+							headers: { Authorization: `Bearer ${apiKey}` },
+							signal: controller.signal,
+						});
+						if (!response.ok) {
+							const detail = await response.text().catch(() => "");
+							return {
+								ok: false,
+								error: `HTTP ${response.status}: ${detail.slice(0, 200)}`,
+							};
+						}
+						const data = (await response.json()) as { data?: unknown };
+						const modelIds = Array.isArray(data.data)
+							? data.data
+									.map((m) => (m && typeof m === "object" && "id" in m ? String(m.id) : ""))
+									.filter(Boolean)
+							: [];
+						return { ok: true, models: modelIds };
+					} finally {
+						clearTimeout(timer);
+					}
+				} catch (error) {
+					if (error instanceof Error && error.name === "AbortError") {
+						return { ok: false, error: "连接超时（15s）" };
+					}
+					return {
+						ok: false,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			},
+		},
+		rpcLogs: {
+			/** 开关某 agent 的 RPC 日志记录 */
+			setLogging: async (_event, agentId: string, enabled: boolean) => {
+				agentManager.setRpcLogging(agentId, enabled);
+				return enabled;
+			},
+			/** 查询某 agent 的 RPC 日志记录状态 */
+			getLogging: async (_event, agentId: string) => agentManager.isRpcLogging(agentId),
+		},
+		settings: {
+			get: async () => settingsStore.get(),
+			update: async (_event, patch: Partial<AppSettings>) => {
+				// 记录更新前的设置，用于驱动桌面宠物对 pet 字段变化的反应
+				const prevSettings = settingsStore.get();
+				const settings = await settingsStore.update(patch);
+				void appLogger.info("settings", "Settings updated", { keys: Object.keys(patch) });
+				// 桌面宠物：设置面板走 settings.update，这里统一驱动开窗/切换/置顶
+				await getPetSystem()?.reactToSettings(prevSettings, settings);
+				if (
+					"desktopProxyEnabled" in patch ||
+					"desktopProxyUrl" in patch ||
+					"desktopProxyBypass" in patch
+				) {
+					await applyDesktopProxy(settings);
+				}
+				if ("theme" in patch) {
+					applyNativeThemeSource(settings);
+				}
+				if ("useNativeTitleBar" in patch) {
+					settingsStore.notifyTitleBarChange(getMainWindow());
+				}
+				if ("zoomFactor" in patch) {
+					getMainWindow()?.webContents.setZoomFactor(settings.zoomFactor);
+				}
+				if (
+					"webServiceEnabled" in patch ||
+					"webServiceHost" in patch ||
+					"webServicePort" in patch
+				) {
+					try {
+						await getWebServiceManager()?.applySettings(settings);
+					} catch (error) {
+						if (settings.webServiceEnabled) {
+							await settingsStore.update({ webServiceEnabled: false });
+						}
+						throw error;
+					}
+				}
+				// WSL 设置变更时同步更新会话扫描器和配置管理器
+				if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
+					await syncWslEnvironment(settings);
+				}
+				return settings;
+			},
+			testPiProxy: async () => {
+				const result = await testPiProxy(settingsStore.get());
+				void appLogger.info("settings", "Pi proxy tested", {
+					success: result.success,
+					elapsedMs: result.elapsedMs,
+					statusCode: result.statusCode,
+					error: result.error,
+				});
+				return result;
+			},
+		},
+	};
+}
+
+/** preload 启动握手（mainOnly 通道，不走通道表命名空间）。 */
+export function registerPreloadHandshakeHandlers(appLogger: AppLogger): void {
 	ipcMain.on(ipcChannels.preloadReady, (event) => {
 		void appLogger.info("app", "Preload API exposed", {
 			url: event.sender.getURL(),
@@ -103,178 +282,5 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 			url: event.sender.getURL(),
 			detail,
 		});
-	});
-	/** 开关某 agent 的 RPC 日志记录 */
-	ipcMain.handle(ipcChannels.rpcLoggingSet, async (_event, agentId: string, enabled: boolean) => {
-		agentManager.setRpcLogging(agentId, enabled);
-		return enabled;
-	});
-	/** 查询某 agent 的 RPC 日志记录状态 */
-	ipcMain.handle(ipcChannels.rpcLoggingGet, async (_event, agentId: string) => agentManager.isRpcLogging(agentId));
-	ipcMain.handle(ipcChannels.appFeedbackEnvironment, async () => {
-		// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
-		const pi = await piLocator.check();
-		return {
-			appVersion: app.getVersion(),
-			platform: process.platform,
-			arch: process.arch,
-			electronVersion: process.versions.electron ?? "",
-			chromeVersion: process.versions.chrome ?? "",
-			nodeVersion: process.versions.node,
-			pi,
-		};
-	});
-	ipcMain.handle(ipcChannels.appOpenExternal, async (_event, url: string, forceSystem?: boolean) => {
-		// 外部链接统一经主进程打开，避免 renderer 直接依赖 shell 权限，并遵守用户设置的打开方式。
-		// forceSystem 为 true 时绕过 linkOpenMode 检查，始终用系统默认浏览器。
-		await openExternalUrl(url, forceSystem);
-	});
-	ipcMain.handle(ipcChannels.appRestart, async () => {
-		// 统一清理 + relaunch；清理失败不能拦住重启，否则应用会卡死在"点了没反应"
-		restartApp();
-	});
-	ipcMain.handle(ipcChannels.appWindowMinimize, () => {
-		const win = getMainWindow();
-		if (!win || win.isDestroyed()) return;
-		win.minimize();
-	});
-	ipcMain.handle(ipcChannels.appWindowToggleMaximize, () => {
-		const win = getMainWindow();
-		if (!win || win.isDestroyed()) return;
-		if (win.isMaximized()) win.unmaximize();
-		else win.maximize();
-	});
-	ipcMain.handle(ipcChannels.appWindowToggleAlwaysOnTop, () => {
-		const win = getMainWindow();
-		if (!win || win.isDestroyed()) return false;
-		const next = !win.isAlwaysOnTop();
-		// floating 适合工具型桌面窗口；跨平台由 Electron 映射到各系统的置顶层级。
-		win.setAlwaysOnTop(next, "floating");
-		return next;
-	});
-	ipcMain.handle(ipcChannels.appWindowClose, () => {
-		const win = getMainWindow();
-		if (!win || win.isDestroyed()) return;
-		win.close();
-	});
-
-	ipcMain.handle(ipcChannels.settingsGet, () => settingsStore.get());
-	ipcMain.handle(
-		ipcChannels.settingsUpdate,
-		async (_event, patch: Partial<AppSettings>) => {
-			// 记录更新前的设置，用于驱动桌面宠物对 pet 字段变化的反应
-			const prevSettings = settingsStore.get();
-			const settings = await settingsStore.update(patch);
-			void appLogger.info("settings", "Settings updated", { keys: Object.keys(patch) });
-			// 桌面宠物：设置面板走 settings.update，这里统一驱动开窗/切换/置顶
-			await getPetSystem()?.reactToSettings(prevSettings, settings);
-			if (
-				"desktopProxyEnabled" in patch ||
-				"desktopProxyUrl" in patch ||
-				"desktopProxyBypass" in patch
-			) {
-				await applyDesktopProxy(settings);
-			}
-			if ("theme" in patch) {
-				applyNativeThemeSource(settings);
-			}
-			if ("useNativeTitleBar" in patch) {
-				settingsStore.notifyTitleBarChange(getMainWindow());
-			}
-			if ("zoomFactor" in patch) {
-				getMainWindow()?.webContents.setZoomFactor(settings.zoomFactor);
-			}
-			if (
-				"webServiceEnabled" in patch ||
-				"webServiceHost" in patch ||
-				"webServicePort" in patch
-			) {
-				try {
-					await getWebServiceManager()?.applySettings(settings);
-				} catch (error) {
-					if (settings.webServiceEnabled) {
-						await settingsStore.update({ webServiceEnabled: false });
-					}
-					throw error;
-				}
-			}
-			// WSL 设置变更时同步更新会话扫描器和配置管理器
-			if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
-				await syncWslEnvironment(settings);
-			}
-			return settings;
-		},
-	);
-	ipcMain.handle(
-		ipcChannels.settingsTestPiProxy,
-		async () => {
-			const result = await testPiProxy(settingsStore.get());
-			void appLogger.info("settings", "Pi proxy tested", {
-				success: result.success,
-				elapsedMs: result.elapsedMs,
-				statusCode: result.statusCode,
-				error: result.error,
-			});
-			return result;
-		},
-	);
-
-	// ── 配置管理 ──────────────────────────────────────
-	// 切换开发者控制台
-	ipcMain.handle(ipcChannels.appToggleDevTools, () => {
-		const win = getMainWindow();
-		if (!win || win.isDestroyed()) return false;
-		if (win.webContents.isDevToolsOpened()) {
-			win.webContents.closeDevTools();
-			return false;
-		}
-		win.webContents.openDevTools({ mode: "detach" });
-		return true;
-	});
-	ipcMain.handle(ipcChannels.visionTest, async (_event, config: unknown) => {
-		// 视觉桥连通性测试：GET {baseUrl}/models 验证端点与 API key（入参校验在边界）。
-		const c = config as {
-			baseUrl?: unknown;
-			apiKey?: unknown;
-		} | null;
-		const baseUrl = typeof c?.baseUrl === "string" ? c.baseUrl.trim().replace(/\/+$/, "") : "";
-		const apiKey = typeof c?.apiKey === "string" ? c.apiKey.trim() : "";
-		if (!baseUrl || !apiKey) {
-			return { ok: false, error: "请先填写端点与 API Key" };
-		}
-		try {
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), 15_000);
-			try {
-				const response = await fetch(`${baseUrl}/models`, {
-					headers: { Authorization: `Bearer ${apiKey}` },
-					signal: controller.signal,
-				});
-				if (!response.ok) {
-					const detail = await response.text().catch(() => "");
-					return {
-						ok: false,
-						error: `HTTP ${response.status}: ${detail.slice(0, 200)}`,
-					};
-				}
-				const data = (await response.json()) as { data?: unknown };
-				const modelIds = Array.isArray(data.data)
-					? data.data
-							.map((m) => (m && typeof m === "object" && "id" in m ? String((m as { id: unknown }).id) : ""))
-							.filter(Boolean)
-					: [];
-				return { ok: true, models: modelIds };
-			} finally {
-				clearTimeout(timer);
-			}
-		} catch (error) {
-			if (error instanceof Error && error.name === "AbortError") {
-				return { ok: false, error: "连接超时（15s）" };
-			}
-			return {
-				ok: false,
-				error: error instanceof Error ? error.message : String(error),
-			};
-		}
 	});
 }
