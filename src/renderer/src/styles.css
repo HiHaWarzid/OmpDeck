@@ -4004,6 +4004,12 @@ body.is-terminal-resizing {
   z-index: 60;
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
 }
+/* TerminalDock 懒加载首帧占位：同尺寸面板，避免 xterm chunk 加载时布局跳动 */
+.terminal-dock-placeholder {
+  border-top: 1px solid var(--terminal-border);
+  background: var(--terminal-panel);
+  z-index: 60;
+}
 .terminal-dock[data-motion-state="hidden"] {
   transform: translate3d(0, 100%, 0);
   pointer-events: none;

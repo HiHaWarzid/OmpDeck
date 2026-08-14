@@ -307,6 +307,7 @@ export function formatToolDetail(
 	args: unknown,
 	result: unknown,
 	isError: boolean,
+	precomputedResultText?: string,
 ): string {
 	const details = extractToolDetails(result);
 	let argsObj = args;
@@ -318,9 +319,14 @@ export function formatToolDetail(
 		}
 	}
 	const argsText = argsObj ? truncateForDetail(safeJson(argsObj)) : "";
-	const resultText = result
-		? truncateForDetail(extractToolResultText(result) || safeJson(result))
-		: "";
+	// 调用方（AgentManager 工具事件热路径）已算过完整结果文本时复用，
+	// 避免大工具结果在同一事件内被 extractToolResultText/safeJson 处理两次。
+	const resultText =
+		precomputedResultText != null
+			? truncateForDetail(precomputedResultText)
+			: result
+				? truncateForDetail(extractToolResultText(result) || safeJson(result))
+				: "";
 	const detailsText = details ? truncateForDetail(safeJson(details)) : "";
 	const sections = [
 		`工具：${toolName ?? "tool"}`,

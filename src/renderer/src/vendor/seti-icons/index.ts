@@ -46,10 +46,18 @@ function getDetails(fileName: string): IconDetails {
 }
 
 /** Returns a trusted, bundled Seti SVG and its semantic color name. */
+const iconCache = new Map<string, { svg: string; color: SetiIconColor }>();
+
 export function getSetiIcon(fileName: string): { svg: string; color: SetiIconColor } {
+  // 文件名集合有限（项目文件树/暂存列表），模块级缓存避免每次渲染重跑
+  // partials 线性扫描 + SVG 查表；结果对象只读共享。
+  const cached = iconCache.get(fileName);
+  if (cached) return cached;
   const [iconName, color] = getDetails(fileName);
-  return {
+  const result = {
     svg: icons[iconName] ?? icons[definitions.default[0]],
     color,
   };
+  iconCache.set(fileName, result);
+  return result;
 }

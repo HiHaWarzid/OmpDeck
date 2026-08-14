@@ -111,17 +111,27 @@ export class XuePromptManager {
 	}
 
 	/**
+	 * 分页查询结果缓存：搜索/翻页的 LIKE 全表扫描 + description gunzip 是主进程
+	 * CPU 大头，同一 (category, search, page) 在 TTL 内重复查询（切分类回跳、
+	 * 防抖窗口内的重复请求）直接复用。
+	 */
+	private readonly queryCache = new Map<string, { expiresAt: number; value: YaoPromptListResult }>();
+	private static readonly QUERY_TTL_MS = 30_000;
+
+	/**
 	 * 列出分类和提示词。
 	 *
 	 * 不传 opts 时保持向后兼容 — 返回全量分类和提示词。
 	 * 传 opts 时支持分页查询：categories 始终返回全部分类，
 	 * prompts 按 category/search 过滤并分页，同时返回 total 总数。
+	 * opts.onlyCategories 时只查分类表（分类栏/计数），不触碰 4000 行提示词表。
 	 */
 	async list(opts?: {
 		category?: string;
 		search?: string;
 		page?: number;
 		pageSize?: number;
+		onlyCategories?: boolean;
 	}): Promise<YaoPromptListResult> {
 		const db = await this.getDb();
 		// db 是复用的只读实例（见 getDb），不能 close——close 会销毁共享连接，
@@ -138,10 +148,16 @@ export class XuePromptManager {
 			count: Number(row[2] ?? 0),
 		}));
 
+		if (opts?.onlyCategories) {
+			// 分类栏轻量路径：不查提示词表，避免 4000 行 + 逐行 gunzip
+			return { categories, prompts: [], repoPath: this.dbPath };
+		}
+
 		if (!opts) {
-			// 向后兼容：全量查询
+			// 向后兼容：全量查询（不取 content 列，YaoPromptItem 不消费它；
+			// 每行省掉一个大 BLOB 的读取与解析）
 			const promptRows = db.exec(
-				"SELECT slug, url, title, category, content, description FROM xueprompts ORDER BY category, title"
+				"SELECT slug, url, title, category, description FROM xueprompts ORDER BY category, title"
 			);
 			const prompts: YaoPromptItem[] = (
 				promptRows[0]?.values ?? []
@@ -151,15 +167,21 @@ export class XuePromptManager {
 				category: String(row[3] ?? ""),
 				subcategory: "",
 				tags: [],
-				description: row[5] ? this.blobToString(row[5]) : "",
+				description: row[4] ? this.blobToString(row[4]) : "",
 				path: String(row[0] ?? ""),
 			}));
 			return { categories, prompts, repoPath: this.dbPath };
 		}
 
+		// 分页查询缓存命中（onlyCategories 之外的带 opts 查询）
+		const cacheKey = JSON.stringify([opts.category ?? "", opts.search ?? "", opts.page ?? 1, opts.pageSize ?? 20]);
+		const now = Date.now();
+		const cached = this.queryCache.get(cacheKey);
+		if (cached && cached.expiresAt > now) return cached.value;
+
 		// 分页查询：构建 WHERE 条件
 		const conditions: string[] = [];
-		const params: any[] = [];
+		const params: unknown[] = [];
 
 		if (opts.category) {
 			// xueprompts.category 存的是原始分类名（如 "营销/SEO提示词"），
@@ -206,7 +228,9 @@ export class XuePromptManager {
 			path: String(row[0] ?? ""),
 		}));
 
-		return { categories, prompts, repoPath: this.dbPath, total, page, pageSize };
+		const result: YaoPromptListResult = { categories, prompts, repoPath: this.dbPath, total, page, pageSize };
+		this.queryCache.set(cacheKey, { expiresAt: now + XuePromptManager.QUERY_TTL_MS, value: result });
+		return result;
 	}
 
 	/**

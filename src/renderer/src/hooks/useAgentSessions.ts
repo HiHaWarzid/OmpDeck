@@ -116,9 +116,16 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	displayAgentsRef.current = displayAgents;
 
 	// 查看器已移除：activeAgent 直接从 displayAgents / pendingAgents 取，不再有伪 Agent。
-	const activeAgent = activeAgentId
-		? [...displayAgents, ...pendingAgents].find((agent) => agent.id === activeAgentId)
-		: undefined;
+	// useMemo 缓存：流式 20Hz 渲染时避免每次展开两数组 + 线性查找。
+	const activeAgent = useMemo(
+		() =>
+			activeAgentId
+				? [...displayAgents, ...pendingAgents].find(
+						(agent) => agent.id === activeAgentId,
+					)
+				: undefined,
+		[activeAgentId, displayAgents, pendingAgents],
+	);
 
 	const activeMessages = activeAgentId
 		? (messagesByAgent[activeAgentId] ?? [])

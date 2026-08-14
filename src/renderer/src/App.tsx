@@ -9,6 +9,7 @@ import {
   useState,
   useCallback,
   useTransition,
+  useDeferredValue,
   type PointerEvent,
   type CSSProperties,
   type ReactNode,
@@ -58,7 +59,13 @@ import { createBrowserApi } from "./browserApi";
 const ConfigModal = lazy(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
 import { isTextFile } from "./utils/isTextFile";
 import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
-import { TerminalDock } from "./components/terminal/TerminalDock";
+// 懒加载：@xterm/xterm（含 FitAddon + 主题 CSS）约数百 KB，终端 Dock 按需打开，
+// 不应在首屏解析执行（此前 xterm 完整打进 1.8MB 入口 chunk）。
+const TerminalDock = lazy(() =>
+  import("./components/terminal/TerminalDock").then((m) => ({
+    default: m.TerminalDock,
+  })),
+);
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
@@ -242,6 +249,37 @@ const isLanWeb =
   !window.piDesktop && window.location.protocol.startsWith("http");
 const isElectronRuntime = navigator.userAgent.includes("Electron/");
 const missingElectronPreload = isElectronRuntime && !window.piDesktop;
+
+/**
+ * 模块级调试日志环形缓冲（最多 200 条）。
+ * 替代 App 内 _logs state：pi 每行 stderr 都触发 setState 会让 App 在流式期间
+ * 每秒数十次整树重渲染，而该日志无任何 UI 消费。需要调试时用 devtools 读取。
+ */
+const DEBUG_LOG_MAX = 200;
+const debugLogBuffer: string[] = [];
+function captureDebugLog(line: string) {
+  debugLogBuffer.push(line);
+  if (debugLogBuffer.length > DEBUG_LOG_MAX) {
+    debugLogBuffer.splice(0, debugLogBuffer.length - DEBUG_LOG_MAX);
+  }
+}
+
+/** 删除 record 中不在保留集合内的键；无键被删时返回原引用，避免无谓重渲染。 */
+function pruneRecordKeys<T>(
+  record: Record<string, T>,
+  keep: Set<string>,
+): Record<string, T> {
+  let changed = false;
+  const next: Record<string, T> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (!keep.has(key)) {
+      changed = true;
+      continue;
+    }
+    next[key] = value;
+  }
+  return changed ? next : record;
+}
 function createUnavailableDesktopApi(): typeof window.piDesktop {
   const fail = () => {
     throw new Error(t("app.preloadMissing"));
@@ -758,8 +796,10 @@ export function App() {
       time: number;
     }>
   >([]);
-  const [_logs, setLogs] = useState<string[]>([]); // 写入式调试日志,仅用于 onLog/onError 捕获
   const [search, setSearch] = useState("");
+  // 侧栏过滤用延迟值：输入框即时响应，O(项目×会话) 的 filter/sort 派生计算
+  // 降级为低优先级更新，避免搜索大量项目/会话时按键阻塞。
+  const deferredSearch = useDeferredValue(search);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
   // 记录 composer 光标位置,用于光标相关的 @ / 触发检测与建议项替换。
@@ -1548,6 +1588,9 @@ export function App() {
   // chatHeader 高度由 ResizeObserver 异步追踪，避免在 render 中同步读 offsetHeight 触发强制布局。
   // 初始值 78 与 CSS 默认高度一致，observer 首帧回调后修正为真实值。
   const [chatHeaderHeight, setChatHeaderHeight] = useState(78);
+  /** composer 外壳高度（footer.offsetHeight - 编辑区.offsetHeight），rAF 中更新；
+   *  渲染路径用它计算 maxHeight，避免每次渲染同步读 DOM 触发强制布局。 */
+  const [composerChrome, setComposerChrome] = useState(0);
   const composerRef = useRef<HTMLElement | null>(null);
   const queuedTrackRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLElement | null>(null);
@@ -2044,8 +2087,19 @@ export function App() {
         Math.max(0, chatPaneHeight - fixedChatHeight - queuedChromeBudget),
       );
   const visibleQueuedPrompts = activeQueuedPrompts;
+  // 渲染路径的输入框最大高度：全部由 state 派生（chatLayoutHeight/chatHeaderHeight/
+  // composerChrome 由 ResizeObserver + rAF 更新），避免每次 App 重渲染（流式 ~20Hz）
+  // 同步读取 4 个 DOM 节点尺寸触发强制同步布局。
+  const composerMaxHeight = Math.max(
+    180,
+    chatPaneHeight -
+      chatHeaderHeight -
+      COMPOSER_MIN_TIMELINE_HEIGHT -
+      terminalRowHeight -
+      composerChrome,
+  );
   const resolvedComposerHeight = Math.min(
-    getComposerMaxHeight(),
+    composerMaxHeight,
     Math.max(composerHeight, composerAutoHeight),
   );
   // composerMode 基于 composerBangMode（state）而非 prompt（ref），避免每键触发重渲染。
@@ -2275,9 +2329,9 @@ export function App() {
   const visibleAgents = useMemo(
     () =>
       displayAgents.filter((agent) =>
-        matches(agent.title + agent.cwd + (agent.sessionId ?? ""), search),
+        matches(agent.title + agent.cwd + (agent.sessionId ?? ""), deferredSearch),
       ),
-    [displayAgents, search],
+    [displayAgents, deferredSearch],
   );
   const filteredAgents = visibleAgents;
   const filteredProjects = useMemo(
@@ -2287,24 +2341,24 @@ export function App() {
         if (project.worktreeParentId) return false;
         const projectSessions = sessionsByProject[project.id] ?? [];
         return (
-          matches(project.name + project.path, search) ||
+          matches(project.name + project.path, deferredSearch) ||
           displayAgents.some(
             (agent) =>
               agent.projectId === project.id &&
               matches(
                 agent.title + agent.cwd + (agent.sessionId ?? ""),
-                search,
+                deferredSearch,
               ),
           ) ||
           projectSessions.some((session) =>
             matches(
               `${session.name ?? ""}${session.preview}${session.filePath}`,
-              search,
+              deferredSearch,
             ),
           )
         );
       }),
-    [displayAgents, projects, search, sessionsByProject],
+    [displayAgents, projects, deferredSearch, sessionsByProject],
   );
   const projectIdsKey = useMemo(
     () => projects.map((project) => project.id).join("\n"),
@@ -2337,7 +2391,7 @@ export function App() {
    * 重渲染时退化为 O(1) 查表；输入未变则跳过全部计算。
    */
   const sidebarProjectDisplayByProject = useMemo(() => {
-    const projectSearch = search.trim();
+    const projectSearch = deferredSearch.trim();
     const result: Record<string, { sessions: SessionSummary[]; display: ProjectAgentSessionDisplay }> = {};
     for (const project of filteredProjects) {
       const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
@@ -2371,7 +2425,7 @@ export function App() {
     filteredProjects,
     sessionsByProject,
     filteredAgentsByProject,
-    search,
+    deferredSearch,
     sessionSourceFilter,
     visibleProjectChildCountByProject,
   ]);
@@ -2531,14 +2585,9 @@ export function App() {
       });
     });
     const offLog = api.agents.onLog((payload) =>
-      setLogs((current) => {
-        // 优化:只在超过200条时才slice,减少不必要的数组操作
-        const newLog = `[${payload.agentId.slice(0, 8)}] ${payload.text}`;
-        if (current.length < 200) {
-          return [...current, newLog];
-        }
-        return [...current.slice(-199), newLog];
-      }),
+      // 写入式调试日志：无 UI 消费。用模块级环形缓冲替代 React state，
+      // 避免 pi 每行 stderr（流式期间可每秒数十行）都触发 App 整树重渲染。
+      captureDebugLog(`[${payload.agentId.slice(0, 8)}] ${payload.text}`),
     );
     const offSettings = api.settings.onApplyWindow((next) => {
       setSettings(next);
@@ -2580,10 +2629,12 @@ export function App() {
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
-      setStreamingThinking((current) => ({
-        ...current,
-        [payload.agentId]: payload.thinking,
-      }));
+      setStreamingThinking((current) => {
+        // 相等守卫：工具执行期间思考文本静止时主进程仍按 50ms 节流推送同一值，
+        // 每次 setState 都让 App 整树重渲染；值未变时返回原引用跳过渲染。
+        if (current[payload.agentId] === payload.thinking) return current;
+        return { ...current, [payload.agentId]: payload.thinking };
+      });
       // 首次收到非空 thinking 时记录开始时间；thinking 清空时清除
       setStreamingThinkingStartedAt((current) => {
         if (payload.thinking) {
@@ -2861,26 +2912,14 @@ export function App() {
 
   useEffect(() => {
     const projectIds = new Set(projects.map((project) => project.id));
-    setSessionsByProject((current) =>
-      Object.fromEntries(
-        Object.entries(current).filter(([projectId]) =>
-          projectIds.has(projectId),
-        ),
-      ),
-    );
+    // 三个按项目键的裁剪统一走 pruneRecordKeys：无键被删时返回原引用，
+    // 项目列表刷新（内容未变）时不会以新对象触发整树重渲染。
+    setSessionsByProject((current) => pruneRecordKeys(current, projectIds));
     setVisibleProjectChildCountByProject((current) =>
-      Object.fromEntries(
-        Object.entries(current).filter(([projectId]) =>
-          projectIds.has(projectId),
-        ),
-      ),
+      pruneRecordKeys(current, projectIds),
     );
     setSessionLoadingByProject((current) =>
-      Object.fromEntries(
-        Object.entries(current).filter(([projectId]) =>
-          projectIds.has(projectId),
-        ),
-      ),
+      pruneRecordKeys(current, projectIds),
     );
 
     if (projects.length === 0) return;
@@ -2998,6 +3037,11 @@ export function App() {
     };
   }, [activeProjectId, activeProjectHasBusyAgent, expandedSidebarProjects]);
 
+  /**
+   * 输入框最大高度（DOM 读取版本）。仅允许在事件回调 / rAF / effect 中调用
+   * （布局变化后低频执行）；渲染路径请用 state 派生的 composerMaxHeight，
+   * 避免流式 20Hz 重渲染时同步读 DOM 触发强制布局。
+   */
   function getComposerMaxHeight() {
     const chatPane = chatPaneRef.current;
     const header = chatHeaderRef.current;
@@ -3142,6 +3186,13 @@ export function App() {
           const next = headerEl.offsetHeight;
           setChatHeaderHeight((current) => (current === next ? current : next));
         }
+        // composer 外壳高度同样缓存到 state（渲染路径计算 maxHeight 使用）
+        const footerEl = composerRef.current;
+        const boxEl = composerBoxRef.current;
+        if (footerEl && boxEl) {
+          const next = Math.max(0, footerEl.offsetHeight - boxEl.offsetHeight);
+          setComposerChrome((current) => (current === next ? current : next));
+        }
       });
     };
 
@@ -3261,22 +3312,6 @@ export function App() {
       const timeline = timelineRef.current;
       if (timeline) {
         programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      }
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeAgentId]);
-
-
-  // 切换 Agent 时重置滚动状态，确保回到该 Agent 时自动滚到底部
-  useEffect(() => {
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-    // 延迟一帧滚动：等 React 完成渲染、DOM 更新后再滚到底部
-    const frame = requestAnimationFrame(() => {
-      const timeline = timelineRef.current;
-      if (timeline) {
         timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
       }
     });
@@ -3424,7 +3459,9 @@ export function App() {
       }
       agentStatusByAgentRef.current[agent.id] = agent.status;
     }
-  }, [displayAgents, activeAgentId, modifiedFiles, messagesByAgent]);
+    // 函数体只读 displayAgents + activeAgentId 的状态记账；messagesByAgent 每次
+    // 流式 delta 都是新引用，列入依赖会让该 effect 每条 delta 空跑 O(agents) 遍历。
+  }, [displayAgents, activeAgentId]);
 
   /** 侧栏 π logo 业务反馈：新建/历史会话启动/关闭 agent 时重播拼装动画。 */
   const triggerBrandLogoReplay = useCallback(() => {
@@ -3490,7 +3527,7 @@ export function App() {
     void api.files
       .list(activeProjectId)
       .then(setFiles)
-      .catch((error) => setLogs((current) => [...current, String(error)]));
+      .catch((error) => captureDebugLog(String(error)));
     void api.git
       .branches(activeProjectId)
       .then(setGitInfo)
@@ -8942,7 +8979,14 @@ export function App() {
         )}
 
         {!isLanWeb && !settingsOpen && !configOpen && !environmentDialog && terminalDockVisible && (
-          <TerminalDock
+          <Suspense
+            fallback={
+              // 首次打开终端时 xterm chunk 从磁盘加载（本地瞬时）；用同尺寸占位
+              // 避免布局跳动。motion 动画由 TerminalDock 内部处理。
+              <div className="terminal-dock-placeholder" style={{ height: terminalRowHeight }} />
+            }
+          >
+            <TerminalDock
             key={terminalDockOwnerKey}
             sessionKey={
               // pending agent 尚未进入主进程 agents map；sessionKey 绝不能用 pending-*
@@ -8974,6 +9018,7 @@ export function App() {
             }}
             onClose={() => setTerminalOpenForOwner(false)}
           />
+          </Suspense>
         )}
       </main>
 

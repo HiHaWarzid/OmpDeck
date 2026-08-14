@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, copyFile, unlink, open } from "node:fs/promises";
+import { readFile, writeFile, readdir, copyFile, unlink, open, stat } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 
@@ -278,10 +278,25 @@ export class SessionJsonl {
 	 * 无可用数据（文件不可读 / 无 assistant / promptTokens 为 0）时返回 undefined。
 	 * 只读尾部窗口（最近几十行足够定位最后一条 assistant），
 	 * 避免每次运行态刷新都整文件读入解析（工具边沿会高频触发）。
+	 *
+	 * 结果按 sessionPath 做 5s TTL 缓存：getRuntimeState 在工具密集循环中每个
+	 * 边沿都会调用本方法，每次都 open/close 文件句柄 + 读尾部窗口 + 逐行 parse，
+	 * 属于流式期间唯一同步磁盘 IO 热点；5s 内重复请求直接复用（命中率展示
+	 * 延迟 5s 无感知，新 assistant 消息的 usage 在窗口过期后自然生效）。
 	 */
+	private readonly cacheHitRateCache = new Map<
+		string,
+		{ expiresAt: number; value: number | undefined }
+	>();
+	private static readonly CACHE_HIT_RATE_TTL_MS = 5_000;
+
 	async getLatestCacheMessageHitRate(
 		sessionPath: string,
 	): Promise<number | undefined> {
+		const now = Date.now();
+		const cached = this.cacheHitRateCache.get(sessionPath);
+		if (cached && cached.expiresAt > now) return cached.value;
+		let value: number | undefined;
 		try {
 			const lines = await this.readTailLines(this.resolve(sessionPath), 32, TAIL_READ_MAX_BYTES);
 			// 从后往前遍历，找到最后一条 assistant 消息
@@ -297,9 +312,9 @@ export class SessionJsonl {
 						const cacheWrite = usage.cacheWrite ?? 0;
 						const promptTokens = input + cacheRead + cacheWrite;
 						if (promptTokens > 0) {
-							return (cacheRead / promptTokens) * 100;
+							value = (cacheRead / promptTokens) * 100;
 						}
-						return undefined;
+						break;
 					}
 				} catch {
 					// 单行解析失败忽略，继续往前找
@@ -308,8 +323,21 @@ export class SessionJsonl {
 		} catch {
 			// 文件不存在或无法读取，返回 undefined
 		}
-		return undefined;
+		this.cacheHitRateCache.set(sessionPath, { expiresAt: now + SessionJsonl.CACHE_HIT_RATE_TTL_MS, value });
+		return value;
 	}
+
+	/**
+	 * parseArchives 的 (size, mtimeMs) 指纹缓存。
+	 * loadMessages 在 agent 打开、compaction_end、编辑/删除后 reload 时都会触发
+	 * parseArchives；压缩过的长会话每次都要整文件 readFile + 全行 JSON.parse +
+	 * 归档消息全量转换。文件指纹未变时直接复用，只有 mtime/size 变化才重解析。
+	 * 仅对未传 sessionContent 的调用生效（调用方自带内容时以调用方为准）。
+	 */
+	private readonly archivesCache = new Map<
+		string,
+		{ size: number; mtimeMs: number; value: SessionArchives }
+	>();
 
 	/**
 	 * 从原始会话文件解析压缩（compaction）记录。
@@ -326,15 +354,42 @@ export class SessionJsonl {
 		agentId: string,
 		sessionContent?: string,
 	): Promise<SessionArchives> {
+		// 指纹缓存：文件未变化（编辑/删除会改写 mtime）时复用上次解析结果
+		if (sessionContent === undefined) {
+			const hostPath = this.resolve(sessionPath);
+			try {
+				const fileStat = await stat(hostPath);
+				const cached = this.archivesCache.get(sessionPath);
+				if (
+					cached &&
+					cached.size === fileStat.size &&
+					cached.mtimeMs === fileStat.mtimeMs
+				) {
+					return cached.value;
+				}
+			} catch {
+				// 文件不可 stat（不存在/权限）时走正常读路径，让原逻辑报错
+			}
+		}
+
 		let content: string;
-		try {
-			content = sessionContent ?? await readFile(this.resolve(sessionPath), "utf8");
-		} catch (error) {
-			void this.deps.logger?.warn("agent", "Failed to read session file for archive parsing", {
-				sessionPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return { compactions: [], archivedMessagesByCompactionId: new Map() };
+		let fileFingerprint: { size: number; mtimeMs: number } | undefined;
+		if (sessionContent === undefined) {
+			const hostPath = this.resolve(sessionPath);
+			const [raw, fileStat] = await Promise.all([
+				readFile(hostPath, "utf8").catch(() => undefined),
+				stat(hostPath).catch(() => undefined),
+			]);
+			if (raw === undefined) {
+				void this.deps.logger?.warn("agent", "Failed to read session file for archive parsing", {
+					sessionPath,
+				});
+				return { compactions: [], archivedMessagesByCompactionId: new Map() };
+			}
+			content = raw;
+			if (fileStat) fileFingerprint = { size: fileStat.size, mtimeMs: fileStat.mtimeMs };
+		} else {
+			content = sessionContent;
 		}
 
 		// 一次遍历收集所有 entry 和原始消息
@@ -444,6 +499,13 @@ export class SessionJsonl {
 					});
 				}
 			}
+		}
+
+		if (fileFingerprint) {
+			this.archivesCache.set(sessionPath, {
+				...fileFingerprint,
+				value: { compactions, archivedMessagesByCompactionId },
+			});
 		}
 
 		return { compactions, archivedMessagesByCompactionId };

@@ -140,6 +140,14 @@ export class AgentManager {
 	 */
 	private readonly runtimeStateInFlight = new Set<string>();
 	private readonly runtimeStatePending = new Set<string>();
+	/**
+	 * emitRuntimeState 最小间隔节流的最近发射时间戳与延迟补发定时器：
+	 * 工具密集循环（tool_start/end 交替）每个边沿都会触发 get_state + get_session_stats
+	 * RPC，间隔 <150ms 的请求延后到间隔满时补发最新状态，减少 RPC 往返次数。
+	 */
+	private static readonly RUNTIME_STATE_MIN_INTERVAL_MS = 150;
+	private readonly runtimeStateLastEmitAt = new Map<string, number>();
+	private readonly runtimeStateThrottleTimers = new Map<string, NodeJS.Timeout>();
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -1450,9 +1458,12 @@ export class AgentManager {
 			provider: model?.provider,
 			modelId: model?.id,
 			thinkingLevel: state?.thinkingLevel ?? state?.thinking_level,
-			isStreaming: state?.isStreaming,
+			// omp 的 get_state 布尔字段可能是字符串（"true"/"false"），truthy 判定会
+			// 把 "false" 当成真值，导致响应完成后 isStreaming/isCompacting 永远为真、
+			// 空闲检查无法通过、左下角三点指示器卡住。这里严格归一化为布尔。
+			isStreaming: state?.isStreaming === true,
 			isCompacting:
-				state?.isCompacting ||
+				state?.isCompacting === true ||
 				runtime.rpcCompacting ||
 				runtime.compacting,
 			/** 工具执行状态从本地追踪，无需 Pi 进程查询 */
@@ -1510,6 +1521,23 @@ export class AgentManager {
 	}
 
 	private async emitRuntimeState(agentId: string) {
+		// 最小间隔节流：工具密集循环中每个事件都触发 getRuntimeState（get_state +
+		// get_session_stats 两次 RPC + 缓存命中率读取），间隔 <150ms 的请求延后到
+		// 间隔满时以最新状态补发一次（latest-wins，与 in-flight 合并互补）。
+		const now = Date.now();
+		const lastEmit = this.runtimeStateLastEmitAt.get(agentId);
+		if (lastEmit !== undefined && now - lastEmit < AgentManager.RUNTIME_STATE_MIN_INTERVAL_MS) {
+			if (!this.runtimeStateThrottleTimers.has(agentId)) {
+				const delay = AgentManager.RUNTIME_STATE_MIN_INTERVAL_MS - (now - lastEmit);
+				const timer = setTimeout(() => {
+					this.runtimeStateThrottleTimers.delete(agentId);
+					void this.emitRuntimeState(agentId);
+				}, delay);
+				timer.unref?.();
+				this.runtimeStateThrottleTimers.set(agentId, timer);
+			}
+			return;
+		}
 		// 在途合并：请求进行中再来新请求只标记 pending，完成后再补发一次最新状态。
 		// 工具边沿（tool_execution_start/end）已由 emitToolRuntimeTransition 同步推送，
 		// 完整状态的中间版本晚到/合并都不会丢失工具真值（toolStateSequence 兜底）。
@@ -1518,6 +1546,7 @@ export class AgentManager {
 			return;
 		}
 		this.runtimeStateInFlight.add(agentId);
+		this.runtimeStateLastEmitAt.set(agentId, Date.now());
 		try {
 			const state = await this.getRuntimeState(agentId);
 			const runtime = this.agents.get(agentId);
@@ -3391,10 +3420,15 @@ export class AgentManager {
 		}
 
 		if (eventType === "text_delta") {
+			// 增量模式：text_delta 是高频路径（每 token 一次），跳过对 partialMessage
+			// 累积 content 的全量提取（extractMessageText 是 O(累积文本) 正则+拼接），
+			// 直接追加 delta。delta 追加语义由 pi 协议保证；text_start/message_end 等
+			// 终态仍走全量提取校准，最终文本不会漂移。
 			this.upsertAssistantMessage(
 				runtime,
 				partialMessage,
 				String(assistantEvent.delta ?? ""),
+				true,
 			);
 			return;
 		}
@@ -3408,9 +3442,12 @@ export class AgentManager {
 				runtime.thinkingStartedAt = Date.now();
 			}
 			runtime.thinkingEndedAt = undefined;
-			runtime.streamingThinking = prev + delta;
-			this.thinkingEmitter.push(runtime.tab.id, stripAnsi(prev + delta));
-			this.upsertAssistantMessage(runtime, partialMessage);
+			// 只拼接一次、strip 一次；upsertAssistantMessage 的增量模式不会再全量
+			// 提取 content，避免同一段思考文本被反复整段扫描。
+			const nextThinking = prev + delta;
+			runtime.streamingThinking = nextThinking;
+			this.thinkingEmitter.push(runtime.tab.id, stripAnsi(nextThinking));
+			this.upsertAssistantMessage(runtime, partialMessage, "", true);
 			return;
 		}
 
@@ -3451,6 +3488,7 @@ export class AgentManager {
 		runtime: AgentRuntime,
 		partialMessage?: unknown,
 		fallbackDelta = "",
+		incremental = false,
 	) {
 		const agentId = runtime.tab.id;
 		const list = runtime.messages;
@@ -3460,21 +3498,33 @@ export class AgentManager {
 			runtime.activeAssistantMessageId = messageId;
 		}
 
-		const existing = list.find((message) => message.id === messageId);
+		// 增量模式（text_delta / thinking_delta 高频路径）：跳过对 partialMessage.content
+		// 的全量提取。每条 delta 都携带完整累积 content，全量 extractMessageText +
+		// extractThinking + stripAnsi 是 O(累积文本)，长回答整体退化为 O(N²)。
+		// delta 追加语义由 pi 协议保证（QuickGenProcess 同样按 delta 累积）；
+		// message_end/text_end/thinking_end 等终态走全量提取，用完整 content 校准。
+		const partialContent =
+			partialMessage && typeof partialMessage === "object" && "content" in partialMessage
+				? partialMessage.content
+				: undefined;
 		const extractedText =
-			partialMessage && typeof partialMessage === "object"
-				? extractMessageText((partialMessage as any).content)
+			!incremental && partialContent !== undefined
+				? extractMessageText(partialContent)
 				: "";
 		const extractedThinking =
-			partialMessage && typeof partialMessage === "object"
-				? extractThinking((partialMessage as any).content)
+			!incremental && partialContent !== undefined
+				? extractThinking(partialContent)
 				: "";
 		const pendingThinking = runtime.streamingThinking;
 		const nextThinking = stripAnsi(extractedThinking || pendingThinking || "");
 		const thinkingStartedAt = runtime.thinkingStartedAt;
 		const thinkingEndedAt = runtime.thinkingEndedAt;
 
-		if (existing) {
+		// 单次线性扫描定位（findIndex），避免原先 find + indexOf 的双重扫描；
+		// 流式消息总是数组尾部，findIndex 命中即退出。
+		const existingIndex = list.findIndex((message) => message.id === messageId);
+		if (existingIndex !== -1) {
+			const existing = list[existingIndex];
 			existing.text = extractedText || `${existing.text}${fallbackDelta}`;
 			if (nextThinking) existing.thinking = nextThinking;
 			existing.timestamp = Date.now();
@@ -3488,7 +3538,7 @@ export class AgentManager {
 			}
 			if (thinkingEndedAt) existing.thinkingEndedAt = thinkingEndedAt;
 			// 就地更新：标记该消息自上次 flush 起已变更，增量推送需覆盖它。
-			this.markMessageDirty(runtime, existing);
+			this.markMessagesDirty(runtime, existingIndex);
 		} else {
 			const text = extractedText || fallbackDelta;
 			if (!text) return;
@@ -3537,7 +3587,8 @@ export class AgentManager {
 		}
 
 		const list = runtime.messages;
-		const existing = list.find((message) => message.id === messageId);
+		const existingIndex = list.findIndex((message) => message.id === messageId);
+		const existing = existingIndex !== -1 ? list[existingIndex] : undefined;
 		const isError = status === "error" || event.isError === true;
 		const args = event.args ?? existing?.meta?.args;
 		const startedAt =
@@ -3553,7 +3604,11 @@ export class AgentManager {
 			event.partialResult ??
 			event.output ??
 			existing?.meta?.result;
-		const detailText = formatToolDetail(toolName, args, result, isError);
+		// 完整结果文本只算一次：detailText（截断版）、meta.result（截断版）、
+		// truncated 判定与全文缓存（未截断）共用同一份，避免大工具结果在同一事件内
+		// 被 extractToolResultText / safeJson 重复处理（历史实现计算了 2~3 次）。
+		const fullResultText = extractToolResultText(result) || safeJson(result);
+		const detailText = formatToolDetail(toolName, args, result, isError, fullResultText);
 		const icon = status === "running" ? "▶" : isError ? "✗" : "✓";
 		const text =
 			status === "running" ? `${icon} ${toolName}` : `${icon} ${toolName}`;
@@ -3567,9 +3622,6 @@ export class AgentManager {
 		// pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装）
 		const askDetails = extractAskQuestionDetails(toolName, result, args);
 		const askCard = buildAskCard(askDetails, runtime.abortedDuringAsk);
-		// 完整结果文本只缓存在内存（不进 meta/JSONL，避免会话文件膨胀），
-		// 供截断卡片的「查看完整输出」按需读取；历史会话重载后回退按 entryId 读文件。
-		const fullResultText = extractToolResultText(result) || safeJson(result);
 		if (fullResultText.length > MAX_TOOL_RESULT_CHARS) {
 			this.toolFullTextByMessageId.set(messageId, fullResultText);
 			// LRU：超限时删除最早插入的一条（Map 迭代序即插入序）
@@ -3602,7 +3654,7 @@ export class AgentManager {
 			existing.text = text;
 			existing.timestamp = Date.now();
 			existing.meta = meta;
-			this.markMessageDirty(runtime, existing);
+			this.markMessagesDirty(runtime, existingIndex);
 		} else {
 			list.push({
 				id: messageId,
@@ -3806,7 +3858,13 @@ export class AgentManager {
 		};
 		// omp 返回 queuedMessageCount，旧 pi 用 pendingMessageCount：两者都读，任一非零都视为仍有排队消息
 		const queued = (state.pendingMessageCount ?? 0) + (state.queuedMessageCount ?? 0);
-		if (state.isStreaming || state.isCompacting || queued > 0) return;
+		// 布尔字段严格判定：omp 可能以字符串形式返回（"false" truthy），
+		// 宽松判定会让空闲检查永远无法通过，UI 停在 running。
+		if (
+			state.isStreaming === true ||
+			state.isCompacting === true ||
+			queued > 0
+		) return;
 
 		runtime.tab.status = "idle";
 		runtime.streamingThinking = "";
@@ -3904,6 +3962,15 @@ export class AgentManager {
 		runtime.recentlyAborted = false;
 		this.thinkingEmitter.cancel(runtime.tab.id);
 		this.cancelMessageEmit(runtime);
+		// 清理运行态节流定时器与在途合并状态，避免 agent 删除后残留 timer / pending
+		const throttleTimer = this.runtimeStateThrottleTimers.get(runtime.tab.id);
+		if (throttleTimer) {
+			clearTimeout(throttleTimer);
+			this.runtimeStateThrottleTimers.delete(runtime.tab.id);
+		}
+		this.runtimeStatePending.delete(runtime.tab.id);
+		this.runtimeStateInFlight.delete(runtime.tab.id);
+		this.runtimeStateLastEmitAt.delete(runtime.tab.id);
 	}
 
 	private scheduleMessageEmit(runtime: AgentRuntime, immediate = false) {
@@ -3983,7 +4050,25 @@ export class AgentManager {
 		this.emit(ipcChannels.agentsThinking, update);
 	}
 
+	/**
+	 * 节流后的状态推送：50ms latest-wins 合并。
+	 * 工具密集循环（tool_start/end 交替）每个事件都调 emitState，每次都全量
+	 * AgentTab[] 排序 + 结构化克隆跨进程推送；合并窗口内只发最新一次，
+	 * 渲染层无需中间态（与消息 flush 共用同一窗口策略）。
+	 */
+	private stateEmitTimer: NodeJS.Timeout | undefined;
+	private static readonly STATE_EMIT_INTERVAL_MS = 50;
+
 	private emitState() {
+		if (this.stateEmitTimer) return;
+		this.stateEmitTimer = setTimeout(() => {
+			this.stateEmitTimer = undefined;
+			this.emitStateNow();
+		}, AgentManager.STATE_EMIT_INTERVAL_MS);
+		this.stateEmitTimer.unref?.();
+	}
+
+	private emitStateNow() {
 		const tabs = this.list();
 		this.emit(ipcChannels.agentsState, tabs);
 		// 同步通知主进程内部状态订阅者（PetStateBridge），使宠物窗能拿到聚合状态。

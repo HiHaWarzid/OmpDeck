@@ -4,7 +4,7 @@ import { ArrowLeft, Check, ChevronLeft, ChevronRight, Download, Search } from "l
 import type { YaoPromptListResult, YaoPromptItem, YaoPromptDetailResult, PiPromptTemplateSummary, YaoPromptCategory, PiPromptTemplateListResult } from "../../../shared/types";
 import { t } from "../i18n";
 
-const api = (window as unknown as { piDesktop: { yaoPrompts: { list: (opts?: { category?: string; search?: string; page?: number; pageSize?: number }) => Promise<YaoPromptListResult>; detail: (slug: string, category: string) => Promise<YaoPromptDetailResult>; import: (slug: string, category: string) => Promise<PiPromptTemplateSummary> } } }).piDesktop;
+const api = (window as unknown as { piDesktop: { yaoPrompts: { list: (opts?: { category?: string; search?: string; page?: number; pageSize?: number; onlyCategories?: boolean }) => Promise<YaoPromptListResult>; detail: (slug: string, category: string) => Promise<YaoPromptDetailResult>; import: (slug: string, category: string) => Promise<PiPromptTemplateSummary> } } }).piDesktop;
 
 /** 获取本地已安装 prompt 名称集合 */
 async function getInstalledPromptNames(): Promise<Set<string>> {
@@ -28,6 +28,9 @@ export function YaoPromptTab(props: {
 	const [data, setData] = useState<YaoPromptListResult | null>(null);
 	const [activeCategory, setActiveCategory] = useState<string | null>(null);
 	const [searchQuery, setSearchQuery] = useState("");
+	// 搜索防抖：每击键都触发 IPC 全表 LIKE 扫描（主进程 CPU 大头），
+	// 输入停顿 250ms 后才真正发起查询；输入框本身保持即时响应。
+	const [debouncedSearch, setDebouncedSearch] = useState("");
 	const [page, setPage] = useState(1);
 	const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
 	const [previewItem, setPreviewItem] = useState<YaoPromptItem | null>(null);
@@ -41,19 +44,27 @@ export function YaoPromptTab(props: {
 		void loadCategories();
 	}, []);
 
-	// 分类/搜索/页码变更时加载分页数据
+	// 搜索防抖：searchQuery 变化后 250ms 无新输入才同步到查询用值
+	useEffect(() => {
+		const timer = setTimeout(() => setDebouncedSearch(searchQuery), 250);
+		return () => clearTimeout(timer);
+	}, [searchQuery]);
+
+	// 分类/搜索/页码变更时加载分页数据（查询用防抖后的搜索词）
 	useEffect(() => {
 		if (!initialLoading) {
 			void loadPrompts();
 		}
-	}, [activeCategory, searchQuery, page, initialLoading]);
+	}, [activeCategory, debouncedSearch, page, initialLoading]);
 
 	const loadCategories = async () => {
 		setInitialLoading(true);
 		setError(null);
 		try {
 			const [result, installed] = await Promise.all([
-				api.yaoPrompts.list(),
+				// 分类栏只需要 categories：走轻量路径，避免主进程全量 4000 行
+				// 提示词查询 + 逐行 gunzip 解压 description
+				api.yaoPrompts.list({ onlyCategories: true }),
 				getInstalledPromptNames(),
 			]);
 			setData(result);
@@ -75,7 +86,7 @@ export function YaoPromptTab(props: {
 			// 分类默认选择全部（不传 category），当 activeCategory 不为 null 时传它
 			const result = await api.yaoPrompts.list({
 				category: activeCategory || undefined,
-				search: searchQuery.trim() || undefined,
+				search: debouncedSearch.trim() || undefined,
 				page,
 				pageSize: PAGE_SIZE,
 			});

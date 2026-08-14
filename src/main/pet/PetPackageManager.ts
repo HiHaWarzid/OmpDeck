@@ -65,7 +65,17 @@ export class PetPackageManager {
 		spritePath: builtinSpritePath(p),
 	}));
 
+	/**
+	 * list 结果缓存：每个内置 spritesheet 6.2MB → ~8MB data URL，重编码是
+	 * 主进程 CPU + 内存大头。右键菜单/打开设置页/换宠物都会触发 list，
+	 * 静态资源会话内不变；TTL 60s 覆盖 petdex 包的新增场景。
+	 */
+	private listCache: { expiresAt: number; value: PetManifest[] } | null = null;
+	private static readonly LIST_TTL_MS = 60_000;
+
 	async list(): Promise<PetManifest[]> {
+		const now = Date.now();
+		if (this.listCache && this.listCache.expiresAt > now) return this.listCache.value;
 		const byId = new Map<string, PetManifest>();
 
 		// 内置包
@@ -94,7 +104,9 @@ export class PetPackageManager {
 			} catch { /* 单个包失败不影响整体 */ }
 		}
 
-		return [...byId.values()];
+		const value = [...byId.values()];
+		this.listCache = { expiresAt: now + PetPackageManager.LIST_TTL_MS, value };
+		return value;
 	}
 
 	async get(id: string): Promise<PetManifest | null> {

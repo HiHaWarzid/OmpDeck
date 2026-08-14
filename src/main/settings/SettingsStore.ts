@@ -246,9 +246,40 @@ export class SettingsStore {
     const { showThinking: _, ...safePatch } = patch;
     this.settings = { ...this.settings, ...safePatch };
     this.lastGetResult = null;
-    await this.save();
+    // 写盘防抖：连续操作（收藏模型切换、连续开关设置）合并为一次全量写。
+    // 内存态立即生效，磁盘写入延迟 150ms；退出路径由 flushSave 兜底。
+    this.scheduleSave();
     this.applyMenu();
     return this.get();
+  }
+
+  /** 防抖写盘（150ms 合并）。timer 触发时立即落盘；重复 update 只重置计时。 */
+  private saveTimer: NodeJS.Timeout | null = null;
+  private saveTimerPromise: Promise<void> | null = null;
+
+  private scheduleSave(): void {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.saveTimerPromise = this.save().catch(() => {});
+    }, 150);
+    this.saveTimer.unref?.();
+  }
+
+  /**
+   * 立即落盘挂起的设置（应用退出前调用）。
+   * 等待已排队的防抖写入完成后强制再写一次，保证最后一次 update 不丢失。
+   */
+  async flushSave(): Promise<void> {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (this.saveTimerPromise) {
+      await this.saveTimerPromise;
+      this.saveTimerPromise = null;
+    }
+    await this.save();
   }
 
   applyMenu() {

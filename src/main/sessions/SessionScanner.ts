@@ -15,6 +15,38 @@ import { extractMessageText, extractThinkingRaw } from "../pi/messageContent";
 import { toWslLinuxPath, type WslEnvironment } from "../wsl/WslPaths";
 import { SessionSummaryCache } from "./sessionSummaryCache";
 
+/** 本地模式扫描并发度：readFile/stat 是异步 IO，32 路足够打满磁盘吞吐且不爆句柄。 */
+const SCAN_CONCURRENCY_LOCAL = 32;
+/** WSL 模式扫描并发度：每个 stat/read 都 spawn 一个 wsl.exe（100~300ms 进程启动），
+ *  8 路并发已能占满 wsl.exe 吞吐，数百文件全并发会进程句柄爆炸。 */
+const SCAN_CONCURRENCY_WSL = 8;
+
+/**
+ * 以固定并发度映射数组。
+ * 替代无限制的 Promise.all：会话文件可能上千，本地模式避免同时持有上千个
+ * 文件句柄/主线程同步解析，WSL 模式避免同时 spawn 上千个 wsl.exe。
+ * 结果按输入顺序返回，与 Promise.all 语义一致。
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.min(limit, items.length);
+  if (workerCount === 0) return results;
+  const workers = Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export class SessionScanner {
   private readonly root = join(app.getPath("home"), ".omp", "agent", "sessions");
   private readonly codexRoot = join(app.getPath("home"), ".codex", "sessions");
@@ -188,9 +220,11 @@ export class SessionScanner {
         this.summaryCacheFileSetKey = fileSetKey;
       }
 
-      const summaries = await Promise.all(files.map(file =>
-        this.readSummary(file, signal).catch(rethrowAbort(null))
-      ));
+      const summaries = await mapWithConcurrency(
+        files,
+        this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
+        (file) => this.readSummary(file, signal).catch(rethrowAbort(null)),
+      );
       signal?.throwIfAborted();
 
       return summaries
@@ -212,8 +246,10 @@ export class SessionScanner {
       ? setTimeout(() => controller.abort(new Error("Session scan timed out")), this.scanTimeoutMs)
       : undefined;
     try {
-      const matched = await Promise.all(
-        summaries.map(summary => this.isSameProject(summary, projectPath, signal))
+      const matched = await mapWithConcurrency(
+        summaries,
+        this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
+        (summary) => this.isSameProject(summary, projectPath, signal),
       );
       signal?.throwIfAborted();
       return matched;

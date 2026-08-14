@@ -232,7 +232,8 @@ export const MessageListContent = memo(
 		);
 	},
 	(previous, next) =>
-		sameRenderMessageListForRender(previous.renderedRuns, next.renderedRuns) &&
+		// 廉价标量比较在前、深比较殿后：App 每次重渲染（含 thinking tick、
+		// 侧栏状态变化）都会跑比较器，标量不匹配时直接短路，省掉 O(runs) 深遍历。
 		previous.streamingMessageId === next.streamingMessageId &&
 		previous.agentRunning === next.agentRunning &&
 		previous.statusRunning === next.statusRunning &&
@@ -247,5 +248,6 @@ export const MessageListContent = memo(
 		previous.activeAgentId === next.activeAgentId &&
 		previous.forkingMessageId === next.forkingMessageId &&
 		previous.validCommandNames === next.validCommandNames &&
-		previous.validFilePaths === next.validFilePaths,
+		previous.validFilePaths === next.validFilePaths &&
+		sameRenderMessageListForRender(previous.renderedRuns, next.renderedRuns),
 );

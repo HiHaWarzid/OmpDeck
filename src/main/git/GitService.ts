@@ -20,19 +20,20 @@ export class GitService {
 	/**
 	 * git:status 冷却缓存：同一 cwd 在 TTL 内重复请求直接复用结果，并发请求共享同一 in-flight
 	 * promise。getStatus 每次 spawn 2 个 git 子进程，抽屉打开/刷新/连续点击时按项目去重。
-	 * 写操作（stage/unstage/discard/commit/checkout 等）调用 invalidateStatus 主动失效，
-	 * 保证冷却窗口内不返回过期的工作区状态。
+	 * TTL 保持短窗口（500ms）：外部终端/IDE 的 git 变更必须在下一次查询立即可见，
+	 * 拉长 TTL（≥轮询间隔）会让外部变更在窗口内永远命中陈旧结果。
+	 * 写操作（stage/unstage/discard/commit/checkout 等）调用 invalidateStatus 主动失效。
 	 */
 	private readonly statusCache = new Map<string, { expiresAt: number; promise: Promise<GitResourceGroups> }>();
 	private static readonly GIT_STATUS_TTL_MS = 500;
 
 	/**
 	 * git:branches 冷却缓存：getBranches 每次 spawn 2 个 git 子进程且原实现无缓存，
-	 * App 每 10s 轮询 + 工作区/侧栏 chip 展示会重复触发。TTL 5s：面板轮询间隔内的
-	 * 重复请求直接命中，分支变更（checkout/createBranch）主动失效。
+	 * App 每 10s 轮询 + 工作区/侧栏 chip 展示会重复触发。TTL 与 App 的 10s 轮询间隔
+	 * 对齐：轮询窗口内的重复请求直接命中；分支变更（checkout/createBranch）主动失效。
 	 */
 	private readonly branchesCache = new Map<string, { expiresAt: number; value: GitBranchInfo }>();
-	private static readonly GIT_BRANCHES_TTL_MS = 5_000;
+	private static readonly GIT_BRANCHES_TTL_MS = 10_000;
 
 	/** 工作区被修改后调用：清除该项目的 status 冷却缓存，下次请求强制重新 spawn git。 */
 	invalidateStatusCache(cwd: string): void {

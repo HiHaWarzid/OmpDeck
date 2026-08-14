@@ -631,14 +631,6 @@ async function createWindow() {
 			arch: process.arch,
 		});
 	});
-	// 子进程（含 GPU/utility）异常退出：Mac 上偶发“整窗闪一下”，需要留下 reason/exitCode。
-	app.on("child-process-gone", (_event, details) => {
-		void appLogger.error("process", "Child process gone", {
-			...details,
-			platform: process.platform,
-			arch: process.arch,
-		});
-	});
 	mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
 		void appLogger.error("app", "Main window preload failed", {
 			preloadPath,
@@ -1283,6 +1275,17 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	}, 0);
 }
 
+// 子进程（含 GPU/utility）异常退出：Mac 上偶发"整窗闪一下"，需要留下 reason/exitCode。
+// 注册在模块级而非 createWindow 内：窗口重建（版本唤起恢复、macOS activate）时
+// 不会累积重复的 app 级监听器。
+app.on("child-process-gone", (_event, details) => {
+	void appLogger.error("process", "Child process gone", {
+		...details,
+		platform: process.platform,
+		arch: process.arch,
+	});
+});
+
 app.on("before-quit", () => {
 	isQuitting = true;
 	trayManager?.destroy();
@@ -1291,6 +1294,10 @@ app.on("before-quit", () => {
 	agentManager?.stopAll();
 	// 退出前刷盘会话摘要缓存，保证下次冷启动可复用未变化文件的摘要。
 	void sessionScanner?.flushSummaryCache();
+	// 退出前刷盘防抖中的设置写入，保证最后一次 update 不丢失。
+	void settingsStore.flushSave().catch((error) => {
+		void appLogger.warn("settings", "Failed to flush settings on quit", error);
+	});
 	petSystem?.stop();
 	petSystem = null;
 	quickGen?.stop();

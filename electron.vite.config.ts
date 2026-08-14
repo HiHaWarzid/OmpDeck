@@ -83,6 +83,13 @@ export default defineConfig({
           // 利用 Rollup 的 chunk 缓存机制：vendor 不变时浏览器复用缓存，加快二次加载。
           // Mermaid 已在渲染层用 dynamic import 惰性加载，此处不额外聚合，避免破坏已有 code splitting。
           manualChunks(id) {
+            // __vitePreload helper 必须独立成小 chunk：Vite 会把它提升进某个 async
+            // chunk（历史上落在 vendor-monaco 8.1MB 里），而入口 chunk 因为自身大量
+            // lazy()/import() 需要 import 该 helper → 整个 monaco-editor 被拖进首屏
+            // 关键路径执行。独立分 chunk 后 helper 只有 ~1KB，首屏不再加载 monaco。
+            if (id.includes("vite/preload-helper")) {
+              return "vendor-preload";
+            }
             if (id.includes("/node_modules/react/") || id.includes("/node_modules/react-dom/") || id.includes("/node_modules/scheduler/")) {
               return "vendor-react";
             }

@@ -115,7 +115,15 @@ export class WebServiceManager {
 				return;
 			}
 			if (url.pathname === "/api/state") {
-				this.sendJson(response, this.getState());
+				// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
+				// 的双重序列化（web UI 每 600ms 轮询，命中缓存时零 stringify 开销）
+				const payload = this.getStatePayload();
+				response.writeHead(200, {
+					"content-type": "application/json; charset=utf-8",
+					"cache-control": "no-store",
+					"access-control-allow-origin": "*",
+				});
+				response.end(payload);
 				return;
 			}
 			const sessionsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions$/);
@@ -215,16 +223,45 @@ export class WebServiceManager {
 			await this.serveRenderer(url.pathname, response);
 	}
 
-	private getState() {
+	/**
+	 * /api/state 序列化缓存：web UI 每 600ms 轮询一次，流式期间消息逐条增长，
+	 * 每次都全量 JSON.stringify 所有 agent 全部消息是主进程 CPU 大头。
+	 * 指纹覆盖 agents 状态与每个 agent 消息数组的（长度、末条 id/timestamp/文本长度），
+	 * 覆盖流式追加、工具消息就地更新（timestamp 变化）、消息增删；
+	 * 指纹未变（轮询间隔内无新内容）时直接复用上次的 JSON 字符串。
+	 */
+	private statePayloadCache: { fingerprint: string; payload: string } | null = null;
+
+	private getStatePayload(): string {
 		const agents = this.deps.listAgents();
-		const messagesByAgent = Object.fromEntries(
-			agents.map((agent) => [agent.id, this.deps.getMessages(agent.id)]),
-		);
-		return {
+		const fingerprint = agents
+			.map((agent) => {
+				const messages = this.deps.getMessages(agent.id);
+				const last = messages[messages.length - 1];
+				return [
+					agent.id,
+					agent.status,
+					agent.title,
+					messages.length,
+					last?.id ?? "",
+					last?.timestamp ?? 0,
+					last?.text?.length ?? 0,
+				].join(":");
+			})
+			.join("|");
+		if (this.statePayloadCache && this.statePayloadCache.fingerprint === fingerprint) {
+			return this.statePayloadCache.payload;
+		}
+		const state = {
 			projects: this.deps.listProjects(),
 			agents,
-			messagesByAgent,
+			messagesByAgent: Object.fromEntries(
+				agents.map((agent) => [agent.id, this.deps.getMessages(agent.id)]),
+			),
 		};
+		const payload = JSON.stringify(state);
+		this.statePayloadCache = { fingerprint, payload };
+		return payload;
 	}
 
 	private renderPage() {

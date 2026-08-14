@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -107,21 +107,31 @@ type ImportType = "opencode_import" | "claude_import" | "codex_import";
  * 读取目标 pi 会话文件头部 8 行，提取上次导入时记录的源 mtime/size。
  * 用于判断源文件是否已更新（new / current / outdated 三态）。
  * importType 区分不同源写入的 import 标记字段名。
+ *
+ * 只定位读文件前 8KB（头部 8 行足够容纳 import 标记行），不整文件读入——
+ * 已导入的 pi 目标文件可能是完整会话（数 MB），scan() 中每个会话都会调用一次。
  */
 export async function readImportMeta(
 	targetPath: string,
 	importType: ImportType,
 ): Promise<ImportMeta | undefined> {
 	try {
-		const raw = await readFile(targetPath, "utf8");
-		for (const line of raw.split(/\r?\n/).filter(Boolean).slice(0, 8)) {
-			const entry = JSON.parse(line) as Record<string, unknown>;
-			if (entry.type === importType) {
-				return {
-					sourceMtime: Number(entry.sourceMtime),
-					sourceSize: Number(entry.sourceSize),
-				};
+		const handle = await open(targetPath, "r");
+		try {
+			const buffer = Buffer.alloc(8 * 1024);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+			const head = buffer.subarray(0, bytesRead).toString("utf8");
+			for (const line of head.split(/\r?\n/).filter(Boolean).slice(0, 8)) {
+				const entry = JSON.parse(line) as Record<string, unknown>;
+				if (entry.type === importType) {
+					return {
+						sourceMtime: Number(entry.sourceMtime),
+						sourceSize: Number(entry.sourceSize),
+					};
+				}
 			}
+		} finally {
+			await handle.close();
 		}
 	} catch {
 		return undefined;

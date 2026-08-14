@@ -111,11 +111,7 @@ export class PetWindow {
 			if (!this.exists) return;
 			const b = this.win!.getBounds();
 			this.pendingPos = { x: b.x, y: b.y };
-			if (this.saveTimer) return;
-			this.saveTimer = setTimeout(() => {
-				this.saveTimer = null;
-				if (this.pendingPos) { const p = this.pendingPos; this.pendingPos = null; void savePos(p); }
-			}, 400);
+			this.scheduleSave();
 		});
 
 		if (!is.dev) {
@@ -169,7 +165,24 @@ export class PetWindow {
 			width: this.targetSize.width,
 			height: this.targetSize.height,
 		});
-		void savePos({ x, y });
+		// 位置持久化统一走 400ms 防抖（与 moved 事件同路径）：
+		// 巡游每 50ms 调一次 moveTo，直接写盘 = 20 次/秒全量 JSON 写，
+		// 会拖慢主进程并放大 tick 抖动。destroy() 时会冲刷挂起位置。
+		this.pendingPos = { x, y };
+		this.scheduleSave();
+	}
+
+	/** 调度位置持久化（400ms 合并），巡游/拖拽高频移动时只写最后一次。 */
+	private scheduleSave() {
+		if (this.saveTimer) return;
+		this.saveTimer = setTimeout(() => {
+			this.saveTimer = null;
+			if (this.pendingPos) {
+				const pending = this.pendingPos;
+				this.pendingPos = null;
+				void savePos(pending);
+			}
+		}, 400);
 	}
 
 	/** 将当前窗口拉回业务目标尺寸，用于拖拽结束后纠正系统合成器造成的尺寸漂移。 */

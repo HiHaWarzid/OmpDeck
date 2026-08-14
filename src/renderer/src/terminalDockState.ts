@@ -94,20 +94,34 @@ export function setTerminalDockCollapsed(
 /**
  * 只按对应集合裁剪：agent 键对照 liveAgentIds，project 键对照 liveProjectIds。
  * 历史 bug：用 agentId 集合 prune projectId 键，流式/状态推送时会把 open 清掉。
+ * 没有任何键被裁剪时返回原引用，避免 App 每次 displayAgents/projects 变化
+ * 都以新对象触发重渲染。
  */
 export function pruneTerminalDockState(
 	current: TerminalDockStateByOwner,
 	liveAgentIds: Set<string>,
 	liveProjectIds: Set<string>,
 ): TerminalDockStateByOwner {
-	return Object.fromEntries(
-		Object.entries(current).filter(([key]) => {
-			const owner = parseTerminalOwnerKey(key);
-			if (!owner) return false;
-			if (owner.kind === "agent") return liveAgentIds.has(owner.id);
-			return liveProjectIds.has(owner.id);
-		}),
-	);
+	let changed = false;
+	const next: TerminalDockStateByOwner = {};
+	for (const [key, value] of Object.entries(current)) {
+		const owner = parseTerminalOwnerKey(key);
+		if (!owner) {
+			changed = true;
+			continue;
+		}
+		if (owner.kind === "agent") {
+			if (!liveAgentIds.has(owner.id)) {
+				changed = true;
+				continue;
+			}
+		} else if (!liveProjectIds.has(owner.id)) {
+			changed = true;
+			continue;
+		}
+		next[key] = value;
+	}
+	return changed ? next : current;
 }
 
 /** pending agent → 真实 agent 时，把 UI 状态迁到新 id（与其它 agent 记录迁移一致） */

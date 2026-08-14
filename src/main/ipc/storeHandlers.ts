@@ -360,6 +360,7 @@ export function registerStoreHandlers(deps: StoreHandlerDeps) {
 			search?: string;
 			page?: number;
 			pageSize?: number;
+			onlyCategories?: boolean;
 		}) => {
 			try {
 				const result = await xuePromptManager.list(opts);

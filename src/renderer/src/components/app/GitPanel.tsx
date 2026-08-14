@@ -1041,11 +1041,35 @@ export function GitPanel(props: GitPanelProps) {
   }, [refresh]);
 
   // 静默轮询：每 5 秒拉取一次最新工作区状态，不显示 loading 动画、不覆盖错误。
+  // 窗口隐藏/最小化时暂停（React 定时器不随 document.hidden 暂停，抽屉不可见时
+  // 继续 spawn git 纯属浪费），恢复可见时立即补一次并重启定时器。
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      void refresh(true);
-    }, 5000);
-    return () => window.clearInterval(timer);
+    let timer: number | undefined;
+    const start = () => {
+      if (timer !== undefined) return;
+      timer = window.setInterval(() => {
+        void refresh(true);
+      }, 5000);
+    };
+    const stop = () => {
+      if (timer !== undefined) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else {
+        void refresh(true);
+        start();
+      }
+    };
+    start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [refresh]);
 
   const toggleResource = (key: keyof typeof resourceOpen) => {
