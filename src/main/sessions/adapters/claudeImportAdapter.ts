@@ -31,6 +31,65 @@ export class ClaudeImportAdapter implements SourceAdapter {
 
 	constructor(private readonly claudeRoot: string) {}
 
+	/**
+	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
+	 * 计数与标题规则与 convert 完全一致（pushMessage 的过滤条件逐条镜像），
+	 * 一致性由 importPipeline.test.ts 的对照测试兜底。
+	 */
+	summarize(
+		projectPath: string,
+		session: ParsedSession,
+	): { title: string; preview: string; messageCount: number } {
+		const entries = session.entries as Array<Record<string, unknown>>;
+		let title = "";
+		let preview = "";
+		let messageCount = 0;
+
+		for (const entry of entries) {
+			if (entry.type === "user") {
+				const message = entry.message as Record<string, unknown> | undefined;
+				const text = String(message?.content ?? "").trim();
+				// 与 convert 的 user 分支一致：text 非空才计一条；preview 取第一条非空文本
+				if (text) {
+					messageCount += 1;
+					if (!preview) preview = text.slice(0, 160);
+					if (!title) title = cleanTitle(text);
+				}
+				continue;
+			}
+			if (entry.type === "assistant") {
+				const message = entry.message as Record<string, unknown> | undefined;
+				if (!message) continue;
+				let hasContent = false;
+				const msgContent = message.content;
+				if (Array.isArray(msgContent)) {
+					for (const item of msgContent as Array<Record<string, unknown>>) {
+						if (item.type === "text") {
+							const text = String(item.text ?? "").trim();
+							if (text && !preview) preview = text.slice(0, 160);
+							hasContent = true;
+						} else if (item.type === "thinking" || item.type === "tool_use") {
+							hasContent = true;
+						}
+					}
+				}
+				// 与 convert 一致：content 非空才计一条
+				if (hasContent) messageCount += 1;
+				continue;
+			}
+			// tool_result 与 convert 一致：无条件计一条（输出为空也 push）
+			if (entry.type === "tool_result") {
+				messageCount += 1;
+			}
+		}
+
+		return {
+			title: title || cleanTitle(basename(session.sourcePath)) || "Claude 会话",
+			preview: preview || "Claude imported session",
+			messageCount,
+		};
+	}
+
 
 	convert(projectPath: string, session: ParsedSession): ConvertedSession {
 		const meta = session.meta as unknown as ParsedClaudeSession["meta"];

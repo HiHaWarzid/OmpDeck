@@ -29,6 +29,91 @@ export class CodexImportAdapter implements SourceAdapter {
 
 	constructor(private readonly codexRoot: string) {}
 
+	/**
+	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
+	 * 逐条镜像 convert 的 pushMessage 过滤/提取规则（含 pendingThinking 累积、
+	 * toolCall 的 name 参与 extractPiText），一致性由 importPipeline.test.ts 对照兜底。
+	 */
+	summarize(
+		projectPath: string,
+		session: ParsedSession,
+	): { title: string; preview: string; messageCount: number } {
+		const entries = session.entries as Array<Record<string, unknown>>;
+		const titleState = { title: "", preview: "" };
+		let messageCount = 0;
+		let pendingThinking = "";
+
+		const pushMessageLike = (role: "user" | "assistant" | "toolResult", content: unknown[]) => {
+			// 与 convert 的 pushMessage 一致：content 空数组不计数
+			if (content.length === 0) return;
+			messageCount += 1;
+			const text = extractPiText(content).trim();
+			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
+			if (role === "user" && text && !titleState.title) {
+				titleState.title = cleanTitle(text);
+			}
+		};
+
+		for (const entry of entries) {
+			if (
+				entry.type === "event_msg" &&
+				(entry.payload as Record<string, unknown> | undefined)?.type === "user_message"
+			) {
+				const payload = entry.payload as Record<string, unknown>;
+				const text = String(payload.message ?? "").trim();
+				if (text) pushMessageLike("user", [{ type: "text", text }]);
+				continue;
+			}
+			if (entry.type !== "response_item") continue;
+			const payload = (entry.payload ?? {}) as Record<string, unknown>;
+
+			if (payload.type === "reasoning") {
+				const reasoning = this.extractCodexText(payload).trim();
+				if (reasoning) pendingThinking = this.joinText(pendingThinking, reasoning);
+				continue;
+			}
+
+			if (payload.type === "message" && payload.role === "assistant") {
+				const text = this.extractCodexText(payload).trim();
+				const content = [
+					...(pendingThinking
+						? [{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" }]
+						: []),
+					...(text ? [{ type: "text", text }] : []),
+				];
+				pendingThinking = "";
+				pushMessageLike("assistant", content);
+				continue;
+			}
+
+			if (payload.type === "function_call") {
+				pendingThinking = "";
+				// convert 中 content 含 toolCall（name 参与 extractPiText），恒非空必计数
+				pushMessageLike("assistant", [
+					{ type: "toolCall", name: String(payload.name ?? "tool") },
+				]);
+				continue;
+			}
+
+			if (payload.type === "function_call_output") {
+				const output = this.extractToolOutput(payload);
+				pushMessageLike("toolResult", [{ type: "text", text: output }]);
+			}
+		}
+
+		if (pendingThinking) {
+			pushMessageLike("assistant", [
+				{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" },
+			]);
+		}
+
+		return {
+			title: titleState.title || cleanTitle(basename(session.sourcePath)) || "Codex 会话",
+			preview: titleState.preview || "Codex imported session",
+			messageCount,
+		};
+	}
+
 	async discover(projectPath: string): Promise<ParsedSession[]> {
 		const files = await this.collectJsonl(this.codexRoot).catch(() => []);
 		const sessions = await Promise.all(

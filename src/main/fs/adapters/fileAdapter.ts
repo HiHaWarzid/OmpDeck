@@ -19,6 +19,13 @@ export interface FileAdapter {
 	write(path: string, content: string): Promise<void>;
 	/** 获取修改时间和大小（缓存指纹） */
 	stat(path: string, signal?: AbortSignal): Promise<FileVersion>;
+	/**
+	 * 批量获取指纹（可选）。WSL 实现把整批合并为单次 wsl.exe 进程，
+	 * 消除「每文件 spawn 一次」的扫描瓶颈；本地实现不提供（单次 stat 足够便宜）。
+	 * 返回的 Map key 必须与传入 paths 完全一致（原样字符串）；单个文件失败时
+	 * 该条目不写入 Map，调用方对缺失条目回退逐文件 stat。
+	 */
+	statMany?(paths: string[], signal?: AbortSignal): Promise<Map<string, FileVersion>>;
 	/** 检查文件是否存在 */
 	exists(path: string, signal?: AbortSignal): Promise<boolean>;
 	/** 检查目录是否存在 */

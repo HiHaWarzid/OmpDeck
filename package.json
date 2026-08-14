@@ -72,9 +72,9 @@
     "docs:preview": "vitepress preview docs-site",
     "postinstall": "node scripts/fix-pty-permissions.js",
     "typecheck": "tsc --noEmit",
-  "test": "vitest run",
-  "test:watch": "vitest",
-  "test:node": "node --experimental-strip-types --test \"tests/*.test.mjs\"",
+    "test": "vitest run --execArgv=--experimental-sqlite",
+    "test:watch": "vitest --execArgv=--experimental-sqlite",
+    "test:node": "node --experimental-strip-types --test \"tests/*.test.mjs\"",
     "make-icon": "node scripts/make-icon.js",
     "compile-exe": "node scripts/compile-exe.js"
   },

@@ -9,22 +9,36 @@ import * as monaco from "monaco-editor";
 // monaco-editor 0.56 的 exports map 为 "./*": "./esm/vs/*.js"，深路径导入必须去掉 esm/vs 前缀，
 // 否则 Rollup 按 exports 重写后指向不存在的 esm/vs/esm/vs/... 路径导致构建失败。
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
-import JsonWorker from "monaco-editor/language/json/json.worker?worker";
-import CssWorker from "monaco-editor/language/css/css.worker?worker";
-import HtmlWorker from "monaco-editor/language/html/html.worker?worker";
 
-// 缓存 TsWorker 实例，防止多次打开 TS 文件时重复加载
-let tsWorkerPromise: Promise<Worker> | null = null;
-async function getTsWorker(): Promise<Worker> {
-	if (!tsWorkerPromise) {
-		tsWorkerPromise = (async () => {
-			// 动态 import TypeScript Worker，Vite 会将其拆为独立 chunk，仅在首次访问 TS/JS 语言时下载
-			const mod = await import("monaco-editor/language/typescript/ts.worker?worker");
-			return new mod.default();
-		})();
-	}
-	return tsWorkerPromise;
+/**
+ * 惰性 worker 工厂：首次访问对应语言时才动态 import worker chunk，并缓存实例。
+ * json/css/html worker（共 ~3.9MB）与 ts.worker 一样按需加载——
+ * 打开纯文本/未知语言文件时只需 editor.worker（571KB），不必下载全部语言 worker。
+ */
+function makeLazyWorker(
+	importFn: () => Promise<{ default: new () => Worker }>,
+): () => Promise<Worker> {
+	let promise: Promise<Worker> | null = null;
+	return () => {
+		if (!promise) {
+			promise = importFn().then((mod) => new mod.default());
+		}
+		return promise;
+	};
 }
+
+const getTsWorker = makeLazyWorker(() =>
+	import("monaco-editor/language/typescript/ts.worker?worker"),
+);
+const getJsonWorker = makeLazyWorker(() =>
+	import("monaco-editor/language/json/json.worker?worker"),
+);
+const getCssWorker = makeLazyWorker(() =>
+	import("monaco-editor/language/css/css.worker?worker"),
+);
+const getHtmlWorker = makeLazyWorker(() =>
+	import("monaco-editor/language/html/html.worker?worker"),
+);
 
 export function setupMonaco(): void {
 	self.MonacoEnvironment = {
@@ -34,15 +48,15 @@ export function setupMonaco(): void {
 				case "javascript":
 					return getTsWorker();
 				case "json":
-					return new JsonWorker();
+					return getJsonWorker();
 				case "css":
 				case "scss":
 				case "less":
-					return new CssWorker();
+					return getCssWorker();
 				case "html":
 				case "handlebars":
 				case "razor":
-					return new HtmlWorker();
+					return getHtmlWorker();
 				default:
 					return new EditorWorker();
 			}

@@ -124,6 +124,41 @@ export class WslFileAdapter implements FileAdapter {
 		return value;
 	}
 
+	/**
+	 * 批量 stat：一次 wsl.exe 进程处理一批路径（`stat -c "%Y %s %n"` 按行输出），
+	 * 把扫描的 N 次 spawn 降为 ceil(N/100) 次。Windows 命令行长度限制（~32KB）
+	 * 决定分批大小；单条失败（文件被并发删除）不写 Map，调用方回退逐文件 stat。
+	 */
+	async statMany(paths: string[], signal?: AbortSignal): Promise<Map<string, FileVersion>> {
+		const result = new Map<string, FileVersion>();
+		if (paths.length === 0) return result;
+		const BATCH_SIZE = 100;
+		for (let offset = 0; offset < paths.length; offset += BATCH_SIZE) {
+			const batch = paths.slice(offset, offset + BATCH_SIZE);
+			// 整批 stat 失败（竞态删除等）时跳过本批，缺的条目由调用方逐文件回退
+			const { stdout } = await this.run(
+				[...this.baseArgs("stat"), "-c", "%Y %s %n", ...batch],
+				{ timeout: 15_000, signal, maxBuffer: 16 * 1024 * 1024 },
+			).catch(() => ({ stdout: "" }));
+			for (const line of stdout.split("\n")) {
+				if (!line) continue;
+				// 行格式：`<mtime秒> <size> <path>`；path 可能含空格，取前两个分隔符后剩余部分
+				const first = line.indexOf(" ");
+				const second = line.indexOf(" ", first + 1);
+				if (first <= 0 || second <= 0) continue;
+				const mtimeSeconds = Number(line.slice(0, first));
+				const size = Number(line.slice(first + 1, second));
+				const path = line.slice(second + 1);
+				if (!Number.isFinite(mtimeSeconds) || !Number.isFinite(size)) continue;
+				const value: FileVersion = { mtimeMs: mtimeSeconds * 1000, size };
+				result.set(path, value);
+				// 同步进短 TTL 缓存，后续单文件 stat（项目归属判断等）直接命中
+				this.statCache.set(path, { at: Date.now(), value });
+			}
+		}
+		return result;
+	}
+
 	async exists(path: string, signal?: AbortSignal): Promise<boolean> {
 		try {
 			await this.run([...this.baseArgs("test"), "-f", path], {

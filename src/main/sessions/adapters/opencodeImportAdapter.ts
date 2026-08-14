@@ -39,6 +39,72 @@ export class OpenCodeImportAdapter implements SourceAdapter {
 
 	constructor(private readonly dbPath: string) {}
 
+	/**
+	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
+	 * 逐条镜像 convert 的 part 组装与 pushMessage 过滤规则（tool part 在非
+	 * assistant role 下即时计数、toolCall 的 name 参与 extractPiText）。
+	 */
+	summarize(
+		projectPath: string,
+		session: ParsedSession,
+	): { title: string; preview: string; messageCount: number } {
+		const messages = session.entries as OpenCodeMessage[];
+		const titleState = { title: "", preview: "" };
+		let messageCount = 0;
+
+		const pushMessageLike = (role: "user" | "assistant" | "toolResult", content: unknown[]) => {
+			if (content.length === 0) return;
+			messageCount += 1;
+			const text = extractPiText(content).trim();
+			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
+			if (role === "user" && text && !titleState.title) titleState.title = cleanTitle(text);
+		};
+
+		for (const message of messages) {
+			const messageData = message.data as Record<string, unknown>;
+			const role = messageData.role as string | undefined;
+			const content: unknown[] = [];
+			for (const part of message.parts) {
+				const partData = part.data as Record<string, unknown>;
+				if (partData.type === "text" && partData.text) {
+					content.push({ type: "text", text: String(partData.text) });
+				} else if (partData.type === "reasoning" && partData.text) {
+					content.push({ type: "thinking", thinking: String(partData.text), thinkingSignature: "opencode_reasoning" });
+				} else if (partData.type === "tool") {
+					if (role === "assistant") {
+						content.push({
+							type: "toolCall",
+							name: String(partData.tool ?? "tool"),
+						});
+					} else {
+						// 与 convert 一致：非 assistant 的 tool part 立即计一条 toolResult
+						pushMessageLike("toolResult", [
+							{ type: "text", text: this.extractToolOutput(partData) },
+						]);
+					}
+				}
+			}
+
+			if (role === "user") {
+				pushMessageLike("user", content);
+			} else if (role === "assistant") {
+				pushMessageLike("assistant", content);
+			}
+		}
+
+		const meta = session.meta as Record<string, unknown>;
+		return {
+			// 与 convert 的 fallback 顺序完全一致：meta.title → 首条 user → sourcePath 尾部 → 默认
+			title:
+				cleanTitle(String(meta.title ?? "")) ||
+				titleState.title ||
+				cleanTitle(session.sourcePath.split("#")[1] ?? session.sourcePath) ||
+				"OpenCode 会话",
+			preview: titleState.preview || "OpenCode imported session",
+			messageCount,
+		};
+	}
+
 	async discover(projectPath: string): Promise<ParsedSession[]> {
 		const info = await stat(this.dbPath);
 		const normalizedProject = normalizePath(projectPath);

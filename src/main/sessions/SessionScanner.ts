@@ -220,10 +220,17 @@ export class SessionScanner {
         this.summaryCacheFileSetKey = fileSetKey;
       }
 
+      // 指纹预取：WSL 模式下 statMany 把 N 次 wsl.exe spawn 合并为 ceil(N/100) 次，
+      // readSummary 直接消费预取结果；本地模式无 statMany，保持逐文件 stat。
+      const prefetchedVersions = this.fileAdapter.statMany
+        ? await this.fileAdapter.statMany(files, signal).catch(() => undefined)
+        : undefined;
+
       const summaries = await mapWithConcurrency(
         files,
         this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
-        (file) => this.readSummary(file, signal).catch(rethrowAbort(null)),
+        (file) =>
+          this.readSummary(file, signal, prefetchedVersions?.get(file)).catch(rethrowAbort(null)),
       );
       signal?.throwIfAborted();
 
@@ -793,10 +800,16 @@ export class SessionScanner {
     return false;
   }
 
-  private async readSummary(filePath: string, signal?: AbortSignal): Promise<SessionSummary | null> {
+  private async readSummary(
+    filePath: string,
+    signal?: AbortSignal,
+    prefetchedVersion?: FileVersion,
+  ): Promise<SessionSummary | null> {
     // 先读取轻量文件指纹；未变化时复用摘要，避免周期扫描反复读取和解析全部 JSONL。
+    // 指纹优先用 scanOnce 的批量预取结果（WSL 单次进程拿全部），缺失时回退单文件 stat。
     const isWsl = this.isWslPath(filePath);
-    const info = await this.fileAdapter.stat(filePath, signal);
+    const info =
+      prefetchedVersion ?? (await this.fileAdapter.stat(filePath, signal));
     const version = { mtimeMs: info.mtimeMs, size: info.size };
     const cached = this.summaryCache.get(filePath, version);
     if (cached !== undefined) return cached;

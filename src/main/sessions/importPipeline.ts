@@ -42,6 +42,12 @@ export interface SourceAdapter {
 	discover(projectPath: string): Promise<ParsedSession[]>;
 	/** 将单个会话转为 pi JSONL 格式 */
 	convert(projectPath: string, session: ParsedSession): ConvertedSession;
+	/**
+	 * 轻量摘要（可选）：scan 列表只需要 title/preview/messageCount。
+	 * 实现应跳过完整 pi JSONL 行构造（convert 的 raw 是大头），只遍历源条目
+	 * 提取三项，且必须与 convert 的结果完全一致。未提供时 pipeline 回退 convert。
+	 */
+	summarize?(projectPath: string, session: ParsedSession): { title: string; preview: string; messageCount: number };
 }
 
 /**
@@ -194,7 +200,19 @@ export class ImportPipeline {
 	): Promise<ImportSummary> {
 		const targetPath = buildTargetPath(this.piRoot, projectPath, adapter.filePrefix, session.id);
 		const importMeta = await readImportMeta(targetPath, this.importType(adapter.source));
-		const converted = adapter.convert(projectPath, session);
+		// 轻量摘要：适配器提供 summarize 时跳过完整 JSONL 行构造（scan 只消费
+		// title/preview/messageCount，convert 的 raw 对 N 个会话是纯浪费）
+		let summary: { title: string; preview: string; messageCount: number };
+		if (adapter.summarize) {
+			summary = adapter.summarize(projectPath, session);
+		} else {
+			const converted = adapter.convert(projectPath, session);
+			summary = {
+				title: converted.title,
+				preview: converted.preview,
+				messageCount: converted.messageCount,
+			};
+		}
 		const status = computeImportStatus(importMeta, session.sourceMtime, session.sourceSize);
 
 		return {
@@ -202,11 +220,11 @@ export class ImportPipeline {
 			sourcePath: session.sourcePath,
 			targetPath,
 			cwd: session.cwd,
-			title: converted.title,
-			preview: converted.preview,
+			title: summary.title,
+			preview: summary.preview,
 			createdAt: session.createdAt,
 			updatedAt: session.updatedAt,
-			messageCount: converted.messageCount,
+			messageCount: summary.messageCount,
 			status,
 			sourceSize: session.sourceSize,
 			importedSourceMtime: importMeta?.sourceMtime,

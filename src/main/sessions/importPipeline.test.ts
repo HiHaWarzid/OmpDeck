@@ -7,6 +7,9 @@ import { test } from "vitest";
 import { ImportPipeline } from "./importPipeline";
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "./importPipeline";
 import { buildTargetPath, cleanTitle, computeImportStatus, makeId, safePathToken } from "./importShared";
+import { ClaudeImportAdapter } from "./adapters/claudeImportAdapter";
+import { CodexImportAdapter } from "./adapters/codexImportAdapter";
+import { OpenCodeImportAdapter } from "./adapters/opencodeImportAdapter";
 
 // ── Fake adapter：验证 pipeline 编排，不验证格式转换 ────
 
@@ -242,4 +245,95 @@ test("computeImportStatus returns correct state", () => {
 	assert.equal(computeImportStatus({ sourceMtime: 1000, sourceSize: 200 }, 1000, 200), "current");
 	assert.equal(computeImportStatus({ sourceMtime: 1000, sourceSize: 200 }, 2000, 200), "outdated");
 	assert.equal(computeImportStatus({ sourceMtime: 1000, sourceSize: 200 }, 1000, 300), "outdated");
+});
+
+// ── 适配器 summarize 与 convert 一致性 ─────────────────
+
+function makeParsedSession(overrides: Partial<ParsedSession> = {}): ParsedSession {
+	return {
+		id: "session-1",
+		sourcePath: "/fake/source.jsonl",
+		sourceSize: 100,
+		sourceMtime: 1000,
+		meta: {},
+		entries: [],
+		cwd: "/project",
+		createdAt: 1000,
+		updatedAt: 2000,
+		...overrides,
+	};
+}
+
+test("Claude summarize matches convert for mixed entries", () => {
+	const adapter = new ClaudeImportAdapter("/tmp/fake-claude-root");
+	const session = makeParsedSession({
+		meta: { sessionId: "s1", cwd: "/project", firstTimestamp: 1000, lastTimestamp: 2000 },
+		entries: [
+			{ type: "user", sessionId: "s1", cwd: "/project", message: { content: "first question" } },
+			{ type: "assistant", message: { content: [{ type: "text", text: "hello answer" }], model: "claude-3" } },
+			{ type: "tool_result", tool_use_id: "t1", content: [{ type: "tool_result", content: "output" }] },
+			{ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "bash", input: {} }] } },
+			{ type: "system", subtype: "turn_duration" }, // 跳过
+			{ type: "user", message: { content: "" } }, // 空文本不计数
+		],
+	});
+	const converted = adapter.convert("/project", session);
+	const summarized = adapter.summarize("/project", session);
+	assert.equal(summarized.title, converted.title);
+	assert.equal(summarized.preview, converted.preview);
+	assert.equal(summarized.messageCount, converted.messageCount);
+});
+
+test("Codex summarize matches convert for mixed entries", () => {
+	const adapter = new CodexImportAdapter("/tmp/fake-codex-root");
+	const session = makeParsedSession({
+		meta: { id: "cx1", cwd: "/project", model: "gpt-5", model_provider: "openai" },
+		entries: [
+			{ type: "event_msg", payload: { type: "user_message", message: "build it" } },
+			{ type: "response_item", payload: { type: "reasoning", summary: "thinking hard" } },
+			{ type: "response_item", payload: { type: "message", role: "assistant", content: "done" } },
+			{ type: "response_item", payload: { type: "function_call", call_id: "c1", name: "bash", arguments: "{}" } },
+			{ type: "response_item", payload: { type: "function_call_output", call_id: "c1", output: "ok" } },
+			{ type: "event_msg", payload: { type: "user_message", message: "" } }, // 空不计数
+		],
+	});
+	const converted = adapter.convert("/project", session);
+	const summarized = adapter.summarize("/project", session);
+	assert.equal(summarized.title, converted.title);
+	assert.equal(summarized.preview, converted.preview);
+	assert.equal(summarized.messageCount, converted.messageCount);
+});
+
+test("OpenCode summarize matches convert for mixed messages", () => {
+	const adapter = new OpenCodeImportAdapter("/tmp/fake-opencode.db");
+	const session = makeParsedSession({
+		meta: { id: "oc1", time_created: 1000, model: "gpt-5" },
+		entries: [
+			{
+				id: "m1", time_created: 1000, time_updated: 1000,
+				data: { role: "user" },
+				parts: [{ id: "p1", message_id: "m1", time_created: 1000, time_updated: 1000, data: { type: "text", text: "hi" } }],
+			},
+			{
+				id: "m2", time_created: 2000, time_updated: 2000,
+				data: { role: "assistant" },
+				parts: [
+					{ id: "p2", message_id: "m2", time_created: 2000, time_updated: 2000, data: { type: "reasoning", text: "let me think" } },
+					{ id: "p3", message_id: "m2", time_created: 2000, time_updated: 2000, data: { type: "text", text: "answer" } },
+				],
+			},
+			{
+				id: "m3", time_created: 3000, time_updated: 3000,
+				data: { role: "user" },
+				parts: [
+					{ id: "p4", message_id: "m3", time_created: 3000, time_updated: 3000, data: { type: "tool", tool: "bash", callID: "c1", state: { input: {}, status: "completed" } } },
+				],
+			},
+		],
+	});
+	const converted = adapter.convert("/project", session);
+	const summarized = adapter.summarize("/project", session);
+	assert.equal(summarized.title, converted.title);
+	assert.equal(summarized.preview, converted.preview);
+	assert.equal(summarized.messageCount, converted.messageCount);
 });
