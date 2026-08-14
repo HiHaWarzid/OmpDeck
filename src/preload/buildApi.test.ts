@@ -97,7 +97,8 @@ describe("buildApi", () => {
 		for (const [ns, members] of Object.entries(ipcTable)) {
 			expect(api[ns], `namespace ${ns}`).toBeDefined();
 			for (const [member, entry] of Object.entries(members)) {
-				if ((entry as IpcOpEntry).kind === "local") continue;
+				const op = entry as IpcOpEntry;
+				if (op.kind === "local" || op.override) continue;
 				expect(typeof api[ns][member], `${ns}.${member}`).toBe("function");
 			}
 		}

@@ -28,6 +28,12 @@ export interface IpcOpEntry {
 	 * 仅 preload 消费；带 pack 的成员主进程 handler 签名退化为宽松类型（见 IpcHandlerMap）。
 	 */
 	readonly pack?: (...args: unknown[]) => readonly unknown[];
+	/**
+	 * preload 覆盖层实现标记：生成器跳过该成员，由 preload 的 apiOverrides 提供实现
+	 * （非 IPC 成员、sendSync 同步读取、fire-and-forget 等特殊形态）。
+	 * kind 仍描述通道协议，主进程照常注册。
+	 */
+	readonly override?: boolean;
 }
 
 export type IpcTable = {
@@ -84,9 +90,9 @@ export const ipcTable = {
 		/** 移动来源路径到目标目录（同设备 rename，跨设备 cp+rm） */
 		move: { channel: "files:move", kind: "invoke" },
 		// Electron 32+ 已移除 File.path；webUtils 解析只在 preload 进程可用，实现走覆盖层
-		getPathForFile: { kind: "local" },
-		// 同步读取剪贴板文件路径（sendSync），try/catch 回落逻辑在覆盖层
-		getClipboardPaths: { channel: "clipboard:read-file-paths", kind: "local" },
+		getPathForFile: { kind: "local", override: true },
+		// 同步读取剪贴板文件路径（sendSync + returnValue），try/catch 回落逻辑在覆盖层
+		getClipboardPaths: { channel: "clipboard:read-file-paths", kind: "sendSync", override: true },
 	},
 	sessions: {
 		list: { channel: "sessions:list", kind: "invoke" },
@@ -411,11 +417,11 @@ export const ipcTable = {
 	},
 	clipboard: {
 		// 写入文本是 fire-and-forget（不返回 Promise，void .catch），实现走覆盖层
-		writeText: { channel: "clipboard:write-text", kind: "local" },
+		writeText: { channel: "clipboard:write-text", kind: "invoke", override: true },
 	},
 	perf: {
 		// 非 IPC：PIDECK_PERF=1 环境标志，实现走覆盖层
-		enabled: { kind: "local" },
+		enabled: { kind: "local", override: true },
 	},
 	browser: {
 		openExternal: { channel: "browser:open-external", kind: "invoke" },
@@ -489,16 +495,17 @@ export const ipcChannels: Readonly<Record<string, string>> = (() => {
 
 /**
  * 主进程 handler 签名映射：由 api 命名空间类型生成。
- * - invoke/sendSync 成员 → ipcMain.handle 的 handler（参数来自成员函数签名；带 pack 的成员退化为宽松签名）
- * - subscribe/send/local 成员不产生 handle handler（subscribe 是主进程推送，send/local 另有去处）
+ * - invoke 成员 → ipcMain.handle 的 handler（参数来自成员函数签名；带 pack 的成员退化为宽松签名）
+ * - subscribe/send/sendSync/local 成员不产生 handle handler
+ *   （subscribe 是主进程推送；send/sendSync 走 ipcMain.on，见 IpcOnMap / 模块内手写）
  */
 export type IpcHandlerMap<TTableNs, TApiNs> = {
-	[M in keyof TTableNs as TTableNs[M] extends { kind: "invoke" } | { kind: "sendSync" } ? M : never]:
+	[M in keyof TTableNs as TTableNs[M] extends { kind: "invoke" } ? M : never]:
 		TTableNs[M] extends { pack: (...args: unknown[]) => readonly unknown[] }
 			? (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown
 			: M extends keyof TApiNs
 				? TApiNs[M] extends (...args: never[]) => unknown
-					? (event: IpcMainInvokeEvent, ...args: Parameters<TApiNs[M]>) => Awaited<ReturnType<TApiNs[M]>>
+					? (event: IpcMainInvokeEvent, ...args: Parameters<TApiNs[M]>) => ReturnType<TApiNs[M]>
 					: never
 				: never;
 };

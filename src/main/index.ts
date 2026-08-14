@@ -1,3 +1,4 @@
+import { registerIpcHandlers } from "./ipc/registerIpc";
 import {
 	app,
 	BrowserWindow,
@@ -830,18 +831,12 @@ async function autoConnectFeishu() {
 
 function registerIpc() {
 	// ===== 已提取到 src/main/ipc/ 的命名空间 =====
-	registerLogHandlers({ appLogger, rpcLogger });
 	registerSkillHandlers({ skillManager, appLogger });
 	registerTerminalHandlers({ terminalManager, appLogger });
 	registerExtensionHandlers({
 		extensionManager,
 		appLogger,
 		getActiveWslEnvironment: () => activeWslEnvironment,
-	});
-	registerEditorHandlers({
-		settingsStore,
-		appLogger,
-		getMainWindow: () => mainWindow,
 	});
 	registerPromptHandlers({ promptManager, appLogger });
 	registerScratchPadHandlers({ appLogger });
@@ -859,11 +854,17 @@ function registerIpc() {
 		syncWslEnvironment,
 	});
 	registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger });
-	registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger });
-	registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! });
-	registerConfigHandlers({ configManager, agentManager, appLogger });
-	registerClipboardHandlers();
-	registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager });
+	// ===== HandlerMap 模块（表驱动注册，通道名/协议取自通道表）=====
+	registerIpcHandlers({
+		...registerLogHandlers({ appLogger, rpcLogger }),
+		...registerEditorHandlers({
+			settingsStore,
+			appLogger,
+			getMainWindow: () => mainWindow,
+		}),
+		...registerClipboardHandlers(),
+		...registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
+	});
 	registerAgentHandlers({
 		agentManager,
 		terminalManager,
@@ -893,127 +894,6 @@ function registerIpc() {
 		applyNativeThemeSource,
 	});
 
-	/**
-	 * 执行 npm install 安装命令，返回 stdout/stderr/exitCode。
-	 * 用于首次安装向导中让用户一键安装 pi CLI。
-	 * 使用 execFile 而非 spawn 以确保命令执行完毕后一次性返回完整输出。
-	 */
-	ipcMain.handle(
-		ipcChannels.piExecInstall,
-		async (_event, command: string): Promise<import("../shared/types").PiInstallExecResult> => {
-			void appLogger.info("pi", "Executing install command", { command });
-			try {
-				const { execFile } = await import("node:child_process");
-				const result = await new Promise<import("../shared/types").PiInstallExecResult>((resolve) => {
-					// Windows 下通过 cmd /c 执行命令，确保 npm.cmd shim 能被正确调用。
-					// Unix 直接使用 shell:true 兼容通过 nvm/n 等版本管理器安装的 npm。
-					const isWin = process.platform === "win32";
-					if (isWin) {
-						const child = execFile(
-							process.env.ComSpec || "cmd.exe",
-							["/d", "/s", "/c", command],
-							{
-								cwd: app.getPath("home"),
-								timeout: 120_000, // npm install 最长 2 分钟
-								env: { ...process.env, npm_config_fund: "false", npm_config_audit: "false" },
-								windowsHide: true,
-								encoding: "utf8",
-								shell: false,
-							},
-							(error: unknown, stdout: string, stderr: string) => {
-								const execError = error as { code?: number | string } | null;
-								resolve({
-									success: !error,
-									exitCode: typeof execError?.code === "number" ? execError.code : execError ? -1 : 0,
-									stdout: stdout || "",
-									stderr: stderr || "",
-								});
-							},
-						);
-					} else {
-						execFile(
-							"/bin/sh",
-							["-c", command],
-							{
-								cwd: app.getPath("home"),
-								timeout: 120_000,
-								env: { ...process.env, npm_config_fund: "false", npm_config_audit: "false" },
-								encoding: "utf8",
-							},
-							(error: unknown, stdout: string, stderr: string) => {
-								const execError = error as { code?: number | string } | null;
-								resolve({
-									success: !error,
-									exitCode: typeof execError?.code === "number" ? execError.code : execError ? -1 : 0,
-									stdout: stdout || "",
-									stderr: stderr || "",
-								});
-							},
-						);
-					}
-				});
-				void appLogger.info("pi", "Install command completed", {
-					success: result.success,
-					exitCode: result.exitCode,
-					stdoutLength: result.stdout.length,
-					stderrLength: result.stderr.length,
-				});
-				return result;
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				void appLogger.error("pi", "Install command threw", { error: message });
-				return { success: false, exitCode: -1, stdout: "", stderr: message };
-			}
-		},
-	);
-
-	/**
-	 * 检查 npm 是否可在系统中执行。
-	 * 通过执行 npm --version 判断，返回版本号或错误信息。
-	 * 用于首次安装向导中判断是否应显示 npm install 按钮或引导安装 Node.js。
-	 */
-	ipcMain.handle(
-		ipcChannels.piCheckNpm,
-		async (): Promise<import("../shared/types").NpmAvailabilityResult> => {
-			try {
-				const { execFile } = await import("node:child_process");
-				const result = await new Promise<import("../shared/types").NpmAvailabilityResult>((resolve) => {
-					const isWin = process.platform === "win32";
-					if (isWin) {
-						execFile(
-							process.env.ComSpec || "cmd.exe",
-							["/d", "/s", "/c", "npm --version"],
-							{ timeout: 10_000, encoding: "utf8", windowsHide: true, shell: false },
-							(error, stdout) => {
-								if (error) {
-									resolve({ available: false, error: error.message });
-								} else {
-									resolve({ available: true, version: stdout.trim() });
-								}
-							},
-						);
-					} else {
-						execFile(
-							"npm",
-							["--version"],
-							{ timeout: 10_000, encoding: "utf8" },
-							(error, stdout) => {
-								if (error) {
-									resolve({ available: false, error: error.message });
-								} else {
-									resolve({ available: true, version: stdout.trim() });
-								}
-							},
-						);
-					}
-				});
-				return result;
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				return { available: false, error: message };
-			}
-		},
-	);
 }
 
 function sendTelemetryHeartbeat() {

@@ -31,7 +31,8 @@ export function buildApi(bridge: IpcBridge): PiDesktopApi {
 		const built: Record<string, unknown> = {};
 		for (const [member, entry] of Object.entries(members)) {
 			const op = entry as IpcOpEntry;
-			if (op.kind === "local") continue;
+			// override 成员（webUtils、环境标志、sendSync 同步读取、fire-and-forget）由 preload 覆盖层提供
+			if (op.kind === "local" || op.override) continue;
 			if (op.kind === "subscribe") {
 				built[member] = (callback: (payload: unknown) => void) => {
 					const listener = (_event: unknown, payload: unknown) => callback(payload);

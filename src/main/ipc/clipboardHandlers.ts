@@ -1,5 +1,6 @@
-import { clipboard, ipcMain } from "electron";
-import { ipcChannels } from "../../shared/ipc";
+import { clipboard, type IpcMainEvent } from "electron";
+import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import type { PiDesktopApi } from "../../shared/api";
 
 /**
  * 解析 Windows CF_HDROP 剪贴板缓冲，得到资源管理器复制的多文件路径。
@@ -114,15 +115,25 @@ function readClipboardFilePaths(): string[] {
 }
 
 /**
- * 剪贴板 IPC 注册。
- * read 走 ipcMain.on + returnValue（同步）；write 走 ipcMain.handle（异步）。
+ * 剪贴板 IPC handler map。
+ * read 走 ipcMain.on + returnValue（同步，sendSync 协议）；write 走 ipcMain.handle（异步）。
  */
-export function registerClipboardHandlers(): void {
-	ipcMain.on(ipcChannels.clipboardReadFilePaths, (event) => {
-		event.returnValue = readClipboardFilePaths();
-	});
+type ClipboardHandlerMaps = {
+	clipboard: IpcHandlerMap<typeof ipcTable.clipboard, PiDesktopApi["clipboard"]> & {
+		/** sendSync 通道：同步读剪贴板文件路径（ipcMain.on + returnValue） */
+		getClipboardPaths: (event: IpcMainEvent) => void;
+	};
+};
 
-	ipcMain.handle(ipcChannels.clipboardWriteText, (_event, text: string) => {
-		clipboard.writeText(String(text));
-	});
+export function registerClipboardHandlers(): ClipboardHandlerMaps {
+	return {
+		clipboard: {
+			writeText: (_event, text: string) => {
+				clipboard.writeText(String(text));
+			},
+			getClipboardPaths: (event) => {
+				event.returnValue = readClipboardFilePaths();
+			},
+		},
+	};
 }

@@ -6,7 +6,7 @@ const panel = readFileSync("src/renderer/src/components/app/GitPanel.tsx", "utf8
 const styles = readFileSync("src/renderer/src/styles.css", "utf8");
 const i18n = readFileSync("src/renderer/src/i18n.ts", "utf8");
 const app = readFileSync("src/renderer/src/App.tsx", "utf8");
-const preload = readFileSync("src/preload/index.ts", "utf8");
+const api = readFileSync("src/shared/api.ts", "utf8");
 const main = readFileSync("src/main/index.ts", "utf8");
 const gitService = readFileSync("src/main/git/GitService.ts", "utf8");
 // Git IPC 与 app 级 IPC 处理器已从 src/main/index.ts 拆到 ipc/ 下的独立模块。
@@ -105,7 +105,7 @@ describe("Git panel VS Code Source Control contract", () => {
 
   test("prefers Electron system language data while preserving explicit locale choices", () => {
     assert.match(appHandlers, /app\.getPreferredSystemLanguages\(\)/);
-    assert.match(preload, /preferredSystemLanguages/);
+    assert.match(api, /preferredSystemLanguages/);
     assert.match(app, /api\.app\s*\.preferredSystemLanguages\(\)/);
     assert.match(i18n, /navigator\.languages\?\.\[0\]/);
     assert.match(i18n, /mode === "zh-CN" \|\| mode === "en-US" \|\| mode === "pseudo"/);
@@ -113,7 +113,7 @@ describe("Git panel VS Code Source Control contract", () => {
   });
 
   test("aligns the commit-log IPC boundary with allBranches filtering", () => {
-    assert.match(preload, /allBranches\?: boolean/);
+    assert.match(api, /allBranches\?: boolean/);
     assert.match(gitHandlers, /allBranches\?: boolean/);
     assert.match(panel, /allBranches:\s*!ref/);
     assert.doesNotMatch(panel, /setAllBranches/);
@@ -194,7 +194,7 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /getFileIconSeti\(name\)/);
     assert.doesNotMatch(panel, /title=\{`\$\{commit\.message\}/);
     assert.match(app, /commitDetail=\{api\.git\.commitDetail\}/);
-    assert.match(preload, /Promise<CommitDetail \| null>/);
+    assert.match(api, /Promise<CommitDetail \| null>/);
     assert.match(styles, /\.git-commit-hover\s*\{/);
     assert.match(styles, /\.git-history-file-row/);
   });
@@ -207,7 +207,7 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(app, /setGitDrawerDiff\(\{/);
     assert.match(app, /label: `\$\{diff\.path\.split[\s\S]*?\$\{commit\.shortHash\}/);
     assert.match(app, /<FileDiffViewer[\s\S]*?displayMode="drawer"[\s\S]*?gitDrawerDiff\.originalContent/);
-    assert.match(preload, /gitCommitFileDiff/);
+    assert.match(api, /commitFileDiff:/);
     assert.match(gitHandlers, /gitCommitFileDiff/);
     assert.match(gitService, /async getCommitFileDiff/);
     assert.match(gitService, /detail\.commit\.parents\[0\]/);
@@ -234,7 +234,7 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(app, /setGitDrawerDiff\(null\)/);
     const commitOpen = app.match(/async function openCommitFileDiff[\s\S]*?async function refreshSessionHistory/)?.[0] ?? "";
     assert.doesNotMatch(commitOpen, /setDrawer\(null\)/);
-    assert.match(preload, /workspaceFileDiff:/);
+    assert.match(api, /workspaceFileDiff:/);
     assert.match(gitHandlers, /gitWorkspaceFileDiff/);
     assert.match(gitService, /async getWorkspaceFileDiff/);
     assert.match(gitService, /group === "untracked"/);
@@ -267,7 +267,7 @@ describe("Git panel VS Code Source Control contract", () => {
   });
 
   test("wires single-file discard through the narrow IPC boundary", () => {
-    assert.match(preload, /discard: \(projectId: string, group: "workingTree" \| "untracked", filePath: string\)/);
+    assert.match(api, /discard: \(projectId: string, group: "workingTree" \| "untracked", filePath: string\)/);
     assert.match(gitHandlers, /ipcChannels\.gitDiscard/);
     assert.match(gitService, /async discardFile/);
     assert.match(gitService, /"--literal-pathspecs", "add"/);
