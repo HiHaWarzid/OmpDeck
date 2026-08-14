@@ -1016,7 +1016,7 @@ app.whenReady().then(async () => {
 	// 扩展部署、WSL 同步、代理/Web 服务/宠物等后置，避免打包后点击启动要先等一长串磁盘/网络 IO。
 	await settingsStore.load();
 	registerIpc();
-	registerFeishuHandlers({
+	registerIpcHandlers(registerFeishuHandlers({
 		agentManager,
 		projectStore,
 		appLogger,
@@ -1025,7 +1025,7 @@ app.whenReady().then(async () => {
 		setFeishuBridge: (bridge) => {
 			feishuBridge = bridge;
 		},
-	});
+	}));
 	await createWindow();
 	setupTray();
 

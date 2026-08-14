@@ -20,14 +20,14 @@ test("FeishuBridge.start propagates startup failure to IPC callers", () => {
 
 test("updating a saved bot only hot-updates the active bridge for that bot", () => {
 	const source = feishuHandlersSource();
-	const handler = source.match(/ipcMain\.handle\(ipcChannels\.feishuBotConfig,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
+	const handler = source.match(/botConfig: async \(_event, botId: string, patch: Partial<FeishuBotConfig>\) => \{[\s\S]*?\n\t\t\t},/)?.[0] ?? "";
 	// 热更新守卫：仅当被更新的 Bot 正是当前在线 bridge 的 Bot 时才 apply。
 	assert.match(handler, /bridge\.getStatus\(\)\.botId === botId/);
 });
 
 test("assigning a session bot refuses to bind through a different active bot", () => {
 	const source = feishuHandlersSource();
-	const handler = source.match(/ipcMain\.handle\(ipcChannels\.feishuSessionBotSet,[\s\S]*?\n\t\}\);/)?.[0] ?? "";
+	const handler = source.match(/sessionBotSet: async \(_event, agentId: string, botId: string \| null\) => \{[\s\S]*?\n\t\t\t},/)?.[0] ?? "";
 	assert.match(handler, /status\.botId !== botId/);
 	// 映射写入必须发生在 bot 校验之后（校验失败不能写入 session-bot 映射）。
 	assert.doesNotMatch(handler, /setSessionBotId\(agentId, botId\);[\s\S]*?status\.botId !== botId/);

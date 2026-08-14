@@ -1,12 +1,21 @@
-import { ipcMain, Menu, type BrowserWindow, type MenuItemConstructorOptions } from "electron";
+import { Menu, type BrowserWindow, type MenuItemConstructorOptions } from "electron";
 import type { AgentManager } from "../pi/AgentManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AgentTab, AppSettings, PetManifest } from "../../shared/types";
-import { ipcChannels } from "../../shared/ipc";
+import { ipcChannels, ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import type { PiDesktopApi } from "../../shared/api";
+import { registerIpcHandlers } from "../ipc/registerIpc";
 import { PetWindow, detectPetWindowCaps } from "./PetWindow";
 import { PetStateBridge } from "./PetStateBridge";
 import { PetPackageManager } from "./PetPackageManager";
 import { PetPatrol } from "./PetPatrol";
+
+type PetHandlerMaps = {
+	pet: IpcHandlerMap<typeof ipcTable.pet, PiDesktopApi["pet"]> & {
+		/** send 通道：宠物窗就绪信号（ipcMain.on） */
+		ready: () => void;
+	};
+};
 
 export type PetSystemDeps = {
 	agentManager: AgentManager;
@@ -20,7 +29,6 @@ export class PetSystem {
 	readonly packageManager = new PetPackageManager();
 	readonly patrol: PetPatrol;
 	private bridge: PetStateBridge;
-	private registered = false;
 
 	constructor(private readonly deps: PetSystemDeps) {
 		this.patrol = new PetPatrol(
@@ -36,7 +44,8 @@ export class PetSystem {
 	}
 
 	async start() {
-		this.registerIpc();
+		// 表驱动注册：通道名/协议取自通道表（pet.ready 为 send → ipcMain.on）
+		registerIpcHandlers(this.handlerMaps());
 		this.bridge.attach(this.deps.agentManager);
 
 		const s = this.deps.settingsStore.get();
@@ -60,37 +69,37 @@ export class PetSystem {
 
 	// ── IPC ──
 
-	private registerIpc() {
-		if (this.registered) return;
-		this.registered = true;
-
+	private handlerMaps(): PetHandlerMaps {
 		const { settingsStore, agentManager, getMainWindow, recreateMainWindow } = this.deps;
 		const C = ipcChannels;
 
-		ipcMain.handle(C.petList, () => this.packageManager.list());
-		ipcMain.handle(C.petGetCurrent, () => this.packageManager.get(settingsStore.get().petId));
+		return {
+			pet: {
 
-		ipcMain.handle(C.petSetEnabled, async (_e, v: boolean) => {
+		list: () => this.packageManager.list(),
+		getCurrent: () => this.packageManager.get(settingsStore.get().petId),
+
+		setEnabled: async (_e, v: boolean) => {
 			const prev = settingsStore.get();
 			await this.reactToSettings(prev, await settingsStore.update({ petEnabled: !!v }));
-		});
-		ipcMain.handle(C.petSetId, async (_e, id: string) => {
+		},
+		setId: async (_e, id: string) => {
 			const prev = settingsStore.get();
 			await this.reactToSettings(prev, await settingsStore.update({ petId: id }));
-		});
-		ipcMain.handle(C.petMoveWindow, async (_e, pos: { x: number; y: number }) => this.petWindow.moveTo(pos.x, pos.y));
-		ipcMain.handle(C.petMoveBy, async (_e, delta: { dx: number; dy: number }) => {
+		},
+		moveWindow: async (_e, pos: { x: number; y: number }) => this.petWindow.moveTo(pos.x, pos.y),
+		moveBy: async (_e, delta: { dx: number; dy: number }) => {
 			if (!this.petWindow.exists) return;
 			const [x, y] = this.petWindow.window!.getPosition();
 			// ipcMain.handle 对同一通道是串行执行的，setPosition 是同步的，不会产生增量竞争
 			this.petWindow.moveTo(x + delta.dx, y + delta.dy);
-		});
-		ipcMain.handle(C.petPreviewMode, async (_e, mode: string) => {
+		},
+		setPreviewMode: async (_e, mode: string) => {
 			const win = this.petWindow.window;
 			if (win && !win.isDestroyed()) win.webContents.send(C.petPreviewMode, mode);
-		});
+		},
 
-		ipcMain.handle(C.petFocusAgent, async () => {
+		focusAgent: async () => {
 			let main = getMainWindow();
 			if ((!main || main.isDestroyed()) && recreateMainWindow) main = await recreateMainWindow();
 			if (!main) return;
@@ -98,10 +107,10 @@ export class PetSystem {
 			main.focus();
 			const agentId = this.bridge.currentState?.activeAgentId;
 			if (agentId) main.webContents.send(C.petFocusAgentTarget, { agentId });
-		});
+		},
 
 		// 测试：模拟真实的 failed/review 状态 + 通知 + 自动恢复 idle（与 PetStateBridge 行为一致）
-		ipcMain.handle(C.petTestNotify, async (_e, type: "error" | "done") => {
+		testNotify: async (_e, type: "error" | "done") => {
 			const win = this.petWindow.window;
 			if (!win || win.isDestroyed()) return;
 			const ts = Date.now();
@@ -118,27 +127,27 @@ export class PetSystem {
 					if (win && !win.isDestroyed()) win.webContents.send(C.petState, { mode: "idle", runningCount: 0, errorCount: 0, activeAgentId: null, timestamp: Date.now() });
 				}, 4000);
 			}
-		});
+		},
 
-		ipcMain.handle(C.petTease, () => this.bridge.tease());
+		tease: async () => this.bridge.tease(),
 		// 拖拽起止：开始时停巡游；结束时先纠正透明窗可能产生的尺寸漂移，再按 idle 状态恢复巡游。
-		ipcMain.handle(C.petDragState, (_e, dragging: boolean) => {
+		setDragging: async (_e, dragging: boolean) => {
 			const isDragging = !!dragging;
 			this.bridge.onDragState(isDragging);
 			if (!isDragging) this.petWindow.ensureTargetSize();
-		});
+		},
 
 		// 宠物窗就绪信号：React 已挂载且 IPC 监听器已注册，安全推送初始数据
-		ipcMain.on(C.petReady, () => {
+		ready: () => {
 			const win = this.petWindow.window;
 			if (!win || win.isDestroyed()) return;
 			this.pushCaps();
 			this.bridge.pushNow(this.deps.agentManager.list());
 			void this.pushCurrentSprite();
-		});
+		},
 
 		// 右键上下文菜单：关闭宠物 / 切换宠物
-		ipcMain.handle(C.petContextMenu, async () => {
+		contextMenu: async () => {
 			const pets = await this.packageManager.list();
 			const currentId = settingsStore.get().petId;
 			const template: MenuItemConstructorOptions[] = [];
@@ -178,7 +187,9 @@ export class PetSystem {
 
 			const menu = Menu.buildFromTemplate(template);
 			menu.popup({});
-		});
+		},
+			},
+		};
 	}
 
 	// ── 设置响应 ──

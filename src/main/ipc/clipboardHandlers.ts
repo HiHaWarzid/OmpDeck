@@ -119,7 +119,9 @@ function readClipboardFilePaths(): string[] {
  * read 走 ipcMain.on + returnValue（同步，sendSync 协议）；write 走 ipcMain.handle（异步）。
  */
 type ClipboardHandlerMaps = {
-	clipboard: IpcHandlerMap<typeof ipcTable.clipboard, PiDesktopApi["clipboard"]> & {
+	clipboard: IpcHandlerMap<typeof ipcTable.clipboard, PiDesktopApi["clipboard"]>;
+	// 同步读剪贴板路径的成员挂在 files 命名空间（api 面 files.getClipboardPaths，sendSync 协议）
+	files: {
 		/** sendSync 通道：同步读剪贴板文件路径（ipcMain.on + returnValue） */
 		getClipboardPaths: (event: IpcMainEvent) => void;
 	};
@@ -131,6 +133,8 @@ export function registerClipboardHandlers(): ClipboardHandlerMaps {
 			writeText: (_event, text: string) => {
 				clipboard.writeText(String(text));
 			},
+		},
+		files: {
 			getClipboardPaths: (event) => {
 				event.returnValue = readClipboardFilePaths();
 			},
