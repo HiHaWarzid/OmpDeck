@@ -2613,6 +2613,18 @@ export function App() {
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
       const previous = runtimeStateByAgentRef.current[payload.agentId];
+      // 完整快照带单调序号：长任务后 omp 繁忙，agent_end 的慢 RPC 快照可能晚于
+      // 更新的空闲快照到达，旧快照（isStreaming: true）会覆盖已 idle 的状态，
+      // 让左下角三点指示器卡住。序号更小的旧快照直接丢弃；
+      // 工具边沿轻量 patch 不带序号（undefined），仍即时应用。
+      const incomingSeq = payload.state.runtimeStateSeq;
+      if (
+        incomingSeq != null &&
+        previous?.runtimeStateSeq != null &&
+        incomingSeq < previous.runtimeStateSeq
+      ) {
+        return;
+      }
       const nextState = applyAgentRuntimeState(payload.agentId, payload.state);
       // tool start/end 会由主进程以轻量 patch 立即推送；与最近一次完整状态合并，
       // 避免为了保证工具边沿顺序而短暂丢失模型、token 等运行信息。

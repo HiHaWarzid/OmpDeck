@@ -34,6 +34,8 @@ export type AgentRuntimeState = {
 	executingToolName?: string;
 	/** 工具状态事件的单调序号，用于忽略晚到的异步完整状态。 */
 	toolStateSequence?: number;
+	/** 完整运行态快照的单调序号：渲染层丢弃乱序到达的旧快照。 */
+	runtimeStateSeq?: number;
 	contextTokens?: number | null;
 	contextWindow?: number | null;
 	contextPercent?: number | null;

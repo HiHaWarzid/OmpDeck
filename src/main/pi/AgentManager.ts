@@ -1547,12 +1547,18 @@ export class AgentManager {
 		}
 		this.runtimeStateInFlight.add(agentId);
 		this.runtimeStateLastEmitAt.set(agentId, Date.now());
+		// 调用发起时分配单调序号：慢 RPC（长任务后 omp 繁忙）可能晚于更新的快照
+		// 到达渲染层，渲染层按序号丢弃旧快照，避免旧 isStreaming:true 覆盖已 idle 状态。
+		const runtime0 = this.agents.get(agentId);
+		const seq = runtime0 ? runtime0.runtimeStateSeq + 1 : 1;
+		if (runtime0) runtime0.runtimeStateSeq = seq;
 		try {
 			const state = await this.getRuntimeState(agentId);
 			const runtime = this.agents.get(agentId);
 			// getRuntimeState 包含异步 RPC；若期间 agent 已被删除，或发生新工具事件，
 			// 工具字段保留调用完成时的最新本地真值和序号。
 			if (!runtime) return;
+			state.runtimeStateSeq = seq;
 			state.isExecutingTool = !!runtime.toolExecuting;
 			state.executingToolName = runtime.toolExecuting ?? undefined;
 			state.toolStateSequence = runtime.toolStateSequence;
@@ -2912,6 +2918,13 @@ export class AgentManager {
 			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
 			runtime.activeAssistantMessageId = undefined;
 			runtime.toolMessageIds.clear();
+			// run 结束意味着本轮工具必然已结束。长任务中最后一个工具的 end 事件可能
+			// 丢失（并行工具批次、错误/中断路径），残留 toolExecuting 会让空闲检查
+			// （markIdleIfPiReportsNoWork）永远判 busy，UI 卡在 running、三点指示器
+			// 无法消失。这里统一清残留；若 omp 实际还有排队工作，空闲检查的
+			// get_state（queuedMessageCount）会正确判定并继续保持 running。
+			runtime.activeToolCalls.clear();
+			runtime.toolExecuting = null;
 			// agent 异常结束时（如 API 返回 400、模型报错等），将错误提示写入会话，避免用户看到空白。
 			// 错误信息的存放位置因 pi 版本和错误类型不同而有多种可能：
 			//   1. agent_end 顶层 errorMessage
@@ -4120,6 +4133,8 @@ type AgentRuntime = {
 	/** toolCallId -> toolName，并行工具等最后一个结束才发 false 边沿 */
 	activeToolCalls: Map<string, string>;
 	toolExecuting: string | null;
+	/** 完整运行态推送的单调序号：渲染层据此丢弃乱序到达的旧快照（长任务后 RPC 慢更容易乱序）。 */
+	runtimeStateSeq: number;
 
 	// abort 流式闸门（按 generation 封印残留 delta）
 	streamGate: StreamGateState;
@@ -4181,6 +4196,7 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 		rpcLogging: false,
 		compacting: false,
 		rpcCompacting: false,
+		runtimeStateSeq: 0,
 		modelRefreshing: false,
 		userInitiatedStop: false,
 		autoRestartAttempted: false,
