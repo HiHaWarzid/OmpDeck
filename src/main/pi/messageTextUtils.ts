@@ -12,8 +12,8 @@
 
 import type { ImageContent } from "../../shared/types";
 
-/** 工具结果文本截断阈值（字符数）。 */
-const MAX_TOOL_RESULT_CHARS = 8000;
+/** 工具结果文本截断阈值（字符数）；超出时 meta 标记 truncated 并缓存全文供「查看完整输出」。 */
+export const MAX_TOOL_RESULT_CHARS = 8000;
 
 /** 安全序列化任意值为 JSON 字符串，处理循环引用等异常。 */
 export function safeJson(value: unknown): string {

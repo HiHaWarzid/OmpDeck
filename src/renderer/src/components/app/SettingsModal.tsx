@@ -9,12 +9,14 @@ import {
 	Brush,
 	Minus,
 	Plus,
+	Eye,
 } from "lucide-react";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
+import { VisionBridgeTab } from "./VisionBridgeTab";
 import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
@@ -22,7 +24,7 @@ const ZOOM_FACTOR_MIN = 0.8;
 const ZOOM_FACTOR_MAX = 1.5;
 const ZOOM_FACTOR_STEP = 0.05;
 
-type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage";
+type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage" | "vision";
 
 /** 代理相关字段：用于判断代理 tab 是否有未保存变更。 */
 const PROXY_FIELDS: (keyof AppSettings)[] = [
@@ -209,8 +211,38 @@ export function SettingsModal(props: SettingsModalProps) {
 	);
 }
 
+/** localStorage 键：设置页上次打开的 tab（重开弹窗时恢复位置，跨应用重启保留）。 */
+const SETTINGS_LAST_TAB_KEY = "ompdeck-settings-last-tab";
+
+/** 全部合法 tab，用于校验持久化值（避免版本更新后残留旧值导致无高亮）。 */
+const SETTINGS_TABS: readonly SettingsTabId[] = [
+	"common",
+	"appearance",
+	"proxy",
+	"dev",
+	"pet",
+	"storage",
+	"vision",
+];
+
+/**
+ * 读取上次打开的 tab；localStorage 不可用、无记录或值已失效时返回默认值。
+ * 弹框关闭会卸载内容，state 在每次打开时重建，因此需要从外部存储恢复。
+ */
+function loadLastSettingsTab(): SettingsTabId {
+	try {
+		const raw = localStorage.getItem(SETTINGS_LAST_TAB_KEY);
+		if (raw && (SETTINGS_TABS as readonly string[]).includes(raw)) {
+			return raw as SettingsTabId;
+		}
+	} catch {
+		// localStorage 不可用时静默回退默认 tab
+	}
+	return "common";
+}
+
 function SettingsModalContent(props: SettingsModalProps) {
-	const [activeTab, setActiveTab] = useState<SettingsTabId>("common");
+	const [activeTab, setActiveTab] = useState<SettingsTabId>(loadLastSettingsTab);
 	// ── 全局设置草稿：进入弹框时快照 props.settings，所有修改在 draft 上操作，保存时统一提交 ──
 	const [draftSettings, setDraftSettings] = useState<AppSettings>(() => ({ ...props.settings }));
 	const [dirtyFields, setDirtyFields] = useState<Set<string>>(new Set());
@@ -435,6 +467,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 			label: t("settings.tabs.storage"),
 			icon: <Trash2 size={16} />,
 		},
+		{
+			id: "vision",
+			label: t("settings.tabs.vision"),
+			icon: <Eye size={16} />,
+		},
 	];
 	const themeOptions = [
 		{ value: "system", label: t("settings.themeSystem") },
@@ -449,6 +486,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 		{ value: "green", label: t("settings.lightBackgroundGreen") },
 	];
 	const startupWindowModeOptions = [
+		{ value: "last", label: t("settings.startupWindow.last") },
 		{ value: "maximized", label: t("settings.startupWindow.maximized") },
 		{ value: "normal-large", label: t("settings.startupWindow.large") },
 		{ value: "normal-medium", label: t("settings.startupWindow.medium") },
@@ -508,7 +546,14 @@ function SettingsModalContent(props: SettingsModalProps) {
 							<button
 								key={tab.id}
 								className={activeTab === tab.id ? "active" : ""}
-								onClick={() => setActiveTab(tab.id)}
+								onClick={() => {
+									setActiveTab(tab.id);
+									try {
+										localStorage.setItem(SETTINGS_LAST_TAB_KEY, tab.id);
+									} catch {
+										// localStorage 不可用时静默忽略，仅本次会话内切换生效
+									}
+								}}
 							>
 								<span className="settings-tab-icon">{tab.icon}</span>
 								<strong>{tab.label}</strong>
@@ -1546,6 +1591,13 @@ function SettingsModalContent(props: SettingsModalProps) {
 						{/* ── 存储与日志 tab ── */}
 						{activeTab === "storage" && (
 							<StorageTab
+								settings={draftSettings}
+								onChange={updateDraft}
+							/>
+						)}
+						{/* ── 视觉桥 tab ── */}
+						{activeTab === "vision" && (
+							<VisionBridgeTab
 								settings={draftSettings}
 								onChange={updateDraft}
 							/>

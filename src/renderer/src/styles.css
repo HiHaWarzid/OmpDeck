@@ -5148,6 +5148,38 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
+/* 「查看完整输出」按钮：截断卡片展开区底部的按需加载入口 */
+.tool-card-full-text {
+  display: block;
+  margin-top: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.tool-card-full-text:hover:not(:disabled),
+.tool-card-full-text:focus-visible {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+  background: var(--color-bg-hover);
+}
+.tool-card-full-text:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.tool-card-full-text:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 
 /* ---------- 工具组卡片：ToolGroupCard（多工具聚合） ---------- */
 .tool-group-card {
@@ -5325,6 +5357,33 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   font-size: var(--font-size-caption);
   flex: 1 1 auto;
   min-width: 0;
+}
+/* 流式思考单行：最新行上叠加扫光高亮，提示仍在生成（deepseek-harness 折叠模式） */
+.thinking-card--streaming .thinking-card-subtitle {
+  position: relative;
+  color: var(--color-text-secondary);
+}
+.thinking-card--streaming .thinking-card-subtitle::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--color-info) 18%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: thinking-card-sweep 1.6s linear infinite;
+  pointer-events: none;
+}
+@keyframes thinking-card-sweep {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
 }
 .thinking-card-trigger span {
   flex: 0 0 auto;

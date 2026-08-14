@@ -6,7 +6,7 @@
  * 用于飞书会话镜像、文件转发和流式卡片控制。
  * agentsStop / agentsRestart 调用 terminalManager.closeAgent 清理终端会话。
  */
-import { ipcMain } from "electron";
+import { ipcMain, Notification, type BrowserWindow } from "electron";
 import { ipcChannels } from "../../shared/ipc";
 import type { CreateAgentInput, SendPromptInput } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
@@ -21,10 +21,34 @@ interface AgentHandlerDeps {
 	terminalManager: TerminalSessionManager;
 	appLogger: AppLogger;
 	getFeishuBridge: () => FeishuBridge | null;
+	getMainWindow: () => BrowserWindow | null;
 }
 
 export function registerAgentHandlers(deps: AgentHandlerDeps) {
-	const { agentManager, terminalManager, appLogger, getFeishuBridge } = deps;
+	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow } = deps;
+
+	ipcMain.handle(
+		ipcChannels.agentsNotifyAsk,
+		(_event, title: unknown, body: unknown) => {
+			// 渲染层判定「非活动 agent 收到 ask 请求且设置开启」后请求主进程发系统通知；
+			// 点击通知聚焦主窗口（询问卡片已渲染在会话流中，用户聚焦后可直接作答）。
+			if (typeof title !== "string" || typeof body !== "string") return;
+			if (!Notification.isSupported()) return;
+			const notification = new Notification({
+				title: title || "OmpDeck",
+				body,
+				silent: false,
+			});
+			notification.on("click", () => {
+				const win = getMainWindow();
+				if (!win || win.isDestroyed()) return;
+				if (win.isMinimized()) win.restore();
+				if (!win.isVisible()) win.show();
+				win.focus();
+			});
+			notification.show();
+		},
+	);
 
 	ipcMain.handle(ipcChannels.agentsList, () => agentManager.list());
 	ipcMain.handle(ipcChannels.agentsGetMessages, (_event, agentId: string) =>

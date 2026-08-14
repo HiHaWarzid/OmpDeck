@@ -196,6 +196,43 @@ export class SessionJsonl {
 	}
 
 	/**
+	 * 按 entryId 定位读取单条消息的文本内容（「查看完整输出」的历史回退路径）。
+	 * 仅按需触发（截断卡片展开时），顺序扫描 + 单行 parse，不做整文件解析；
+	 * 找不到 entryId 时返回 null（调用方据此回退运行时内存缓存或报错）。
+	 */
+	async readEntryTextById(
+		sessionPath: string,
+		entryId: string,
+	): Promise<string | null> {
+		const hostPath = this.resolve(sessionPath);
+		const handle = await open(hostPath, "r");
+		try {
+			const { size } = await handle.stat();
+			const buffer = Buffer.alloc(Math.min(size, TAIL_READ_MAX_BYTES));
+			await handle.read(buffer, 0, buffer.length, 0);
+			for (const line of buffer.toString("utf8").split("\n")) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				try {
+					const entry = JSON.parse(trimmed) as {
+						id?: unknown;
+						type?: unknown;
+						message?: { content?: unknown };
+					};
+					if (entry.type === "message" && entry.id === entryId && entry.message?.content) {
+						return extractMessageText(entry.message.content);
+					}
+				} catch {
+					// 单行解析失败跳过
+				}
+			}
+			return null;
+		} finally {
+			await handle.close();
+		}
+	}
+
+	/**
 	 * 计算会话文件中最后一条 assistant 消息的 cache hit rate（百分比）。
 	 * 从文件尾部向前扫描，命中第一条带 usage 的 assistant 消息即返回；
 	 * 无可用数据（文件不可读 / 无 assistant / promptTokens 为 0）时返回 undefined。

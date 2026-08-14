@@ -40,6 +40,7 @@ import {
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
 import {
+	MAX_TOOL_RESULT_CHARS,
 	extractImages,
 	extractThinking,
 	extractToolResultText,
@@ -54,6 +55,7 @@ import {
 	takeActiveEntryId,
 } from "./sessionEntryIds";
 import { SessionJsonl } from "./sessionJsonl";
+import { describeImage, isVisionBridgeReady } from "../vision/VisionBridge";
 import { LatestByKeyEmitter } from "./LatestByKeyEmitter";
 import {
 	createStreamGateState,
@@ -123,6 +125,13 @@ export class AgentManager {
 	private static readonly ABORT_SETTLED_FALLBACK_MS = 1500;
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
 	private readonly pendingTrustRequests = new Map<string, { resolve: (choice: ProjectTrustChoice) => void }>();
+	/**
+	 * 工具结果全文缓存（仅存被截断下发的完整文本），供「查看完整输出」按需读取。
+	 * LRU 上限 200 条防止长会话无界增长；agent 退出时由 stopAll/删除路径清空关联条目
+	 * （messageId 全局唯一，直接按 id 删除即可）。
+	 */
+	private readonly toolFullTextByMessageId = new Map<string, string>();
+	private static readonly TOOL_FULL_TEXT_LRU_MAX = 200;
 	/**
 	 * emitRuntimeState 并发合并：工具密集循环（tool_start/end 交替）每个边沿都会
 	 * 触发一次 get_state + get_session_stats RPC 与文件尾部读取；同一时刻只允许
@@ -641,8 +650,11 @@ export class AgentManager {
 		// 添加自动重试机制补偿 pi 初始化期间的瞬时延迟（如系统负载高、会话语料加载慢、
 		// 反病毒扫描），避免一次超时就永久标记为启动失败——用户反馈重启即可恢复说明进程本身正常。
 		void this.appLogger?.info("agent", "Agent get_state request start", { agentId: id });
-		// 单次 get_state 超时 45s，配合重试覆盖 pi 初始化期间的瞬时延迟。
-		const GET_STATE_TIMEOUT_MS = 45_000;
+		// 单次 get_state 超时接用户配置的 rpcTimeout（默认 600s），下限 45s：
+		// WSL/代理/慢机器上 omp 首次响应可能远超默认值，用户调大超时时启动路径必须同步生效
+		// （否则诊断卡"调大 RPC 超时"的指引对启动无效）；进程退出会立刻 reject pending
+		// （PiProcess exit → rpc.close），不会白等整个窗口。配合重试覆盖 omp 初始化期间的瞬时延迟。
+		const GET_STATE_TIMEOUT_MS = Math.max(45_000, this.settingsStore.get().rpcTimeout);
 		const GET_STATE_RETRIES = 2;
 		const GET_STATE_RETRY_DELAY_MS = 2_000;
 		void this.appLogger?.info("agent", "Agent get_state retry config", {
@@ -717,7 +729,7 @@ export class AgentManager {
 			// preserveMessagesAfter 保护加载期间用户新发的消息/流式回复，防止历史结果回写时覆盖当前会话。
 			// 状态就绪后发送 get_messages，确保 pi 进程已完全加载会话文件，避免竞态。
 			const messagesPromise = historyLoadDecision.shouldLoad
-				? client.request({ type: "get_messages" })
+				? client.request({ type: "get_messages" }, this.settingsStore.get().rpcTimeout)
 				: undefined;
 			const preserveMessagesAfter = Date.now();
 			if (messagesPromise) {
@@ -853,7 +865,7 @@ export class AgentManager {
 		const runtime = this.requireRuntime(input.agentId);
 		const trimmed = input.message.trim();
 		const hasImages = input.images && input.images.length > 0;
-		const agentMessage = input.agentMessage?.trim() || trimmed || "Describe this image.";
+		let agentMessage = input.agentMessage?.trim() || trimmed || "Describe this image.";
 		// 允许只有图片没有文字的情况发送
 		if (!trimmed && !hasImages) {
 			return { accepted: false, error: "消息不能为空" };
@@ -879,6 +891,32 @@ export class AgentManager {
 		const alreadyBusy = runtime.tab.status === "running";
 		const statusBeforePrompt = runtime.tab.status;
 		const promptDeliveryBehavior = input.streamingBehavior ?? (alreadyBusy ? "steer" : undefined);
+
+		// 视觉桥：启用时把图片转成文本描述注入 agentMessage（内部指令，不进 UI 气泡）。
+		// 图片仍作为 images 传给 RPC——模型支持视觉时不受影响，描述只是补充上下文；
+		// 单张转换失败不阻断发送（appLogger 留痕），避免视觉桥故障卡住用户消息。
+		const visionBridgeConfig = this.settingsStore.get().visionBridge;
+		if (hasImages && isVisionBridgeReady(visionBridgeConfig)) {
+			const descriptions = await Promise.all(
+				input.images!.map((image) => describeImage(visionBridgeConfig, image)),
+			);
+			const okTexts = descriptions
+				.filter((d): d is { ok: true; text: string } => d.ok)
+				.map((d) => d.text);
+			const failed = descriptions.filter((d): d is { ok: false; error: string } => !d.ok);
+			if (failed.length > 0) {
+				void this.appLogger?.warn("vision", "Vision bridge failed for some images", {
+					agentId: input.agentId,
+					failed: failed.map((f) => f.error),
+				});
+			}
+			if (okTexts.length > 0) {
+				const bridgeNote = okTexts
+					.map((text, i) => `[图片 ${i + 1} 描述]\n${text}`)
+					.join("\n\n");
+				agentMessage = `${agentMessage}\n\n${bridgeNote}`;
+			}
+		}
 
 		// 在设置状态为 running 之前检查进程是否还活着，避免进程崩溃后状态不一致
 		if (!runtime.process.isRunning()) {
@@ -1303,7 +1341,7 @@ export class AgentManager {
 		runtime.process = process;
 
 		try {
-			const stateResponse = await client.request({ type: "get_state" });
+			const stateResponse = await client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
 			const data = stateResponse.data as
 				| { sessionId?: string; sessionFile?: string; sessionName?: string }
 				| undefined;
@@ -1940,6 +1978,27 @@ export class AgentManager {
 	}
 
 	/**
+	 * 按需读取消息完整文本（工具结果截断后的「查看完整输出」）。
+	 * 优先运行时内存缓存（toolFullTextByMessageId，仅截断下发的完整文本），
+	 * 回退按 entryId 在会话文件里定位读取；找不到或读取失败抛错，由 IPC 层转结构化错误。
+	 */
+	async readMessageFullText(
+		agentId: string,
+		messageId: string,
+		entryId?: string,
+	): Promise<{ text: string }> {
+		const cached = this.toolFullTextByMessageId.get(messageId);
+		if (cached !== undefined) return { text: cached };
+		const runtime = this.agents.get(agentId);
+		const sessionPath = runtime?.tab.sessionPath;
+		if (sessionPath && entryId) {
+			const text = await this.sessionJsonl.readEntryTextById(sessionPath, entryId);
+			if (text !== null) return { text };
+		}
+		throw new Error("Message full text unavailable");
+	}
+
+	/**
 	 * 同文件重发：截断该用户消息及其所有后代（assistant/tool 等），再返回可重新 prompt 的原文。
 	 * 不调用 fork，因此不会生成新的会话文件。
 	 *
@@ -2219,7 +2278,7 @@ export class AgentManager {
 	async cloneSessionFile(projectId: string, sessionPath: string) {
 		return this.withTemporarySession(projectId, sessionPath, async (process) => {
 			const response = await process.client.request({ type: "clone" }, 120_000);
-			const state = await process.client.request({ type: "get_state" });
+			const state = await process.client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
 			return {
 				...((response.data as object | undefined) ?? {}),
 				sessionPath: (state.data as { sessionFile?: string } | undefined)?.sessionFile,
@@ -2293,7 +2352,7 @@ export class AgentManager {
 	private async refreshRuntimeAfterSessionReplacement(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
 		const stateResponse = await runtime.process.client
-			.request({ type: "get_state" })
+			.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout)
 			.catch(() => ({ data: undefined }));
 		const state = stateResponse.data as { sessionFile?: string; sessionName?: string } | undefined;
 		if (state?.sessionFile) runtime.tab.sessionPath = state.sessionFile;
@@ -2889,6 +2948,10 @@ export class AgentManager {
 			// 通知 stream gate：abort 对应的 settled 已到。
 			// 若 settled 前已有 agent_start（用户立刻重发），此处才真正解封；
 			// 若还没有新 start，则保持封印，防止 settled 后残留 delta 复活旧气泡。
+			// 先捕获「该 settled 是否由 abort 触发」再清标记：abortAgent 在发送 abort RPC 前
+			// 置 recentlyAborted=true，此处若为 true 说明是用户手动停止后的收尾，
+			// 不再发「已完成」系统通知（用户主动中止，无需提醒）。
+			const settledAfterAbort = runtime.recentlyAborted;
 			this.noteAgentAbortSettled(runtime);
 			runtime.recentlyAborted = false;
 			if (runtime.settleCheckTimer) {
@@ -2914,7 +2977,7 @@ export class AgentManager {
 
 				const messages = runtime.messages;
 				const lastMessage = messages[messages.length - 1];
-				if (lastMessage?.role === "assistant") {
+				if (lastMessage?.role === "assistant" && !settledAfterAbort) {
 					this.notifySessionEnd(runtime.tab.title);
 				}
 			}
@@ -3495,6 +3558,17 @@ export class AgentManager {
 		// pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装）
 		const askDetails = extractAskQuestionDetails(toolName, result, args);
 		const askCard = buildAskCard(askDetails, runtime.abortedDuringAsk);
+		// 完整结果文本只缓存在内存（不进 meta/JSONL，避免会话文件膨胀），
+		// 供截断卡片的「查看完整输出」按需读取；历史会话重载后回退按 entryId 读文件。
+		const fullResultText = extractToolResultText(result) || safeJson(result);
+		if (fullResultText.length > MAX_TOOL_RESULT_CHARS) {
+			this.toolFullTextByMessageId.set(messageId, fullResultText);
+			// LRU：超限时删除最早插入的一条（Map 迭代序即插入序）
+			if (this.toolFullTextByMessageId.size > AgentManager.TOOL_FULL_TEXT_LRU_MAX) {
+				const oldest = this.toolFullTextByMessageId.keys().next().value;
+				if (oldest !== undefined) this.toolFullTextByMessageId.delete(oldest);
+			}
+		}
 		const meta = {
 			status,
 			toolName,
@@ -3502,7 +3576,10 @@ export class AgentManager {
 			startedAt,
 			...(durationMs !== undefined ? { durationMs } : {}),
 			args: argsMeta,
-			result: truncateForDetail(extractToolResultText(result) || safeJson(result)),
+			result: truncateForDetail(fullResultText),
+			...(fullResultText.length > MAX_TOOL_RESULT_CHARS
+				? { truncated: true, fullLength: fullResultText.length }
+				: {}),
 			...(resultDetails !== undefined ? { details: resultDetails } : {}),
 			isError,
 			detailText,

@@ -205,10 +205,14 @@ export function registerProjectHandlers(deps: ProjectHandlerDeps) {
 		return result.filePaths[0];
 	});
 
-	ipcMain.handle(ipcChannels.dialogPickFiles, async (_event, options?: { title?: string }) => {
+	ipcMain.handle(ipcChannels.dialogPickFiles, async (_event, options?: { title?: string; includeDirectories?: boolean }) => {
 		const result = await dialog.showOpenDialog({
 			title: options?.title ?? "选择文件或文件夹",
-			properties: ["openFile", "openDirectory", "multiSelections"],
+			// Windows 上 openFile 与 openDirectory 并存会退化为「只选文件夹」（FOS_PICKFOLDERS），
+			// 附件引用场景以选文件为主，默认只开文件；目录选择由调用方显式开启。
+			properties: options?.includeDirectories
+				? ["openFile", "openDirectory", "multiSelections"]
+				: ["openFile", "multiSelections"],
 		});
 		return result.canceled ? [] : result.filePaths;
 	});

@@ -59,7 +59,10 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 	);
 	const sessionSummaryCache = loadTranspiledModule(
 		"src/main/sessions/sessionSummaryCache.ts",
-		new Map([["electron", { app: { getPath: () => homePath } }]]),
+		new Map([
+			["electron", { app: { getPath: () => homePath } }],
+			["../utils/fsRetry", loadTranspiledModule("src/main/utils/fsRetry.ts")],
+		]),
 	);
 	const wslPaths = loadTranspiledModule("src/main/wsl/WslPaths.ts");
 	// readHead/stat 在 LocalFileAdapter 内实现（独立加载，不走 SessionScanner 的 require），

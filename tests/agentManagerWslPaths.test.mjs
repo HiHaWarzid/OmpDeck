@@ -101,6 +101,7 @@ function loadAgentManager() {
 		if (id === "./LatestByKeyEmitter") return { LatestByKeyEmitter };
 		if (id === "../../shared/toolRuntimeState") return { updateActiveToolCalls: () => new Map() };
 		if (id === "../wsl/WslPaths") return wslPaths;
+		if (id === "../vision/VisionBridge") return loadModule("src/main/vision/VisionBridge.ts", "VisionBridge.ts");
 		return require(id);
 	}
 

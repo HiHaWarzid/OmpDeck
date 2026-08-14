@@ -53,7 +53,7 @@ export class WslFileAdapter implements FileAdapter {
 
 	private run(
 		args: string[],
-		options: { timeout: number; signal?: AbortSignal },
+		options: { timeout: number; signal?: AbortSignal; maxBuffer?: number },
 	): Promise<{ stdout: string; stdin?: never }> {
 		return new Promise((resolve, reject) => {
 			this.exec(this.wslExePath, args, {
@@ -62,6 +62,7 @@ export class WslFileAdapter implements FileAdapter {
 				timeout: options.timeout,
 				signal: options.signal,
 				windowsHide: true,
+				maxBuffer: options.maxBuffer,
 			}, (err, stdout) => {
 				if (err) reject(err);
 				else resolve({ stdout });
@@ -73,6 +74,10 @@ export class WslFileAdapter implements FileAdapter {
 		const { stdout } = await this.run([...this.baseArgs("cat"), path], {
 			timeout: 10_000,
 			signal,
+			// 会话 JSONL 可能很大（单条 thinking 块可到 600KB+，千条消息轻松超 1MB）；
+			// Node execFile 默认 maxBuffer=1MB，超出抛 ERR_CHILD_PROCESS_STDIO_MAXBUFFER，
+			// 导致会话读取失败、从列表消失。64MB 覆盖常见大会话。
+			maxBuffer: 64 * 1024 * 1024,
 		});
 		return stdout;
 	}
@@ -87,11 +92,14 @@ export class WslFileAdapter implements FileAdapter {
 
 	async write(path: string, content: string): Promise<void> {
 		this.statCache.delete(path);
-		// 使用 tee 写入，避免 heredoc 中的特殊字符问题
+		// 用 dd of= 从 stdin 写入：tee 会把内容回显到 stdout，大文件回写时同样撞
+		// 1MB maxBuffer，Node 会 kill 子进程，文件可能只写一半。内容走 stdin 传参，
+		// 天然避开 heredoc/特殊字符问题；of= 作为单一参数传给 dd，含空格路径也安全
+		// （数组传参不会被拆分）。
 		await new Promise<void>((resolve, reject) => {
 			const proc = this.exec(
 				this.wslExePath,
-				[...this.baseArgs("tee"), path],
+				[...this.baseArgs("dd"), `of=${path}`, "bs=1M"],
 				{ encoding: "utf8", timeout: 10_000, windowsHide: true },
 				(err) => (err ? reject(err) : resolve()),
 			);
@@ -157,7 +165,7 @@ export class WslFileAdapter implements FileAdapter {
 	async collectJsonl(dir: string, signal?: AbortSignal): Promise<string[]> {
 		const { stdout } = await this.run(
 			[...this.baseArgs("find"), dir, "-name", "*.jsonl", "-type", "f"],
-			{ timeout: 15_000, signal },
+			{ timeout: 15_000, signal, maxBuffer: 16 * 1024 * 1024 },
 		);
 		return stdout.trim().split(/\r?\n/).filter(Boolean);
 	}

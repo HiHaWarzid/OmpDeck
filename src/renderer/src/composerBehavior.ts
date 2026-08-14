@@ -144,7 +144,7 @@ function stripFrontmatter(raw: string): string {
 export function expandPromptTemplates(
 	message: string,
 	templates: PromptTemplateInfo[],
-): { message: string; description?: string } {
+): { message: string; description?: string; emptyTemplateName?: string } {
 	if (!templates.length || !message.includes("/")) return { message };
 
 	// 按 name 长度降序排序，确保正则交替时最长匹配优先
@@ -154,6 +154,8 @@ export function expandPromptTemplates(
 
 	// 记录最后匹配到的模板名，用于提取 description 作为元数据发送给 pi agent
 	let matchedName: string | undefined;
+	// 记录展开时发现正文为空的模板名（可能多个，取最后一个即可用于提示）
+	let emptyTemplateName: string | undefined;
 
 	// 构建 /name1|/name2|/name3 的单一正则，捕获命令前后的空白分隔符
 	const escapedNames = sorted.map((t) =>
@@ -170,6 +172,13 @@ export function expandPromptTemplates(
 		// 剥离 content 中的 frontmatter 元数据，只保留正文，
 		// 避免 `---\ndescription: xxx\n---` 泄漏到 pi agent 的对话消息中。
 		const content = stripFrontmatter(rawContent);
+		// 正文为空时（如 UI 新建模板只写了 frontmatter、正文待编辑）不展开，
+		// 保留 /name 原样并返回 emptyTemplateName：直接展开会产出空白/仅分隔符消息，
+		// 被主进程拒为"消息不能为空"，误导用户。
+		if (!content.trim()) {
+			emptyTemplateName = name;
+			return _match;
+		}
 		// 命令后有用户输入时用两个换行分隔模板内容和用户输入，提升可读性
 		const separator = suffix && /\s/.test(suffix) ? "\n\n" : "";
 		return prefix + content + separator;
@@ -178,6 +187,7 @@ export function expandPromptTemplates(
 	return {
 		message: expanded,
 		description: matchedName ? nameToDescription.get(matchedName) : undefined,
+		emptyTemplateName,
 	};
 }
 

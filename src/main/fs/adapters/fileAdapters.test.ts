@@ -46,6 +46,7 @@ test("WslFileAdapter read builds cat command with distro/user prefix", async () 
 	assert.equal(calls[0].command, "C:\\Windows\\System32\\wsl.exe");
 	assert.equal(calls[0].options.shell, false);
 	assert.equal(calls[0].options.timeout, 10_000);
+	assert.equal(calls[0].options.maxBuffer, 64 * 1024 * 1024);
 });
 
 test("WslFileAdapter readHead builds head -c command", async () => {
@@ -60,13 +61,13 @@ test("WslFileAdapter readHead builds head -c command", async () => {
 	assert.equal(calls[0].options.timeout, 5_000);
 });
 
-test("WslFileAdapter write pipes content to stdin of tee command", async () => {
+test("WslFileAdapter write pipes content to stdin of dd command", async () => {
 	const { calls, mockExec } = makeMockExec();
 	const adapter = makeAdapter(mockExec);
 
 	await adapter.write("/f.jsonl", "content");
 
-	assert.deepEqual(calls[0].args, ["-d", "Ubuntu", "-u", "ethan", "tee", "/f.jsonl"]);
+	assert.deepEqual(calls[0].args, ["-d", "Ubuntu", "-u", "ethan", "dd", "of=/f.jsonl", "bs=1M"]);
 	assert.equal(calls[0].options.timeout, 10_000);
 });
 

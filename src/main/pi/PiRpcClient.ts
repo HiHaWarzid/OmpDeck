@@ -38,7 +38,8 @@ export class PiRpcClient extends EventEmitter {
     const promise = new Promise<RpcResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`RPC command timed out: ${String(command.type)}`));
+        // 错误文本带超时时长，方便 toast/诊断卡直接看出是等待过久而非连接断开
+        reject(new Error(`RPC command timed out after ${timeoutMs}ms: ${String(command.type)}`));
       }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });

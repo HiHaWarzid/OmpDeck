@@ -72,6 +72,19 @@ export function registerSessionHandlers(deps: SessionHandlerDeps) {
 		const content = await sessionScanner.readSessionRawText(filePath);
 		return agentManager.readSessionDisplayMessages(filePath, "_viewer", content);
 	});
+	ipcMain.handle(
+		ipcChannels.sessionsReadMessageFullText,
+		async (_event, agentId: unknown, messageId: unknown, entryId?: unknown) => {
+			// 入参校验在边界（渲染层数据不可信），agentId/messageId 必须为非空字符串
+			if (typeof agentId !== "string" || !agentId.trim() || typeof messageId !== "string" || !messageId.trim()) {
+				throw new Error("Invalid message full-text request");
+			}
+			if (entryId !== undefined && (typeof entryId !== "string" || !entryId.trim())) {
+				throw new Error("Invalid entryId");
+			}
+			return agentManager.readMessageFullText(agentId, messageId, entryId as string | undefined);
+		},
+	);
 
 	// ── Codex / Claude / OpenCode 会话导入 ──
 	ipcMain.handle(ipcChannels.codexSessionsScan, async (_event, projectId: string) => {

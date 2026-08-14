@@ -2358,10 +2358,39 @@ const statusLabel =
 			: "";
 	const [copied, setCopied] = useState(false);
 	const handleCopy = () => {
-		writeClipboard(detailText);
+		// 全文加载后复制全文，否则复制截断的 detailText
+		writeClipboard(displayText);
 		setCopied(true);
 		showNotice(t("app.codeCopied"), 1200);
 		setTimeout(() => setCopied(false), 2000);
+	};
+	// 「查看完整输出」：detailText 被截断（meta.truncated）时按需经 IPC 拉取全文；
+	// 内存缓存优先，历史会话回退按 entryId 读文件。展开后展示全文并让复制按钮复制全文。
+	const isTruncated = props.message.meta?.truncated === true;
+	const [fullText, setFullText] = useState<string | null>(null);
+	const [fullTextLoading, setFullTextLoading] = useState(false);
+	const [fullTextError, setFullTextError] = useState(false);
+	const displayText = fullText ?? detailText;
+	const loadFullText = async () => {
+		if (fullText !== null || fullTextLoading) return;
+		setFullTextLoading(true);
+		setFullTextError(false);
+		try {
+			const api = (window as unknown as {
+				piDesktop?: { sessions?: { readMessageFullText?: (agentId: string, messageId: string, entryId?: string) => Promise<{ text: string }> } };
+			}).piDesktop;
+			const agentId = props.message.agentId;
+			const entryId = props.message.meta?.entryId as string | undefined;
+			if (!api?.sessions?.readMessageFullText || !agentId) {
+				throw new Error("full-text unavailable");
+			}
+			const { text } = await api.sessions.readMessageFullText(agentId, props.message.id, entryId);
+			setFullText(text);
+		} catch {
+			setFullTextError(true);
+		} finally {
+			setFullTextLoading(false);
+		}
 	};
 	return (
 		<section
@@ -2552,7 +2581,23 @@ const statusLabel =
 							{renderTodoGroups(todoItems)}
 						</ol>
 					) : (
-						<pre className="tool-card-detail">{detailText}</pre>
+						<pre className="tool-card-detail">{displayText}</pre>
+					)}
+					{isTruncated && (
+						<button
+							className="tool-card-full-text"
+							onClick={loadFullText}
+							disabled={fullTextLoading}
+							title={t("tool.showFullOutput")}
+						>
+							{fullTextLoading
+								? t("tool.loadingFullOutput")
+								: fullTextError
+									? t("tool.fullOutputFailed")
+									: fullText !== null
+										? t("tool.fullOutputLoaded")
+										: t("tool.showFullOutput")}
+						</button>
 					)}
 					<button
 						className="tool-card-copy"
@@ -3230,15 +3275,16 @@ export const BatchAskInlineBar = memo(function BatchAskInlineBar(props: {
 	);
 });
 
-/** 思考过程折叠卡片：默认收起，展开后显示完整推理文本（超长时提供截断展开）。 */
+/** 思考过程折叠卡片：默认收起为单行（deepseek-harness 模式），展开后显示完整推理文本。 */
 export const ThinkingBlock = memo(function ThinkingBlock(props: {
 	text: string;
 	startedAt?: number;
 	endedAt?: number;
 	showThinking?: boolean;
 }) {
-	// 默认展开，方便用户看到推理过程；可手动折叠
-	const [expanded, setExpanded] = useState(true);
+	// 默认折叠为一行：流式中显示最新行（带扫光动画），结束后显示第一行并静止；
+	// 点击标题行展开全文。对应 deepseek-harness 的思考折叠体验，避免长推理占满消息流。
+	const [expanded, setExpanded] = useState(false);
 	// 流式思考进行中（有起点、未正常结束）时每秒刷新计时
 	const [, setTick] = useState(0);
 	useEffect(() => {
@@ -3264,8 +3310,24 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 				: Date.now()) - props.startedAt
 			: null;
 	const durationText = durationMs != null && durationMs >= 0 ? formatDuration(durationMs) : null;
+	// 单行摘要：流式中（有起点未结束）取最新一行并标记流式态（扫光动画）；
+	// 结束后显示第一行并静止。多段思考按最后一段的最后一行取。
+	const isStreamingThinking =
+		props.startedAt != null &&
+		(props.endedAt == null || props.endedAt < props.startedAt);
+	const foldedLine = (() => {
+		const clean = stripAnsi(props.text).trim();
+		if (!clean) return "";
+		if (isStreamingThinking) {
+			const lastLine = clean.split("\n").filter(Boolean).pop() ?? "";
+			return lastLine;
+		}
+		return clean.split("\n").find((l) => l.trim()) ?? clean;
+	})();
 	return (
-		<section className="thinking-card">
+		<section
+			className={`thinking-card${expanded ? " expanded" : ""}${isStreamingThinking ? " thinking-card--streaming" : ""}`}
+		>
 			<button
 				className="thinking-card-trigger"
 				onClick={() => setExpanded((v) => !v)}
@@ -3277,9 +3339,9 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 					size={15}
 					className={`thinking-card-chevron${expanded ? " open" : ""}`}
 				/>
-				{!expanded && props.text && (
+				{!expanded && foldedLine && (
 					<span className="thinking-card-subtitle" title={props.text}>
-						{props.text.slice(0, 80)}{props.text.length > 80 ? "..." : ""}
+						{foldedLine}
 					</span>
 				)}
 				{durationText && <small>{durationText}</small>}

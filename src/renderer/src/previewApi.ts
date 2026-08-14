@@ -152,6 +152,14 @@ let previewSettings: AppSettings = {
 	webServiceHost: "0.0.0.0",
 	webServicePort: 8765,
 	rpcTimeout: 600_000,
+	visionBridge: {
+		enabled: false,
+		baseUrl: "",
+		apiKey: "",
+		model: "",
+		prompt: "",
+		timeoutMs: 120_000,
+	},
 	linkOpenMode: "external",
 	contentMaxWidth: 1400,
 	maxEditorFileSizeMB: 5,
@@ -319,6 +327,8 @@ export function createPreviewApi(): PiDesktopApi {
 			],
 			readSessionMeta: async () => ({}),
 			readChatMessages: async () => [],
+			// 预览模式无主进程：完整输出按需读取直接返回空文本
+			readMessageFullText: async () => ({ text: "" }),
 		},
 		codexSessions: {
 			scan: async () => [],
@@ -469,6 +479,7 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			openExternal: async () => undefined,
 			restart: async () => undefined,
+			visionTest: async () => ({ ok: true, models: [] }),
 			rendererLog: async (level, scope, message, detail) => {
 				console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
 					`[${scope}] ${message}`,
@@ -704,6 +715,7 @@ export function createPreviewApi(): PiDesktopApi {
 			stop: async () => undefined,
 			prompt: async () => ({ accepted: true }),
 			abort: async () => undefined,
+			notifyAsk: async () => undefined,
 			exportHtml: async () => ({ path: "preview.html" }),
 			getForkMessages: async () => [
 				{ entryId: "preview-user-1", text: "Preview prompt" },

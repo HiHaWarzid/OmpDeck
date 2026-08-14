@@ -21,6 +21,7 @@ import {
 	readSingleInstancePreference,
 } from "./settings/SettingsStore";
 import { acquireVersionSingleInstance } from "./singleInstance";
+import { readLastWindowBounds, saveLastWindowBounds } from "./windowState";
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
@@ -351,6 +352,25 @@ function setupTray() {
 	trayManager?.setupTray();
 }
 
+/**
+ * 重启应用：统一清理后 relaunch + quit。
+ * 必须先置 isQuitting，否则 closeToTray 会把退出流程吞成「隐藏到托盘」，relaunch 不生效；
+ * 清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
+ * 托盘菜单与设置页「重启」IPC（registerAppHandlers → appRestart）共用此流程。
+ */
+function restartApp() {
+	isQuitting = true;
+	void webServiceManager?.stop();
+	terminalManager?.closeAll();
+	void agentManager?.stopAll();
+	// 先释放单实例锁再 relaunch：新实例启动时旧实例仍持有锁（锁内 PID 存活判定），
+	// 会被当成"同版本二次启动"而写 .focus 后立即退出，导致重启变成退出、应用不再回来。
+	// 旧实例随后 will-quit 的 dispose 是幂等的，读到新实例 PID 不会误删新锁。
+	versionSingleInstance.dispose();
+	app.relaunch();
+	app.quit();
+}
+
 /** 启动窗口预设 → BrowserWindow 初始尺寸；fullscreen/maximized 另用 setFullScreen/maximize。 */
 function resolveStartupWindowBounds(mode: StartupWindowMode): {
 	width: number;
@@ -489,8 +509,22 @@ async function createWindow() {
 	// 对齐两处 loading 渐变的主色（浅 #eef0f3 / 深 #111315），避免闪出异色纯色帧。
 	const backgroundColor = isDark ? "#111315" : "#eef0f3";
 
-	const startupWindowMode = settingsStore.get().startupWindowMode ?? "maximized";
-	const startupBounds = resolveStartupWindowBounds(startupWindowMode);
+	// 按外观设置的启动预设调整初始尺寸；隐藏态先 maximize/fullscreen，减少首帧跳动。
+	// startupWindowMode="last"：读上次关闭时的窗口大小；读不到（首次启动/记录损坏）顺延默认 maximized。
+	const requestedWindowMode = settingsStore.get().startupWindowMode ?? "last";
+	let effectiveStartupMode = requestedWindowMode;
+	let startupBounds: { width: number; height: number };
+	if (requestedWindowMode === "last") {
+		const last = readLastWindowBounds(app.getPath("userData"));
+		if (last) {
+			startupBounds = last;
+		} else {
+			effectiveStartupMode = "maximized";
+			startupBounds = resolveStartupWindowBounds("maximized");
+		}
+	} else {
+		startupBounds = resolveStartupWindowBounds(requestedWindowMode);
+	}
 
 	mainWindow = new BrowserWindow({
 		show: showMainWindowImmediately,
@@ -529,10 +563,9 @@ async function createWindow() {
 		printStartupInfo();
 	}
 
-	// 按外观设置的启动预设调整尺寸；隐藏态先 maximize/fullscreen，减少首帧跳动。
 	applyStartupWindowMode(
 		mainWindow,
-		startupWindowMode,
+		effectiveStartupMode,
 		showMainWindowImmediately,
 	);
 
@@ -660,6 +693,19 @@ async function createWindow() {
 	}
 
 	// 关闭窗口时根据设置决定：隐藏到托盘还是正常退出
+	// 窗口大小记忆：关闭/退出前保存 normal bounds（最大化/全屏时取恢复后的尺寸），
+	// 供下次 startupWindowMode="last" 启动使用；隐藏到托盘不记录（窗口未关闭）。
+	// 注意：mainWindow 为模块级可空变量，此处用创建后的局部引用确保非空。
+	const windowForState = createdWindow;
+	windowForState.on("close", () => {
+		if (!windowForState.isDestroyed()) {
+			const normal = windowForState.isMaximized() || windowForState.isFullScreen()
+				? windowForState.getNormalBounds()
+				: windowForState.getBounds();
+			saveLastWindowBounds(app.getPath("userData"), { width: normal.width, height: normal.height });
+		}
+	});
+
 	mainWindow.on("close", (event) => {
 		if (!isQuitting && settingsStore.get().closeToTray) {
 			event.preventDefault();
@@ -829,6 +875,7 @@ function registerIpc() {
 		terminalManager,
 		appLogger,
 		getFeishuBridge: () => feishuBridge,
+		getMainWindow: () => mainWindow,
 	});
 	registerAppHandlers({
 		appLogger,
@@ -843,6 +890,8 @@ function registerIpc() {
 		},
 		// 重启前主动让出单实例锁，保证 relaunch 的新实例能拿到主实例身份
 		releaseSingleInstanceLock: () => versionSingleInstance.dispose(),
+		// 托盘菜单与设置 IPC 共用同一重启语义
+		restartApp,
 		getPetSystem: () => petSystem,
 		getWebServiceManager: () => webServiceManager,
 		openExternalUrl,
@@ -1031,7 +1080,7 @@ app.whenReady().then(async () => {
 	rpcLogger = new RpcLogger();
 	updateManager = new UpdateManager({ appLogger, getMainWindow: () => mainWindow });
 	linkOpener = new LinkOpener({ getMainWindow: () => mainWindow, getSettings: () => settingsStore.get() });
-	trayManager = new TrayManager({ getMainWindow: () => mainWindow, setIsQuitting: (v) => { isQuitting = v; }, onQuit: () => { app.quit(); } });
+	trayManager = new TrayManager({ getMainWindow: () => mainWindow, setIsQuitting: (v) => { isQuitting = v; }, onQuit: () => { app.quit(); }, onRestart: restartApp });
 	gitService = new GitService();
 	worktreeService = new WorktreeService();
 	piLocator = new PiLocator("omp");

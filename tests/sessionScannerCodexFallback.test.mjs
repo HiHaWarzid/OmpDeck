@@ -61,7 +61,10 @@ function loadSessionScanner(homePath) {
 	);
 	const sessionSummaryCache = loadTranspiledModule(
 		"src/main/sessions/sessionSummaryCache.ts",
-		new Map([["electron", { app: { getPath: () => homePath } }]]),
+		new Map([
+			["electron", { app: { getPath: () => homePath } }],
+			["../utils/fsRetry", loadTranspiledModule("src/main/utils/fsRetry.ts")],
+		]),
 	);
 	const wslPaths = loadTranspiledModule("src/main/wsl/WslPaths.ts");
 	const localFileAdapter = loadTranspiledModule("src/main/fs/adapters/localFileAdapter.ts");

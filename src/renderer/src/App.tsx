@@ -1327,6 +1327,14 @@ export function App() {
     webServiceHost: "0.0.0.0",
     webServicePort: 8765,
     rpcTimeout: 600_000,
+    visionBridge: {
+      enabled: false,
+      baseUrl: "",
+      apiKey: "",
+      model: "",
+      prompt: "",
+      timeoutMs: 120_000,
+    },
     linkOpenMode: "external",
     contentMaxWidth: 1400,
     maxEditorFileSizeMB: 5,
@@ -1412,8 +1420,33 @@ export function App() {
   const [installCompleted, setInstallCompleted] = useState(false);
   const [environmentDialog, setEnvironmentDialog] = useState(false);
   const DEFAULT_LIST_WIDTH = 221;
-  const [listWidth, setListWidth] = useState(DEFAULT_LIST_WIDTH);
-  const [drawerWidth, setDrawerWidth] = useState(320);
+  const LIST_WIDTH_STORAGE_KEY = "pid:list-width";
+  const DRAWER_WIDTH_STORAGE_KEY = "pid:drawer-width";
+  /** 读取持久化宽度并 clamp 到合法范围；无记录/损坏时回退默认值。 */
+  const loadPanelWidth = (key: string, fallback: number, min: number, max: number) => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw == null) return fallback;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return fallback;
+      return Math.min(max, Math.max(min, value));
+    } catch {
+      return fallback;
+    }
+  };
+  const savePanelWidth = (key: string, width: number) => {
+    try {
+      localStorage.setItem(key, String(width));
+    } catch {
+      // localStorage 不可用时静默忽略，仅本次会话内生效
+    }
+  };
+  const [listWidth, setListWidth] = useState(() =>
+    loadPanelWidth(LIST_WIDTH_STORAGE_KEY, DEFAULT_LIST_WIDTH, 100, 440),
+  );
+  const [drawerWidth, setDrawerWidth] = useState(() =>
+    loadPanelWidth(DRAWER_WIDTH_STORAGE_KEY, 320, 180, 560),
+  );
   const [composerHeight, setComposerHeight] = useState(COMPOSER_MIN_HEIGHT);
   const [composerOffsetHeight, setComposerOffsetHeight] = useState(0);
   /** ResizeObserver 驱动布局预算重新计算；ref 尺寸本身变化不会触发 React render。 */
@@ -2579,6 +2612,26 @@ export function App() {
           delete next[request.requestId];
           if (Object.keys(next).length === 0) return null;
           return next;
+        }
+
+        // 非活动 Agent 收到对话类 ask 请求时发系统通知（每 requestId 一次，completed 不重复）：
+        // 用户在别的会话工作时，后台 agent 的提问不应被错过。设置关闭或聚焦时不打扰。
+        if (
+          request.agentId !== activeAgentIdRef.current &&
+          settings.enableNotifications &&
+          (request.method === "select" ||
+            request.method === "confirm" ||
+            request.method === "input" ||
+            request.method === "editor" ||
+            request.method === "batch_ask")
+        ) {
+          const askTitle = typeof request.title === "string" && request.title.trim()
+            ? request.title
+            : t("app.askPendingTitle");
+          void api.agents.notifyAsk(
+            t("app.askNotificationTitle", { app: "OmpDeck" }),
+            t("app.askNotificationBody", { title: askTitle }),
+          );
         }
 
         /*
@@ -5467,7 +5520,14 @@ export function App() {
     // 在发送前本地展开 prompt template 命令（/name → 完整内容），
     // 避免依赖 pi 的展开导致用户附加文本丢失以及特殊符号干扰
     // 同时提取模板的 description 作为元数据发给 pi agent，让其了解本次 prompt 意图
-    const { message: expandedMessage, description: templateDescription } = expandPromptTemplates(message, promptTemplateList);
+    const { message: expandedMessage, description: templateDescription, emptyTemplateName } = expandPromptTemplates(message, promptTemplateList);
+
+    // 模板正文为空（UI 新建模板只写 frontmatter）时不发送：展开会产出空白消息，
+    // 被主进程拒为"消息不能为空"；这里拦截并明确提示补正文，便于定位编辑。
+    if (emptyTemplateName) {
+      showToast(t("app.promptTemplateEmptyBody", { name: emptyTemplateName }), 4000);
+      return;
+    }
 
     const queuedPromptSnapshot: QueuedPrompt = {
       id: crypto.randomUUID(),
@@ -6077,8 +6137,9 @@ export function App() {
   }
 
   /**
-   * 打开系统原生文件/文件夹选择器，将选中路径以 @path 引用格式插入到消息中。
-   * 仅引用路径，不读取/上传文件内容。
+   * 打开系统原生文件选择器，将选中路径以 @path 引用格式插入到消息中。
+   * 仅引用路径，不读取/上传文件内容。默认只选文件（Windows 上文件+目录并存
+   * 会退化为只选文件夹）；需要目录选择时由主进程显式开启 includeDirectories。
    */
   async function handleAttachFile() {
     try {
@@ -6453,6 +6514,10 @@ export function App() {
     const startListWidth = listCollapsed ? 68 : listWidth;
     const startDrawerWidth = drawerCollapsed ? 0 : drawerWidth;
     let frame = 0;
+    // 拖拽期间的最新宽度（onMove 里 setState 是异步的，onUp 时闭包里的 listWidth/drawerWidth
+    // 还是起始值；这里同步跟踪，供 onUp 一次性持久化）。
+    let latestListWidth = listCollapsed ? 68 : listWidth;
+    let latestDrawerWidth = drawerCollapsed ? 0 : drawerWidth;
 
     function onMove(moveEvent: globalThis.PointerEvent) {
       cancelAnimationFrame(frame);
@@ -6460,6 +6525,7 @@ export function App() {
         const delta = moveEvent.clientX - startX;
         if (target === "list") {
           const next = Math.min(440, Math.max(100, startListWidth + delta));
+          latestListWidth = next;
           setListCollapsed(next <= 120);
           setListWidth(next);
         } else {
@@ -6468,6 +6534,7 @@ export function App() {
             560,
             Math.max(minDrawerWidth, startDrawerWidth - delta),
           );
+          latestDrawerWidth = next;
           setDrawerCollapsed(!drawerPinned && next <= 190);
           setDrawerWidth(next);
         }
@@ -6480,6 +6547,10 @@ export function App() {
       window.removeEventListener("pointerup", onUp);
       document.body.classList.remove("is-resizing");
       document.body.classList.remove("is-list-resizing");
+      // 拖拽结束一次性持久化（避免高频写 localStorage）；
+      // 折叠状态下保存展开宽度（折叠状态本身已由列表记忆持久化）
+      savePanelWidth(LIST_WIDTH_STORAGE_KEY, Math.max(100, latestListWidth));
+      savePanelWidth(DRAWER_WIDTH_STORAGE_KEY, Math.max(180, latestDrawerWidth) || 320);
     }
 
     document.body.classList.add("is-resizing");

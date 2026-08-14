@@ -95,9 +95,8 @@ const defaultSettings: AppSettings = {
   theme: "system",
   lightBackground: "white",
   language: "system",
-  // 默认最大化：与历史 createWindow 在 ready-to-show 后 maximize() 的行为一致
-  // （1480×960 只是最大化前的兜底尺寸，不是最终展示态）
-  startupWindowMode: "maximized",
+  // 默认「上次窗口大小」：无记录时顺延最大化（见 createWindow），行为与历史一致
+  startupWindowMode: "last",
   piEnvironmentChecked: false,
   enableGitManagement: true,
   gitCommitMessagePrompt: `请根据以下 git diff 生成一条中文 git commit message。
@@ -144,6 +143,15 @@ Gitmoji 对应关系：
   webServiceHost: "0.0.0.0",
   webServicePort: 8765,
   rpcTimeout: 600_000,
+  // 视觉桥默认关闭：需要用户在设置里配置 OpenAI 兼容端点与视觉模型后启用
+  visionBridge: {
+    enabled: false,
+    baseUrl: "",
+    apiKey: "",
+    model: "",
+    prompt: "请详细描述这张图片的内容，包括文字、图表、界面元素与操作步骤。",
+    timeoutMs: 120_000,
+  },
   linkOpenMode: "external",
   contentMaxWidth: 1400,
   maxEditorFileSizeMB: 5,

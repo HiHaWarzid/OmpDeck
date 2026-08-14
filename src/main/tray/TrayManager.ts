@@ -11,6 +11,8 @@ export interface TrayManagerDeps {
 	setIsQuitting: (value: boolean) => void;
 	/** 用户从托盘菜单点击「退出」时触发；由 index.ts 注入 app.quit() 以避免在此处直接依赖 app 引用。 */
 	onQuit: () => void;
+	/** 用户从托盘菜单点击「重启」时触发；index.ts 注入统一清理 + relaunch 流程。 */
+	onRestart: () => void;
 }
 
 export class TrayManager {
@@ -54,6 +56,13 @@ export class TrayManager {
 				label: "显示窗口",
 				click: () => {
 					this.focusMainWindow();
+				},
+			},
+			{ type: "separator" },
+			{
+				label: "重启 OmpDeck",
+				click: () => {
+					this.deps.onRestart();
 				},
 			},
 			{ type: "separator" },

@@ -351,6 +351,17 @@ const api = {
 			ipcRenderer.invoke(ipcChannels.sessionsReadChatMessages, filePath) as Promise<
 				import("../shared/types").ChatMessage[]
 			>,
+		readMessageFullText: (
+			agentId: string,
+			messageId: string,
+			entryId?: string,
+		) =>
+			ipcRenderer.invoke(
+				ipcChannels.sessionsReadMessageFullText,
+				agentId,
+				messageId,
+				entryId,
+			) as Promise<{ text: string }>,
 	},
 	codexSessions: {
 		scan: (projectId: string) =>
@@ -657,6 +668,12 @@ const api = {
 		onOpenInBrowser: (callback: (url: string) => void) =>
 			subscribe(ipcChannels.appOpenInBrowser, callback),
 		restart: () => ipcRenderer.invoke(ipcChannels.appRestart) as Promise<void>,
+		visionTest: (config: { baseUrl: string; apiKey: string }) =>
+			ipcRenderer.invoke(ipcChannels.visionTest, config) as Promise<{
+				ok: boolean;
+				models?: string[];
+				error?: string;
+			}>,
 		rendererLog: (
 			level: AppLogLevel,
 			scope: string,
@@ -1035,6 +1052,9 @@ const api = {
 		/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor） */
 		onUiRequest: (callback: (request: { agentId: string; requestId: string; method: string; title: string; options?: string[]; placeholder?: string; prefill?: string; allowOther?: boolean; completed?: boolean; value?: string; cancelled?: boolean; message?: string; notifyType?: "info" | "warning" | "error"; text?: string; widgetKey?: string; widgetLines?: string[]; widgetPlacement?: "aboveEditor" | "belowEditor" }) => void) =>
 			subscribe(ipcChannels.agentsUiRequest, callback),
+		/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关） */
+		notifyAsk: (title: string, body: string) =>
+			ipcRenderer.invoke(ipcChannels.agentsNotifyAsk, title, body) as Promise<void>,
 		/** 监听项目信任确认请求（主进程在启动 Agent 前对含 .pi 资源的项目发起） */
 		onTrustRequest: (callback: (request: { requestId: string; cwd: string; projectName: string }) => void) =>
 			subscribe(ipcChannels.agentsTrustRequest, callback),
@@ -1194,10 +1214,12 @@ const api = {
 	// ===== 系统文件选择器 =====
 	dialog: {
 		/**
-		 * 打开系统原生文件/文件夹选择器，支持多选。
+		 * 打开系统原生文件选择器，支持多选。
+		 * 默认只选文件（Windows 上文件+目录并存会退化为只选文件夹）；
+		 * 需要目录选择时传 includeDirectories: true。
 		 * 返回选中路径列表，取消时返回空数组。
 		 */
-		pickFiles: (options?: { title?: string }) =>
+		pickFiles: (options?: { title?: string; includeDirectories?: boolean }) =>
 			ipcRenderer.invoke(ipcChannels.dialogPickFiles, options) as Promise<string[]>,
 	},
 

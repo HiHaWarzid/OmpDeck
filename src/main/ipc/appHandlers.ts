@@ -39,6 +39,8 @@ interface AppHandlerDeps {
 	setIsQuitting: (value: boolean) => void;
 	/** 重启前释放版本级单实例锁，避免新实例被旧实例的锁挡掉 */
 	releaseSingleInstanceLock: () => void;
+	/** 统一重启流程（清理服务 + 释放锁 + relaunch）；托盘菜单与设置 IPC 共用同一语义 */
+	restartApp: () => void;
 	getPetSystem: () => PetSystem | null;
 	getWebServiceManager: () => WebServiceManager | undefined;
 	// 顶层函数 dep（定义留在 index.ts）
@@ -63,6 +65,7 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		openExternalUrl,
 		syncWslEnvironment,
 		applyNativeThemeSource,
+		restartApp,
 	} = deps;
 
 	ipcMain.handle(ipcChannels.appInfo, () => ({
@@ -127,22 +130,8 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		await openExternalUrl(url, forceSystem);
 	});
 	ipcMain.handle(ipcChannels.appRestart, async () => {
-		// 标记为退出状态，避免 closeToTray 阻止重启
-		setIsQuitting(true);
-		// 停止所有 Agent 和服务。清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
-		try {
-			await getWebServiceManager()?.stop();
-			terminalManager?.closeAll();
-			agentManager?.stopAll();
-		} catch (error) {
-			void appLogger.error("app", "Cleanup before restart failed, continuing anyway", error);
-		}
-		// 先释放单实例锁再 relaunch：新实例启动时旧实例仍持有锁（锁内 PID 存活判定），
-		// 会被当成"同版本二次启动"而写 .focus 后立即退出，导致重启变成退出、应用不再回来。
-		// 旧实例随后 will-quit 的 dispose 是幂等的，读到新实例 PID 不会误删新锁。
-		releaseSingleInstanceLock?.();
-		app.relaunch();
-		app.quit();
+		// 统一清理 + relaunch；清理失败不能拦住重启，否则应用会卡死在"点了没反应"
+		restartApp();
 	});
 	ipcMain.handle(ipcChannels.appWindowMinimize, () => {
 		const win = getMainWindow();
@@ -241,5 +230,51 @@ export function registerAppHandlers(deps: AppHandlerDeps) {
 		}
 		win.webContents.openDevTools({ mode: "detach" });
 		return true;
+	});
+	ipcMain.handle(ipcChannels.visionTest, async (_event, config: unknown) => {
+		// 视觉桥连通性测试：GET {baseUrl}/models 验证端点与 API key（入参校验在边界）。
+		const c = config as {
+			baseUrl?: unknown;
+			apiKey?: unknown;
+		} | null;
+		const baseUrl = typeof c?.baseUrl === "string" ? c.baseUrl.trim().replace(/\/+$/, "") : "";
+		const apiKey = typeof c?.apiKey === "string" ? c.apiKey.trim() : "";
+		if (!baseUrl || !apiKey) {
+			return { ok: false, error: "请先填写端点与 API Key" };
+		}
+		try {
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), 15_000);
+			try {
+				const response = await fetch(`${baseUrl}/models`, {
+					headers: { Authorization: `Bearer ${apiKey}` },
+					signal: controller.signal,
+				});
+				if (!response.ok) {
+					const detail = await response.text().catch(() => "");
+					return {
+						ok: false,
+						error: `HTTP ${response.status}: ${detail.slice(0, 200)}`,
+					};
+				}
+				const data = (await response.json()) as { data?: unknown };
+				const modelIds = Array.isArray(data.data)
+					? data.data
+							.map((m) => (m && typeof m === "object" && "id" in m ? String((m as { id: unknown }).id) : ""))
+							.filter(Boolean)
+					: [];
+				return { ok: true, models: modelIds };
+			} finally {
+				clearTimeout(timer);
+			}
+		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") {
+				return { ok: false, error: "连接超时（15s）" };
+			}
+			return {
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
 	});
 }
