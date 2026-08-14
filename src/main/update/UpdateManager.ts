@@ -24,9 +24,6 @@ import type { AppLogger } from "../logging/AppLogger";
 export const RELEASES_URL = "https://github.com/HiHaWarzid/OmpDeck";
 const LATEST_RELEASE_API =
 	"https://api.github.com/repos/HiHaWarzid/OmpDeck/releases/latest";
-// Fork 仓库尚未发布 Release 时回退到上游 PiDeck 检查，避免 404 导致检查更新始终失败。
-const UPSTREAM_LATEST_RELEASE_API =
-	"https://api.github.com/repos/ayuayue/PiDeck/releases/latest";
 // GitHub API 认证：设置 GITHUB_TOKEN 环境变量可提升请求限额，
 // 避免国内网络下因限频（403）导致检查更新失败。
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? process.env.PI_DECK_GITHUB_TOKEN ?? "";
@@ -267,14 +264,27 @@ export class UpdateManager {
 		if (GITHUB_TOKEN) {
 			headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
 		}
-		// Fork 仓库可能尚未发布 Release（404），此时回退到上游 PiDeck 检查，避免检查更新始终失败。
-		let response = await fetch(LATEST_RELEASE_API, { headers });
-		let releaseUrlFallback = RELEASES_URL;
-		if (!response.ok && response.status === 404) {
-			response = await fetch(UPSTREAM_LATEST_RELEASE_API, { headers });
-			releaseUrlFallback = "https://github.com/ayuayue/PiDeck";
-		}
+		// Fork 仓库尚未发布 Release（404）时不回退到上游 PiDeck 检查：
+		// 上游安装包（PiDeck.Setup.*.exe）不适用于 OmpDeck，提示会误导用户下载错误产物；
+		// 自家 repo 发布 Release 后检查自然生效。仍失败（如 403 限频）抛错走原逻辑。
+		const response = await fetch(LATEST_RELEASE_API, { headers });
 		if (!response.ok) {
+			if (response.status === 404) {
+				void appLogger.info("update", "No OmpDeck release published, update check skipped", {
+					currentVersion,
+				});
+				return {
+					currentVersion,
+					latestVersion: currentVersion,
+					hasUpdate: false,
+					releaseName: `v${currentVersion}`,
+					releaseNotes: "",
+					releaseUrl: RELEASES_URL,
+					publishedAt: undefined,
+					assets: [],
+					recommendedAsset: undefined,
+				};
+			}
 			throw new Error(`GitHub Release 检查失败：HTTP ${response.status}`);
 		}
 		const release = (await response.json()) as GitHubRelease;
@@ -297,7 +307,7 @@ export class UpdateManager {
 			hasUpdate: compareVersions(latestVersion, currentVersion) > 0,
 			releaseName: release.name || `v${latestVersion}`,
 			releaseNotes: release.body || "",
-			releaseUrl: release.html_url || releaseUrlFallback,
+			releaseUrl: release.html_url || RELEASES_URL,
 			publishedAt: release.published_at,
 			assets,
 			recommendedAsset,
