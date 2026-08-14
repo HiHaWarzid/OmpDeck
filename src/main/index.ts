@@ -198,6 +198,7 @@ import { registerFileHandlers } from "./ipc/fileHandlers";
 import { registerSessionHandlers } from "./ipc/sessionHandlers";
 import { registerGitHandlers } from "./ipc/gitHandlers";
 import { registerConfigHandlers } from "./ipc/configHandlers";
+import { registerClipboardHandlers } from "./ipc/clipboardHandlers";
 import { registerFeishuHandlers } from "./ipc/feishuHandlers";
 import { registerPiHandlers } from "./ipc/piHandlers";
 import { registerAgentHandlers } from "./ipc/agentHandlers";
@@ -861,6 +862,7 @@ function registerIpc() {
 	registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger });
 	registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! });
 	registerConfigHandlers({ configManager, agentManager, appLogger });
+	registerClipboardHandlers();
 	registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager });
 	registerAgentHandlers({
 		agentManager,

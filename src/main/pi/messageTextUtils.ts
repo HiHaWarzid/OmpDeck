@@ -18,7 +18,10 @@ export const MAX_TOOL_RESULT_CHARS = 8000;
 /** 安全序列化任意值为 JSON 字符串，处理循环引用等异常。 */
 export function safeJson(value: unknown): string {
 	try {
-		return JSON.stringify(value, null, 2);
+		const serialized = JSON.stringify(value, null, 2);
+		// JSON.stringify(undefined/function/symbol) 返回 undefined 而非字符串，
+		// 违反 ": string" 契约；调用方会直接对其 .length / 拼接，必须归一为 ""。
+		return serialized === undefined ? "" : serialized;
 	} catch {
 		return String(value);
 	}

@@ -250,6 +250,14 @@ test("safeJson serializes objects", () => {
 	assert.equal(safeJson({ a: 1 }), '{\n  "a": 1\n}');
 });
 
+// 回归：JSON.stringify(undefined) 返回 undefined，曾被 safeJson 直接透传，
+// 导致工具事件热路径 fullResultText.length 抛 TypeError（tool_execution_start 无 result）。
+test("safeJson(undefined) returns empty string per string contract", () => {
+	assert.equal(safeJson(undefined), "");
+	assert.equal(safeJson(null), "null");
+	assert.equal(typeof safeJson(undefined), "string");
+});
+
 test("safeJson handles circular references", () => {
 	const circular: Record<string, unknown> = {};
 	circular.self = circular;

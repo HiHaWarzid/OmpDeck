@@ -334,4 +334,13 @@ export const ipcChannels = {
 	// ===== 系统文件选择器 =====
 	/** 打开系统原生文件/文件夹选择器，返回选中路径列表 */
 	dialogPickFiles: "dialog:pick-files",
+
+	// ===== 剪贴板 =====
+	/**
+	 * 剪贴板读写统一走主进程：Electron 已弃用 renderer/preload 进程直接访问
+	 * clipboard API（未来版本将移除），必须经 IPC 转发。
+	 * read 用 sendSync 通道（ipcMain.on + returnValue）保持粘贴事件同步契约。
+	 */
+	clipboardReadFilePaths: "clipboard:read-file-paths",
+	clipboardWriteText: "clipboard:write-text",
 } as const;

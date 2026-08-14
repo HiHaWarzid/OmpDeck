@@ -3620,7 +3620,10 @@ export class AgentManager {
 		// 完整结果文本只算一次：detailText（截断版）、meta.result（截断版）、
 		// truncated 判定与全文缓存（未截断）共用同一份，避免大工具结果在同一事件内
 		// 被 extractToolResultText / safeJson 重复处理（历史实现计算了 2~3 次）。
-		const fullResultText = extractToolResultText(result) || safeJson(result);
+		const fullResultText =
+			extractToolResultText(result) || safeJson(result) || "";
+		// tool_execution_start 事件（omp 协议）不带 result/partialResult/output，
+		// result 为 undefined；safeJson 归一为 "" 后此处恒为字符串，下游 .length 安全。
 		const detailText = formatToolDetail(toolName, args, result, isError, fullResultText);
 		const icon = status === "running" ? "▶" : isError ? "✗" : "✓";
 		const text =
