@@ -1,4 +1,4 @@
-import type { PiDesktopApi } from "../../preload";
+import type { PiDesktopApi } from "../../shared/api";
 import { createDefaultExternalEditorSettings } from "../../shared/types";
 import type {
 	AgentTab,

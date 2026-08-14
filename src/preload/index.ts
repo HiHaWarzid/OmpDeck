@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { ipcChannels } from "../shared/ipc";
+import type { PiDesktopApi } from "../shared/api";
 import type {
 	YaoPromptListResult,
 	YaoPromptDetailResult,
@@ -78,6 +79,7 @@ import type {
 	TerminalTab,
 	ThinkingUpdate,
 	AgentMessagesDelta,
+	AgentUiRequest,
 } from "../shared/types";
 
 /**
@@ -923,7 +925,7 @@ const api = {
 				level,
 			) as Promise<AgentRuntimeState>,
 		commands: (agentId: string) =>
-			ipcRenderer.invoke("agents:commands", agentId) as Promise<PiCommand[]>,
+			ipcRenderer.invoke(ipcChannels.agentsCommands, agentId) as Promise<PiCommand[]>,
 		onState: (callback: (tabs: AgentTab[]) => void) =>
 			subscribe(ipcChannels.agentsState, callback),
 		/** 桌面宠物点击跳转：主进程通知主窗切换到活跃 Agent tab */
@@ -961,7 +963,7 @@ const api = {
 		sendUiResponse: (agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) =>
 			ipcRenderer.invoke(ipcChannels.agentsUiResponse, agentId, requestId, response) as Promise<void>,
 		/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor） */
-		onUiRequest: (callback: (request: { agentId: string; requestId: string; method: string; title: string; options?: string[]; placeholder?: string; prefill?: string; allowOther?: boolean; completed?: boolean; value?: string; cancelled?: boolean; message?: string; notifyType?: "info" | "warning" | "error"; text?: string; widgetKey?: string; widgetLines?: string[]; widgetPlacement?: "aboveEditor" | "belowEditor" }) => void) =>
+		onUiRequest: (callback: (request: AgentUiRequest) => void) =>
 			subscribe(ipcChannels.agentsUiRequest, callback),
 		/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关） */
 		notifyAsk: (title: string, body: string) =>
@@ -1175,7 +1177,7 @@ const api = {
 		export: (draftPath: string) =>
 			ipcRenderer.invoke(ipcChannels.scratchPadExport, draftPath) as Promise<boolean>,
 	},
-};
+} satisfies PiDesktopApi;
 
 function subscribe<T>(channel: string, callback: (payload: T) => void) {
 	const listener = (_event: Electron.IpcRendererEvent, payload: T) =>
@@ -1197,5 +1199,3 @@ try {
 	console.error("[OmpDeck preload] Failed to expose desktop API", detail);
 	ipcRenderer.send(ipcChannels.preloadError, detail);
 }
-
-export type PiDesktopApi = typeof api;

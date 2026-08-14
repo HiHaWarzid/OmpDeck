@@ -19,7 +19,7 @@ import type {
 	ChatMessage,
 	SessionSummary,
 } from "../../../shared/types";
-import type { PiDesktopApi } from "../../../preload";
+import type { PiDesktopApi } from "../../../shared/api";
 import { isReplacementForPendingAgent, type PendingAgentTab } from "../agentListDisplay";
 import { mergeAgentRuntimeState } from "../utils/agentRuntimeState";
 import { translateAgentErrorMessage } from "../utils/agentErrors";

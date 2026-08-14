@@ -241,6 +241,7 @@ import type {
   Project,
   SessionSummary,
   ComposerAgentMode,
+  AgentUiRequest,
   ThinkingUpdate,
   WidgetLineItem,
 } from "../../shared/types";
@@ -500,39 +501,6 @@ function getEditorLogoUrl(editorId: string) {
   return EDITOR_LOGO_URLS[editorId];
 }
 
-/** 扩展 UI 请求，适配 onUiRequest 回调中的 request 对象 */
-interface UiRequest {
-	agentId: string;
-	requestId: string;
-	method: string;
-	title: string;
-	options?: string[];
-	placeholder?: string;
-	prefill?: string;
-	allowOther?: boolean;
-	/** 批量问卷：扩展 envelope 解析后的问题列表 */
-	batchQuestions?: Array<{
-		id: string;
-		type: "select" | "confirm" | "input" | "editor";
-		question: string;
-		options?: Array<string | { label: string; value?: string; description?: string }>;
-		allowOther?: boolean;
-		placeholder?: string;
-		prefill?: string;
-	}>;
-	/** 批量是否强制 Submit 审阅 tab */
-	batchReview?: boolean;
-	completed?: boolean;
-	value?: string;
-	cancelled?: boolean;
-	message?: string;
-	notifyType?: "info" | "warning" | "error";
-	text?: string;
-	widgetKey?: string;
-	widgetLines?: WidgetLine[];
-	widgetPlacement?: "aboveEditor" | "belowEditor";
-}
-
 /** Agent 运行时暂存在 renderer、尚未提交给 pi 的消息。 */
 type QueuedPrompt = QueuedPromptSnapshot;
 
@@ -703,7 +671,7 @@ export function App() {
   }, [editorsOpen]);
 
   /** 活跃的 Extension UI 请求 map（requestId → UiRequest），用于实时显示 ask_question 卡片 */
-  const [activeUiRequest, setActiveUiRequest] = useState<Record<string, UiRequest> | null>(null);
+  const [activeUiRequest, setActiveUiRequest] = useState<Record<string, AgentUiRequest> | null>(null);
   /** Extension 通过 RPC setWidget 推送的轻量状态块；按 agent 隔离，避免切换会话串台。 */
   const [extensionWidgetsByAgent, setExtensionWidgetsByAgent] = useState<
     Record<string, Record<string, WidgetLine[]>>
@@ -2669,7 +2637,7 @@ export function App() {
     // 监听 Extension UI 请求：对话类渲染为提问卡片；setWidget 类作为 composer 上方的轻量状态块展示。
     const offUiRequest = api.agents.onUiRequest((request) => {
       if (request.method === "notify") {
-        const notifyRequest = request as UiRequest;
+        const notifyRequest = request;
         if (notifyRequest.message) {
           showNotice(notifyRequest.message, notifyRequest.notifyType === "error" ? 5000 : 3500);
         }
@@ -2677,7 +2645,7 @@ export function App() {
       }
 
       if (request.method === "set_editor_text") {
-        const editorRequest = request as UiRequest;
+        const editorRequest = request;
         const text = editorRequest.text ?? "";
         setPromptForAgent(request.agentId, text);
         if (request.agentId === activeAgentIdRef.current) {
@@ -2688,7 +2656,7 @@ export function App() {
       }
 
       if (request.method === "setWidget") {
-        const widgetRequest = request as UiRequest;
+        const widgetRequest = request;
         const widgetKey = widgetRequest.widgetKey || widgetRequest.requestId;
         // 兼容新协议：widgetLines 元素可以是 string（老扩展）或 WidgetLineItem（todo 等结构化扩展）
         // 过滤掉 null/undefined 等非法值，保留 string 和带 content 的对象
@@ -2780,7 +2748,7 @@ export function App() {
         }
 
         // 新增或更新 UI 请求
-        return { ...(current ?? {}), [request.requestId]: request as UiRequest };
+        return { ...(current ?? {}), [request.requestId]: request };
       });
     });
     // 监听项目信任确认请求：主进程在启动 pi 前对含 .pi 资源的项目发起，弹窗等待用户决策

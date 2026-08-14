@@ -283,7 +283,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps) {
 			return result;
 		},
 	);
-	ipcMain.handle("agents:commands", async (_event, agentId: string) => {
+	ipcMain.handle(ipcChannels.agentsCommands, async (_event, agentId: string) => {
 		try {
 			return await agentManager.getCommands(agentId);
 		} catch {

@@ -1,3 +1,5 @@
+import type { WidgetLineItem } from "./message";
+
 export type AgentStatus = "starting" | "idle" | "running" | "error" | "closed";
 
 export type AgentTab = {
@@ -67,4 +69,45 @@ export type CreateAgentInput = {
 export type ForkMessage = {
 	entryId: string;
 	text: string;
+};
+
+/** 批量问卷：扩展把 questions JSON 塞进 input title，桌面端解析后渲染 Tab 问卷。 */
+export type AgentUiBatchQuestion = {
+	id: string;
+	type: "select" | "confirm" | "input" | "editor";
+	question: string;
+	options?: Array<string | { label: string; value?: string; description?: string }>;
+	allowOther?: boolean;
+	placeholder?: string;
+	prefill?: string;
+};
+
+/**
+ * Agent 扩展 UI 请求（ctx.ui.select/confirm/input/editor/notify/setWidget）。
+ * 主进程 AgentManager 发出、preload 原样透传、渲染层渲染卡片——三侧共用同一类型，
+ * 避免各自内联声明导致字段漂移（历史教训：batchQuestions/widgetLines 曾只存在于渲染层）。
+ */
+export type AgentUiRequest = {
+	agentId: string;
+	requestId: string;
+	method: string;
+	title: string;
+	options?: string[];
+	placeholder?: string;
+	prefill?: string;
+	allowOther?: boolean;
+	/** 批量问卷：扩展 envelope 解析后的问题列表（method 为 batch_ask） */
+	batchQuestions?: AgentUiBatchQuestion[];
+	/** 批量是否强制 Submit 审阅 tab */
+	batchReview?: boolean;
+	completed?: boolean;
+	value?: string;
+	cancelled?: boolean;
+	message?: string;
+	notifyType?: "info" | "warning" | "error";
+	text?: string;
+	widgetKey?: string;
+	/** widget 行元素：兼容老协议的 string 和新协议的 WidgetLineItem（结构化三态）。 */
+	widgetLines?: Array<string | WidgetLineItem>;
+	widgetPlacement?: "aboveEditor" | "belowEditor";
 };

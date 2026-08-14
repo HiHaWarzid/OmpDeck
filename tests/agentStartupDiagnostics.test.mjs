@@ -12,7 +12,7 @@ const appSource = readFileSync("src/renderer/src/App.tsx", "utf8");
 const rendererMainSource = readFileSync("src/renderer/src/main.tsx", "utf8");
 
 test("agent startup writes diagnostics across renderer IPC and pi launch boundaries", () => {
-	assert.match(ipcSource, /rendererLog:\s*"renderer:log"/);
+	assert.match(ipcSource, /channel:\s*"renderer:log"/);
 	assert.match(preloadSource, /rendererLog:\s*\(\s*level: AppLogLevel,\s*scope: string,\s*message: string,\s*detail\?: unknown,/);
 	// Agent create IPC 处理器与 rendererLog 通道已从 index.ts 拆到 src/main/ipc/ 下
 	assert.match(logHandlersSource, /ipcChannels\.rendererLog/);

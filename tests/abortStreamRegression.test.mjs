@@ -19,7 +19,7 @@ test("abort feedback is toast-only and seals stream generation", () => {
 		/addMessage\(runtime,\s*"system",\s*"已请求停止当前响应"/,
 	);
 	assert.match(agentManager, /ipcChannels\.agentsNotice/);
-	assert.match(ipc, /agentsNotice:\s*"agents:notice"/);
+	assert.match(ipc, /channel:\s*"agents:notice"/);
 
 	// 2) abort 必须封印 stream generation，并走 settled 协同解封
 	// 现在所有 stream gate 调用接收 runtime（不再按 agentId 索引 Map）

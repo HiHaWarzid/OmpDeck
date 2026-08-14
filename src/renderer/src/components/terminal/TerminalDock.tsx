@@ -11,7 +11,7 @@ import "@xterm/xterm/css/xterm.css";
 import { showNotice } from "../../utils/notice";
 import { writeClipboard } from "../../utils/clipboard";
 import { ChevronDown, ChevronUp, MoreHorizontal, Plus, X } from "lucide-react";
-import type { PiDesktopApi } from "../../../../preload";
+import type { PiDesktopApi } from "../../../../shared/api";
 import type { TerminalTab } from "../../../../shared/types";
 import { t } from "../../i18n";
 

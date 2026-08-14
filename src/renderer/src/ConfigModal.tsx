@@ -1,6 +1,6 @@
 import { showNotice } from "./utils/notice";
 import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
-import type { PiDesktopApi } from "../../preload";
+import type { PiDesktopApi } from "../../shared/api";
 import { AuthTab } from "./config/AuthTab";
 import { ModelsTab } from "./config/ModelsTab";
 import { RawTab } from "./config/RawTab";

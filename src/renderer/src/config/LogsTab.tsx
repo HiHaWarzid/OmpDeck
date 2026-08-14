@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { PiDesktopApi } from "../../../preload";
+import type { PiDesktopApi } from "../../../shared/api";
 import type { AppLogEntry, AppLogLevel } from "../../../shared/types";
 import { SelectField } from "../components/ui/SelectField";
 import { t } from "../i18n";

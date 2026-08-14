@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createDefaultExternalEditorSettings, type AppSettings } from "../../shared/types";
+import { ipcChannels } from "../../shared/ipc";
 
 /** 桌面端 settings.json（userData），与 pi agent settings 分离 */
 function desktopSettingsPath() {
@@ -309,7 +310,7 @@ export class SettingsStore {
   notifyTitleBarChange(window: BrowserWindow | null) {
     if (!window || window.isDestroyed()) return;
     // Electron 的 frame 不能运行时无刷新切换；设置页保存后提示用户重启生效。
-    window.webContents.send("settings:apply-window", this.get());
+    window.webContents.send(ipcChannels.settingsApplyWindow, this.get());
   }
 
   /**

@@ -55,6 +55,6 @@ test("main window logs configured preload file and preload reports initializatio
 	assert.match(preloadSource, /ipcChannels\.preloadReady/);
 	assert.match(preloadSource, /ipcChannels\.preloadError/);
 	assert.match(preloadSource, /contextBridge\.exposeInMainWorld\("piDesktop", api\)/);
-	assert.match(ipcSource, /preloadReady:\s*"preload:ready"/);
-	assert.match(ipcSource, /preloadError:\s*"preload:error"/);
+	assert.match(ipcSource, /channel:\s*"preload:ready"/);
+	assert.match(ipcSource, /channel:\s*"preload:error"/);
 });

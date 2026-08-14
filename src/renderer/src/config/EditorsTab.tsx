@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { PiDesktopApi } from "../../../preload";
+import type { PiDesktopApi } from "../../../shared/api";
 import {
 	SUPPORTED_EXTERNAL_EDITORS,
 	type AppSettings,

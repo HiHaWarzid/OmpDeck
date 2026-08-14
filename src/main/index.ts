@@ -1264,7 +1264,7 @@ async function runPostWindowStartupTasks(): Promise<void> {
 			const visible = s.wslEnabled
 				? projectStore.list().filter((p) => p.kind === "chat" || p.environment === "wsl")
 				: projectStore.list().filter((p) => p.kind === "chat" || !p.environment || p.environment === "windows");
-			mainWindow?.webContents.send("projects:changed", visible);
+			mainWindow?.webContents.send(ipcChannels.projectsChanged, visible);
 		})
 		.catch(() => undefined);
 
