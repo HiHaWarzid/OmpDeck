@@ -93,7 +93,7 @@ import {
   type ProjectAgentSessionDisplay,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
-import { mergeAgentRuntimeState } from "./utils/agentRuntimeState";
+import { isAgentBusy as agentBusy, isAgentStreaming, mergeAgentRuntimeState } from "./utils/agentRuntimeState";
 import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
@@ -1876,12 +1876,8 @@ export function App() {
   const activeRuntimeState = agentRuntimeState;
   const activeProjectHasBusyAgent = Boolean(
     activeProjectId && displayAgents.some((agent) =>
-      agent.projectId === activeProjectId && (
-        agent.status === "starting" ||
-        agent.status === "running" ||
-        runtimeStateByAgent[agent.id]?.isStreaming ||
-        runtimeStateByAgent[agent.id]?.isExecutingTool
-      ),
+      agent.projectId === activeProjectId &&
+      agentBusy(agent, runtimeStateByAgent[agent.id]),
     ),
   );
   // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
@@ -2000,7 +1996,7 @@ export function App() {
   const isAwaitingAssistant = Boolean(
     activeAgent &&
     !cancellingUi &&
-    (activeAgent.status === "running" || activeRuntimeState?.isStreaming) &&
+    isAgentStreaming(activeAgent, activeRuntimeState) &&
     activeMessages.at(-1)?.role !== "assistant",
   );
   /** 正在流式追加的最后一条 assistant 消息的 id（agent 处于运行/流式状态时才有值）。
@@ -2023,7 +2019,7 @@ export function App() {
     ? (streamingThinking[activeAgentId] ?? "")
     : "";
   // PIDECK_PERF=1 帧率诊断：agent 运行/流式期间采样帧间隔，结束时输出 P50/P95（验收指标）。
-  const isStreamingNow = Boolean(activeRuntimeState?.isStreaming) || activeAgent?.status === "running";
+  const isStreamingNow = isAgentStreaming(activeAgent, activeRuntimeState);
   useEffect(() => {
     if (isStreamingNow) startFrameSampling();
     else stopFrameSampling();
@@ -5089,12 +5085,7 @@ export function App() {
   function isAgentCurrentlyBusy(agentId: string) {
     const agent = displayAgentsRef.current.find((item) => item.id === agentId);
     const runtimeState = runtimeStateByAgentRef.current[agentId];
-    return Boolean(
-      agent?.status === "starting" ||
-      agent?.status === "running" ||
-      runtimeState?.isStreaming ||
-      runtimeState?.isExecutingTool,
-    );
+    return agentBusy(agent, runtimeState);
   }
 
   function canFlushQueuedPrompt(agentId: string) {
@@ -5403,8 +5394,7 @@ export function App() {
   // isCompacting / 本地 compacting 也算 busy：压缩期间禁止再发消息，并显示停止区语义。
   const isAgentBusy = Boolean(
     activeAgent &&
-    (activeAgent.status === "running" ||
-      activeRuntimeState?.isStreaming ||
+    (agentBusy(activeAgent, activeRuntimeState) ||
       activeRuntimeState?.isCompacting ||
       compacting),
   );
@@ -6448,7 +6438,7 @@ export function App() {
       ? displayAgents.filter(
           (a) =>
             a.projectId === childProject.id &&
-            (a.status === "running" || a.status === "starting"),
+            agentBusy(a, runtimeStateByAgent[a.id]),
         )
       : [];
     if (childAgents.length > 0) {
