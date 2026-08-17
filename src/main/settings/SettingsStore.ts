@@ -216,6 +216,13 @@ export class SettingsStore {
       this.settings = {
         ...defaultSettings,
         ...parsed,
+        // afk 与 externalEditors 都是嵌套对象：顶层浅合并会用磁盘旧值整体替换默认值，
+        // 后续新增字段（如 targetProjectIds）会随默认值一起丢失 → 渲染/运行时报 undefined。
+        // 逐字段补默认，保证字段演进对旧 settings.json 兼容。
+        afk: {
+          ...defaultSettings.afk,
+          ...(parsed.afk ?? {}),
+        },
         externalEditors: {
           ...createDefaultExternalEditorSettings(),
           ...(parsed.externalEditors ?? {}),
