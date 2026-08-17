@@ -28,6 +28,7 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { ConfirmDialog } from "./AppParts";
 import { showNotice } from "../../utils/notice";
+import type { PiDesktopApi } from "../../../../shared/api";
 import type {
   BranchDiffResult,
   CommitDetail,
@@ -41,18 +42,36 @@ import { GitStatus } from "../../../../shared/types";
 import { getFileIconColor, getFileIconSeti } from "../../fileIcons";
 import { t, type TranslationKey } from "../../i18n";
 
+/**
+ * Git 服务门面：聚合 GitPanel 所需的 PiDesktopApi.git IPC 方法，避免透传 props
+ * 随 PiDesktopApi.git 演化逐一手动同步（漂移面收敛到一处）。
+ */
+type GitServiceFacade = Pick<
+  PiDesktopApi["git"],
+  | "commitLog"
+  | "commitDetail"
+  | "branchCompare"
+  | "status"
+  | "stage"
+  | "unstage"
+  | "discard"
+  | "commit"
+  | "cherryPick"
+  | "revert"
+  | "reset"
+  | "dropCommit"
+  | "generateCommitMessage"
+  | "init"
+  | "push"
+  | "pull"
+>;
+
 type GitPanelProps = {
   projectId: string;
   /** 项目根目录路径，用于将绝对路径转为相对路径显示 */
   projectRoot?: string;
-  commitLog: (
-    projectId: string,
-    options?: { maxEntries?: number; ref?: string; allBranches?: boolean },
-  ) => Promise<CommitEntry[]>;
-  commitDetail: (
-    projectId: string,
-    ref: string,
-  ) => Promise<CommitDetail | null>;
+  /** Git IPC 服务门面（见 GitServiceFacade） */
+  git: GitServiceFacade;
   onOpenCommitFileDiff: (
     commit: CommitEntry,
     file: GitChangedFile,
@@ -61,45 +80,12 @@ type GitPanelProps = {
     group: GitResourceGroupType,
     path: string,
   ) => void | Promise<void>;
-  branchCompare: (
-    projectId: string,
-    base: string,
-    target: string,
-  ) => Promise<BranchDiffResult>;
-  getStatus: (projectId: string) => Promise<GitResourceGroups>;
-  stageFiles: (projectId: string, paths: string[]) => Promise<void>;
-  unstageFiles: (projectId: string, paths: string[]) => Promise<void>;
-  discardFile: (
-    projectId: string,
-    group: "workingTree" | "untracked",
-    path: string,
-  ) => Promise<void>;
-  commit: (projectId: string, message: string) => Promise<void>;
   branches: string[];
   currentBranch: string | null;
   /** 切换分支 */
   onSwitchBranch?: (branch: string) => void;
   /** 创建新分支 */
   onCreateBranch?: (branchName: string) => void;
-  cherryPick?: (projectId: string, hash: string) => Promise<void>;
-  revert?: (projectId: string, hash: string) => Promise<void>;
-  reset?: (
-    projectId: string,
-    hash: string,
-    mode: "soft" | "mixed" | "hard",
-  ) => Promise<void>;
-  dropCommit?: (projectId: string, hash: string) => Promise<void>;
-  /** AI 生成提交摘要 */
-  generateCommitMessage?: (
-    projectId: string,
-    stagedPaths?: string[],
-  ) => Promise<string>;
-  /** 初始化 Git 仓库 */
-  gitInit?: (projectId: string) => Promise<void>;
-  /** Push：将当前分支推送到远程 */
-  push?: (projectId: string) => Promise<void>;
-  /** Pull：从远程拉取并合并到当前分支 */
-  pull?: (projectId: string) => Promise<void>;
 };
 
 type PaneId = "changes" | "graph" | "compare";
@@ -994,7 +980,7 @@ export function GitPanel(props: GitPanelProps) {
         setError(null);
       }
       try {
-        const next = await props.getStatus(projectId);
+        const next = await props.git.status(projectId);
         if (
           request === statusRequestRef.current &&
           projectId === projectIdRef.current
@@ -1032,7 +1018,7 @@ export function GitPanel(props: GitPanelProps) {
           setLoading(false);
       }
     },
-    [props.getStatus, props.projectId],
+    [props.git.status, props.projectId],
   );
 
   // 打开 Git drawer 时首次加载；依赖 refresh 引用稳定。
@@ -1188,9 +1174,9 @@ export function GitPanel(props: GitPanelProps) {
     try {
       if (stageAll) {
         const paths = workingChanges.map((resource) => resource.path);
-        if (paths.length > 0) await props.stageFiles(projectId, paths);
+        if (paths.length > 0) await props.git.stage(projectId, paths);
       }
-      await props.commit(projectId, message);
+      await props.git.commit(projectId, message);
       if (projectId !== projectIdRef.current) return;
       setCommitMessage("");
       await refresh();
@@ -1240,19 +1226,19 @@ export function GitPanel(props: GitPanelProps) {
     if (!target) return;
     setDiscardTarget(null);
     void act(() =>
-      props.discardFile(props.projectId, target.group, target.path),
+      props.git.discard(props.projectId, target.group, target.path),
     );
   };
 
   const doPush = async () => {
-    if (!props.push || mutationRunningRef.current) return;
+    if (!props.git.push || mutationRunningRef.current) return;
     const projectId = props.projectId;
     const mutationRequest = ++mutationRequestRef.current;
     mutationRunningRef.current = true;
     setPushing(true);
     setError(null);
     try {
-      await props.push(projectId);
+      await props.git.push(projectId);
       if (projectId !== projectIdRef.current) return;
       await refresh();
     } catch (caught) {
@@ -1270,14 +1256,14 @@ export function GitPanel(props: GitPanelProps) {
   };
 
   const doPull = async () => {
-    if (!props.pull || mutationRunningRef.current) return;
+    if (!props.git.pull || mutationRunningRef.current) return;
     const projectId = props.projectId;
     const mutationRequest = ++mutationRequestRef.current;
     mutationRunningRef.current = true;
     setPulling(true);
     setError(null);
     try {
-      await props.pull(projectId);
+      await props.git.pull(projectId);
       if (projectId !== projectIdRef.current) return;
       await refresh();
     } catch (caught) {
@@ -1380,10 +1366,10 @@ export function GitPanel(props: GitPanelProps) {
             title={t("git.initInBranchBar")}
             disabled={initializing}
             onClick={async () => {
-              if (!props.gitInit) return;
+              if (!props.git.init) return;
               setInitializing(true);
               try {
-                await props.gitInit(props.projectId);
+                await props.git.init(props.projectId);
                 setNotAGitRepo(false);
                 void refresh();
               } catch (caught) {
@@ -1516,38 +1502,35 @@ export function GitPanel(props: GitPanelProps) {
           >
             <RefreshCw size={14} />
           </button>
-          {props.push && (
-            <button
-              type="button"
-              className="git-action-btn"
-              title={t("git.push")}
-              aria-label={t("git.push")}
-              disabled={pushing || mutationRunningRef.current}
-              onClick={() => void doPush()}
-            >
-              {pushing ? (
-                <Loader2 size={14} className="git-spin" />
-              ) : (
-                <ArrowUpFromLine size={14} />
-              )}
-            </button>
-          )}
-          {props.pull && (
-            <button
-              type="button"
-              className="git-action-btn"
-              title={t("git.pull")}
-              aria-label={t("git.pull")}
-              disabled={pulling || mutationRunningRef.current}
-              onClick={() => void doPull()}
-            >
-              {pulling ? (
+          {/* push/pull 经 git 门面必选（PiDesktopApi["git"] 契约），无需条件守卫 */}
+          <button
+            type="button"
+            className="git-action-btn"
+            title={t("git.push")}
+            aria-label={t("git.push")}
+            disabled={pushing || mutationRunningRef.current}
+            onClick={() => void doPush()}
+          >
+            {pushing ? (
+              <Loader2 size={14} className="git-spin" />
+            ) : (
+              <ArrowUpFromLine size={14} />
+            )}
+          </button>
+          <button
+            type="button"
+            className="git-action-btn"
+            title={t("git.pull")}
+            aria-label={t("git.pull")}
+            disabled={pulling || mutationRunningRef.current}
+            onClick={() => void doPull()}
+          >
+            {pulling ? (
                 <Loader2 size={14} className="git-spin" />
               ) : (
                 <ArrowDownToLine size={14} />
               )}
             </button>
-          )}
         </PaneHeader>
         {paneState.open.changes && (
           <div className="git-pane-body git-changes-body">
@@ -1565,10 +1548,10 @@ export function GitPanel(props: GitPanelProps) {
                   className="git-compare-btn"
                   disabled={initializing}
                   onClick={async () => {
-                    if (!props.gitInit) return;
+                    if (!props.git.init) return;
                     setInitializing(true);
                     try {
-                      await props.gitInit(props.projectId);
+                      await props.git.init(props.projectId);
                       setNotAGitRepo(false);
                       // 初始化完成后刷新状态
                       void refresh();
@@ -1612,14 +1595,14 @@ export function GitPanel(props: GitPanelProps) {
                   title={t("git.generateCommitMessage")}
                   disabled={commitGenLoading || mutating}
                   onClick={async () => {
-                    if (!props.generateCommitMessage) return;
+                    if (!props.git.generateCommitMessage) return;
                     if (groups.index.length === 0) {
                       showNotice(t("git.stageBeforeGenerateCommitMessage"), 3000);
                       return;
                     }
                     setCommitGenLoading(true);
                     try {
-                      const message = await props.generateCommitMessage(props.projectId);
+                      const message = await props.git.generateCommitMessage(props.projectId);
                       if (message) setCommitMessage(message);
                       setCommitGenLoading(false);
                     } catch (err) {
@@ -1683,7 +1666,7 @@ export function GitPanel(props: GitPanelProps) {
                   onToggle={() => toggleResource("staged")}
                   allAction={() =>
                     act(() =>
-                      props.unstageFiles(
+                      props.git.unstage(
                         props.projectId,
                         groups.index.map((resource) => resource.path),
                       ),
@@ -1697,7 +1680,7 @@ export function GitPanel(props: GitPanelProps) {
                     groupType="index"
                     onOpenWorkspaceFileDiff={props.onOpenWorkspaceFileDiff}
                     mutating={mutating || committing}
-                    unstageFile={(path) => act(() => props.unstageFiles(props.projectId, [path]))}
+                    unstageFile={(path) => act(() => props.git.unstage(props.projectId, [path]))}
                     projectRoot={props.projectRoot}
                     collapsedDirs={collapsedChangeDirs}
                     onToggleDir={toggleChangeDir}
@@ -1712,7 +1695,7 @@ export function GitPanel(props: GitPanelProps) {
                   onToggle={() => toggleResource("changes")}
                   allAction={() =>
                     act(() =>
-                      props.stageFiles(
+                      props.git.stage(
                         props.projectId,
                         workingChanges.map((resource) => resource.path),
                       ),
@@ -1726,7 +1709,7 @@ export function GitPanel(props: GitPanelProps) {
                     groupType="workingTree"
                     onOpenWorkspaceFileDiff={props.onOpenWorkspaceFileDiff}
                     mutating={mutating || committing}
-                    stageFile={(path) => act(() => props.stageFiles(props.projectId, [path]))}
+                    stageFile={(path) => act(() => props.git.stage(props.projectId, [path]))}
                     discardFile={(path, group) => setDiscardTarget({ group, path })}
                     projectRoot={props.projectRoot}
                     collapsedDirs={collapsedChangeDirs}
@@ -1744,18 +1727,18 @@ export function GitPanel(props: GitPanelProps) {
 
       <SourceControlGraph
         projectId={props.projectId}
-        commitLog={props.commitLog}
-        commitDetail={props.commitDetail}
+        commitLog={props.git.commitLog}
+        commitDetail={props.git.commitDetail}
         onOpenCommitFileDiff={props.onOpenCommitFileDiff}
         branches={props.branches}
         currentBranch={props.currentBranch}
         open={paneState.open.graph}
         height={paneState.heights.graph}
         onToggle={() => togglePane("graph")}
-        cherryPick={props.cherryPick}
-        revert={props.revert}
-        reset={props.reset}
-        dropCommit={props.dropCommit}
+        cherryPick={props.git.cherryPick}
+        revert={props.git.revert}
+        reset={props.git.reset}
+        dropCommit={props.git.dropCommit}
       />
 
       {paneState.open.graph &&
@@ -1765,7 +1748,7 @@ export function GitPanel(props: GitPanelProps) {
       <CompareChanges
         projectId={props.projectId}
         branches={props.branches}
-        branchCompare={props.branchCompare}
+        branchCompare={props.git.branchCompare}
         open={paneState.open.compare}
         height={paneState.heights.compare}
         onToggle={() => togglePane("compare")}
@@ -2279,18 +2262,18 @@ function CommitHoverCard(props: {
 
 function SourceControlGraph(props: {
   projectId: string;
-  commitLog: GitPanelProps["commitLog"];
-  commitDetail: GitPanelProps["commitDetail"];
+  commitLog: GitServiceFacade["commitLog"];
+  commitDetail: GitServiceFacade["commitDetail"];
   onOpenCommitFileDiff: GitPanelProps["onOpenCommitFileDiff"];
   branches: string[];
   currentBranch: string | null;
   open: boolean;
   height: number;
   onToggle: () => void;
-  cherryPick?: GitPanelProps["cherryPick"];
-  revert?: GitPanelProps["revert"];
-  reset?: GitPanelProps["reset"];
-  dropCommit?: GitPanelProps["dropCommit"];
+  cherryPick?: GitServiceFacade["cherryPick"];
+  revert?: GitServiceFacade["revert"];
+  reset?: GitServiceFacade["reset"];
+  dropCommit?: GitServiceFacade["dropCommit"];
 }) {
   const [commits, setCommits] = useState<CommitEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -2967,7 +2950,7 @@ function SourceControlGraph(props: {
 function CompareChanges(props: {
   projectId: string;
   branches: string[];
-  branchCompare: GitPanelProps["branchCompare"];
+  branchCompare: GitServiceFacade["branchCompare"];
   open: boolean;
   height: number;
   onToggle: () => void;

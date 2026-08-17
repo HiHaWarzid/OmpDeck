@@ -137,7 +137,7 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /chooseSmartCommit\("yes"\)/);
     assert.match(panel, /chooseSmartCommit\("always"\)/);
     assert.match(panel, /chooseSmartCommit\("never"\)/);
-    assert.match(panel, /await props\.stageFiles\(projectId, paths\)[\s\S]*?await props\.commit\(projectId, message\)/);
+    assert.match(panel, /await props\.git\.stage\(projectId, paths\)[\s\S]*?await props\.git\.commit\(projectId, message\)/);
     assert.match(i18n, /"git\.smartCommitPrompt"/);
     assert.match(i18n, /"git\.smartCommitAlways"/);
     assert.match(i18n, /"git\.smartCommitNever"/);
@@ -193,7 +193,9 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /function GraphContinuation/);
     assert.match(panel, /getFileIconSeti\(name\)/);
     assert.doesNotMatch(panel, /title=\{`\$\{commit\.message\}/);
-    assert.match(app, /commitDetail=\{api\.git\.commitDetail\}/);
+    // GitPanel 经单一 git 门面 prop 接入 IPC，不再逐方法透传。
+    assert.match(app, /git=\{api\.git\}/);
+    assert.doesNotMatch(app, /commitDetail=\{api\.git\.commitDetail\}/);
     assert.match(api, /Promise<CommitDetail \| null>/);
     assert.match(styles, /\.git-commit-hover\s*\{/);
     assert.match(styles, /\.git-history-file-row/);
