@@ -173,6 +173,15 @@ Gitmoji 对应关系：
   /** 用户手动移除的内置扩展，启动时跳过自动部署 */
   removedBuiltInExtensions: [],
 
+  // ── AFK 挂机编排 ──
+  /** 默认关闭；启用后启动自动恢复轮询（Orchestrator 读取本字段） */
+  afk: {
+    enabled: false,
+    // targetProjectId 无默认：设置页选择后写入
+    pollIntervalMs: 60_000,
+    timeoutMs: 30 * 60_000,
+  },
+
   // ── 更新检测：默认正常检测，用户可手动关闭忽略更新 ──
   disableUpdateCheck: false,
 

@@ -68,6 +68,88 @@ export class WorktreeService {
 	}
 
 	/**
+	 * AFK 专用 worktree 创建：分支 afk-{ticketId}-{slug}（- 分隔，slug 取自 issue title）。
+	 * 与 create() 不同：目录/分支碰撞时**复用**而非抛错（重跑从 [afk-wip] commit 继续，见 CONTEXT.md）。
+	 *
+	 * 复用语义（精确）：
+	 * - git 里已有该分支的 worktree → 返回它的实际路径（可能不在目标目录）；
+	 * - 分支已存在但未挂 worktree → 复用分支（重新挂载到目标目录，或直接复用已存在的老目录）；
+	 * - 目录已存在但 git 无登记、分支也不存在 → 复用老目录路径；
+	 * - 以上皆否 → 全新创建（git worktree add --no-checkout -b + reset --hard）。
+	 * 目标目录已被登记成其他分支的 worktree 时无法复用，明确报错。
+	 */
+	async createAfk(
+		projectPath: string,
+		ticketId: number,
+		title: string,
+	): Promise<{ path: string; branch: string; reused: boolean }> {
+		const slug = this.slugify(title);
+		const branch = `afk-${ticketId}-${slug}`;
+		// worktree 放在项目目录同级：{dirname(projectPath)}/{branch}，目录名与分支名一致。
+		const worktreeDir = join(resolve(projectPath, ".."), branch);
+
+		const entries = await this.list(projectPath);
+
+		// 分支已挂在某个 worktree 上（含上次超时/崩溃残留、或挂在其他路径的情况）：
+		// 直接复用其实际路径，重跑从该分支的 [afk-wip] commit 继续（ADR-0003）。
+		const existing = entries.find(entry => entry.branch === branch);
+		if (existing) {
+			return { path: existing.path, branch, reused: true };
+		}
+
+		// 目标目录已是 worktree 但挂的是别的分支：不能复用（会跑错分支），明确报错而非静默错用。
+		const dirOccupied = entries.find(entry => this.samePath(entry.path, worktreeDir));
+		if (dirOccupied) {
+			throw new Error(`AFK 目录已被其他分支占用：${worktreeDir}（${dirOccupied.branch}）`);
+		}
+
+		const branchExists = await execFileAsync(
+			"git",
+			["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+			{ cwd: projectPath },
+		)
+			.then(() => true)
+			.catch(() => false);
+
+		if (branchExists) {
+			// 分支存在但未挂任何 worktree（如上次 remove() 清了目录但分支保留，或创建中断残留）：
+			// 复用分支。老目录已存在则直接复用目录路径；否则重新挂载 worktree 指向该分支
+			// （分支已存在，不能加 -b，与新建路径不同）。
+			if (existsSync(worktreeDir)) {
+				return { path: worktreeDir, branch, reused: true };
+			}
+			await execFileAsync("git", ["worktree", "add", "--no-checkout", worktreeDir, branch], { cwd: projectPath });
+			try {
+				await execFileAsync("git", ["reset", "--hard"], { cwd: worktreeDir });
+			} catch (error) {
+				// 挂载失败：只摘除 worktree、不删分支——分支上可能有 [afk-wip] WIP，
+				// 不能走 remove()（其 branch === 目录名 判定会 branch -D 抹掉 WIP，违反 ADR-0003）。
+				await execFileAsync("git", ["worktree", "remove", "--force", worktreeDir], { cwd: projectPath }).catch(() => undefined);
+				await rm(worktreeDir, { recursive: true, force: true }).catch(() => undefined);
+				throw error;
+			}
+			return { path: worktreeDir, branch, reused: true };
+		}
+
+		// 老目录：目录存在但 git 无登记、分支也不存在（上次创建中断残留）→ 按复用语义直接返回目录路径。
+		if (existsSync(worktreeDir)) {
+			return { path: worktreeDir, branch, reused: true };
+		}
+
+		// 全新创建：复用现有 create 的步骤（--no-checkout -b + reset --hard）。
+		// 不能走 allocateWorktreeTarget——它目录/分支碰撞即抛错，与 AFK 的复用语义冲突。
+		await execFileAsync("git", ["worktree", "add", "--no-checkout", "-b", branch, worktreeDir], { cwd: projectPath });
+		try {
+			await execFileAsync("git", ["reset", "--hard"], { cwd: worktreeDir });
+		} catch (error) {
+			// reset 失败时清理刚创建的 worktree（与 create() 一致；此分支是本方法刚建的，无 WIP 可丢）。
+			await this.remove(worktreeDir, projectPath).catch(() => false);
+			throw error;
+		}
+		return { path: worktreeDir, branch, reused: false };
+	}
+
+	/**
 	 * 删除指定 worktree。
 	 * 先 git worktree remove --force，再清理目录，最后删除对应的分支。
 	 */
@@ -98,6 +180,37 @@ export class WorktreeService {
 		}
 
 		return true;
+	}
+
+	/**
+	 * AFK 删除前保留 WIP：git add -A && git commit -m "[afk-wip] #{ticketRef}"（无变更跳过），
+	 * 再调 remove()。永不裸删抹工作树（ADR-0003）。
+	 * 返回值透传 remove()：worktree 未登记时返回 false。
+	 */
+	async removeWithWip(worktreePath: string, projectPath: string, ticketRef: number): Promise<boolean> {
+		// ADR-0003：删 worktree 前必须先把未提交改动快照成 [afk-wip] commit，留在 afk 分支供重跑复用。
+		// 工作树干净时跳过（无变更不产生 commit）；快照失败则中止删除——宁可保留 worktree
+		// 等重跑复用，也不裸删抹掉进度（崩溃/超时场景，见 CONTEXT.md Retry）。
+		const { stdout } = await execFileAsync("git", ["status", "--porcelain"], { cwd: worktreePath });
+		if (stdout.trim()) {
+			await execFileAsync("git", ["add", "-A"], { cwd: worktreePath });
+			// commit 失败忽略（无变更 / 钩子拦截 / 作者配置缺失）：WIP 快照 best-effort，
+			// 不因快照失败阻塞删除流程。
+			await execFileAsync("git", ["commit", "-m", `[afk-wip] #${ticketRef}`], { cwd: worktreePath })
+				.catch(() => undefined);
+		}
+		// 快照完成后才允许裸删：remove() 内部就是 worktree remove --force + rm -rf + branch -D
+		// （afk 分支名 === 目录名，命中 branch -D，本地分支随 remove 删除）。
+		return this.remove(worktreePath, projectPath);
+	}
+
+	/**
+	 * PR 合并后删除远程 afk 分支（P0 半人工：UI「已合并」触发；本地分支随 remove 已删，见 ADR-0006）。
+	 */
+	async gcBranch(projectPath: string, branch: string): Promise<void> {
+		// ADR-0006 分支 GC：PR 合并由人确认后删除远程分支；分支可能已被别人删过 → 失败忽略。
+		await execFileAsync("git", ["push", "origin", "--delete", branch], { cwd: projectPath })
+			.catch(() => undefined);
 	}
 
 	/**

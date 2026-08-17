@@ -20,4 +20,5 @@ export * from "./types/skill";
 export * from "./types/git";
 export * from "./types/feishu";
 export * from "./types/app";
+export * from "./types/afk";
 export * from "./types/agentEvents";

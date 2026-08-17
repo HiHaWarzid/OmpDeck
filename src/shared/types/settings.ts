@@ -191,4 +191,16 @@ export type AppSettings = {
 	 */
 	removedBuiltInExtensions: string[];
 
+	// ── AFK 挂机编排 ──
+	/** AFK 配置（设置页 afk tab 编辑；enabled 持久化，启动自动恢复轮询） */
+	afk: {
+		enabled: boolean;
+		/** 目标项目 id：工单来自该项目 git remote（gh 自动推断仓库） */
+		targetProjectId?: string;
+		/** 轮询间隔 ms（gh issue list 扫描频率，默认 60s） */
+		pollIntervalMs: number;
+		/** 单 agent 任务预算 ms（默认 30min，超时 → failed 并保留 WIP） */
+		timeoutMs: number;
+	};
+
 };

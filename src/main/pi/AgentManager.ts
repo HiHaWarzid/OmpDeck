@@ -604,7 +604,9 @@ export class AgentManager {
 		const tab: AgentTab = {
 			id,
 			projectId: project.id,
-			cwd: project.path,
+			// AFK 编排器经 CreateAgentInput.cwd 指定 worktree 工作目录；tab.cwd 与 PiProcess 必须一致，
+			// 半改会让 PiProcess 仍停留在项目根，出现「tab 显示 worktree 实际操作根目录」的错位。
+			cwd: input.cwd ?? project.path,
 			title: input.title || `${project.name} agent`,
 			status: "starting",
 			sessionPath: input.sessionPath,
@@ -618,7 +620,8 @@ export class AgentManager {
 
 		void this.appLogger?.info("agent", "Agent pi process start", { agentId: id });
 		// agentHomeDir：WSL 模式下扩展目录在映射的 Windows home，需与 ExtensionManager 一致。
-		const process = new PiProcess(project.path, this.settingsStore.get(), undefined, {
+		// cwd 与 tab.cwd 同源（input.cwd ?? project.path）：AFK 派发到 worktree 时进程必须落在同一目录。
+		const process = new PiProcess(input.cwd ?? project.path, this.settingsStore.get(), undefined, {
 			agentHomeDir: this.wslEnvironment?.windowsHome,
 		});
 		process.on("version-check", (payload) => {
@@ -650,6 +653,8 @@ export class AgentManager {
 			// start() 同步失败（非法 cwd、spawn 抛错等）也要落到会话错误卡，而不是 IPC 裸抛。
 			tab.status = "error";
 			const rawMessage = error instanceof Error ? error.message : String(error);
+			// lastError 供 AFK 编排器与错误卡读取（ADR-0005）；start 抛错即启动失败原因。
+			tab.lastError = rawMessage;
 			void this.appLogger?.error("agent", "Agent pi process start threw", {
 				agentId: id,
 				projectId: project.id,
@@ -849,6 +854,7 @@ export class AgentManager {
 		} catch (error) {
 			tab.status = "error";
 			const rawMessage = error instanceof Error ? error.message : String(error);
+			tab.lastError = rawMessage;
 			void this.appLogger?.error("agent", "Agent create failed", {
 				agentId: id,
 				projectId: project.id,
@@ -954,12 +960,15 @@ export class AgentManager {
 		if (!runtime.process.isRunning()) {
 			const errorMessage = "Agent 进程已停止，请重启 Agent 后重试";
 			runtime.tab.status = "error";
+			runtime.tab.lastError = errorMessage;
 			this.addMessage(runtime, "error", errorMessage);
 			this.emitState();
 			return { accepted: false, error: errorMessage };
 		}
 
 		runtime.tab.status = "running";
+		// 用户重新发送消息即恢复：清掉上次 error 的 lastError，避免状态恢复后展示陈旧错误。
+		delete runtime.tab.lastError;
 		this.emitState();
 
 		// 乐观更新：在等待 RPC 返回前先把用户消息写入会话，让用户立即看到自己的消息。
@@ -1045,12 +1054,15 @@ export class AgentManager {
 		if (!runtime.process.isRunning()) {
 			const errorMessage = "Agent 进程已停止，请重启 Agent 后重试";
 			runtime.tab.status = "error";
+			runtime.tab.lastError = errorMessage;
 			this.addMessage(runtime, "error", errorMessage);
 			this.emitState();
 			return { accepted: false, error: errorMessage };
 		}
 
 		runtime.tab.status = "running";
+		// 重新执行命令即恢复：清掉上次 error 的 lastError，避免陈旧错误残留。
+		delete runtime.tab.lastError;
 		this.emitState();
 
 		try {
@@ -1206,6 +1218,8 @@ export class AgentManager {
 		this.cancelMessageEmit(runtime);
 
 		runtime.tab.status = "idle";
+		// 中止即离开 error：清掉 lastError，避免状态恢复后展示陈旧错误。
+		delete runtime.tab.lastError;
 		// 停止反馈改 toast，不再写入会话时间线：
 		// 1) 系统状态卡片太抢眼；2) 插在 assistant 中间会打断 agent-run 分组，放大“消息串台”体感。
 		this.emit(ipcChannels.agentsNotice, {
@@ -1352,6 +1366,8 @@ export class AgentManager {
 			sessionPath,
 		});
 
+		// 非 AFK 路径（崩溃恢复/压缩重启）：不携带 CreateAgentInput.cwd，固定使用项目根目录；
+		// 若未来需要按 worktree 重连，需与 createUnlocked 的 cwd 解析保持一致。
 		const process = new PiProcess(project.path, this.settingsStore.get(), undefined, {
 			agentHomeDir: this.wslEnvironment?.windowsHome,
 		});
@@ -2356,6 +2372,7 @@ export class AgentManager {
 	): Promise<T> {
 		const project = this.getProject(projectId);
 		if (!project) throw new Error(`Project not found: ${projectId}`);
+		// 临时会话（clone/export 等）非 AFK 路径：固定使用项目根目录，不接受 worktree cwd。
 		const process = new PiProcess(project.path, this.settingsStore.get(), undefined, {
 			agentHomeDir: this.wslEnvironment?.windowsHome,
 		});
@@ -2632,8 +2649,12 @@ export class AgentManager {
 		});
 		piProcess.on("error", (error: Error) => {
 			const runtime = this.agents.get(agentId);
-			if (runtime) runtime.tab.status = "error";
 			const message = error instanceof Error ? error.message : String(error);
+			if (runtime) {
+				runtime.tab.status = "error";
+				// 进程级错误（spawn ENOENT、崩溃等）写入 lastError，供 AFK 判断失败原因（ADR-0005）。
+				runtime.tab.lastError = message;
+			}
 			void this.appLogger?.error("agent", "Pi process error", {
 				agentId,
 				error: message,
@@ -2675,6 +2696,8 @@ export class AgentManager {
 		if (!runtime.autoRestartAttempted && tab.sessionPath && payload.code === 0) {
 			runtime.autoRestartAttempted = true;
 			tab.status = "starting";
+			// 自动重连开始即恢复：清掉进程 error 留下的 lastError，避免重连成功后展示陈旧错误。
+			delete tab.lastError;
 			this.emitState();
 			this.reattachProcess(agentId, tab.sessionPath)
 				.then(() => {
@@ -2725,6 +2748,8 @@ export class AgentManager {
 		if (!runtime.autoRestartAttempted && runtime.tab.sessionPath && payload.code === 0) {
 			runtime.autoRestartAttempted = true;
 			runtime.tab.status = "starting";
+			// 自动重连开始即恢复：清掉进程 error 留下的 lastError。
+			delete runtime.tab.lastError;
 			this.emitState();
 			this.reattachProcess(agentId, runtime.tab.sessionPath)
 				.then(() => {
@@ -2860,6 +2885,8 @@ export class AgentManager {
 				runtime.settleCheckTimer = undefined;
 			}
 			runtime.tab.status = "running";
+			// 新一轮回答开始即恢复：清掉上次 error 的 lastError（如 auto_retry_end 失败后重新触发）。
+			delete runtime.tab.lastError;
 			runtime.activeAssistantMessageId = undefined;
 			runtime.toolMessageIds.clear();
 			runtime.activeToolCalls.clear();
@@ -2888,6 +2915,8 @@ export class AgentManager {
 				// pi 在等待指数退避期间可能短暂结束一轮 agent run；桌面端保持 running，
 				// 让用户明确知道当前不是最终失败，而是在等待下一次自动重试。
 				runtime.tab.status = "running";
+				// 自动重试开始即恢复：清掉上次 error 的 lastError。
+				delete runtime.tab.lastError;
 				this.emitState();
 			}
 		}
@@ -2903,7 +2932,9 @@ export class AgentManager {
 			if (!typed.success && !runtime.recentlyAborted) {
 				runtime.tab.status = "error";
 				const reason = typed.finalError ?? typed.errorMessage ?? "API 请求失败";
-				this.addMessage(runtime, "error", `请求失败：${String(reason)}`);
+				const failureText = `请求失败：${String(reason)}`;
+				runtime.tab.lastError = failureText;
+				this.addMessage(runtime, "error", failureText);
 				this.emitState();
 			}
 		}
@@ -3007,18 +3038,24 @@ export class AgentManager {
 				}
 				// 重试中保持 running，不能误置为 idle/error，否则宠物聚合状态会提前转 done/failed
 				// 用户已主动中止时不覆盖 state，避免 abort 后收到此事件又重新激活 running
-				if (!runtime.recentlyAborted) runtime.tab.status = "running";
+				if (!runtime.recentlyAborted) {
+					runtime.tab.status = "running";
+					// 进入自动重试即恢复：清掉上次 error 的 lastError。
+					delete runtime.tab.lastError;
+				}
 			} else if (errorMsg) {
 				this.addDetailedErrorMessage(runtime, String(errorMsg));
 				// 有错误且不会重试 → Agent 进入 error 态，宠物聚合为 failed（行5），
 				// 否则会被误置为 idle 触发"所有任务完成"通知
 				runtime.tab.status = "error";
+				runtime.tab.lastError = String(errorMsg);
 			} else if (
 				typed.stopReason === "error" ||
 				errorMessages.length > 0
 			) {
 				this.addDetailedErrorMessage(runtime, "Agent 返回未知错误，请重试");
 				runtime.tab.status = "error";
+				runtime.tab.lastError = "Agent 返回未知错误，请重试";
 			}
 			this.emitState();
 			// agent_end 后 runtimeState 可能暂时仍显示后续 compaction/retry；立即同步一次，

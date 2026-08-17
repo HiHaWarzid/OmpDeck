@@ -13,6 +13,8 @@ import type {
 	AgentRuntimeState,
 	AgentTab,
 	AgentUiRequest,
+	AfkState,
+	AfkTask,
 	AppInfo,
 	AppLogEntry,
 	AppLogLevel,
@@ -517,6 +519,20 @@ export interface ScratchPadApi {
 	export: (draftPath: string) => Promise<boolean>;
 }
 
+/** AFK 挂机编排（主进程 AfkOrchestrator 的 IPC 面）。 */
+export interface AfkApi {
+	/** 快照：运行态 + 历史归档 */
+	status: () => Promise<AfkState>;
+	/** 启用/恢复轮询（设置变更后调用；enabled 持久化在 AppSettings.afk） */
+	start: () => Promise<void>;
+	/** 停用：停止轮询与新任务派发；已在跑的任务保持运行到终态 */
+	stop: () => Promise<void>;
+	/** 语义事件订阅：任务状态变更（AfkTask） */
+	onStatusChanged: (callback: (task: AfkTask) => void) => () => void;
+	/** 语义事件订阅：ticket complete（PR 已建） */
+	onTicketCompleted: (callback: (task: AfkTask) => void) => () => void;
+}
+
 export interface PiDesktopApi {
 	editors: EditorsApi;
 	projects: ProjectsApi;
@@ -550,4 +566,5 @@ export interface PiDesktopApi {
 	perf: PerfApi;
 	browser: BrowserApi;
 	scratchPad: ScratchPadApi;
+	afk: AfkApi;
 }

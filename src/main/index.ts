@@ -201,6 +201,8 @@ import { registerGitHandlers } from "./ipc/gitHandlers";
 import { registerConfigHandlers } from "./ipc/configHandlers";
 import { registerClipboardHandlers } from "./ipc/clipboardHandlers";
 import { registerFeishuHandlers } from "./ipc/feishuHandlers";
+import { AfkOrchestrator } from "./afk/AfkOrchestrator";
+import { registerAfkHandlers } from "./afk/afkHandlers";
 import { registerPiHandlers } from "./ipc/piHandlers";
 import { registerAgentHandlers } from "./ipc/agentHandlers";
 import { registerAppHandlers } from "./ipc/appHandlers";
@@ -241,6 +243,7 @@ let worktreeService: WorktreeService;
 let gitService: GitService;
 let piLocator: PiLocator;
 let agentManager: AgentManager;
+let afkOrchestrator: AfkOrchestrator;
 let configManager: ConfigManager;
 let promptManager: PromptManager;
 let xuePromptManager: XuePromptManager;
@@ -862,6 +865,7 @@ function registerIpc() {
 		registerConfigHandlers({ configManager, agentManager, appLogger }),
 		registerClipboardHandlers(),
 		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
+		registerAfkHandlers({ orchestrator: afkOrchestrator }),
 		registerAgentHandlers({
 			agentManager,
 			terminalManager,
@@ -999,6 +1003,15 @@ app.whenReady().then(async () => {
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
 	});
+	// AFK 编排器：消费 AgentManager 语义事件（settled/statusChanged error）驱动
+	// ticket→worktree→agent→PR 链路；启动自动恢复在 runPostWindowStartupTasks。
+	afkOrchestrator = new AfkOrchestrator({
+		agentManager,
+		worktreeService,
+		projectStore,
+		settingsStore,
+		getMainWindow: () => mainWindow,
+	});
 	terminalManager = new TerminalSessionManager(
 		(agentId) => agentManager.getCwd(agentId),
 		(channel, payload) => {
@@ -1084,6 +1097,13 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	void ensureAllPiSettingsDefaults(settingsStore.get(), piLocator, activeWslEnvironment).catch((error) => {
 		console.error("Failed to ensure pi settings defaults:", error);
 	});
+
+	// AFK 启动自动恢复：设置持久化的 enabled 时恢复轮询与未完成任务判定。
+	if (settingsStore.get().afk?.enabled) {
+		void afkOrchestrator.start().catch((error) => {
+			console.error("Failed to start AFK orchestrator:", error);
+		});
+	}
 
 	// 清理上次异常退出留下的 codeisland 停放文件，避免扩展在磁盘上永久消失。
 	try {

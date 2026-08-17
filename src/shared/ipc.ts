@@ -411,6 +411,17 @@ export const ipcTable = {
 		/** 设置指定 Agent 使用的飞书 Bot ID */
 		sessionBotSet: { channel: "feishu:session-bot-set", kind: "invoke" },
 	},
+	// AFK 挂机编排（Orchestrator 主进程组件；subscribe 通道 = renderer 语义事件订阅）
+	afk: {
+		/** 快照：运行态 + 历史归档（AfkState） */
+		status: { channel: "afk:status", kind: "invoke" },
+		start: { channel: "afk:start", kind: "invoke" },
+		stop: { channel: "afk:stop", kind: "invoke" },
+		/** 语义事件：任务状态变更推送（AfkTask） */
+		onStatusChanged: { channel: "afk:status-changed", kind: "subscribe" },
+		/** 语义事件：ticket complete 推送（PR 已建/重标 ready-for-human） */
+		onTicketCompleted: { channel: "afk:ticket-completed", kind: "subscribe" },
+	},
 	dialog: {
 		/** 打开系统原生文件/文件夹选择器，返回选中路径列表 */
 		pickFiles: { channel: "dialog:pick-files", kind: "invoke" },

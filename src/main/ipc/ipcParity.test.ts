@@ -22,6 +22,7 @@ vi.mock("@electron-toolkit/utils", () => ({
 
 import { ipcTable, type IpcOpEntry } from "../../shared/ipc";
 import { registerAgentHandlers } from "./agentHandlers";
+import { registerAfkHandlers } from "../afk/afkHandlers";
 import { registerAppHandlers } from "./appHandlers";
 import { registerClipboardHandlers } from "./clipboardHandlers";
 import { registerConfigHandlers } from "./configHandlers";
@@ -77,6 +78,7 @@ const moduleMaps = [
 	registerConfigHandlers({ configManager: stubs, agentManager: stubs, appLogger: stubs }),
 	registerClipboardHandlers(),
 	registerPiHandlers({ piLocator: stubs, settingsStore: stubs, extensionManager: stubs, appLogger: stubs, configManager: stubs }),
+	registerAfkHandlers({ orchestrator: stubs }),
 	registerAgentHandlers({
 		agentManager: stubs,
 		terminalManager: stubs,

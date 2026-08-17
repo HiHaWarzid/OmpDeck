@@ -15,6 +15,8 @@ export type AgentTab = {
 	compactionCount?: number;
 	/** 瞬时会话（--no-session），不保存记录，关闭即丢失 */
 	noSession?: boolean;
+	/** 最近一次失败原因（error 状态填充，AFK 详情与列表展示用；见 ADR-0005） */
+	lastError?: string;
 };
 
 export type PiCommand = {
@@ -64,6 +66,11 @@ export type CreateAgentInput = {
 	sessionPath?: string;
 	/** 瞬时会话：不保存 session 文件（对应 pi --no-session） */
 	noSession?: boolean;
+	/**
+	 * 覆盖 agent 工作目录（默认 project.path）。AFK 编排器把 agent 派到
+	 * 独立 worktree 时需要 cwd 指向 worktree；双穿 tab.cwd 与 PiProcess。
+	 */
+	cwd?: string;
 };
 
 export type ForkMessage = {
