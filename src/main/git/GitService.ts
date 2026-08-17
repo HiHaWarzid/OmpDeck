@@ -9,6 +9,17 @@ import type { GitResource, GitResourceGroups } from "../../shared/types";
 
 const execFileAsync = promisify(execFile);
 const GIT_MUTATION_TIMEOUT_MS = 30_000;
+/** git 可执行文件名（统一经 runGit 调用；不经字面量散落 spawn，便于收敛审计）。 */
+const GIT_EXECUTABLE = "git";
+
+type RunGitOptions = {
+	/** 探测型命令：失败返回空串而非抛错（isGitRepo/readBlob 等调用方自行降级） */
+	allowFailure?: boolean;
+	/** 覆盖默认输出缓冲（默认 32MB，覆盖大 log/ref/status 输出；读 blob 用 limit+1 收紧） */
+	maxBuffer?: number;
+	/** 覆盖默认超时（默认 GIT_MUTATION_TIMEOUT_MS；push/pull/fetch 用 4 倍） */
+	timeout?: number;
+};
 
 export class GitService {
 	/** 只缓存轻量 commit 元数据/文件清单；正文永不缓存，且 LRU 总预算不超过 2MB。 */
@@ -90,19 +101,37 @@ export class GitService {
 		}
 	}
 
+	/**
+	 * git 命令执行器：收敛全部 spawn 的超时/缓冲/stderr 错误归一化。
+	 * execFile 的 error.message 不含 stderr，而 git 的失败原因在 stderr（如 checkout 冲突、
+	 * push 认证拒绝）——统一把 stderr 并入错误消息，避免渲染层只看到 "Command failed"。
+	 */
+	private async runGit(cwd: string, args: string[], options: RunGitOptions = {}): Promise<string> {
+		try {
+			const { stdout } = await execFileAsync(GIT_EXECUTABLE, args, {
+				cwd,
+				timeout: options.timeout ?? GIT_MUTATION_TIMEOUT_MS,
+				maxBuffer: options.maxBuffer ?? 32 * 1024 * 1024,
+			});
+			return stdout;
+		} catch (error) {
+			if (options.allowFailure) return "";
+			// execFile 错误对象的 stderr 字段未被 node 类型暴露；具名 const 收窄读取。
+			const execError = error as { stderr?: string };
+			const detail = execError.stderr?.trim() || (error instanceof Error ? error.message : String(error));
+			throw new Error(`git ${args[0] ?? "command"} failed: ${detail}`);
+		}
+	}
+
 	/** 将 renderer 提供的 commit-ish 安全解析为完整 SHA，后续命令只接收 hash。 */
 	private async resolveCommitHash(cwd: string, ref: string): Promise<string | null> {
-		try {
-			const { stdout } = await execFileAsync(
-				"git",
-				["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-				{ cwd },
-			);
-			const hash = stdout.trim();
-			return /^[0-9a-f]{40}$/i.test(hash) ? hash : null;
-		} catch {
-			return null;
-		}
+		const stdout = await this.runGit(
+			cwd,
+			["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+			{ allowFailure: true },
+		);
+		const hash = stdout.trim();
+		return /^[0-9a-f]{40}$/i.test(hash) ? hash : null;
 	}
 
 	/**
@@ -111,12 +140,8 @@ export class GitService {
 	 * 直到点击"新建工作区"才在 create 阶段报错。
 	 */
 	async isGitRepo(cwd: string): Promise<boolean> {
-		try {
-			await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
-			return true;
-		} catch {
-			return false;
-		}
+		const stdout = await this.runGit(cwd, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
+		return stdout.trim() !== "";
 	}
 
 	async getBranches(cwd: string): Promise<GitBranchInfo> {
@@ -127,9 +152,9 @@ export class GitService {
 		}
 		try {
 			// 获取当前分支和所有本地分支（不包含远程分支）
-			const [{ stdout: currentRaw }, { stdout: localRaw }] = await Promise.all([
-				execFileAsync("git", ["branch", "--show-current"], { cwd }),
-				execFileAsync("git", ["branch", "--format=%(refname:short)"], { cwd }),
+			const [currentRaw, localRaw] = await Promise.all([
+				this.runGit(cwd, ["branch", "--show-current"]),
+				this.runGit(cwd, ["branch", "--format=%(refname:short)"]),
 			]);
 
 			const current = currentRaw.trim() || null;
@@ -158,12 +183,12 @@ export class GitService {
 		try {
 			if (!branch || branch.startsWith("-")) throw new Error("Invalid branch name");
 			const fullRef = `refs/heads/${branch}`;
-			await execFileAsync("git", ["check-ref-format", fullRef], { cwd });
-			await execFileAsync("git", ["show-ref", "--verify", "--quiet", fullRef], { cwd });
-			await execFileAsync("git", ["checkout", "--end-of-options", branch], { cwd });
+			await this.runGit(cwd, ["check-ref-format", fullRef]);
+			await this.runGit(cwd, ["show-ref", "--verify", "--quiet", fullRef]);
+			await this.runGit(cwd, ["checkout", "--end-of-options", branch]);
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
-			// execFile 默认只输出 stdout；checkout 失败时 stderr 包含真正原因。
+			// runGit 已把 stderr 并入错误消息，这里只补充分支名上下文。
 			throw new Error(`Git checkout "${branch}" failed: ${msg}`);
 		}
 		return this.getBranches(cwd);
@@ -175,10 +200,10 @@ export class GitService {
 	 */
 	async createBranch(cwd: string, branchName: string): Promise<GitBranchInfo> {
 		if (!branchName || branchName.startsWith("-")) throw new Error("Invalid branch name");
-		await execFileAsync("git", ["check-ref-format", `refs/heads/${branchName}`], { cwd });
+		await this.runGit(cwd, ["check-ref-format", `refs/heads/${branchName}`]);
 		this.invalidateStatusCache(cwd);
 		this.invalidateBranchesCache(cwd);
-		await execFileAsync("git", ["checkout", "-b", branchName], { cwd });
+		await this.runGit(cwd, ["checkout", "-b", branchName]);
 		return this.getBranches(cwd);
 	}
 
@@ -195,11 +220,7 @@ export class GitService {
 	async getOriginalContent(filePath: string, maxBytes = 5 * 1024 * 1024): Promise<string> {
 		try {
 			const dir = dirname(filePath);
-			const { stdout: rootRaw } = await execFileAsync(
-				"git",
-				["rev-parse", "--show-toplevel"],
-				{ cwd: dir },
-			);
+			const rootRaw = await this.runGit(dir, ["rev-parse", "--show-toplevel"]);
 			const repoRoot = rootRaw.trim();
 			if (!repoRoot) return "";
 
@@ -209,11 +230,7 @@ export class GitService {
 
 			const blobRef = `HEAD:${relPath}`;
 			const limit = Math.max(1, Math.floor(maxBytes));
-			const { stdout } = await execFileAsync(
-				"git",
-				["-C", repoRoot, "show", blobRef],
-				{ maxBuffer: limit + 1 },
-			);
+			const stdout = await this.runGit(repoRoot, ["show", blobRef], { maxBuffer: limit + 1 });
 			return Buffer.byteLength(stdout, "utf8") > limit || stdout.includes("\0") ? "" : stdout;
 		} catch {
 			return "";
@@ -227,12 +244,9 @@ export class GitService {
 		projectRoot: string;
 	}> {
 		// `-- .` 将 monorepo 中的状态限定到当前项目目录，避免 sibling 资源进入抽屉。
-		const [{ stdout: statusRaw }, { stdout: rootRaw }] = await Promise.all([
-			execFileAsync(
-				"git", ["status", "--porcelain", "-z", "--untracked-files=all", "--", "."],
-				{ cwd, maxBuffer: 16 * 1024 * 1024, timeout: GIT_MUTATION_TIMEOUT_MS },
-			),
-			execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS }),
+		const [statusRaw, rootRaw] = await Promise.all([
+			this.runGit(cwd, ["status", "--porcelain", "-z", "--untracked-files=all", "--", "."]),
+			this.runGit(cwd, ["rev-parse", "--show-toplevel"]),
 		]);
 		const repoRoot = await realpath(resolve(rootRaw.trim()));
 		const inputProjectRoot = resolve(cwd);
@@ -343,16 +357,13 @@ export class GitService {
 			const oldPath = resource.oldPath ? toRepoPath(resource.oldPath) : currentPath;
 			const limit = Math.max(1, Math.floor(maxBytes));
 			const readBlob = async (blobRef: string): Promise<string | null> => {
-				try {
-					// maxBuffer 按字节硬限制输出；一次 git show 即可兼顾内存边界与较低进程开销。
-					const { stdout } = await execFileAsync("git", ["show", blobRef], {
-						cwd: repoRoot,
-						maxBuffer: limit + 1,
-					});
-					return Buffer.byteLength(stdout, "utf8") > limit || stdout.includes("\0") ? null : stdout;
-				} catch {
-					return null;
-				}
+				// maxBuffer 按字节硬限制输出；一次 git show 即可兼顾内存边界与较低进程开销。
+				const stdout = await this.runGit(repoRoot, ["show", blobRef], {
+					maxBuffer: limit + 1,
+					allowFailure: true,
+				});
+				if (!stdout) return null;
+				return Buffer.byteLength(stdout, "utf8") > limit || stdout.includes("\0") ? null : stdout;
 			};
 			const readWorkingTree = async (): Promise<string | null> => {
 				try {
@@ -426,10 +437,7 @@ export class GitService {
 	async getStagedDiff(cwd: string, maxBytes = 100 * 1024): Promise<string> {
 		try {
 			// 先试暂存区 diff
-			let { stdout } = await execFileAsync("git", ["diff", "--staged", "--unified=3"], {
-				cwd,
-				encoding: "utf8",
-				timeout: GIT_MUTATION_TIMEOUT_MS,
+			let stdout = await this.runGit(cwd, ["diff", "--staged", "--unified=3"], {
 				maxBuffer: 10 * 1024 * 1024,
 			});
 			// 无暂存内容时直接返回空，不再回退到工作区 diff；由调用方提示用户先暂存
@@ -474,7 +482,7 @@ export class GitService {
 		}
 
 		try {
-			const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 32 * 1024 * 1024 });
+			const stdout = await this.runGit(cwd, args);
 			if (!stdout) return [];
 
 			return parseCommits(stdout);
@@ -490,11 +498,7 @@ export class GitService {
 	async getRefs(cwd: string): Promise<GitRef[]> {
 		const format = "%(refname)%00%(objectname)%00%(*objectname)";
 		try {
-			const { stdout } = await execFileAsync(
-				"git",
-				["for-each-ref", `--format=${format}`, "--sort=-committerdate"],
-				{ cwd, maxBuffer: 32 * 1024 * 1024 },
-			);
+			const stdout = await this.runGit(cwd, ["for-each-ref", `--format=${format}`, "--sort=-committerdate"]);
 			return parseRefs(stdout);
 		} catch {
 			return [];
@@ -517,17 +521,9 @@ export class GitService {
 			]);
 			if (!baseHash || !targetHash) return { files: [], ahead: 0, behind: 0 };
 			const range = `${baseHash}...${targetHash}`;
-			const [{ stdout: diffOut }, { stdout: countOut }] = await Promise.all([
-				execFileAsync(
-					"git",
-					["diff", "--name-status", "-z", "--diff-filter=ADMR", range],
-					{ cwd, maxBuffer: 32 * 1024 * 1024 },
-				),
-				execFileAsync(
-					"git",
-					["rev-list", "--left-right", "--count", range],
-					{ cwd },
-				).catch(() => ({ stdout: "0\t0" })),
+			const [diffOut, countOut] = await Promise.all([
+				this.runGit(cwd, ["diff", "--name-status", "-z", "--diff-filter=ADMR", range]),
+				this.runGit(cwd, ["rev-list", "--left-right", "--count", range]).catch(() => "0\t0"),
 			]);
 
 			const [leftCount, rightCount] = countOut.trim().split(/	/);
@@ -558,11 +554,7 @@ export class GitService {
 			]);
 			if (!leftHash || !rightHash) return "";
 			const range = `${leftHash}...${rightHash}`;
-			const { stdout } = await execFileAsync(
-				"git",
-				["diff", range, "--", filePath],
-				{ cwd, maxBuffer: 32 * 1024 * 1024 },
-			);
+			const stdout = await this.runGit(cwd, ["diff", range, "--", filePath]);
 			return stdout;
 		} catch {
 			return "";
@@ -588,11 +580,7 @@ export class GitService {
 			const cacheKey = `${resolve(cwd)}\0${commitHash.toLowerCase()}`;
 			const cached = this.readCommitDetailCache(cacheKey);
 			if (cached) return cached;
-			const { stdout } = await execFileAsync(
-				"git",
-				["show", "-s", "--shortstat", `--format=${COMMIT_FORMAT}`, "-z", commitHash, "--"],
-				{ cwd, maxBuffer: 32 * 1024 * 1024 },
-			);
+			const stdout = await this.runGit(cwd, ["show", "-s", "--shortstat", `--format=${COMMIT_FORMAT}`, "-z", commitHash, "--"]);
 			if (!stdout) return null;
 
 			const commit = parseCommits(stdout, true)[0];
@@ -601,10 +589,7 @@ export class GitService {
 			const diffArgs = commit.parents[0]
 				? ["diff", "--name-status", "-z", "--find-renames", commit.parents[0], commit.hash]
 				: ["diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-z", "--find-renames", commit.hash];
-			const { stdout: filesRaw } = await execFileAsync("git", diffArgs, {
-				cwd,
-				maxBuffer: 32 * 1024 * 1024,
-			});
+			const filesRaw = await this.runGit(cwd, diffArgs);
 
 			const detail = { commit, files: parseDiffNameStatus(filesRaw) };
 			// LRU 准入预算同时作为 IPC 硬上限，防止异常大 message/文件清单进入 renderer。
@@ -640,15 +625,12 @@ export class GitService {
 			const oldPath = file.originalPath ?? file.path;
 			const limit = Math.max(1, Math.floor(maxBytes));
 			const readBlob = async (blobRef: string): Promise<string | null> => {
-				try {
-					const { stdout } = await execFileAsync("git", ["show", blobRef], {
-						cwd,
-						maxBuffer: limit + 1,
-					});
-					return Buffer.byteLength(stdout, "utf8") > limit || stdout.includes("\0") ? null : stdout;
-				} catch {
-					return null;
-				}
+				const stdout = await this.runGit(cwd, ["show", blobRef], {
+					maxBuffer: limit + 1,
+					allowFailure: true,
+				});
+				if (!stdout) return null;
+				return Buffer.byteLength(stdout, "utf8") > limit || stdout.includes("\0") ? null : stdout;
 			};
 			// 只有 Git 状态明确表示该侧不存在时才返回空字符串。两侧顺序读取，
 			// 避免两个接近上限的 git show 缓冲区同时驻留在主进程内存中。
@@ -703,7 +685,7 @@ export class GitService {
 		const safePaths = await this.resolveMutationPaths(cwd, paths, "stage");
 		if (safePaths.length === 0) return;
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["--literal-pathspecs", "add", "--", ...safePaths], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(cwd, ["--literal-pathspecs", "add", "--", ...safePaths]);
 	}
 
 	/** Unstage 文件（git restore --staged） */
@@ -713,10 +695,10 @@ export class GitService {
 		this.invalidateStatusCache(cwd);
 		const head = await this.resolveCommitHash(cwd, "HEAD");
 		if (head) {
-			await execFileAsync("git", ["--literal-pathspecs", "restore", "--staged", "--", ...safePaths], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+			await this.runGit(cwd, ["--literal-pathspecs", "restore", "--staged", "--", ...safePaths]);
 		} else {
 			// Unborn repository 没有 HEAD，restore --staged 无基线；从 index 移除但保留工作区文件。
-			await execFileAsync("git", ["--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "--", ...safePaths], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+			await this.runGit(cwd, ["--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "--", ...safePaths]);
 		}
 	}
 
@@ -751,25 +733,25 @@ export class GitService {
 			return;
 		}
 
-		await execFileAsync("git", ["--literal-pathspecs", "restore", "--worktree", "--", resource.path], { cwd: repoRoot, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(repoRoot, ["--literal-pathspecs", "restore", "--worktree", "--", resource.path]);
 	}
 
 	/** 创建提交 */
 	async commit(cwd: string, message: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["commit", "-m", message], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(cwd, ["commit", "-m", message]);
 	}
 
 	/** Cherry-pick：将指定提交应用到当前分支 */
 	async cherryPick(cwd: string, hash: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["cherry-pick", hash], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(cwd, ["cherry-pick", hash]);
 	}
 
 	/** Revert：创建一个反向提交撤销指定提交的变更 */
 	async revertCommit(cwd: string, hash: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["revert", "--no-edit", hash], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(cwd, ["revert", "--no-edit", hash]);
 	}
 
 	/**
@@ -778,7 +760,7 @@ export class GitService {
 	 */
 	async resetToCommit(cwd: string, hash: string, mode: "soft" | "mixed" | "hard" = "soft"): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["reset", `--${mode}`, hash], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		await this.runGit(cwd, ["reset", `--${mode}`, hash]);
 	}
 
 	/**
@@ -788,24 +770,24 @@ export class GitService {
 	async dropCommit(cwd: string, hash: string): Promise<void> {
 		// 先获取 parent hash
 		this.invalidateStatusCache(cwd);
-		const { stdout: parentHash } = await execFileAsync("git", ["rev-parse", `${hash}^`], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
-		await execFileAsync("git", ["rebase", "--onto", parentHash.trim(), hash], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS });
+		const parentHash = await this.runGit(cwd, ["rev-parse", `${hash}^`]);
+		await this.runGit(cwd, ["rebase", "--onto", parentHash.trim(), hash]);
 	}
 
 	/** Push：将当前分支推送到远程 */
 	async push(cwd: string): Promise<void> {
-		await execFileAsync("git", ["push"], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.runGit(cwd, ["push"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
 	}
 
 	/** Pull：从远程拉取并合并到当前分支 */
 	async pull(cwd: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await execFileAsync("git", ["pull"], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.runGit(cwd, ["pull"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
 	}
 
 	/** Fetch：从远程获取最新数据但不合并 */
 	async fetch(cwd: string): Promise<void> {
-		await execFileAsync("git", ["fetch"], { cwd, timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.runGit(cwd, ["fetch"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
 	}
 }
 
