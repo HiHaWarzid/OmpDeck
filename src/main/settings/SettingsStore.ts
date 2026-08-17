@@ -177,7 +177,8 @@ Gitmoji 对应关系：
   /** 默认关闭；启用后启动自动恢复轮询（Orchestrator 读取本字段） */
   afk: {
     enabled: false,
-    // targetProjectId 无默认：设置页选择后写入
+    // targetProjectIds 无默认：设置页多选后写入
+    targetProjectIds: [],
     pollIntervalMs: 60_000,
     timeoutMs: 30 * 60_000,
   },

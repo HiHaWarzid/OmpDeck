@@ -1642,20 +1642,36 @@ function SettingsModalContent(props: SettingsModalProps) {
 											updateDraft({ afk: { ...draftSettings.afk, enabled: checked } })
 										}
 									/>
-									<SelectField
-										className="setting-field"
-										label={t("afk.targetProject")}
-										value={draftSettings.afk.targetProjectId ?? ""}
-										options={[
-											{ value: "", label: t("afk.targetProjectPlaceholder") },
-											...afkProjectOptions,
-										]}
-										onChange={(value) =>
-											updateDraft({
-												afk: { ...draftSettings.afk, targetProjectId: value || undefined },
+									<div className="setting-field">
+										<span className="setting-label">{t("afk.targetProject")}</span>
+										{afkProjectOptions.length === 0 ? (
+											<span className="setting-hint">{t("afk.targetProjectPlaceholder")}</span>
+										) : (
+											// B 方案多项目轮转：checkbox 列表（项目数量少，不用 SelectField 多选定制）
+											afkProjectOptions.map((option) => {
+												const selected = draftSettings.afk.targetProjectIds.includes(option.value);
+												return (
+													<label key={option.value} className="afk-project-option">
+														<input
+															type="checkbox"
+															checked={selected}
+															onChange={(event) => {
+																const next = event.target.checked
+																	? [...draftSettings.afk.targetProjectIds, option.value]
+																	: draftSettings.afk.targetProjectIds.filter(
+																			(id) => id !== option.value,
+																		);
+																updateDraft({
+																	afk: { ...draftSettings.afk, targetProjectIds: next },
+																});
+															}}
+														/>
+														<span>{option.label}</span>
+													</label>
+												);
 											})
-										}
-									/>
+										)}
+									</div>
 									<TextField
 										className="setting-field"
 										label={t("afk.pollInterval")}

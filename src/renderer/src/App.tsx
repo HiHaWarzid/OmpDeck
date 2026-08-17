@@ -1457,7 +1457,7 @@ export function App() {
     piRpcOffline: true,
     piRpcNoExtensions: false,
     piRpcNoSkills: false,
-    afk: { enabled: false, pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
+    afk: { enabled: false, targetProjectIds: [], pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
   });
   /* settingsNotice 已改用 showToast (app-notice) 实现 */
   const [piProxyNotice, setPiProxyNotice] = useState("");

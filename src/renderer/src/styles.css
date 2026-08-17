@@ -22102,8 +22102,7 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   min-width: 0;
 }
 .afk-task-row-main {
-  flex: 1;
-  min-width: 0;
+  flex: 1;  min-width: 0;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -22451,3 +22450,21 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
 }
 
 
+
+/* AFK 设置页：目标项目多选（B 方案多项目轮转） */
+.afk-project-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.afk-project-option:hover {
+  color: var(--color-text-primary);
+}
+.afk-project-option input[type="checkbox"] {
+  accent-color: var(--color-accent);
+  margin: 0;
+}

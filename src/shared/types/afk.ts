@@ -18,6 +18,12 @@ export type AfkTask = {
 	ticketRef: number;
 	/** Issue title（作为 brief goal 原样派发） */
 	title: string;
+	/**
+	 * 来源项目 id（B 方案多项目轮转：任务与项目绑定，后续 worktree 定位/push/PR/
+	 * 崩溃恢复都从本字段解析项目，而非当前配置的目标项目）。
+	 * 可选：兼容旧 afk-state.json（恢复时缺失 → 回落当前目标项目列表）。
+	 */
+	projectId?: string;
 	/** worktree 绝对路径（创建后填充） */
 	worktreePath?: string;
 	/** afk-{ticketId}-{slug} 分支名 */
@@ -46,8 +52,11 @@ export type AfkState = {
 /** AppSettings 中的 AFK 配置（设置页 afk tab 编辑）。 */
 export type AfkSettings = {
 	enabled: boolean;
-	/** 目标项目 id（工单来自该项目 git remote） */
-	targetProjectId?: string;
+	/**
+	 * 目标项目 id 列表（B 方案多项目轮转）：工单来自各项目 git remote（gh 自动推断仓库）。
+	 * 轮询按列表顺序扫描，全局仍一次只派发一个任务（P0 串行）。
+	 */
+	targetProjectIds: string[];
 	/** 轮询间隔 ms（gh issue list 扫描频率） */
 	pollIntervalMs: number;
 	/** 单 agent 任务预算 ms（默认 30min，超时 → failed） */

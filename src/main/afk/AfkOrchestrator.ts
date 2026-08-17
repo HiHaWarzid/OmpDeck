@@ -189,7 +189,6 @@ export class AfkOrchestrator {
 	}
 
 	private async recoverInterruptedTasks(): Promise<void> {
-		const project = this.targetProject();
 		for (const task of this.state.tasks) {
 			if (task.status !== "running" && task.status !== "queued") continue;
 			const alive = task.agentId
@@ -204,6 +203,8 @@ export class AfkOrchestrator {
 			}
 			// agent 不存在（应用重启）或 queued 未派发：强清 worktree 留 WIP，issue 回写 needs-info
 			task.errorSummary = "崩溃恢复：应用重启时任务未完成";
+			// 项目按任务绑定解析（多项目下每个任务可属不同项目，不能用单一当前目标项目）
+			const project = this.resolveProject(task);
 			if (project && task.worktreePath) {
 				await this.worktreeService
 					.removeWithWip(task.worktreePath, project.path, task.ticketRef)
@@ -237,22 +238,26 @@ export class AfkOrchestrator {
 			this.state.lastPollAt = Date.now();
 			await this.checkTimeouts();
 			if (this.hasActiveTask()) return;
-			const project = this.targetProject();
-			if (!project) return;
-			const tickets = await listReadyForAgent(project.path);
-			// 认领基准 = gh 认证账户 @me（AFK Identity）；gh api user 失败时保守跳过所有已认领 ticket
-			const me = await getCurrentUser(project.path).catch(() => null);
-			for (const ticket of tickets) {
-				if (!this.isClaimable(ticket, me)) continue;
-				try {
-					await claim(project.path, ticket.number);
-				} catch (error) {
-					// 认领失败（网络/权限/未认证）：本轮跳过该 ticket，不派发
-					console.warn("[AFK] 认领 ticket 失败:", ticket.number, errorMessage(error));
-					continue;
+			// B 方案多项目轮转：按设置顺序扫描各项目，认领第一个可认领的 ticket；
+			// 全局仍一次只派一个任务（hasActiveTask 串行锁在轮询入口，跨项目共享）。
+			const projects = this.targetProjects();
+			if (projects.length === 0) return;
+			for (const project of projects) {
+				const tickets = await listReadyForAgent(project.path);
+				// 认领基准 = gh 认证账户 @me（AFK Identity）；gh api user 失败时保守跳过所有已认领 ticket
+				const me = await getCurrentUser(project.path).catch(() => null);
+				for (const ticket of tickets) {
+					if (!this.isClaimable(ticket, me)) continue;
+					try {
+						await claim(project.path, ticket.number);
+					} catch (error) {
+						// 认领失败（网络/权限/未认证）：本轮跳过该 ticket，不派发
+						console.warn("[AFK] 认领 ticket 失败:", ticket.number, errorMessage(error));
+						continue;
+					}
+					await this.dispatch(ticket, project);
+					return; // 派发完成即结束本轮（串行：一次只派一个）
 				}
-				await this.dispatch(ticket, project);
-				break; // P0 串行：一次只派一个
 			}
 		} catch (error) {
 			// 轮询异常（gh 未装/未认证/网络）：不崩溃，保留 lastPollAt，下轮重试
@@ -286,6 +291,7 @@ export class AfkOrchestrator {
 		const task: AfkTask = {
 			ticketRef: ticket.number,
 			title: ticket.title,
+			projectId: project.id,
 			status: "running",
 			startedAt: Date.now(),
 		};
@@ -346,7 +352,7 @@ export class AfkOrchestrator {
 		const task = this.findTaskByAgentId(agentId);
 		// 幂等：settled 可能迟到/重复；needs-review/pr-pending 等非 running 态不重复处理
 		if (!task || task.status !== "running") return;
-		const project = this.targetProject();
+		const project = this.resolveProject(task);
 		const projectPath = project?.path;
 		try {
 			if (!projectPath || !task.worktreePath || !task.branch) {
@@ -420,7 +426,7 @@ export class AfkOrchestrator {
 		opts: { keepWorktree: boolean },
 	): Promise<void> {
 		task.errorSummary = errorSummary;
-		const project = this.targetProject();
+		const project = this.resolveProject(task);
 		try {
 			// 先停 agent 再动工作树：避免停止过程中 agent 继续写文件产生脏快照
 			if (task.agentId) {
@@ -531,10 +537,30 @@ export class AfkOrchestrator {
 
 	// ── 工具 ──
 
-	private targetProject(): Project | undefined {
-		const afk = this.getAfkSettings();
-		if (!afk.targetProjectId) return undefined;
-		return this.projectStore.get(afk.targetProjectId);
+	/**
+	 * 目标项目列表（B 方案多项目轮转）：按设置顺序返回存在的项目。
+	 * 工单扫描按列表顺序进行，认领第一个可认领的（全局仍一次一个任务）。
+	 */
+	private targetProjects(): Project[] {
+		const ids = this.getAfkSettings().targetProjectIds;
+		const projects: Project[] = [];
+		for (const id of ids) {
+			const project = this.projectStore.get(id);
+			if (project) projects.push(project);
+		}
+		return projects;
+	}
+
+	/**
+	 * 从任务解析其来源项目：优先 task.projectId（dispatch 时绑定），
+	 * 缺失（旧 afk-state.json 存档）时回落当前目标项目列表第一个。
+	 */
+	private resolveProject(task: AfkTask): Project | undefined {
+		if (task.projectId) {
+			const project = this.projectStore.get(task.projectId);
+			if (project) return project;
+		}
+		return this.targetProjects()[0];
 	}
 
 	/**
@@ -549,9 +575,15 @@ export class AfkOrchestrator {
 				: DEFAULT_POLL_INTERVAL_MS;
 		const timeoutMs =
 			Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0 ? raw.timeoutMs : DEFAULT_TIMEOUT_MS;
+		// B 方案多项目迁移：新配置是数组；旧 settings.json 若仍是单值 targetProjectId，自动迁移为数组。
+		// 运行时旧存档形状与 AfkSettings 不符（TS 只认新契约），具名收窄读取旧字段。
+		const legacyRaw = raw as unknown as { targetProjectId?: string };
+		const targetProjectIds = Array.isArray(raw.targetProjectIds)
+			? raw.targetProjectIds
+			: (legacyRaw.targetProjectId ? [legacyRaw.targetProjectId] : []);
 		return {
 			enabled: raw.enabled === true,
-			targetProjectId: raw.targetProjectId,
+			targetProjectIds,
 			pollIntervalMs,
 			timeoutMs,
 		};
