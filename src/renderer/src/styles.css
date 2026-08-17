@@ -21869,4 +21869,581 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   color: var(--color-info);
 }
 
+/* ── AFK 中心页 ──────────────────────────────────
+ * 全屏 Modal 内 3 tab 套件（总览/任务/PR 待合并）+ 详情抽屉。
+ * 全部颜色走语义 token，暗色模式自然适配；状态色与 agent-status-* 同一套语义。
+ */
+.afk-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+/* 顶部 tab 工具栏 */
+.afk-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  flex: 0 0 auto;
+}
+.afk-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+.afk-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 44px;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-control);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s;
+}
+.afk-tab:hover {
+  color: var(--color-text-primary);
+}
+.afk-tab.active {
+  color: var(--color-accent);
+  border-bottom-color: var(--color-accent);
+  font-weight: 600;
+}
+.afk-toolbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* 侧栏入口按钮（App.tsx sidebar-bottom-actions 使用） */
+.afk-icon:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-accent);
+}
+
+/* 主体：内部滚动区 + 详情抽屉叠层 */
+.afk-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.afk-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-5) var(--space-5);
+}
+
+/* 总览：4 统计卡 */
+.afk-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+.afk-stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-muted);
+}
+.afk-stat-value {
+  font-size: var(--font-size-heading);
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.afk-stat-label {
+  font-size: var(--font-size-caption);
+  color: var(--color-text-tertiary);
+}
+.afk-stat-active .afk-stat-value { color: var(--color-brand-blue); }
+.afk-stat-complete .afk-stat-value { color: var(--color-accent); }
+.afk-stat-failed .afk-stat-value { color: var(--color-danger); }
+.afk-stat-pr-pending .afk-stat-value { color: var(--color-brand-purple); }
+
+/* 启用状态 + 最后轮询 */
+.afk-status-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+  flex-wrap: wrap;
+}
+.afk-last-poll {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+  font-family: var(--font-family-business);
+}
+.afk-badge-enabled {
+  border-color: color-mix(in srgb, var(--color-accent) 30%, var(--color-border-subtle)) !important;
+  color: var(--color-accent) !important;
+  background: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg-panel)) !important;
+}
+
+/* 区块标题 */
+.afk-section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--font-size-title);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+/* 空状态（未配置引导） */
+.afk-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-muted);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-control);
+}
+
+/* 6 状态色点：语义 token，不写死色值（暗色自动适配） */
+.afk-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  flex: none;
+  background: var(--color-text-tertiary);
+}
+.afk-status-dot.afk-status-queued {
+  background: var(--color-text-tertiary);
+  opacity: 0.7;
+}
+.afk-status-dot.afk-status-running {
+  background: transparent;
+  border: 2px solid color-mix(in srgb, var(--color-brand-blue) 28%, transparent);
+  border-top-color: var(--color-brand-blue);
+  animation: afk-status-spin 0.8s linear infinite;
+}
+.afk-status-dot.afk-status-complete {
+  background: var(--color-accent);
+}
+.afk-status-dot.afk-status-failed {
+  background: var(--color-danger);
+}
+.afk-status-dot.afk-status-pr-pending {
+  background: var(--color-brand-purple);
+}
+.afk-status-dot.afk-status-needs-review {
+  background: var(--color-warning);
+}
+@keyframes afk-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.afk-status-text {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  white-space: nowrap;
+}
+
+/* 任务列表行 */
+.afk-task-list,
+.afk-pr-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.afk-task-row,
+.afk-pr-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-panel);
+  transition:
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.afk-task-row:hover,
+.afk-pr-row:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-bg-hover);
+}
+.afk-task-row-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.afk-task-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.afk-task-row-main:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: var(--radius-xs);
+}
+.afk-task-ticket {
+  flex: none;
+  font-family: var(--font-family-business);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-control);
+}
+.afk-task-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-control);
+}
+.afk-task-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-family: var(--font-family-business);
+}
+.afk-task-branch {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afk-task-duration {
+  white-space: nowrap;
+}
+.afk-task-error {
+  color: var(--color-danger);
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+/* 任务列表筛选按钮组 */
+.afk-list-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: var(--space-3);
+}
+.afk-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.afk-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-panel);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.afk-filter-btn:hover:not(.active) {
+  color: var(--color-text-primary);
+  border-color: var(--color-border-strong);
+}
+.afk-filter-btn.active {
+  color: var(--color-text-primary);
+  border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-border-subtle));
+  background: var(--color-bg-active);
+  font-weight: 600;
+}
+
+/* PR 待合并行 */
+.afk-pr-row {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+.afk-pr-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.afk-pr-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  border: 0;
+  background: none;
+  padding: 0;
+  text-align: left;
+  color: var(--color-accent);
+  font-size: var(--font-size-control);
+  font-weight: 600;
+  cursor: pointer;
+}
+.afk-pr-link:hover {
+  text-decoration: underline;
+  color: var(--color-accent-strong);
+}
+.afk-pr-link-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afk-pr-ticket {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.afk-pr-ticket strong {
+  color: var(--color-text-primary);
+  font-family: var(--font-family-business);
+  font-weight: 600;
+}
+.afk-pr-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-family: var(--font-family-business);
+}
+.afk-pr-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.afk-pr-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.afk-pr-gc-hint {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-warning) 8%, var(--color-bg-panel));
+  color: var(--color-warning);
+  font-size: var(--font-size-caption);
+}
+
+/* 详情抽屉：页内右侧叠层 */
+.afk-detail-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;
+  background: color-mix(in srgb, var(--color-bg-app) 45%, transparent);
+}
+.afk-detail-drawer {
+  width: min(420px, 46%);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-panel);
+  border-left: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-drawer);
+  animation: afk-detail-in 0.18s ease-out;
+}
+@keyframes afk-detail-in {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+.afk-detail-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+  flex: 0 0 auto;
+}
+.afk-detail-ticket {
+  font-family: var(--font-family-business);
+  font-weight: 700;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-title);
+  flex: none;
+}
+.afk-detail-header .afk-detail-status {
+  margin-left: auto;
+}
+.afk-detail-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.afk-detail-title {
+  margin: 0;
+  font-size: var(--font-size-body);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  line-height: 1.5;
+}
+.afk-detail-meta {
+  display: grid;
+  gap: 6px;
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+}
+.afk-detail-meta-row {
+  display: flex;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.afk-detail-meta-row > span:first-child {
+  flex: none;
+  width: 72px;
+  color: var(--color-text-tertiary);
+}
+.afk-detail-meta-row code {
+  font-family: var(--font-family-business);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+.afk-detail-section-title {
+  font-size: var(--font-size-control);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+/* 生命周期时间线：created → worktree → running → complete/failed（+PR） */
+.afk-timeline {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding-left: 2px;
+  list-style: none;
+}
+.afk-timeline-item {
+  position: relative;
+  display: flex;
+  gap: var(--space-3);
+  padding-bottom: var(--space-3);
+}
+.afk-timeline-item:last-child {
+  padding-bottom: 0;
+}
+.afk-timeline-item::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 16px;
+  bottom: 0;
+  width: 2px;
+  background: var(--color-border-default);
+}
+.afk-timeline-item:last-child::before {
+  display: none;
+}
+.afk-timeline-dot {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  margin-top: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border-strong);
+}
+.afk-timeline-item.done .afk-timeline-dot {
+  background: var(--color-accent);
+}
+.afk-timeline-item.done.failed .afk-timeline-dot {
+  background: var(--color-danger);
+}
+.afk-timeline-item.current .afk-timeline-dot {
+  background: var(--color-brand-blue);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-brand-blue) 22%, transparent);
+}
+.afk-timeline-item.current.failed .afk-timeline-dot {
+  background: var(--color-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-danger) 22%, transparent);
+}
+.afk-timeline-item.current::before {
+  background: color-mix(in srgb, var(--color-brand-blue) 35%, var(--color-border-default));
+}
+.afk-timeline-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.afk-timeline-label {
+  font-size: var(--font-size-control);
+  color: var(--color-text-primary);
+}
+.afk-timeline-time {
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-business);
+}
+.afk-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border-subtle);
+  flex: 0 0 auto;
+}
+
 

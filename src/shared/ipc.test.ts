@@ -64,7 +64,7 @@ describe("IPC 通道表契约", () => {
 		expect(ipcChannels.agentsRuntimeState).toBe("agents:runtime-state");
 	});
 
-	test("总通道数 = 260（262 旧键 - 3 死通道 + 1 新增 agents:commands）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(260);
+	test("总通道数 = 265（262 旧键 - 3 死通道 + 1 新增 agents:commands + 5 afk 命名空间）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(265);
 	});
 });

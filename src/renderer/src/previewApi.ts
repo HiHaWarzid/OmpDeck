@@ -198,6 +198,7 @@ let previewSettings: AppSettings = {
 	piRpcOffline: true,
 	piRpcNoExtensions: false,
 	piRpcNoSkills: false,
+	afk: { enabled: false, pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
 };
 
 /** 预览终端：创建 tab 后异步推送欢迎输出，模拟主进程 pty 数据流。 */

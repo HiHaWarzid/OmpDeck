@@ -10,6 +10,7 @@ import {
 	Minus,
 	Plus,
 	Eye,
+	Bot,
 } from "lucide-react";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
@@ -24,7 +25,7 @@ const ZOOM_FACTOR_MIN = 0.8;
 const ZOOM_FACTOR_MAX = 1.5;
 const ZOOM_FACTOR_STEP = 0.05;
 
-type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage" | "vision";
+type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage" | "vision" | "afk";
 
 /** 代理相关字段：用于判断代理 tab 是否有未保存变更。 */
 const PROXY_FIELDS: (keyof AppSettings)[] = [
@@ -128,6 +129,8 @@ function DirtyMarker(props: { dirty: boolean; label: string }) {
 
 type SettingsModalProps = {
 	settings: AppSettings;
+	/** 打开时直接定位到的 tab（如从 AFK 中心「去配置」跳转）；缺省恢复上次打开的 tab */
+	initialTab?: SettingsTabId;
 	piStatus: PiInstallStatus | null;
 	piChecking: boolean;
 	piProxyChecking: boolean;
@@ -223,6 +226,7 @@ const SETTINGS_TABS: readonly SettingsTabId[] = [
 	"pet",
 	"storage",
 	"vision",
+	"afk",
 ];
 
 /**
@@ -242,7 +246,7 @@ function loadLastSettingsTab(): SettingsTabId {
 }
 
 function SettingsModalContent(props: SettingsModalProps) {
-	const [activeTab, setActiveTab] = useState<SettingsTabId>(loadLastSettingsTab);
+	const [activeTab, setActiveTab] = useState<SettingsTabId>(() => props.initialTab ?? loadLastSettingsTab());
 	// ── 全局设置草稿：进入弹框时快照 props.settings，所有修改在 draft 上操作，保存时统一提交 ──
 	const [draftSettings, setDraftSettings] = useState<AppSettings>(() => ({ ...props.settings }));
 	const [dirtyFields, setDirtyFields] = useState<Set<string>>(new Set());
@@ -421,6 +425,25 @@ function SettingsModalContent(props: SettingsModalProps) {
 			props.onCheckPi();
 		}
 	}, [activeTab, props.piStatus, props.piChecking, props.onCheckPi]);
+	// ── AFK tab：目标项目下拉选项来自项目列表（工单来源项目），每次进入 tab 拉取一次 ──
+	const [afkProjectOptions, setAfkProjectOptions] = useState<Array<{ value: string; label: string }>>([]);
+	useEffect(() => {
+		if (activeTab !== "afk") return;
+		let cancelled = false;
+		window.piDesktop.projects
+			.list()
+			.then((projects) => {
+				if (!cancelled) {
+					setAfkProjectOptions(projects.map((project) => ({ value: project.id, label: project.name })));
+				}
+			})
+			.catch(() => {
+				if (!cancelled) setAfkProjectOptions([]);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeTab]);
 	const [petPreviewMode, setPetPreviewMode] = useState("__auto");
 
 	const applyWebPortDraft = () => {
@@ -471,6 +494,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 			id: "vision",
 			label: t("settings.tabs.vision"),
 			icon: <Eye size={16} />,
+		},
+		{
+			id: "afk",
+			label: t("afk.title"),
+			icon: <Bot size={16} />,
 		},
 	];
 	const themeOptions = [
@@ -1601,6 +1629,65 @@ function SettingsModalContent(props: SettingsModalProps) {
 								settings={draftSettings}
 								onChange={updateDraft}
 							/>
+						)}
+						{/* ── AFK 编排 tab ── */}
+						{activeTab === "afk" && (
+							<>
+								<SettingsSection title={t("afk.title")}>
+									<SettingSwitch
+										title={t("afk.enabled")}
+										description={t("afk.enabledDesc")}
+										checked={draftSettings.afk.enabled}
+										onChange={(checked) =>
+											updateDraft({ afk: { ...draftSettings.afk, enabled: checked } })
+										}
+									/>
+									<SelectField
+										className="setting-field"
+										label={t("afk.targetProject")}
+										value={draftSettings.afk.targetProjectId ?? ""}
+										options={[
+											{ value: "", label: t("afk.targetProjectPlaceholder") },
+											...afkProjectOptions,
+										]}
+										onChange={(value) =>
+											updateDraft({
+												afk: { ...draftSettings.afk, targetProjectId: value || undefined },
+											})
+										}
+									/>
+									<TextField
+										className="setting-field"
+										label={t("afk.pollInterval")}
+										type="number"
+										min={1}
+										value={String(Math.round((draftSettings.afk.pollIntervalMs || 60000) / 1000))}
+										onChange={(value) =>
+											updateDraft({
+												afk: {
+													...draftSettings.afk,
+													pollIntervalMs: Math.max(1, Math.round(Number(value) || 60)) * 1000,
+												},
+											})
+										}
+									/>
+									<TextField
+										className="setting-field"
+										label={t("afk.timeout")}
+										type="number"
+										min={1}
+										value={String(Math.round((draftSettings.afk.timeoutMs || 1800000) / 60000))}
+										onChange={(value) =>
+											updateDraft({
+												afk: {
+													...draftSettings.afk,
+													timeoutMs: Math.max(1, Math.round(Number(value) || 30)) * 60000,
+												},
+											})
+										}
+									/>
+								</SettingsSection>
+							</>
 						)}
 					</div>
 				</div>

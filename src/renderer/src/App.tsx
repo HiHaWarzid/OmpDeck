@@ -19,6 +19,7 @@ import remarkGfm from "remark-gfm";
 import {
   Settings,
   Sliders,
+  Bot,
   ChevronLeft,
   ChevronRight,
   ChevronDown,
@@ -69,6 +70,7 @@ const TerminalDock = lazy(() =>
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
+import { Badge } from "./components/ui/Badge";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/AppParts";
@@ -199,6 +201,8 @@ import {
 const FileDiffViewer = lazy(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
 // 懒加载模态框，减少首屏 JS 体积
 const SettingsModal = lazy(() => import("./components/app/SettingsModal").then((m) => ({ default: m.SettingsModal })));
+// AFK 中心：按需懒加载（与 SettingsModal 同策略，减少首屏 JS）
+const AfkPanel = lazy(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
 
 const CodexImportModal = lazy(() => import("./components/app/ImportModals").then((m) => ({ default: m.CodexImportModal })));
 const ClaudeImportModal = lazy(() => import("./components/app/ImportModals").then((m) => ({ default: m.ClaudeImportModal })));
@@ -1344,6 +1348,9 @@ export function App() {
   const [sessionsProjectId, setSessionsProjectId] = useState<string>();
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [afkOpen, setAfkOpen] = useState(false);
+  // 从 AFK 中心「去配置」跳转：SettingsModal 挂载时定位到 afk tab，关闭后复位
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"afk" | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -1450,6 +1457,7 @@ export function App() {
     piRpcOffline: true,
     piRpcNoExtensions: false,
     piRpcNoSkills: false,
+    afk: { enabled: false, pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
   });
   /* settingsNotice 已改用 showToast (app-notice) 实现 */
   const [piProxyNotice, setPiProxyNotice] = useState("");
@@ -7327,6 +7335,11 @@ export function App() {
                           <div className="conversation-body">
                             <div className="conversation-title">
                               <strong>{agent.title}</strong>
+                              {agent.title.startsWith("AFK: #") && (
+                                <Badge variant="outline" badgeSize="sm" className="afk-sidebar-badge">
+                                  {t("afk.sidebar.badge")}
+                                </Badge>
+                              )}
                               {child.source && child.source !== "pi" && (
                                 <span className={`session-source-badge ${child.source}`}>
                                   {t(`sessionSource.${child.source}` as any)}
@@ -7633,6 +7646,11 @@ export function App() {
                                   <div className="conversation-body">
                                     <div className="conversation-title">
                                       <strong>{agent.title}</strong>
+                                      {agent.title.startsWith("AFK: #") && (
+                                        <Badge variant="outline" badgeSize="sm" className="afk-sidebar-badge">
+                                          {t("afk.sidebar.badge")}
+                                        </Badge>
+                                      )}
                                       {agent.noSession && (
                                         <span
                                           className="anonymous-indicator"
@@ -7756,6 +7774,14 @@ export function App() {
                 onClick={() => setFeedbackOpen(true)}
               >
                 <MessageSquare size={17} />
+              </button>
+              <button
+                className="icon-button afk-icon"
+                title={t("afk.openCenter")}
+                aria-label={t("afk.openCenter")}
+                onClick={() => setAfkOpen(true)}
+              >
+                <Bot size={17} />
               </button>
               <button
                 className="icon-button homepage-icon"
@@ -9989,6 +10015,7 @@ export function App() {
         <Suspense fallback={null}>
         <SettingsModal
           settings={settings}
+          initialTab={settingsInitialTab ?? undefined}
           piStatus={piStatus}
           piChecking={piChecking}
           piProxyChecking={piProxyChecking}
@@ -10032,10 +10059,24 @@ export function App() {
           }
           onClose={() => {
             setSettingsOpen(false);
+            setSettingsInitialTab(null);
           }}
           onChange={updateSettings}
         />
       </Suspense>
+      )}
+      {afkOpen && (
+        <Suspense fallback={null}>
+          <AfkPanel
+            open={afkOpen}
+            onClose={() => setAfkOpen(false)}
+            onGoConfigure={() => {
+              setAfkOpen(false);
+              setSettingsInitialTab("afk");
+              setSettingsOpen(true);
+            }}
+          />
+        </Suspense>
       )}
       {feedbackOpen && (
         <FeedbackModal
