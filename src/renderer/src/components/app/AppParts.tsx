@@ -3574,6 +3574,9 @@ export const TurnRow = memo(function TurnRow(props: {
 	onPreviewImage: (image: ImageContent) => void;
 	showThinking?: boolean;
 	isStreaming?: boolean;
+	/** 流式思考的开始时间（App 侧 streamingThinkingStartedAt[agentId]）。双来源优先级：
+	 *  message.thinkingStartedAt（消息落库，最精确）→ 本 prop（agent 级流式开始）→ run.startedAt。 */
+	streamingThinkingStartedAt?: number;
 	onOpenExternal: (url: string) => void;
 	onOpenFile?: (path: string) => void;
 	onDiffFile?: DiffFileHandler;
@@ -3678,13 +3681,14 @@ export const TurnRow = memo(function TurnRow(props: {
 				id: `final-thinking-${finalMessageItem?.message.id ?? run.id}`,
 				messages: finalMessageItem?.message ? [finalMessageItem.message] : [],
 				text: finalThinkingTxt,
-				startedAt: finalMessageItem?.message.thinkingStartedAt ?? run.startedAt,
+				startedAt: finalMessageItem?.message.thinkingStartedAt ?? props.streamingThinkingStartedAt ?? run.startedAt,
 				endedAt: finalMessageItem?.message.thinkingEndedAt ?? finalMessageItem?.message.timestamp ?? run.endedAt,
 			};
 			items.push(thinkingItem);
 		}
 		return items;
 	}, [executionItems, hasFinalThinking, finalThinkingTxt, props.showThinking,
+		props.streamingThinkingStartedAt,
 		finalMessageItem?.message.id, finalMessageItem?.message.timestamp,
 		finalMessageItem?.message, run.id, run.startedAt, run.endedAt,
 	]);
@@ -3765,7 +3769,7 @@ export const TurnRow = memo(function TurnRow(props: {
 					id: `streaming-thinking-${last.message.id}`,
 					messages: [last.message],
 					text: stripAnsi(last.message.thinking),
-					startedAt: last.message.thinkingStartedAt ?? run.startedAt,
+					startedAt: last.message.thinkingStartedAt ?? props.streamingThinkingStartedAt ?? run.startedAt,
 					endedAt: last.message.thinkingEndedAt ?? last.message.timestamp ?? run.endedAt,
 				};
 				return [...allItems.slice(0, -1), thinkingBlock, last];
@@ -3974,7 +3978,8 @@ export const TurnRow = memo(function TurnRow(props: {
 	sameAgentRunForRender(previous.run, next.run) &&
 	previous.showThinking === next.showThinking &&
 	previous.isStreaming === next.isStreaming &&
-	previous.agentRunning === next.agentRunning,
+	previous.agentRunning === next.agentRunning &&
+	previous.streamingThinkingStartedAt === next.streamingThinkingStartedAt,
 );
 
 /**
