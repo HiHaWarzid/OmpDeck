@@ -11,6 +11,7 @@ export function TextField(props: {
 	type?: "text" | "number" | "password";
 	min?: number;
 	max?: number;
+	step?: number;
 	onBlur?: () => void;
 	onKeyDown?: KeyboardEventHandler<HTMLInputElement>;
 }) {
@@ -28,6 +29,7 @@ export function TextField(props: {
 				disabled={props.disabled}
 				min={props.min}
 				max={props.max}
+				step={props.step}
 				onChange={(event) => props.onChange(event.target.value)}
 				onBlur={props.onBlur}
 				onKeyDown={props.onKeyDown}

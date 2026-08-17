@@ -11940,6 +11940,10 @@ body.is-composer-resizing .composer-resize-handle::after {
 .setting-field--after-switch {
   margin-top: var(--space-2);
 }
+/* 技术文本输入（URL/API Key/模型 ID 等）：等宽字体，高度与间距仍走 .setting-field input */
+.setting-field--mono input {
+  font-family: var(--font-family-mono);
+}
 /* SettingSwitch 后若仍需要分组，用无边框 spacer 代替 divider */
 .setting-spacer {
   height: var(--space-2);
