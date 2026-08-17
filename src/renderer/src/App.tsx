@@ -93,7 +93,7 @@ import {
   type ProjectAgentSessionDisplay,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
-import { isAgentBusy as agentBusy, isAgentStreaming, mergeAgentRuntimeState } from "./utils/agentRuntimeState";
+import { isAgentBusy as agentBusy, isAgentStreaming, mergeAgentRuntimeState, resolveIncomingRuntimeState } from "./utils/agentRuntimeState";
 import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
@@ -2576,30 +2576,16 @@ export function App() {
       navigateTo(url);
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
-      const previous = runtimeStateByAgentRef.current[payload.agentId];
-      // 完整快照带单调序号：长任务后 omp 繁忙，agent_end 的慢 RPC 快照可能晚于
-      // 更新的空闲快照到达，旧快照（isStreaming: true）会覆盖已 idle 的状态，
-      // 让左下角三点指示器卡住。序号更小的旧快照直接丢弃；
-      // 工具边沿轻量 patch 不带序号（undefined），仍即时应用。
-      const incomingSeq = payload.state.runtimeStateSeq;
-      if (
-        incomingSeq != null &&
-        previous?.runtimeStateSeq != null &&
-        incomingSeq < previous.runtimeStateSeq
-      ) {
-        return;
-      }
-      const nextState = applyAgentRuntimeState(payload.agentId, payload.state);
-      // tool start/end 会由主进程以轻量 patch 立即推送；与最近一次完整状态合并，
-      // 避免为了保证工具边沿顺序而短暂丢失模型、token 等运行信息。
-      if (
-        previous?.isExecutingTool &&
-        !nextState.isExecutingTool &&
-        (payload.state.toolStateSequence == null ||
-          previous.toolStateSequence == null ||
-          payload.state.toolStateSequence >= previous.toolStateSequence) &&
-        isAgentCurrentlyBusy(payload.agentId)
-      ) {
+      // 解码逻辑（seq 守卫 + 状态合并 + tool true→false 边沿判定）已提炼为
+      // resolveIncomingRuntimeState 纯函数，保证 steer 投递窗口不因 React
+      // 批量渲染丢失；此处只负责落库与投递。
+      const resolved = resolveIncomingRuntimeState(
+        runtimeStateByAgentRef.current[payload.agentId],
+        payload.state,
+      );
+      if (!resolved) return;
+      const nextState = applyAgentRuntimeState(payload.agentId, resolved.state);
+      if (resolved.isToolCompletionEdge && isAgentCurrentlyBusy(payload.agentId)) {
         void flushQueuedSteerPrompts(payload.agentId);
       }
     });
@@ -5426,6 +5412,41 @@ export function App() {
     prevIsAgentBusyRef.current = isAgentBusy;
   }, [isAgentBusy]);
 
+  /** 流式/运行相关的时间线展示状态：App 侧聚合为单一对象传给 MessageListContent，
+   *  用 useMemo 保证只有任一输入真正变化时才重建引用——流式期间 App 每次重渲染
+   *  （~50ms delta + 侧栏等无关状态变化）不能让对象每帧新建，否则 memo 失效整树重渲染。
+   *  MessageListContent 的比较器按内容比较（sameMessageStreamState），
+   *  即使这里漏列依赖，字段变化仍能被比较器捕获。 */
+  const streamState = useMemo(
+    () => ({
+      streamingMessageId,
+      agentRunning: isAgentBusy,
+      statusRunning: activeAgent?.status === "running",
+      isAwaitingAssistant,
+      showThinking: settings.showThinking,
+      activeThinking,
+      thinkingStartedAt: activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined,
+      isExecutingTool: activeRuntimeState?.isExecutingTool,
+      isStreaming: activeRuntimeState?.isStreaming,
+      cancellingUi,
+      activeUiAskRequestId: activeUiAsk?.requestId,
+    }),
+    [
+      streamingMessageId,
+      isAgentBusy,
+      activeAgent?.status,
+      isAwaitingAssistant,
+      settings.showThinking,
+      activeThinking,
+      activeAgentId,
+      streamingThinkingStartedAt,
+      activeRuntimeState?.isExecutingTool,
+      activeRuntimeState?.isStreaming,
+      cancellingUi,
+      activeUiAsk?.requestId,
+    ],
+  );
+
   /** 解析消息中的 & 会话引用，将 chip 替换为引用上下文 */
   async function resolveSessionRefs(message: string): Promise<string> {
     let resolved = message;
@@ -8012,17 +8033,7 @@ export function App() {
           {(activeAgent && activeAgent.status !== "starting" && activeMessages.length > 0) ? (
             <MessageListContent
               renderedRuns={renderedRuns}
-              streamingMessageId={streamingMessageId}
-              agentRunning={isAgentBusy}
-              statusRunning={activeAgent.status === "running"}
-              isAwaitingAssistant={isAwaitingAssistant}
-              showThinking={settings.showThinking}
-              activeThinking={activeThinking}
-              thinkingStartedAt={activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined}
-              isExecutingTool={activeRuntimeState?.isExecutingTool}
-              isStreaming={activeRuntimeState?.isStreaming}
-              cancellingUi={cancellingUi}
-              activeUiAskRequestId={activeUiAsk?.requestId}
+              streamState={streamState}
               activeAgentId={activeAgentId}
               forkingMessageId={forkingMessageId}
               validCommandNames={validCommandNames}
@@ -9122,28 +9133,13 @@ export function App() {
                       <GitPanel
                         projectId={activeProjectId}
                         projectRoot={activeProject?.path}
-                        commitLog={api.git.commitLog}
-                        commitDetail={api.git.commitDetail}
+                        git={api.git}
                         onOpenCommitFileDiff={openCommitFileDiff}
                         onOpenWorkspaceFileDiff={openWorkspaceFileDiff}
-                        branchCompare={api.git.branchCompare}
-                        getStatus={api.git.status}
-                        stageFiles={api.git.stage}
-                        unstageFiles={api.git.unstage}
-                        discardFile={api.git.discard}
-                        commit={api.git.commit}
                         branches={gitInfo.branches}
                         currentBranch={gitInfo.current}
                         onSwitchBranch={switchBranch}
                         onCreateBranch={createBranch}
-                        cherryPick={api.git.cherryPick}
-                        revert={api.git.revert}
-                        reset={api.git.reset}
-                        dropCommit={api.git.dropCommit}
-                        generateCommitMessage={api.git.generateCommitMessage}
-                        gitInit={api.git.init}
-                        push={api.git.push}
-                        pull={api.git.pull}
                       />
                     </div>
                     {gitDrawerDiff && gitDrawerDiff.projectId === activeProjectId && gitDiffDisplayMode === "drawer" && (
