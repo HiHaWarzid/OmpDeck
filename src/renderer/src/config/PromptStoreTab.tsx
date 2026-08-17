@@ -2,6 +2,7 @@ import { showNotice } from "../utils/notice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, BookOpen, Check, Download, ExternalLink, Globe, Search } from "lucide-react";
 import type { PromptStoreItem, PromptStoreSearchResult, PiPromptTemplateSummary, PiPromptTemplateListResult } from "../../../shared/types";
+import type { PiDesktopApi } from "../../../shared/api";
 import { t } from "../i18n";
 import { YaoPromptTab } from "./YaoPromptTab";
 
@@ -20,7 +21,7 @@ function predictImportName(title: string): string {
 /** 获取本地已安装 prompt 名称集合 */
 async function getInstalledPromptNames(): Promise<Set<string>> {
 	try {
-		const piDesktop = (window as any).piDesktop;
+		const piDesktop = (window as unknown as { piDesktop?: Pick<PiDesktopApi, "prompts"> }).piDesktop;
 		if (!piDesktop?.prompts?.list) return new Set();
 		const list: PiPromptTemplateListResult = await piDesktop.prompts.list();
 		return new Set(list.templates.filter((t) => t.userCreated).map((t) => t.name.toLowerCase()));
@@ -29,7 +30,7 @@ async function getInstalledPromptNames(): Promise<Set<string>> {
 	}
 }
 
-const api = (window as unknown as { piDesktop: { promptStore: { search: (q: string, opts?: { limit?: number }) => Promise<PromptStoreSearchResult>; get: (id: string) => Promise<PromptStoreItem>; import: (data: { title: string; description: string; content: string }) => Promise<PiPromptTemplateSummary> } } }).piDesktop;
+const api = (window as unknown as { piDesktop: Pick<PiDesktopApi, "promptStore"> }).piDesktop;
 
 /**
  * 搜索提示常量：用户在商店搜索栏中看到的热门推荐关键词。

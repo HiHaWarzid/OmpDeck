@@ -292,7 +292,11 @@ export interface PromptStoreApi {
 
 export interface SkillStoreApi {
 	search: (query: string) => Promise<PromptStoreSearchResult>;
-	import: (item: PromptStoreItem, locationId?: "pi-global" | "agents-global") => Promise<PiSkillSummary>;
+	/**
+	 * locationId 运行期接受任意位置 id（主进程 handler 默认 "pi-global" 且不校验枚举，
+	 * 渲染层保存位置含 project 级 4 值）；类型放宽为 string 与运行期契约一致。
+	 */
+	import: (item: PromptStoreItem, locationId?: string) => Promise<PiSkillSummary>;
 }
 
 /** SkillHub（api.skillhub.cn） */

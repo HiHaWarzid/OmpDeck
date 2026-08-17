@@ -15,6 +15,7 @@ import type {
 	FeishuChatBinding,
 	FeishuTestResult,
 } from "../../../shared/types";
+import type { PiDesktopApi } from "../../../shared/api";
 import { t } from "../i18n";
 
 type Props = {
@@ -81,25 +82,8 @@ const CALLBACKS_JSON = `[
   "card.action.trigger"
 ]`;
 
-type FeishuApiRaw = {
-	botsList?: () => Promise<FeishuBotConfig[]>;
-	statusRequest?: () => Promise<FeishuBridgeStatus>;
-	bindingsList?: () => Promise<FeishuChatBinding[]>;
-	onStatus?: (cb: (s: FeishuBridgeStatus) => void) => () => void;
-	connect?: (input: { appId: string; appSecret: string; name: string }) => Promise<{ success: boolean; message: string }>;
-	/** 临时连接（不保存 bot 配置），返回 botInfo 用于后续保存 */
-	connectTemp?: (input: { appId: string; appSecret: string; name?: string }) => Promise<{ success: boolean; message: string; botInfo?: { id: string; name: string } }>;
-	connectByBot?: (botId: string) => Promise<{ success: boolean; message: string }>;
-	disconnect?: () => Promise<unknown>;
-	botAdd?: (input: { appId: string; appSecret: string; name?: string; defaultUserOpenId?: string }) => Promise<{ success: boolean; bot?: FeishuBotConfig; error?: string }>;
-	botRemove?: (botId: string) => Promise<boolean>;
-	botSecret?: (botId: string) => Promise<string>;
-	testConnection?: (appId: string, appSecret: string) => Promise<FeishuTestResult>;
-	bindingRemove?: (chatId: string) => Promise<boolean>;
-	botConfig?: (botId: string, patch: Partial<FeishuBotConfig>) => Promise<FeishuBotConfig | undefined>;
-	/** 监听飞书 whoami 结果 */
-	onWhoamiResult?: (cb: (openId: string) => void) => () => void;
-};
+/** 所有成员名均已核对存在于 PiDesktopApi["feishu"]；Partial 保留原有全可选语义 */
+type FeishuApiRaw = Partial<PiDesktopApi["feishu"]>;
 
 export function ImTab(_props: Props) {
 	const [bots, setBots] = useState<FeishuBotConfig[]>([]);
@@ -136,7 +120,7 @@ export function ImTab(_props: Props) {
 
 	/** 使用主进程能力打开外部链接；force=true 强制系统浏览器（如飞书登录/指南页不适合内置浏览器）。 */
 	const openExternal = useCallback(async (url: string, forceSystem?: boolean) => {
-		const appApi = (window as unknown as { piDesktop?: { app?: { openExternal: (u: string, forceSystem?: boolean) => Promise<void> } } }).piDesktop?.app;
+		const appApi = (window as unknown as { piDesktop?: { app?: PiDesktopApi["app"] } }).piDesktop?.app;
 		if (appApi?.openExternal) {
 			await appApi.openExternal(url, forceSystem);
 		} else {

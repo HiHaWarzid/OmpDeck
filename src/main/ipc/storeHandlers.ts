@@ -266,11 +266,22 @@ export function registerStoreHandlers(deps: StoreHandlerDeps): StoreHandlerMaps 
 
 					const { writeFile } = await import("node:fs/promises");
 
+					// 运行期输入验证：IPC 契约是宽松 string（渲染层保存位置 4 值联合经
+					// 序列化后到达），创建器只接受 4 值枚举；未知值回退默认，
+					// 防止任意字符串穿透到 SKILL 落盘路径拼接。
+					const resolvedLocation =
+						locationId === "pi-global" ||
+						locationId === "agents-global" ||
+						locationId === "project-pi" ||
+						locationId === "project-agents"
+							? locationId
+							: "pi-global";
+
 					// 用 SkillManager 创建 skill（默认 pi-global，用户可通过 dropdown 切换）
 					const summary = await skillManager.create({
 						name,
 						description: item.description || item.title,
-						locationId: locationId ?? "pi-global",
+						locationId: resolvedLocation,
 					});
 
 					// 覆盖 SKILL.md 为实际内容

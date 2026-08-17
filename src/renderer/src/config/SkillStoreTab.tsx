@@ -1,16 +1,18 @@
 import { showNotice } from "../utils/notice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, Download, ExternalLink, Search, Sparkles } from "lucide-react";
-import type { PromptStoreItem, PromptStoreSearchResult, PiSkillSummary } from "../../../shared/types";
+import type { PromptStoreItem, PromptStoreSearchResult, PiSkillSummary, PiSkillLocation } from "../../../shared/types";
+import type { PiDesktopApi } from "../../../shared/api";
 import { t } from "../i18n";
 
-const api = (window as unknown as { piDesktop: { skillStore: { search: (q: string) => Promise<PromptStoreSearchResult>; import: (item: PromptStoreItem, locationId?: string) => Promise<PiSkillSummary> } } }).piDesktop;
+const api = (window as unknown as { piDesktop: Pick<PiDesktopApi, "skillStore"> }).piDesktop;
 
 const SUGGESTED_SEARCHES = ["code review", "testing", "react", "python", "git", "docker", "security", "refactoring", "typescript", "node"];
 
 export function SkillStoreTab(props: {
 	onImported?: () => void;
-	locationId?: string;
+	/** 落盘位置：与 SkillsTab 的选中位置同源（PiSkillLocation["id"]），放宽到 string 会丢契约 */
+	locationId?: PiSkillLocation["id"];
 }) {
 	const [query, setQuery] = useState("");
 	const [searching, setSearching] = useState(false);

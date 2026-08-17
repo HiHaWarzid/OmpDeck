@@ -1,18 +1,12 @@
 import { useEffect, useState } from "react";
 import { Copy, RotateCcw, Trash2 } from "lucide-react";
 import type { PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary } from "../../../shared/types";
+import type { PiDesktopApi } from "../../../shared/api";
 import { t } from "../i18n";
 import { showNotice } from "../utils/notice";
 import { writeClipboard } from "../utils/clipboard";
 
-type ExtensionsApi = {
-	list: () => Promise<PiExtensionListResult>;
-	uninstall: (source: string, scope?: "user" | "project" | "unknown") => Promise<void>;
-	install: (source: string) => Promise<string>;
-	removeBuiltIn: (source: string) => Promise<void>;
-	restoreBuiltIn: (source: string) => Promise<void>;
-	update: () => Promise<PiCliUpdateResult>;
-};
+type ExtensionsApi = PiDesktopApi["extensions"];
 
 function getExtensionsApi(): ExtensionsApi {
 	const api = (window as unknown as { piDesktop?: { extensions?: ExtensionsApi } })

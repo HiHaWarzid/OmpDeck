@@ -10,9 +10,10 @@ import type {
 	Project,
 	ProjectResourceListResult,
 } from "../../../../shared/types";
+import type { PiDesktopApi } from "../../../../shared/api";
 import { t } from "../../i18n";
 
-type ProjectResourcesApi = typeof window.piDesktop.projectResources;
+type ProjectResourcesApi = PiDesktopApi["projectResources"];
 
 type ProjectResourceTab = "skills" | "extensions" | "prompts";
 
