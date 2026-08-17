@@ -125,10 +125,10 @@ test("App keeps native typing responsive with a live draft ref", () => {
 test("queue drain is serialized and waits for an ordered raw tool-end event", () => {
   // queueFlushByAgentRef 声明已迁移到 useAgentLifecycle hook
   assert.match(lifecycleSource, /queueFlushByAgentRef = useRef<Set<string>>/);
-  assert.match(
-    appSource,
-    /previous\?\.isExecutingTool\s*&&\s*!nextState\.isExecutingTool[\s\S]*?flushQueuedSteerPrompts\(payload\.agentId\)/,
-  );
+  // onRuntimeState 解码已提炼为 utils/agentRuntimeState.ts 的 resolveIncomingRuntimeState
+  // 纯函数（批次2D）：tool true→false 边沿判定与 seq 守卫迁出 App.tsx，处理器只消费结果。
+  assert.match(runtimeStateSource, /resolveIncomingRuntimeState\([\s\S]*?isToolCompletionEdge[\s\S]*?previous\?\.isExecutingTool[\s\S]*?!state\.isExecutingTool/);
+  assert.match(appSource, /resolved\.isToolCompletionEdge\s*&&\s*isAgentCurrentlyBusy\(payload\.agentId\)[\s\S]*?flushQueuedSteerPrompts\(payload\.agentId\)/);
   assert.match(runtimeStateSource, /incoming\.toolStateSequence < current\.toolStateSequence/);
   assert.match(agentManagerSource, /updateActiveToolCalls/);
   assert.match(toolRuntimeStateSource, /calls\.delete\(event\.toolCallId\)/);
