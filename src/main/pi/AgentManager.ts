@@ -5,7 +5,10 @@ import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type {
+	AgentManagerEvent,
+	AgentManagerEventListener,
 	AgentRuntimeState,
+	AgentStatus,
 	AgentTab,
 	AvailableModel,
 	ChatMessage,
@@ -121,6 +124,18 @@ export class AgentManager {
 	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
 	/** 状态变更监听器（用于 PetStateBridge 等主进程内部模块订阅 AgentTab[] 聚合状态） */
 	private readonly stateListeners = new Set<(tabs: AgentTab[]) => void>();
+	/**
+	 * 语义事件监听器（AFK 编排器/后续 renderer 语义订阅用）。
+	 * 与 stateListeners 不同：这里订阅的是增量语义事件（消息追加/状态变更/运行态/已稳定），
+	 * 而非整表快照；回调在汇聚点同步执行，单个监听器抛异常不影响其它监听器。
+	 */
+	private readonly eventListeners = new Set<AgentManagerEventListener>();
+	/**
+	 * statusChanged 语义事件的去重基准：记录每个 agent 上次已向语义订阅者发表的 status。
+	 * emitStateNow 是 50ms 聚合快照，若每次都全量发 statusChanged，会把「无变化」也当成
+	 * 变更流（AFK 编排器按增量消费）；diff 上次已发表值，只发实际变化的 agent。
+	 */
+	private readonly lastEmittedTabStatus = new Map<string, AgentStatus>();
 	/** abort settled 兜底超时：覆盖多数管道残留，同时不让“立刻重发”永久卡死。 */
 	private static readonly ABORT_SETTLED_FALLBACK_MS = 1500;
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
@@ -1563,6 +1578,9 @@ export class AgentManager {
 			state.executingToolName = runtime.toolExecuting ?? undefined;
 			state.toolStateSequence = runtime.toolStateSequence;
 			this.emit(ipcChannels.agentsRuntimeState, { agentId, state });
+			// 语义事件：完整运行态就绪后同步发给语义订阅者（与 IPC 推送同一份 state，
+			// 含调用完成时写入的 runtimeStateSeq/toolStateSequence 等真值字段）。
+			this.notifyEventListeners({ type: "runtimeStateChanged", agentId, state });
 		} catch {
 			// 运行态刷新失败不影响主流程；下一次轮询或事件会继续同步。
 		} finally {
@@ -2285,6 +2303,7 @@ export class AgentManager {
 		// 停止旧进程并清理状态
 		runtime.process.stop();
 		this.agents.delete(agentId);
+		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
 		this.emitState();
 
@@ -2452,6 +2471,7 @@ export class AgentManager {
 		runtime.userInitiatedStop = true;
 		const process = runtime.process;
 		this.agents.delete(agentId);
+		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
 		process.stop();
 		this.emitState();
@@ -2469,9 +2489,25 @@ export class AgentManager {
 		return () => { this.stateListeners.delete(listener); };
 	}
 
+	/**
+	 * 注册语义事件监听器（AFK 编排器/后续 renderer 语义订阅用）。
+	 * 提供的是增量语义事件而非整表快照；事件在汇聚点同步回调。
+	 * 返回的退订函数可安全重复调用。
+	 */
+	onAgentEvent(listener: AgentManagerEventListener): () => void {
+		this.eventListeners.add(listener);
+		return () => { this.eventListeners.delete(listener); };
+	}
+
 	private notifyStateListeners(tabs: AgentTab[]) {
 		for (const listener of this.stateListeners) {
 			try { listener(tabs); } catch {}
+		}
+	}
+
+	private notifyEventListeners(event: AgentManagerEvent) {
+		for (const listener of this.eventListeners) {
+			try { listener(event); } catch {}
 		}
 	}
 
@@ -2482,6 +2518,7 @@ export class AgentManager {
 			runtime.process.stop();
 		}
 		this.agents.clear();
+		this.lastEmittedTabStatus.clear();
 		this.emitState();
 	}
 
@@ -3012,6 +3049,10 @@ export class AgentManager {
 			if (runtime.tab.status !== "error" && runtime.tab.status !== "closed") {
 				// agent_settled 是 Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry
 				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
+				// 语义事件：仅当本次把 busy 状态收口为 idle 时发 settled——若 omp 兜底
+				// （markIdleIfPiReportsNoWork）已先置 idle，此处幂等跳过，避免重复通知。
+				const settledFromBusy =
+					runtime.tab.status === "running" || runtime.tab.status === "starting";
 				runtime.tab.status = "idle";
 				runtime.streamingThinking = "";
 				runtime.thinkingStartedAt = undefined;
@@ -3025,6 +3066,9 @@ export class AgentManager {
 				this.emitThinking(agentId, "");
 				this.emitState();
 				void this.emitRuntimeState(agentId);
+				if (settledFromBusy) {
+					this.notifyEventListeners({ type: "settled", agentId });
+				}
 
 				const messages = runtime.messages;
 				const lastMessage = messages[messages.length - 1];
@@ -3694,7 +3738,7 @@ export class AgentManager {
 		images?: ImageContent[],
 	) {
 		const agentId = runtime.tab.id;
-		runtime.messages.push({
+		const message: ChatMessage = {
 			id: randomUUID(),
 			agentId,
 			role,
@@ -3702,10 +3746,14 @@ export class AgentManager {
 			timestamp: Date.now(),
 			meta,
 			...(images && images.length > 0 ? { images } : {}),
-		});
+		};
+		runtime.messages.push(message);
 		this.markMessagesDirty(runtime, runtime.messages.length - 1);
 		if (role === "user" || role === "assistant") this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
+		// 语义事件：消息追加在统一写入点汇聚发出（而非散落在各调用处），
+		// 保证订阅者拿到的 message 与 runtime.messages 中实际落库的对象完全同构。
+		this.notifyEventListeners({ type: "messageAppended", agentId, message });
 	}
 
 	private refreshAutoTitle(runtime: AgentRuntime) {
@@ -3889,6 +3937,10 @@ export class AgentManager {
 		this.emitThinking(agentId, "");
 		this.emitState();
 		void this.emitRuntimeState(agentId);
+		// 语义事件：omp 无 agent_settled 事件，本函数（get_state 校验后确认无后续工作）
+		// 就是 omp 下唯一真实的 settled 汇聚点；进入本函数时 status 必为 running，
+		// 因此不会与 agent_settled 分支重复发（该分支先到会清掉本兜底定时器）。
+		this.notifyEventListeners({ type: "settled", agentId });
 	}
 
 	private requireRuntime(agentId: string) {
@@ -4091,6 +4143,21 @@ export class AgentManager {
 		// 设计文档原拟用 ipcMain.on("agents:state") 桥接是错的：webContents.send 是
 		// 主进程→渲染层单向通道，ipcMain 收不到主进程自己发出的消息，故改用本钩子。
 		this.notifyStateListeners(tabs);
+		// 语义事件：statusChanged 只在状态实际变化时发（diff 上次已发表值）。
+		// 不选 ~20 处 `tab.status =` 散点 hook：散点路径多（start/stop/exit/settle/restart
+		// 等）易遗漏，且同一状态连续赋值不应重复通知；50ms 聚合点做 diff 侵入最小且不遗漏。
+		for (const tab of tabs) {
+			const previous = this.lastEmittedTabStatus.get(tab.id);
+			if (previous !== tab.status) {
+				this.lastEmittedTabStatus.set(tab.id, tab.status);
+				this.notifyEventListeners({
+					type: "statusChanged",
+					agentId: tab.id,
+					status: tab.status,
+					tab,
+				});
+			}
+		}
 	}
 
 	private emit(channel: string, payload: unknown) {
