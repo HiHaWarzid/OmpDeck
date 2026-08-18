@@ -109,6 +109,21 @@ export class AgentManager {
 	/** 流式 emit 合并窗口（毫秒）。50ms 兼顾流畅度与传输量，肉眼几乎无延迟。 */
 	private static readonly MESSAGE_FLUSH_INTERVAL_MS = 50;
 	/**
+	 * omp settings.json 中 defaultThinkingLevel 的合法档位（含 auto）。
+	 * 与 omp 的 parseConfiguredThinkingLevel 接受集合一致；值不在此集合内时
+	 * 不向 RPC 转发，避免把用户配置的非法值变成每个会话启动时的报错。
+	 */
+	private static readonly OMP_THINKING_LEVELS: Record<string, true> = {
+		off: true,
+		minimal: true,
+		low: true,
+		medium: true,
+		high: true,
+		xhigh: true,
+		max: true,
+		auto: true,
+	};
+	/**
 	 * 超过该大小的历史会话跳过 get_messages RPC，改为直接从 JSONL 文件尾部读取最近 N 条消息。
 	 * pi 当前不支持 limit/cursor，40MB JSONL 会以单行大 JSON 返回，主进程 JSON.parse 会短暂冻结整个应用。
 	 * 文件直接读取仅解析近尾部少量消息，避免大会话加载导致的界面冻结。
@@ -573,6 +588,23 @@ export class AgentManager {
 		);
 	}
 
+	/**
+	 * 读取 omp 全局 settings.json 中用户配置的默认思考级别（defaultThinkingLevel）。
+	 * 只接受 omp 认识的档位，返回 undefined 表示未配置或值无效，不向 RPC 转发。
+	 */
+	private async readConfiguredDefaultThinkingLevel(): Promise<string | undefined> {
+		try {
+			const { parsed } = await this.configManager.getSettingsConfig();
+			const level = parsed?.defaultThinkingLevel;
+			return typeof level === "string" && AgentManager.OMP_THINKING_LEVELS[level] === true
+				? level
+				: undefined;
+		} catch {
+			// 读取失败按未配置处理：不阻塞 Agent 启动，用户仍可在输入栏手动切换。
+			return undefined;
+		}
+	}
+
 	private async createUnlocked(input: CreateAgentInput) {
 		const t0 = Date.now();
 		const project = this.getProject(input.projectId);
@@ -756,6 +788,47 @@ export class AgentManager {
 					agentId: id,
 					blocked: blockedOnStart,
 				});
+			}
+			// 对齐 omp 默认思考级别：omp 创建会话时，默认模型角色里的 :level 后缀
+			// （如 opencode/deepseek-v4-flash:max）优先级高于 settings.json 的
+			// defaultThinkingLevel，导致用户配置的默认思考级别对新开会话不生效；
+			// 会话就绪后主动 set 一次，让「默认思考级别」对所有新打开的会话生效。
+			// 在历史消息加载前等待完成，保证 UI 拿到的首个 runtime state 已对齐。
+			const configuredThinkingLevel = await this.readConfiguredDefaultThinkingLevel();
+			if (configuredThinkingLevel) {
+				const currentThinkingLevel = (state.data as { thinkingLevel?: unknown } | undefined)
+					?.thinkingLevel;
+				if (
+					typeof currentThinkingLevel !== "string" ||
+					currentThinkingLevel !== configuredThinkingLevel
+				) {
+					try {
+						await client.request(
+							{ type: "set_thinking_level", level: configuredThinkingLevel },
+							10_000,
+						);
+						void this.appLogger?.info(
+							"agent",
+							"Configured default thinking level applied",
+							{
+								agentId: id,
+								level: configuredThinkingLevel,
+								previous: currentThinkingLevel,
+							},
+						);
+					} catch (error) {
+						// 应用失败不阻塞 Agent 启动：会话仍可用，用户可随时在输入栏手动切换。
+						void this.appLogger?.warn(
+							"agent",
+							"Configured default thinking level apply failed",
+							{
+								agentId: id,
+								level: configuredThinkingLevel,
+								error: error instanceof Error ? error.message : String(error),
+							},
+						);
+					}
+				}
 			}
 			// 大历史会话的 get_messages 可能需要十几秒；Agent 可用只依赖 get_state，
 			// 因此历史消息后台加载，避免 40MB+ 会话把“打开 Agent”阻塞到十几秒。
