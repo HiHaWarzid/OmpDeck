@@ -234,6 +234,22 @@ let mainFrameLoadFailed = false;
 let pendingErrorPageFinish = false;
 // dev URL 首次加载失败后回退到已构建的 renderer 产物，只回退一次，避免无产物时反复重试。
 let mainWindowDevFallbackTried = false;
+/**
+ * renderer console 已知噪音（仅 dev 模式过滤）：CSP 开发警告、vite HMR 中间态
+ * （[vite] reload 失败、保存代码瞬间的 ReferenceError not defined、hooks 顺序告警）
+ * 会随每次保存反复出现，逐条落盘会淹没真实错误。打包版无 HMR，不适用过滤。
+ */
+const RENDERER_CONSOLE_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+	{ pattern: /Insecure Content-Security-Policy/i, reason: "dev-csp-warning" },
+	{ pattern: /^\[vite\]/i, reason: "vite-hmr" },
+	{ pattern: /ReferenceError: \w+ is not defined/, reason: "hmr-transient" },
+	{ pattern: /Should have a queue\. You are likely calling Hooks conditionally/, reason: "hmr-transient" },
+	{ pattern: /React has detected a change in the order of Hooks/, reason: "hmr-transient" },
+];
+/** console 错误聚合限流：同类错误窗口内只落盘首条 + 计数，第三条起再记一次 repeated。 */
+const RENDERER_CONSOLE_AGGREGATE_WINDOW_MS = 60_000;
+const RENDERER_CONSOLE_AGGREGATE_MAX = 3;
+const rendererConsoleRate = new Map<string, { count: number; lastAt: number }>();
 let projectStore: ProjectStore;
 let fileSystemService: FileSystemService;
 let sessionScanner: SessionScanner;
@@ -660,9 +676,45 @@ async function createWindow() {
 		"console-message",
 		(event) => {
 			if (!["warning", "error"].includes(event.level)) return;
+			const message = event.message ?? "";
+			// dev 模式噪音（CSP 警告 / vite HMR 瞬态）直接丢弃，避免淹没真实错误。
+			if (!app.isPackaged) {
+				const noise = RENDERER_CONSOLE_NOISE_PATTERNS.find(({ pattern }) =>
+					pattern.test(message),
+				);
+				if (noise) return;
+			}
+			// 同类错误聚合限流：同一错误反复出现时只记录首条与计数，
+			// 第三条起再记一条 repeated 标记，避免日志被同一错误刷屏。
+			const key = `${event.level}:${message.slice(0, 120)}`;
+			const now = Date.now();
+			const agg = rendererConsoleRate.get(key);
+			if (agg && now - agg.lastAt < RENDERER_CONSOLE_AGGREGATE_WINDOW_MS) {
+				agg.count += 1;
+				agg.lastAt = now;
+				if (agg.count === RENDERER_CONSOLE_AGGREGATE_MAX) {
+					void appLogger.warn("app", "Main window renderer console error (repeated)", {
+						level: event.level,
+						message,
+						line: event.lineNumber,
+						sourceId: event.sourceId,
+						repeated: agg.count,
+					});
+				}
+				return;
+			}
+			// 新错误或窗口过期：重置计数并落盘；map 过大时顺带清理过期条目。
+			if (rendererConsoleRate.size > 200) {
+				for (const [k, v] of rendererConsoleRate) {
+					if (now - v.lastAt >= RENDERER_CONSOLE_AGGREGATE_WINDOW_MS) {
+						rendererConsoleRate.delete(k);
+					}
+				}
+			}
+			rendererConsoleRate.set(key, { count: 1, lastAt: now });
 			void appLogger.warn("app", "Main window renderer console error", {
 				level: event.level,
-				message: event.message,
+				message,
 				line: event.lineNumber,
 				sourceId: event.sourceId,
 			});

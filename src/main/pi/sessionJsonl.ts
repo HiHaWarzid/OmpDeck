@@ -31,6 +31,7 @@ import { findLastUserMessageLine } from "./sessionEntryIds";
 
 /** SessionJsonl 使用的最小日志结构（与 AppLogger 结构兼容，避免硬依赖 AppLogger）。 */
 export interface SessionJsonlLogger {
+	debug?(scope: string, message: string, detail?: unknown): void;
 	warn(scope: string, message: string, detail?: unknown): void;
 	info(scope: string, message: string, detail?: unknown): void;
 	error(scope: string, message: string, detail?: unknown): void;
@@ -376,14 +377,30 @@ export class SessionJsonl {
 		let fileFingerprint: { size: number; mtimeMs: number } | undefined;
 		if (sessionContent === undefined) {
 			const hostPath = this.resolve(sessionPath);
+			let readError: NodeJS.ErrnoException | undefined;
 			const [raw, fileStat] = await Promise.all([
-				readFile(hostPath, "utf8").catch(() => undefined),
+				readFile(hostPath, "utf8").catch((err: NodeJS.ErrnoException) => {
+					readError = err;
+					return undefined;
+				}),
 				stat(hostPath).catch(() => undefined),
 			]);
 			if (raw === undefined) {
-				void this.deps.logger?.warn("agent", "Failed to read session file for archive parsing", {
-					sessionPath,
-				});
+				if (readError?.code === "ENOENT") {
+					// 会话刚创建、文件尚未落盘（创建与归档解析竞态）：正常时序，
+					// 静默降级为空归档，仅留 debug 线索，不打 warn 噪音。
+					void this.deps.logger?.debug?.(
+						"agent",
+						"Session file not ready for archive parsing (ENOENT)",
+						{ sessionPath },
+					);
+				} else {
+					void this.deps.logger?.warn("agent", "Failed to read session file for archive parsing", {
+						sessionPath,
+						code: readError?.code,
+						message: readError?.message,
+					});
+				}
 				return { compactions: [], archivedMessagesByCompactionId: new Map() };
 			}
 			content = raw;

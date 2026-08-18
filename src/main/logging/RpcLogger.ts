@@ -228,6 +228,24 @@ export class RpcLogger {
         };
       }
     }
+    // 其余大 data 通用截断：RPC 日志默认落盘后，get_messages 对大会话返回的
+    // 单行响应可达数 MB，直接写入会撑爆日志文件。保留类型与顶层键名便于诊断。
+    const serialized = JSON.stringify(entry.data);
+    if (serialized && serialized.length > MAX_DATA_BYTES) {
+      const data = entry.data as Record<string, unknown> | undefined;
+      return {
+        ...entry,
+        data: {
+          _truncated: true,
+          type: typeof data?.type === "string" ? data.type : undefined,
+          keys:
+            data && typeof data === "object"
+              ? Object.keys(data).slice(0, 20)
+              : undefined,
+          size: serialized.length,
+        },
+      };
+    }
     return entry;
   }
 }

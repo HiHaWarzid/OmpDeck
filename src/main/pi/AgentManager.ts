@@ -60,6 +60,24 @@ import {
 import { SessionJsonl } from "./sessionJsonl";
 import { describeImage, isVisionBridgeReady } from "../vision/VisionBridge";
 import { LatestByKeyEmitter } from "./LatestByKeyEmitter";
+
+/**
+ * 流式增量事件类型：text_delta/thinking_delta 每 token 一条，RPC 日志默认不落盘
+ * （用户打开 RPC 控制台后记录全量）。其余 send/response/阶段事件低频且有诊断价值。
+ */
+const RPC_STREAMING_DELTA_TYPES: Record<string, true> = {
+	text_delta: true,
+	thinking_delta: true,
+};
+
+/** RPC 日志默认落盘判定：send 与阶段/响应事件全记，流式增量跳过。 */
+export function isRpcLogWorthy(entry: { direction: string; data: unknown }): boolean {
+	if (entry.direction === "send") return true;
+	const data = entry.data as Record<string, unknown> | undefined;
+	if (data?.type !== "message_update") return true;
+	const eventType = (data.assistantMessageEvent as Record<string, unknown> | undefined)?.type;
+	return typeof eventType !== "string" || RPC_STREAMING_DELTA_TYPES[eventType] !== true;
+}
 import {
 	createStreamGateState,
 	isStreamGateSealed,
@@ -2668,10 +2686,11 @@ export class AgentManager {
 		piProcess.on("rpc-log", (entry: { direction: string; data: unknown }) => {
 			// 渲染层的实时 RPC 控制台与文件日志共用同一个 per-agent 开关
 			//（renderer 的 onRpcLog 处理器在开关关闭时直接丢弃，见 App.tsx）。
-			// 开关关闭时主进程不再构造 logEntry 也不发 IPC：每条进出 RPC 消息
-			// 都省去 randomUUID + 对象构造 + 结构化克隆序列化（流式期每 token 一次）。
+			// 默认（开关关闭）仍落盘低频事件（send/response/阶段事件），仅跳过
+			// text_delta/thinking_delta 这类每 token 一条的流式增量——全量记录会
+			// 拖慢事件循环且文件快速膨胀；用户打开 RPC 控制台后记录全量。
 			const rt = this.agents.get(agentId);
-			if (!rt?.rpcLogging) return;
+			if (!rt || (!rt.rpcLogging && !isRpcLogWorthy(entry))) return;
 			try {
 				const data = entry.data as Record<string, any>;
 				let summary: string;
@@ -2703,7 +2722,10 @@ export class AgentManager {
 					data,
 					time: Date.now(),
 				};
-				this.emit(ipcChannels.agentsRpcLog, logEntry);
+				// 渲染层控制台只在开关打开时推送（实时逐条展示）；文件日志始终写。
+				if (rt.rpcLogging) {
+					this.emit(ipcChannels.agentsRpcLog, logEntry);
+				}
 				this.rpcLogger?.push(logEntry);
 			} catch (error) {
 				void this.appLogger?.warn("agent", "rpc-log handler failed", {

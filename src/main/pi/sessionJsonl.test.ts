@@ -314,6 +314,26 @@ test("parseArchives returns empty result for missing file", async () => {
 	assert.equal(result.archivedMessagesByCompactionId.size, 0);
 });
 
+test("parseArchives ENOENT 竞态只记 debug 不记 warn", async () => {
+	// 会话刚创建、文件尚未落盘时 readFile 抛 ENOENT：静默降级为空归档，
+	// 日志级别降为 debug，避免「创建-解析」竞态在每个新会话启动时刷 warn。
+	const calls: Array<{ level: string; message: string }> = [];
+	const sj = new SessionJsonl({
+		resolveHostPath: (p) => p,
+		logger: {
+			warn: (_s, m) => calls.push({ level: "warn", message: m }),
+			info: () => {},
+			error: () => {},
+			debug: (_s, m) => calls.push({ level: "debug", message: m }),
+		},
+	});
+	const result = await sj.parseArchives(join(tmpRoot, "not-yet-created.jsonl"), "agent1");
+	assert.equal(result.compactions.length, 0);
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].level, "debug");
+	assert.ok(calls[0].message.includes("ENOENT"));
+});
+
 test("parseArchives accepts pre-read sessionContent", async () => {
 	const sj = makeSessionJsonl();
 	const content = toJsonl([
