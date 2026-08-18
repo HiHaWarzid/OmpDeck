@@ -5,6 +5,7 @@
 
 import type { ReactNode } from "react";
 import type { ChatMessage, FileTreeNode, PiCommand } from "../../../../shared/types";
+import { computeThinkingTiming } from "../../utils/thinkingTiming";
 import { formatFilePathRef } from "./RichInput";
 
 /* ── ANSI 清理 ── */
@@ -252,6 +253,24 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 	function flushThinking() {
 		if (currentThinking.length === 0) return;
 		const previous = currentRun[currentRun.length - 1];
+		// 单一计时链：startedAt 取首条消息、endedAt 取末条消息，均走
+		// computeThinkingTiming（timestampTier 保留本路径原链的 timestamp 层级），
+		// run.endedAt 兜底是模块签名外的显式尾部回退（见 thinkingTiming 变化报告）。
+		const now = Date.now();
+		const started = computeThinkingTiming(
+			currentThinking[0],
+			undefined,
+			runStartedAt,
+			now,
+			{ timestampTier: true },
+		);
+		const ended = computeThinkingTiming(
+			currentThinking[currentThinking.length - 1],
+			undefined,
+			runEndedAt,
+			now,
+			{ timestampTier: true },
+		);
 		const nextGroup: ThinkingGroupItem = {
 			kind: "thinking-group",
 			id: currentThinking.map((message) => message.id).join("|"),
@@ -260,10 +279,8 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 				.map((message) => stripAnsi(message.thinking ?? ""))
 				.filter(Boolean)
 				.join("\n\n"),
-			startedAt: currentThinking[0]?.thinkingStartedAt ?? currentThinking[0]?.timestamp ?? runStartedAt,
-			endedAt:
-				currentThinking[currentThinking.length - 1]?.thinkingEndedAt ??
-				currentThinking[currentThinking.length - 1]?.timestamp ?? runEndedAt,
+			startedAt: started.startedAt ?? runStartedAt,
+			endedAt: ended.endedAt ?? runEndedAt,
 		};
 		if (previous?.kind === "thinking-group") {
 			previous.id = `${previous.id}|${nextGroup.id}`;

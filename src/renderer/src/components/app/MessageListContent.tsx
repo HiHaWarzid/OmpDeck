@@ -7,6 +7,10 @@ import {
 	type RenderMessage,
 } from "./AppUtils";
 import {
+	areStreamStatesEqual,
+	type MessageStreamState,
+} from "./streamStateSelector";
+import {
 	AskQuestionCard,
 	CompactionCard,
 	DiagnosticMessageCard,
@@ -16,54 +20,13 @@ import {
 	UserBubble,
 } from "./AppParts";
 
+export type { MessageStreamState } from "./streamStateSelector";
+
 type AskResponse = {
 	value?: string | boolean | null;
 	cancelled?: boolean;
 	confirmed?: boolean;
 };
-
-/** 流式/运行中的时间线展示状态。App 侧用 useMemo 组装（依赖全部输入 state），
- *  比较器按内容比较（sameMessageStreamState），任一字段变化都能触发重渲染。 */
-export type MessageStreamState = {
-	/** 正在流式追加的最后一条 assistant 消息 id（见 App.streamingMessageId） */
-	streamingMessageId?: string;
-	/** Agent 处理中（含多步工具调用之间的短暂间隙，驱动 TurnRow 折叠行为） */
-	agentRunning: boolean;
-	/** 精确的 activeAgent.status === "running"，驱动响应指示器（与 agentRunning 语义不同） */
-	statusRunning: boolean;
-	/** 等待首条 assistant 消息时的占位/指示器显示条件 */
-	isAwaitingAssistant: boolean;
-	showThinking: boolean;
-	activeThinking?: string;
-	/** 流式思考的开始时间（App 侧 streamingThinkingStartedAt[agentId]，首次 thinking 到达时记录）；
-	 *  消息落库后以 message.thinkingStartedAt 为准（见 TurnRow 双来源优先级） */
-	thinkingStartedAt?: number;
-	isExecutingTool?: boolean;
-	isStreaming?: boolean;
-	/** 正在取消 ask 响应（发送 cancelled 期间），隐藏响应指示器 */
-	cancellingUi: boolean;
-	/** 正在用 composer 内联栏回答同一 request 时隐藏时间线 pending 卡 */
-	activeUiAskRequestId?: string;
-};
-
-/** MessageStreamState 的内容相等比较：字段全是原始值，逐项 Object.is 比较即可。
- *  相比引用比较更保守——即使 App 侧 useMemo 依赖漏列某个输入，
- *  这里仍能捕获其变化触发重渲染（代价与原先 10 个标量 prop 的逐一比较一致）。 */
-function sameMessageStreamState(previous: MessageStreamState, next: MessageStreamState): boolean {
-	return (
-		previous.streamingMessageId === next.streamingMessageId &&
-		previous.agentRunning === next.agentRunning &&
-		previous.statusRunning === next.statusRunning &&
-		previous.isAwaitingAssistant === next.isAwaitingAssistant &&
-		previous.showThinking === next.showThinking &&
-		previous.activeThinking === next.activeThinking &&
-		previous.thinkingStartedAt === next.thinkingStartedAt &&
-		previous.isExecutingTool === next.isExecutingTool &&
-		previous.isStreaming === next.isStreaming &&
-		previous.cancellingUi === next.cancellingUi &&
-		previous.activeUiAskRequestId === next.activeUiAskRequestId
-	);
-}
 
 export type MessageListContentProps = {
 	renderedRuns: RenderMessage[];
@@ -266,10 +229,11 @@ export const MessageListContent = memo(
 	(previous, next) =>
 		// 廉价标量比较在前、深比较殿后：App 每次重渲染（含 thinking tick、
 		// 侧栏状态变化）都会跑比较器，标量不匹配时直接短路，省掉 O(runs) 深遍历。
-		// streamState 由 App 侧 useMemo 组装，这里按内容比较（见 sameMessageStreamState），
-		// 任一流式字段变化（含 thinkingStartedAt/activeThinking 等可能与 renderedRuns
-		// 不同步变化的字段）都能触发重渲染，行为与合并前的 10 个标量 prop 一致。
-		sameMessageStreamState(previous.streamState, next.streamState) &&
+		// streamState 由 App 侧 useMemo 经由 streamStateSelector 模块组装，这里按
+		// 内容比较（areStreamStatesEqual，与聚合同模块），任一流式字段变化
+		// （含 thinkingStartedAt/activeThinking 等可能与 renderedRuns 不同步变化的
+		// 字段）都能触发重渲染，行为与合并前的 10 个标量 prop 一致。
+		areStreamStatesEqual(previous.streamState, next.streamState) &&
 		previous.activeAgentId === next.activeAgentId &&
 		previous.forkingMessageId === next.forkingMessageId &&
 		previous.validCommandNames === next.validCommandNames &&

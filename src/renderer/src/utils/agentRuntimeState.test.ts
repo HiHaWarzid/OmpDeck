@@ -124,3 +124,36 @@ test("mergeAgentRuntimeState 语义：工具序号倒退时丢弃 incoming 工�
   assert.equal(merged.executingToolName, "bash");
   assert.equal(merged.modelName, "stale-model");
 });
+
+// ── 生命周期态命名谓词（W5 收敛：全项目 RAW status 比较替换为具名谓词） ──
+
+import { isAgentExactlyRunning, isAgentActiveOrIdle, isAgentActiveOrStarting, isAgentStarting, isAgentIdle } from "./agentRuntimeState";
+
+test("isAgentExactlyRunning：仅 status === running", () => {
+  assert.equal(isAgentExactlyRunning({ status: "running" }), true);
+  assert.equal(isAgentExactlyRunning({ status: "idle" }), false);
+  assert.equal(isAgentExactlyRunning({ status: "starting" }), false);
+  assert.equal(isAgentExactlyRunning(undefined), false);
+});
+
+test("isAgentStarting / isAgentIdle：精确匹配各自生命周期态", () => {
+  assert.equal(isAgentStarting({ status: "starting" }), true);
+  assert.equal(isAgentStarting({ status: "running" }), false);
+  assert.equal(isAgentIdle({ status: "idle" }), true);
+  assert.equal(isAgentIdle({ status: "running" }), false);
+  assert.equal(isAgentIdle(undefined), false);
+});
+
+test("isAgentActiveOrIdle：running 或 idle（排除 starting/error/closed）", () => {
+  assert.equal(isAgentActiveOrIdle({ status: "running" }), true);
+  assert.equal(isAgentActiveOrIdle({ status: "idle" }), true);
+  assert.equal(isAgentActiveOrIdle({ status: "starting" }), false);
+  assert.equal(isAgentActiveOrIdle({ status: "error" }), false);
+  assert.equal(isAgentActiveOrIdle({ status: "closed" }), false);
+});
+
+test("isAgentActiveOrStarting：running 或 starting", () => {
+  assert.equal(isAgentActiveOrStarting({ status: "running" }), true);
+  assert.equal(isAgentActiveOrStarting({ status: "starting" }), true);
+  assert.equal(isAgentActiveOrStarting({ status: "idle" }), false);
+});

@@ -286,7 +286,9 @@ export function BrowserPanel(props: {
 			if (evt.url.startsWith("http://") || evt.url.startsWith("https://")) {
 				navigateTo(evt.url);
 			} else {
-				void window.piDesktop.browser.openExternal(evt.url);
+				// 系统浏览器打开非 http(s) 链接：forceSystem 保留原 browser.openExternal
+				// 语义（始终走默认浏览器，不受 linkOpenMode=internal 影响，避免内置面板内自循环）。
+				void window.piDesktop.app.openExternal(evt.url, true);
 			}
 		};
 

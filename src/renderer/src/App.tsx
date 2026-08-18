@@ -81,13 +81,11 @@ import {
   getComposerHistoryLineBounds,
   isYesNoConfirmOptions,
   parseArgumentHint,
-  resolveComposerHistoryDraft,
   translateBuiltinPromptDescription,
 } from "./composerBehavior";
 import {
   getAgentForSessionPath,
   getProjectAgentSessionDisplay,
-  isReplacementForPendingAgent,
   isSameSessionPath,
   isSidebarSessionRowActive,
   normalizeSessionPathForCompare,
@@ -95,32 +93,34 @@ import {
   type ProjectAgentSessionDisplay,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
-import { isAgentBusy as agentBusy, isAgentStreaming, mergeAgentRuntimeState, resolveIncomingRuntimeState } from "./utils/agentRuntimeState";
+import {
+  isAgentActiveOrIdle,
+  isAgentActiveOrStarting,
+  isAgentBusy as agentBusy,
+  isAgentExactlyRunning,
+  isAgentIdle,
+  isAgentStarting,
+  isAgentStreaming,
+  mergeAgentRuntimeState,
+  resolveIncomingRuntimeState,
+} from "./utils/agentRuntimeState";
 import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
-  acknowledgeUnknownPrompt,
   canDiscardQueuedPrompt,
   canRetractQueuedPromptToInput,
-  claimIdleHead,
-  claimNextSteerPrompt,
-  enqueuePrompt,
   QUEUED_PROMPT_LIMIT,
   QUEUED_PROMPT_VISIBLE,
-  replaceAgentQueue,
-  resolveClaimedPrompt,
-  retractPrompt,
   type QueuedPromptSnapshot,
 } from "./utils/queuedPromptQueue";
+import { resolveIncomingMessagesDelta, resolveFullPullResult } from "./utils/messageDeltaResolver";
+import { usePersistedState } from "./hooks/usePersistedState";
 import {
-  loadTerminalHeight,
+  TERMINAL_HEIGHT_STORAGE_KEY,
+  TERMINAL_HEIGHT_MIN,
   projectTerminalSessionKey,
-  pruneTerminalDockState,
   resolveTerminalOwner,
-  saveTerminalHeight,
-  setTerminalDockCollapsed,
-  setTerminalDockOpen,
   terminalOwnerKey,
   type TerminalDockStateByOwner,
 } from "./terminalDockState";
@@ -128,7 +128,9 @@ import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useSessionLoader } from "./hooks/useSessionLoader";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
-import { useAgentLifecycle, migrateAgentRecord } from "./hooks/useAgentLifecycle";
+import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
+import { reconcileAgentState } from "./utils/agentStateReconciliation";
+import { reduceThinkingUpdate } from "./utils/thinkingState";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
@@ -169,6 +171,7 @@ import {
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
 import { MessageListContent } from "./components/app/MessageListContent";
+import { buildStreamState } from "./components/app/streamStateSelector";
 import {
   groupToolMessages,
   getMultiSelectImageCaptureIds,
@@ -541,7 +544,12 @@ export function App() {
   const [worktreesByProject, setWorktreesByProject] = useState<
     Record<string, WorktreeEntry[]>
   >({});
-  const [branchByProject, setBranchByProject] = useState<Record<string, string | null>>({});
+  // 统一分支信息 store（按 projectId）：合并原 gitInfo（当前项目全量）与
+  // branchByProject（各项目 current）两个平行切片；composer 分支展示、worktree
+  // 分支 chip 统一读取，GitPanel 面板分支由面板自持（initialBranchInfo 种子）。
+  const [branchInfoByProject, setBranchInfoByProject] = useState<
+    Record<string, GitBranchInfo>
+  >({});
   const [draggingProjectId, setDraggingProjectId] = useState<string>();
   const [dragOverProjectId, setDragOverProjectId] = useState<string>();
   /** 侧栏 π logo 重播令牌：agent 启动（含历史会话）/关闭时递增，驱动 BrandLockup 动画 */
@@ -569,15 +577,14 @@ export function App() {
     agents, pendingAgents, activeAgentId, activeAgentByProject,
     messagesByAgent, runtimeStateByAgent, sessions, sessionsByProject,
     sessionLoadingByProject, sessionErrorByProject,
-    setAgents, setPendingAgents, setActiveAgentId, setActiveAgentByProject,
-    setMessagesByAgent, setRuntimeStateByAgent, setSessions,
-    setSessionsByProject, setSessionLoadingByProject, setSessionErrorByProject,
-    agentsRef, activeAgentIdRef, pendingAgentsRef, runtimeStateByAgentRef,
-    agentStatusByAgentRef, sessionRequestByProjectRef, sessionRefreshRunningRef,
-    sessionRefreshPendingRef, displayAgentsRef,
+    setAgents, setActiveAgentId, setActiveAgentByProject,
+    setSessions, setSessionsByProject, setSessionLoadingByProject,
+    agentsRef, activeAgentIdRef, messagesByAgentRef, pendingAgentsRef, runtimeStateByAgentRef,
+    agentStatusByAgentRef, displayAgentsRef,
     displayAgents, activeAgent, activeMessages,
     applyAgentRuntimeState, refreshRuntimeState, cycleModel, cycleThinking,
     editMessage, refreshSessions, refreshProjectSessions,
+    updatePendingAgents, setAgentMessages, migrateAgentMessages,
   } = useAgentSessions({
     api,
     activeProjectId,
@@ -585,15 +592,17 @@ export function App() {
   });
   // Agent 生命周期 per-agent 状态：prompt/images/queuedPrompts/terminalDock/
   // drawerPinned/promptHistory/queueFlush，以及 agent 替换时的原子迁移方法。
+  // prompt 的 ref/state 双写、images 的 ref 镜像与终端 Dock 的函数式更新
+  // 都收敛为 hook 内 op（setLivePrompt / setNativePrompt / stageLivePrompt 等）。
   const {
-    promptByAgent, setPromptByAgent, livePromptByAgentRef,
-    attachedImagesByAgent, setAttachedImagesByAgent, attachedImagesByAgentRef,
-    queuedPrompts, setQueuedPrompts, queuedPromptsRef,
-    terminalDockStateByOwner, setTerminalDockStateByOwner,
+    getLivePrompt, setLivePrompt, setNativePrompt, stageLivePrompt,
+    attachedImagesByAgent, setAttachedImagesForAgent,
+    queuedPrompts, queuedPromptStore,
+    terminalDockStateByOwner, setTerminalDockOpen, setTerminalDockCollapsed, pruneTerminalDock,
     drawerPinnedByProject, setDrawerPinnedByProject,
-    promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
+    promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
     migratePerAgentState, commitPendingToReal,
-  } = useAgentLifecycle();
+  } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
   // 切换 agent（新会话/恢复会话）时刷新设置，使 pi agent 的 hideThinkingBlock 立即生效
   useEffect(() => {
     if (activeAgentId) {
@@ -612,10 +621,6 @@ export function App() {
   /** 已从 settings.json 合并过展开状态，避免被后续 settings 刷新覆盖用户刚点的展开 */
   const expandedSidebarFromSettingsRef = useRef(false);
   const [files, setFiles] = useState<FileTreeNode[]>([]);
-  const [gitInfo, setGitInfo] = useState<GitBranchInfo>({
-    current: null,
-    branches: [],
-  });
   const [commands, setCommands] = useState<PiCommand[]>([]);
   // 全局 + 项目级 skills 合成的斜线命令（/skill:<name>），注入 / 建议与 chip 白名单。
   // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充，让用户输入 / 即可见到 skills。
@@ -749,6 +754,12 @@ export function App() {
   const [streamingThinkingStartedAt, setStreamingThinkingStartedAt] = useState<
     Record<string, number>
   >({});
+  // 流式思考状态的同步镜像：挂载一次的 onThinking 监听器需要读取最新缓存
+  // （reduceThinkingUpdate 的纯归约以 ref 快照为输入，见 utils/thinkingState）。
+  const streamingThinkingRef = useRef(streamingThinking);
+  streamingThinkingRef.current = streamingThinking;
+  const streamingThinkingStartedAtRef = useRef(streamingThinkingStartedAt);
+  streamingThinkingStartedAtRef.current = streamingThinkingStartedAt;
   /** 每个 agent 最后一次会话的开始时间(status 变为 running 时记录),用 ref 避免 effect 闭包陈旧 */
   const sessionStartByAgentRef = useRef<Record<string, number>>({});
   /** 每个 agent 最后一次会话的总时长(ms),仅在会话结束后更新 */
@@ -1154,8 +1165,8 @@ export function App() {
     useState<OpenCodeImportReport | null>(null);
   // 历史命令：按会话隔离，通过 localStorage 持久化，重启后可恢复上下方向键导航的历史。
   // 键优先用 sessionPath（跨重启/重开稳定，agentId 是每次打开随机生成的 UUID，跨重启无意义），
-  // 匿名会话没有 sessionPath 时退回 agentId。promptHistoryRef 在首次挂载时从 localStorage 恢复。
-  const PROMPT_HISTORY_STORAGE_KEY = "pid:prompt-history";
+  // 匿名会话没有 sessionPath 时退回 agentId。存储由 useAgentLifecycle 内的
+  // usePersistedState 统一承载（键 pid:prompt-history，含读-写-ref 同步）。
   /** 上下键导航的历史条数上限：发送保存、消息基线重建、会话文件补全统一使用。 */
   const PROMPT_HISTORY_LIMIT = 100;
   /** 会话路径键一定包含路径分隔符；agentId（UUID / pending-*）永不含分隔符。 */
@@ -1182,54 +1193,24 @@ export function App() {
     }
     return merged.slice(0, PROMPT_HISTORY_LIMIT);
   }
-  function savePromptHistory() {
-    try {
-      localStorage.setItem(PROMPT_HISTORY_STORAGE_KEY, JSON.stringify(promptHistoryRef.current));
-    } catch {
-      // 配额/隐私模式失败时静默忽略
-    }
-  }
-  function loadPromptHistory(): void {
-    try {
-      const raw = localStorage.getItem(PROMPT_HISTORY_STORAGE_KEY);
-      if (raw) promptHistoryRef.current = JSON.parse(raw) as Record<string, string[]>;
-    } catch {
-      // localStorage 不可用时忽略
-    }
-  }
 
-  // 首次加载/重启后加载会话时，从全量消息重建 prompt history（按历史键幂等，只执行一次）。
-  // 加载占位（“正在加载历史会话…”，仅 system 消息）也以 replaceFrom=0 基线先到达——
-  // 若此时设置 inited 标记，真实历史基线到达时会被幂等保护挡住，重启后打开历史会话
-  // 上下键导航会没有记录。因此只对包含用户消息的基线设置标记；空/占位基线直接跳过。
-  // “!” 开头的 bash 命令与 sendPrompt 保存路径保持一致，不进历史记录。
-  // 注意：主进程对大会话只推送最近窗口（文件尾部 30 轮），窗口外的更早发送记录
-  // 由 refreshPromptHistoryFromFile 从会话文件直接补全，保证“之前发送过的对话”完整。
-  function rebuildPromptHistory(agentId: string, messages: ChatMessage[]) {
+  // 提升历史重建：提取/合并/限长/幂等判断全部由 messageDeltaResolver 完成
+  // （resolveIncomingMessagesDelta / resolveFullPullResult 的 promptHistory 结果），
+  // 这里只负责落库（inited 标记 + setPromptHistory 持久化）与异步会话文件补全。
+  // 注意：仅对包含用户消息的基线设置 inited；load 占位（只有 system 消息）时结果
+  // 为 null，故意不置标记，避免真实历史基线到达时被幂等保护挡住。
+  function applyPromptHistoryRebuild(agentId: string, history: string[] | null) {
+    if (!history) return;
     const key = historyKeyForAgentId(agentId);
-    if (promptHistoryInitedRef.current.has(key)) return;
-    const userMessages = messages
-      .filter(
-        (m) =>
-          m.role === "user" &&
-          m.text?.trim() &&
-          !m.text.trim().startsWith("!"),
-      )
-      .map((m) => m.text.trim());
-    if (userMessages.length === 0) return;
     promptHistoryInitedRef.current.add(key);
-    promptHistoryRef.current[key] = mergePromptHistory(
-      promptHistoryRef.current[key],
-      userMessages.reverse(),
-    );
-    savePromptHistory();
+    setPromptHistory((current) => ({ ...current, [key]: history }));
     // 窗口只覆盖最近消息；异步从会话文件提取完整用户消息文本补全更早记录，不阻塞导航。
     void refreshPromptHistoryFromFile(key, agentId);
   }
 
   // 从会话 JSONL 提取最近 PROMPT_HISTORY_LIMIT 条用户消息文本（最新在前），与当前记录合并。
-  // 文件结果是更早记录的权威来源；读取期间用户新发送的消息已写入 ref，
-  // 合并以 ref 当前值为基准追加缺失的旧条目，不会覆盖新发送的内容。
+  // 文件结果是更早记录的权威来源；读取期间用户新发送的消息已写入记录，
+  // 合并以当前值为基准追加缺失的旧条目，不会覆盖新发送的内容。
   async function refreshPromptHistoryFromFile(key: string, agentId: string) {
     const agent = displayAgentsRef.current.find((a) => a.id === agentId);
     if (!agent?.sessionPath) return;
@@ -1239,11 +1220,10 @@ export function App() {
         PROMPT_HISTORY_LIMIT,
       );
       if (filePrompts.length === 0) return;
-      promptHistoryRef.current[key] = mergePromptHistory(
-        promptHistoryRef.current[key],
-        filePrompts,
-      );
-      savePromptHistory();
+      setPromptHistory((current) => ({
+        ...current,
+        [key]: mergePromptHistory(current[key], filePrompts),
+      }));
     } catch {
       // 文件读取失败静默降级：消息窗口基线已提供最近记录
     }
@@ -1516,30 +1496,28 @@ export function App() {
   const DEFAULT_LIST_WIDTH = 221;
   const LIST_WIDTH_STORAGE_KEY = "pid:list-width";
   const DRAWER_WIDTH_STORAGE_KEY = "pid:drawer-width";
-  /** 读取持久化宽度并 clamp 到合法范围；无记录/损坏时回退默认值。 */
-  const loadPanelWidth = (key: string, fallback: number, min: number, max: number) => {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw == null) return fallback;
-      const value = Number(raw);
-      if (!Number.isFinite(value)) return fallback;
-      return Math.min(max, Math.max(min, value));
-    } catch {
-      return fallback;
-    }
-  };
-  const savePanelWidth = (key: string, width: number) => {
-    try {
-      localStorage.setItem(key, String(width));
-    } catch {
-      // localStorage 不可用时静默忽略，仅本次会话内生效
-    }
-  };
-  const [listWidth, setListWidth] = useState(() =>
-    loadPanelWidth(LIST_WIDTH_STORAGE_KEY, DEFAULT_LIST_WIDTH, 100, 440),
+  // 宽度持久化（pid:list-width / pid:drawer-width）收敛到 usePersistedState：
+  // parse 负责读时 clamp（原 loadPanelWidth 语义），拖拽 onUp 一次性写盘，
+  // onMove 高频帧用裸 setter 只更内存值（原 savePanelWidth 的防高频写盘语义）。
+  const [listWidth, setListWidth, , setListWidthState] = usePersistedState<number>(
+    LIST_WIDTH_STORAGE_KEY,
+    DEFAULT_LIST_WIDTH,
+    {
+      parse: (raw) =>
+        typeof raw === "number" && Number.isFinite(raw)
+          ? Math.min(440, Math.max(100, Math.round(raw)))
+          : undefined,
+    },
   );
-  const [drawerWidth, setDrawerWidth] = useState(() =>
-    loadPanelWidth(DRAWER_WIDTH_STORAGE_KEY, 320, 180, 560),
+  const [drawerWidth, setDrawerWidth, , setDrawerWidthState] = usePersistedState<number>(
+    DRAWER_WIDTH_STORAGE_KEY,
+    320,
+    {
+      parse: (raw) =>
+        typeof raw === "number" && Number.isFinite(raw)
+          ? Math.min(560, Math.max(180, Math.round(raw)))
+          : undefined,
+    },
   );
   const [composerHeight, setComposerHeight] = useState(COMPOSER_MIN_HEIGHT);
   const [composerOffsetHeight, setComposerOffsetHeight] = useState(0);
@@ -1547,8 +1525,16 @@ export function App() {
   const [chatLayoutHeight, setChatLayoutHeight] = useState(() => window.innerHeight);
   const [composerAutoHeight, setComposerAutoHeight] =
     useState(COMPOSER_MIN_HEIGHT);
-  const [terminalHeight, setTerminalHeight] = useState(() =>
-    loadTerminalHeight(COMPOSER_DEFAULT_TERMINAL_HEIGHT),
+  const [terminalHeight, setTerminalHeight] = usePersistedState<number>(
+    TERMINAL_HEIGHT_STORAGE_KEY,
+    COMPOSER_DEFAULT_TERMINAL_HEIGHT,
+    {
+      // 校验/clamp/round 与 loadTerminalHeight/saveTerminalHeight 语义一致。
+      parse: (raw) =>
+        typeof raw === "number" && Number.isFinite(raw) && raw >= TERMINAL_HEIGHT_MIN
+          ? Math.round(raw)
+          : undefined,
+    },
   );
   const [terminalDockMounted, setTerminalDockMounted] = useState(false);
   const [terminalDockClosing, setTerminalDockClosing] = useState(false);
@@ -1687,14 +1673,9 @@ export function App() {
   const sessionsProject = projects.find(
     (project) => project.id === sessionsProjectId,
   );
-  // 从 localStorage 恢复历史（组件挂载时执行一次）
-  useEffect(() => {
-    loadPromptHistory();
-  }, []);
-
   // Agent 关闭后清除对应历史命令。
   // 挂载初期 agents 尚未从主进程同步（displayAgents 为空），此时不能裁剪：
-  // 否则会把 loadPromptHistory 刚从 localStorage 恢复的记录误删并回写空对象，
+  // 否则会把 usePersistedState 刚从 localStorage 恢复的记录误删并回写空对象，
   // 渲染层重载（agent id 不变、依赖 localStorage 恢复历史）时上下键导航就丢了。
   // 用 agentsLoadedOnceRef 记录“agent 列表至少加载过一次”，之后才允许按列表裁剪。
   // 会话路径键（sessionPath 形态）跨重启/重开稳定：即使 agent 关闭也保留，
@@ -1704,57 +1685,33 @@ export function App() {
     if (displayAgents.length > 0) agentsLoadedOnceRef.current = true;
     if (!agentsLoadedOnceRef.current) return;
     const currentIds = new Set(displayAgents.map(a => a.id));
-    let changed = false;
-    for (const id of Object.keys(promptHistoryRef.current)) {
-      if (isSessionPathKey(id)) continue;
-      if (!currentIds.has(id)) {
-        delete promptHistoryRef.current[id];
-        changed = true;
+    setPromptHistory((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const id of Object.keys(next)) {
+        if (isSessionPathKey(id)) continue;
+        if (!currentIds.has(id)) {
+          delete next[id];
+          changed = true;
+        }
       }
-    }
-    if (changed) savePromptHistory();
-  }, [displayAgents]);
+      return changed ? next : current;
+    });
+  }, [displayAgents, setPromptHistory]);
   // Agent 切换时重置历史导航状态，避免跨 Agent 泄漏 historyIndex / savedPrompt
   useEffect(() => {
     setHistoryIndex(-1);
     setHistoryNavigating(false);
     setSavedPrompt("");
   }, [activeAgentId]);
-  // prompt 文本：优先从 live ref 读取（始终保持最新），promptByAgent 仅在 chips 变化时更新作为兜底。
-  // 不建立 state 依赖——普通按键不会触发 App 重渲染，仅靠 hasComposerContent / composerBangMode
-  // 等布尔状态在真正翻转时驱动 UI 刷新。建议框打开时由 composerCursor 变化驱动重渲染。
+  // prompt 文本：优先从 live ref 读取（始终保持最新），promptByAgent 在 chips 变化时兜底。
+  // ref/state 双写镜像已收敛到 useAgentLifecycle（getLivePrompt / setLivePrompt /
+  // setNativePrompt / stageLivePrompt），此处只做读。
   const promptAgentKey = activeAgentId ?? "";
-  const prompt = promptAgentKey
-    ? (livePromptByAgentRef.current[promptAgentKey] ?? promptByAgent[promptAgentKey] ?? "")
-    : "";
+  const prompt = promptAgentKey ? getLivePrompt(promptAgentKey) : "";
   const attachedImages = activeAgentId
     ? (attachedImagesByAgent[activeAgentId] ?? [])
     : [];
-
-  function setPromptForAgent(
-    agentId: string,
-    value: string | ((current: string) => string),
-  ) {
-    const targetAgentId = agentId;
-    const previous = livePromptByAgentRef.current[targetAgentId] ?? "";
-    const nextValue = typeof value === "function" ? value(previous) : value;
-    if (nextValue) livePromptByAgentRef.current[targetAgentId] = nextValue;
-    else delete livePromptByAgentRef.current[targetAgentId];
-    // 程序化更新（建议选择、历史恢复、发送后清空等）需要同步更新 state
-    // 以触发 RichInput 的 chip 渲染和 useLayoutEffect 受控检查。
-    syncComposerFlags(nextValue);
-    setPromptByAgent((current) => {
-      if (!nextValue) {
-        const next = { ...current };
-        delete next[targetAgentId];
-        return next;
-      }
-      return {
-        ...current,
-        [targetAgentId]: nextValue,
-      };
-    });
-  }
 
   /** 同步 hasComposerText / composerBangMode 等布尔状态，仅在值翻转时触发重渲染。 */
   function syncComposerFlags(text: string) {
@@ -1768,54 +1725,9 @@ export function App() {
     setComposerBangMode((prev) => (prev !== bangMode ? bangMode : prev));
   }
 
-  function setPromptFromNativeInput(agentId: string, value: string) {
-    // 同步更新 live ref（发送路径读取）。普通按键不触发 promptByAgent 更新——
-    // RichInput 的 contentEditable 自行管理 DOM，React state 仅用于 chip 重渲染。
-    if (value) livePromptByAgentRef.current[agentId] = value;
-    else delete livePromptByAgentRef.current[agentId];
-
-    // 仅布尔状态翻转时才触发重渲染（有/无内容、!/!! 前缀变化）
-    syncComposerFlags(value);
-
-    // 仅 chips 变化时才更新 promptByAgent（触发 RichInput 的 useMemo chips 重算 + renderDom）。
-    // 但文本从有到无/从无到有时也要更新，否则 prompt 兜底读旧值导致 placeholder 不显示。
-    const oldValue = promptByAgent[agentId] ?? "";
-    const oldChipsKey = parseRichInputChips(oldValue, validCommandNames, validFilePaths, validSessionRefs)
-      .map((c) => `${c.start}:${c.end}:${c.kind}`)
-      .join(",");
-    const newChipsKey = parseRichInputChips(value, validCommandNames, validFilePaths, validSessionRefs)
-      .map((c) => `${c.start}:${c.end}:${c.kind}`)
-      .join(",");
-    const isEmptyChanged = Boolean(oldValue) !== Boolean(value);
-    if (oldChipsKey !== newChipsKey || isEmptyChanged) {
-      setPromptByAgent((current) => {
-        if (!value) {
-          const next = { ...current };
-          delete next[agentId];
-          return next;
-        }
-        return { ...current, [agentId]: value };
-      });
-    }
-  }
-
   function setPrompt(value: string | ((current: string) => string)) {
     const targetAgentId = activeAgentIdRef.current;
-    if (targetAgentId) setPromptForAgent(targetAgentId, value);
-  }
-
-  function setAttachedImagesForAgent(
-    agentId: string,
-    value: ImageContent[] | ((current: ImageContent[]) => ImageContent[]),
-  ) {
-    const current = attachedImagesByAgentRef.current;
-    const previous = current[agentId] ?? [];
-    const nextValue = typeof value === "function" ? value(previous) : value;
-    const next = { ...current };
-    if (nextValue.length === 0) delete next[agentId];
-    else next[agentId] = nextValue;
-    attachedImagesByAgentRef.current = next;
-    setAttachedImagesByAgent(next);
+    if (targetAgentId) setLivePrompt(targetAgentId, value);
   }
 
   function setAttachedImages(
@@ -2011,7 +1923,7 @@ export function App() {
    *  用于让对应 AssistantText 走轻量渲染路径，避免每个 token 都对不断增长的全量正文
    *  反复运行 KaTeX 数学解析导致渲染主线程卡死；回答结束后切回完整渲染。 */
   const streamingMessageId = useMemo(() => {
-    if (!activeAgent || activeAgent.status !== "running") return undefined;
+    if (!activeAgent || !isAgentExactlyRunning(activeAgent)) return undefined;
     if (!(activeRuntimeState?.isStreaming)) return undefined;
     for (let i = activeMessages.length - 1; i >= 0; i--) {
       const m = activeMessages[i];
@@ -2269,6 +2181,16 @@ export function App() {
     [activeProjectSessions],
   );
 
+  /** RichInput 原生输入的 chips 形态 key：只比较 key 是否变化来决定是否同步 prompt state。
+   *  注入 useAgentLifecycle.setNativePrompt，hook 内部不感知 chips 细节。 */
+  const chipsKeyOf = useCallback(
+    (text: string) =>
+      parseRichInputChips(text, validCommandNames, validFilePaths, validSessionRefs)
+        .map((c) => `${c.start}:${c.end}:${c.kind}`)
+        .join(","),
+    [validCommandNames, validFilePaths, validSessionRefs],
+  );
+
   /** 菜单光标锚定位置（屏幕坐标），仅在 suggestionsOpen 时计算。 */
   const suggestionAnchorStyle = useMemo<React.CSSProperties | undefined>(() => {
     if (!suggestionsOpen) return undefined;
@@ -2462,99 +2384,76 @@ export function App() {
       if (!activeProjectId && next.length > 0) setActiveProjectId(next[0].id);
     });
     const offState = api.agents.onState((nextAgents) => {
-      const previousPendingAgents = pendingAgentsRef.current;
-      const remainingPendingAgents = previousPendingAgents.filter(
-        (pending) =>
-          !nextAgents.some((agent) =>
-            isReplacementForPendingAgent(agent, pending),
-          ),
+      // 纯派生（pending 裁剪 / 替换映射 / active 重映射 / 迁移键）收敛为
+      // utils/agentStateReconciliation.reconcileAgentState（见同名测试）。
+      const {
+        remainingPendingAgents,
+        pendingReplacementById,
+        nextActiveAgentId,
+        draftIds,
+        activeProjectIds,
+      } = reconcileAgentState(
+        pendingAgentsRef.current,
+        nextAgents,
+        activeAgentIdRef.current,
       );
-      const pendingReplacementById = new Map(
-        previousPendingAgents
-          .map((pending) => {
-            const replacement = nextAgents.find((agent) =>
-              isReplacementForPendingAgent(agent, pending),
-            );
-            return replacement ? [pending.id, replacement.id] : undefined;
-          })
-          .filter((entry): entry is [string, string] => Boolean(entry)),
-      );
-      if (remainingPendingAgents.length !== previousPendingAgents.length) {
-        pendingAgentsRef.current = remainingPendingAgents;
-        setPendingAgents(remainingPendingAgents);
+      if (remainingPendingAgents.length !== pendingAgentsRef.current.length) {
+        updatePendingAgents(() => remainingPendingAgents);
       }
       setAgents(nextAgents);
-      setActiveAgentId((current) => {
-        if (!current) return undefined;
-        if (nextAgents.some((agent) => agent.id === current)) return current;
-        const pendingAgent = previousPendingAgents.find(
-          (agent) => agent.id === current,
-        );
-        const replacement = pendingAgent
-          ? nextAgents.find((agent) =>
-              isReplacementForPendingAgent(agent, pendingAgent),
-            )
-          : undefined;
-        if (replacement) return replacement.id;
-        return pendingAgent ? current : undefined;
-      });
-      const activeProjectIds = new Set(nextAgents.map((agent) => agent.projectId));
-      const draftIds = new Set([
-        ...nextAgents.map((agent) => agent.id),
-        ...remainingPendingAgents.map((agent) => agent.id),
-      ]);
+      setActiveAgentId(nextActiveAgentId);
       // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
       // terminalDock/drawerPinned/promptHistory/queueFlush）
       migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
       // 裁剪已关闭 agent 的消息缓存，释放 renderer 内存；重启占位需要参与 liveIds，避免旧进程移除时聊天记录闪空。
-      setMessagesByAgent((current) =>
-        migrateAgentRecord(current, pendingReplacementById, draftIds),
-      );
+      migrateAgentMessages(pendingReplacementById, draftIds);
     });
-    // rebuildPromptHistory 为组件级函数（见上方定义）：onMessages 仅负责在
-    // 全量基线/失同步自愈时调用它重建 prompt history，并异步从会话文件补全更早记录。
+    // applyPromptHistoryRebuild 为组件级函数（见上方定义）：onMessages 仅负责在
+    // 全量基线/失同步自愈时调用它落地 prompt history，并异步从会话文件补全更早记录。
 
     // 优化:历史会话加载时消息更新频繁,只在消息真正变化时 update state,避免不必要的重渲染导致输入卡顿
     // 主进程走增量推送（AgentMessagesDelta）：流式期间每条 text_delta 只发尾部变更，
     // replaceFrom 之前的部分保持原数组引用，减少 IPC 传输与合并成本。
+    // 合并/失同步自愈标记/全量基线 prompt 历史重建已收敛为 messageDeltaResolver
+    // 纯函数（resolveIncomingMessagesDelta / resolveFullPullResult），此处只负责
+    // 闭包状态映射、代数序号落库与异步全量拉取流程。
     const offMessages = api.agents.onMessages((payload) => {
       const agentId = payload.agentId;
+      const key = historyKeyForAgentId(agentId);
       // 每应用一个 delta 递增代数；失同步自愈的全量拉取结果只在没有更新的 delta
-      // 到达时生效，避免旧基线覆盖新消息。
-      const seq = (messageDeltaSeqRef.current[agentId] ?? 0) + 1;
-      messageDeltaSeqRef.current[agentId] = seq;
-      setMessagesByAgent((current) => {
-        const prevMessages = current[agentId] ?? [];
-        // 增量失同步（如渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）：
-        // 异步拉取全量基线补平。
-        if (payload.replaceFrom > prevMessages.length) {
-          void api.agents.getMessages(agentId).then((full) => {
-            if (messageDeltaSeqRef.current[agentId] !== seq) return;
-            setMessagesByAgent((cur) => ({ ...cur, [agentId]: full }));
-            rebuildPromptHistory(agentId, full);
-          });
-        }
-        // replaceFrom === 0 即全量基线（历史加载/重启重建），整体替换；
-        // 否则只替换 replaceFrom 之后的尾部（含就地更新的消息与增删）。
-        const merged =
-          payload.replaceFrom === 0
-            ? payload.messages
-            : [
-                ...prevMessages.slice(0, Math.min(payload.replaceFrom, prevMessages.length)),
-                ...payload.messages,
-              ];
-
-        // 首次加载/重启后加载会话时，重建 prompt history。
-        // 只在全量基线上重建——增量事件可能只含尾部消息，用它重建会得到不完整历史。
-        if (payload.replaceFrom === 0) {
-          rebuildPromptHistory(agentId, merged);
-        }
-
-        return {
-          ...current,
-          [agentId]: merged,
-        };
-      });
+      // 到达时生效（resolveFullPullResult 的 pure 形态），避免旧基线覆盖新消息。
+      const resolved = resolveIncomingMessagesDelta(
+        messagesByAgentRef.current[agentId],
+        payload,
+        {
+          currentSeq: messageDeltaSeqRef.current[agentId] ?? 0,
+          inited: promptHistoryInitedRef.current.has(key),
+          existingHistory: promptHistoryRef.current[key],
+        },
+      );
+      messageDeltaSeqRef.current[agentId] = resolved.seq;
+      if (resolved.promptHistory) {
+        applyPromptHistoryRebuild(agentId, resolved.promptHistory);
+      }
+      setAgentMessages(agentId, resolved.messages);
+      // 增量失同步（如渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）：
+      // 异步拉取全量基线补平。拉取期间的更新 delta 使代数前进，旧基线被丢弃。
+      if (resolved.needsFullPull) {
+        void api.agents.getMessages(agentId).then((full) => {
+          const pull = resolveFullPullResult(
+            resolved.seq,
+            messageDeltaSeqRef.current[agentId] ?? 0,
+            full,
+            {
+              inited: promptHistoryInitedRef.current.has(key),
+              existingHistory: promptHistoryRef.current[key],
+            },
+          );
+          if (!pull) return;
+          setAgentMessages(agentId, pull.messages);
+          applyPromptHistoryRebuild(agentId, pull.promptHistory);
+        });
+      }
     });
     const offLog = api.agents.onLog((payload) =>
       // 写入式调试日志：无 UI 消费。用模块级环形缓冲替代 React state，
@@ -2599,23 +2498,24 @@ export function App() {
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
-      setStreamingThinking((current) => {
-        // 相等守卫：工具执行期间思考文本静止时主进程仍按 50ms 节流推送同一值，
-        // 每次 setState 都让 App 整树重渲染；值未变时返回原引用跳过渲染。
-        if (current[payload.agentId] === payload.thinking) return current;
-        return { ...current, [payload.agentId]: payload.thinking };
-      });
-      // 首次收到非空 thinking 时记录开始时间；thinking 清空时清除
-      setStreamingThinkingStartedAt((current) => {
-        if (payload.thinking) {
-          if (current[payload.agentId] != null) return current;
-          return { ...current, [payload.agentId]: Date.now() };
-        }
-        if (current[payload.agentId] == null) return current;
-        const next = { ...current };
-        delete next[payload.agentId];
-        return next;
-      });
+      // 纯归约（相同文本跳过、首次非空记录开始时间、清空移除）收敛为
+      // utils/thinkingState.reduceThinkingUpdate（见同名测试）；
+      // 经 ref 快照读取最新缓存（监听器挂载一次），只在实际变化时 setState，
+      // 避免工具执行期间 50ms 节流推送触发 20Hz 全树重渲染。
+      const next = reduceThinkingUpdate(
+        {
+          thinkingByAgent: streamingThinkingRef.current,
+          startedAtByAgent: streamingThinkingStartedAtRef.current,
+        },
+        payload.agentId,
+        payload.thinking,
+      );
+      if (next.thinkingByAgent !== streamingThinkingRef.current) {
+        setStreamingThinking(next.thinkingByAgent);
+      }
+      if (next.startedAtByAgent !== streamingThinkingStartedAtRef.current) {
+        setStreamingThinkingStartedAt(next.startedAtByAgent);
+      }
     });
     const offNotice = api.agents.onNotice((payload) => {
       const text =
@@ -2637,7 +2537,7 @@ export function App() {
       if (request.method === "set_editor_text") {
         const editorRequest = request;
         const text = editorRequest.text ?? "";
-        setPromptForAgent(request.agentId, text);
+        setLivePrompt(request.agentId, text);
         if (request.agentId === activeAgentIdRef.current) {
           setComposerCursor(text.length);
           pendingComposerCaretRef.current = text.length;
@@ -2962,9 +2862,7 @@ export function App() {
     // displayAgents 含 pending；项目键按完整 projects 列表保留（无 agent 的项目也能开终端）
     const liveAgentIds = new Set(displayAgents.map((agent) => agent.id));
     const liveProjectIds = new Set(projects.map((project) => project.id));
-    setTerminalDockStateByOwner((current) =>
-      pruneTerminalDockState(current, liveAgentIds, liveProjectIds),
-    );
+    pruneTerminalDock(liveAgentIds, liveProjectIds);
   }, [displayAgents, projects]);
 
   useEffect(() => {
@@ -3414,11 +3312,11 @@ export function App() {
     for (const agent of displayAgents) {
       if (agent.id !== activeAgentId) continue;
       const previousStatus = agentStatusByAgentRef.current[agent.id];
-      if (agent.status === "running") {
+      if (isAgentExactlyRunning(agent)) {
         if (previousStatus !== "running") {
           sessionStartByAgentRef.current[agent.id] = Date.now();
         }
-      } else if (agent.status === "idle") {
+      } else if (isAgentIdle(agent)) {
         const start = sessionStartByAgentRef.current[agent.id];
         if (start) {
           setSessionDurationByAgent((d) => ({
@@ -3461,7 +3359,7 @@ export function App() {
     if (!activeProjectId) {
       setFiles([]);
       setSessions([]);
-      setGitInfo({ current: null, branches: [] });
+      setBranchInfoByProject({});
       return;
     }
 
@@ -3500,8 +3398,15 @@ export function App() {
       .catch((error) => captureDebugLog(String(error)));
     void api.git
       .branches(activeProjectId)
-      .then(setGitInfo)
-      .catch(() => setGitInfo({ current: null, branches: [] }));
+      .then((info) => {
+        setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: info }));
+      })
+      .catch(() =>
+        setBranchInfoByProject((prev) => ({
+          ...prev,
+          [activeProjectId]: { current: null, branches: [] },
+        })),
+      );
   }, [activeProjectId, displayAgents.length]);
 
   useEffect(() => {
@@ -3513,15 +3418,19 @@ export function App() {
         const next = await api.git.branches(activeProjectId);
         if (stopped) return;
         // 分支可能在外部终端/IDE 中切换,轮询只在状态真的变化时更新,避免不必要重渲染。
-        setGitInfo((current) =>
-          current.current === next.current &&
-          current.branches.join("\n") === next.branches.join("\n")
+        setBranchInfoByProject((current) => {
+          const prev = current[activeProjectId] ?? { current: null, branches: [] };
+          return prev.current === next.current &&
+            prev.branches.join("\n") === next.branches.join("\n")
             ? current
-            : next,
-        );
+            : { ...current, [activeProjectId]: next };
+        });
       } catch {
         if (!stopped) {
-          setGitInfo({ current: null, branches: [] });
+          setBranchInfoByProject((current) => ({
+            ...current,
+            [activeProjectId]: { current: null, branches: [] },
+          }));
         }
       }
     };
@@ -3815,7 +3724,7 @@ export function App() {
         api.git.branches(projectId).catch(() => ({ current: null, branches: [] })),
       ]);
       setWorktreesByProject((prev) => ({ ...prev, [projectId]: entries }));
-      setBranchByProject((prev) => ({ ...prev, [projectId]: branchInfo.current }));
+      setBranchInfoByProject((prev) => ({ ...prev, [projectId]: branchInfo }));
       // 刷新项目列表（可能已有新注册的 worktree 子项目）
       const next = await api.projects.list();
       setProjects(next);
@@ -4151,9 +4060,18 @@ export function App() {
         // 用户已切走也不写入。
         if (messageDeltaSeqRef.current[agentId] !== seqAtRequest) return;
         if (activeAgentIdRef.current !== agentId) return;
-        setMessagesByAgent((current) => ({ ...current, [agentId]: messages }));
+        // 手动全量拉取走与 onMessages 自愈路径相同的代数守卫 + prompt 历史重建
+        // （resolveFullPullResult pure 形态；capturedSeq 与 currentSeq 相等，
+        // 结果必然非 null，仅复用其替换与重建语义）。
+        const key = historyKeyForAgentId(agentId);
+        const pull = resolveFullPullResult(seqAtRequest, seqAtRequest, messages, {
+          inited: promptHistoryInitedRef.current.has(key),
+          existingHistory: promptHistoryRef.current[key],
+        });
+        if (!pull) return;
+        setAgentMessages(agentId, pull.messages);
         // 渲染层重载后主进程不会重推基线，手动拉取的消息同样用于重建 prompt history
-        rebuildPromptHistory(agentId, messages);
+        applyPromptHistoryRebuild(agentId, pull.promptHistory);
       })
       .catch(() => undefined);
   }
@@ -4630,8 +4548,7 @@ export function App() {
       noSession,
       createdAt: Date.now(),
     };
-    pendingAgentsRef.current = [...pendingAgentsRef.current, pendingTab];
-    setPendingAgents(pendingAgentsRef.current);
+    updatePendingAgents((current) => [...current, pendingTab]);
     setActiveProjectId(projectId);
     setActiveAgentId(pendingTab.id);
     setActiveAgentByProject((current) => ({
@@ -4670,10 +4587,9 @@ export function App() {
         }
         return [...current, tab];
       });
-      pendingAgentsRef.current = pendingAgentsRef.current.filter(
-        (agent) => agent.id !== pendingTab.id,
+      updatePendingAgents((current) =>
+        current.filter((agent) => agent.id !== pendingTab.id),
       );
-      setPendingAgents(pendingAgentsRef.current);
       setActiveAgentId((current) =>
         current === pendingTab.id ? tab.id : current,
       );
@@ -4703,10 +4619,9 @@ export function App() {
       });
       return tab;
     } catch (e) {
-      pendingAgentsRef.current = pendingAgentsRef.current.filter(
-        (agent) => agent.id !== pendingTab.id,
+      updatePendingAgents((current) =>
+        current.filter((agent) => agent.id !== pendingTab.id),
       );
-      setPendingAgents(pendingAgentsRef.current);
       setActiveAgentId((current) =>
         current === pendingTab.id ? previousAgentId : current,
       );
@@ -4985,30 +4900,17 @@ export function App() {
   }
 
   /**
-   * 队列 ref 是 drain 的同步数据源：React 批量 state 更新期间也能原子 claim，
-   * 避免 tool-end 与 idle 两条状态边沿把同一条消息提交两次。
+   * 队列唯一事实来源是 queuedPromptStore：所有队列变更（claim/enqueue/resolve/
+   * retract/discard/migrate）都经 store 原子 op，onUpdate 自动回填 React state，
+   * 不再需要 ref/state 双写（见 useAgentLifecycle）。
    */
-  function updateQueuedPrompts(
-    updater: (current: Record<string, QueuedPrompt[]>) => Record<string, QueuedPrompt[]>,
-  ) {
-    const next = updater(queuedPromptsRef.current);
-    queuedPromptsRef.current = next;
-    setQueuedPrompts(next);
-  }
-
-  function setAgentQueuedPrompts(
-    agentId: string,
-    updater: (current: QueuedPrompt[]) => QueuedPrompt[],
-  ) {
-    updateQueuedPrompts((current) => replaceAgentQueue(current, agentId, updater));
-  }
 
   /** 入队；满员时返回 false，调用方应保留输入框内容并 toast。 */
   function enqueueQueuedPrompt(agentId: string, queuedPrompt: QueuedPrompt): boolean {
-    const before = queuedPromptsRef.current[agentId]?.length ?? 0;
+    const before = queuedPromptStore.state[agentId]?.length ?? 0;
     if (before >= QUEUED_PROMPT_LIMIT) return false;
-    updateQueuedPrompts((current) => enqueuePrompt(current, agentId, queuedPrompt));
-    return (queuedPromptsRef.current[agentId]?.length ?? 0) > before;
+    // store.enqueue 的 FSM 门禁与上限判断一致；返回是否真的入队。
+    return queuedPromptStore.enqueue(agentId, queuedPrompt, QUEUED_PROMPT_LIMIT);
   }
 
   function appendUnknownQueuedPrompt(
@@ -5016,34 +4918,25 @@ export function App() {
     queuedPrompt: QueuedPrompt,
     error?: string,
   ) {
-    setAgentQueuedPrompts(agentId, (current) => {
-      if (current.length >= QUEUED_PROMPT_LIMIT) return current;
-      return [
-        ...current,
-        { ...queuedPrompt, status: "unknown", error },
-      ];
-    });
+    queuedPromptStore.enqueue(
+      agentId,
+      { ...queuedPrompt, status: "unknown", error },
+      QUEUED_PROMPT_LIMIT,
+    );
   }
 
+  /** 撤回输入框：仅 pending/failed 可撤回；sending/unknown 拒绝（防双发/误导）。 */
   function retractQueuedPrompt(agentId: string, promptId: string) {
-    updateQueuedPrompts((current) => retractPrompt(current, agentId, promptId));
+    queuedPromptStore.retract(agentId, promptId);
   }
 
-  /** 丢弃：pending/failed 走 retract；unknown 仅移除提示（不重发）。sending 不可丢弃。 */
+  /** 丢弃：sending 拒绝；pending/failed 移除，unknown 仅清提示（不重发）。 */
   function discardQueuedPrompt(agentId: string, promptId: string) {
-    const live = queuedPromptsRef.current[agentId]?.find((item) => item.id === promptId);
-    if (!live || live.status === "sending") return;
-    if (live.status === "unknown") {
-      updateQueuedPrompts((current) =>
-        acknowledgeUnknownPrompt(current, agentId, promptId),
-      );
-      return;
-    }
-    retractQueuedPrompt(agentId, promptId);
+    queuedPromptStore.discard(agentId, promptId);
   }
 
   function retractQueuedPromptForEdit(agentId: string, queuedPrompt: QueuedPrompt) {
-    const livePrompt = queuedPromptsRef.current[agentId]?.find(
+    const livePrompt = queuedPromptStore.state[agentId]?.find(
       (promptItem) => promptItem.id === queuedPrompt.id,
     );
     if (
@@ -5052,12 +4945,11 @@ export function App() {
       livePrompt.status === "unknown"
     ) return;
     retractQueuedPrompt(agentId, livePrompt.id);
-    const currentDraft =
-      livePromptByAgentRef.current[agentId] ?? promptByAgent[agentId] ?? "";
+    const currentDraft = getLivePrompt(agentId);
     const restoredPrompt = [livePrompt.displayText, currentDraft]
       .filter((text) => text.trim())
       .join("\n\n");
-    setPromptForAgent(agentId, restoredPrompt);
+    setLivePrompt(agentId, restoredPrompt);
     if (livePrompt.images?.length) {
       setAttachedImagesForAgent(agentId, (current) => [
         ...livePrompt.images!,
@@ -5084,7 +4976,7 @@ export function App() {
 
   function canFlushQueuedPrompt(agentId: string) {
     const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    return agent?.status === "idle" && !isAgentCurrentlyBusy(agentId);
+    return isAgentIdle(agent) && !isAgentCurrentlyBusy(agentId);
   }
 
   async function flushQueuedSteerPrompts(agentId: string) {
@@ -5094,11 +4986,9 @@ export function App() {
       // Keep one lock for the whole ordered batch. Releasing it between items would let a second
       // tool-end/idle event claim the next snapshot while this loop is still advancing.
       while (isAgentCurrentlyBusy(agentId)) {
-        const claimed = claimNextSteerPrompt(queuedPromptsRef.current, agentId);
+        const claimed = queuedPromptStore.claimNextSteer(agentId);
         if (!claimed.prompt) break;
         const queuedPrompt = claimed.prompt;
-        queuedPromptsRef.current = claimed.queues;
-        setQueuedPrompts(claimed.queues);
 
         try {
           await dispatchPromptSnapshot(
@@ -5109,20 +4999,16 @@ export function App() {
             queuedPrompt.agentMode,
             queuedPrompt.templateDescription,
           );
-          updateQueuedPrompts((current) =>
-            resolveClaimedPrompt(current, agentId, queuedPrompt.id, {
-              type: "accepted",
-            }),
-          );
+          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
+            type: "accepted",
+          });
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-          updateQueuedPrompts((current) =>
-            resolveClaimedPrompt(current, agentId, queuedPrompt.id, {
-              type: deliveryUnknown ? "unknown" : "failed",
-              error: errorMessage,
-            }),
-          );
+          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
+            type: deliveryUnknown ? "unknown" : "failed",
+            error: errorMessage,
+          });
           showToast(
             deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
             deliveryUnknown ? 6000 : 4000,
@@ -5145,12 +5031,10 @@ export function App() {
   /** Paseo 同款串行策略：agent 每次空闲只发送队首，其余消息继续可撤回。 */
   async function flushNextQueuedPrompt(agentId: string) {
     if (queueFlushByAgentRef.current.has(agentId) || !canFlushQueuedPrompt(agentId)) return;
-    const claimed = claimIdleHead(queuedPromptsRef.current, agentId);
+    const claimed = queuedPromptStore.claimIdleHead(agentId);
     if (!claimed.prompt) return;
     const queuedPrompt = claimed.prompt;
 
-    queuedPromptsRef.current = claimed.queues;
-    setQueuedPrompts(claimed.queues);
     queueFlushByAgentRef.current.add(agentId);
     try {
       await dispatchPromptSnapshot(
@@ -5161,20 +5045,16 @@ export function App() {
         queuedPrompt.agentMode,
         queuedPrompt.templateDescription,
       );
-      updateQueuedPrompts((current) =>
-        resolveClaimedPrompt(current, agentId, queuedPrompt.id, {
-          type: "accepted",
-        }),
-      );
+      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
+        type: "accepted",
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-      updateQueuedPrompts((current) =>
-        resolveClaimedPrompt(current, agentId, queuedPrompt.id, {
-          type: deliveryUnknown ? "unknown" : "failed",
-          error: errorMessage,
-        }),
-      );
+      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
+        type: deliveryUnknown ? "unknown" : "failed",
+        error: errorMessage,
+      });
       showToast(
         deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
         deliveryUnknown ? 6000 : 4000,
@@ -5206,22 +5086,16 @@ export function App() {
   /** 按当前上下文 owner 写入 open；流式/刷新路径不得调用此函数关终端 */
   function setTerminalOpenForOwner(open: boolean) {
     if (!activeTerminalOwnerKey) return;
-    setTerminalDockStateByOwner((current) =>
-      setTerminalDockOpen(current, activeTerminalOwnerKey, open),
-    );
+    setTerminalDockOpen(activeTerminalOwnerKey, open);
   }
 
   function setTerminalCollapsedForOwner(collapsed: boolean) {
     if (!activeTerminalOwnerKey) return;
-    setTerminalDockStateByOwner((current) =>
-      setTerminalDockCollapsed(current, activeTerminalOwnerKey, collapsed),
-    );
+    setTerminalDockCollapsed(activeTerminalOwnerKey, collapsed);
   }
 
   function updateTerminalHeight(height: number) {
-    const next = Math.max(120, Math.round(height));
-    setTerminalHeight(next);
-    saveTerminalHeight(next);
+    setTerminalHeight(Math.max(TERMINAL_HEIGHT_MIN, Math.round(height)));
   }
 
   function handleComposerKeyDown(
@@ -5253,9 +5127,7 @@ export function App() {
           // 以光标为锚替换触发符..光标这一段,并在下一帧恢复光标到插入项之后。
           const el = event.currentTarget;
           const cursor = getCaretOffsetOf(el);
-          const liveComposerPrompt = activeAgentIdRef.current
-            ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-            : prompt;
+          const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
           const result = applySuggestion(liveComposerPrompt, cursor, selected.value);
           // RichInput 的受控同步会基于 value 重渲染并恢复光标,这里同步状态即可。
           setPrompt(result.text);
@@ -5272,10 +5144,9 @@ export function App() {
         event.preventDefault();
         const el = event.currentTarget;
         const cursor = getCaretOffsetOf(el);
-        const liveComposerPrompt = activeAgentIdRef.current
-          ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-          : prompt;
+        const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
         const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
+        setPrompt(result.text);
         setPrompt(result.text);
         setComposerCursor(result.cursor);
         pendingComposerCaretRef.current = result.cursor;
@@ -5293,11 +5164,7 @@ export function App() {
     // ArrowDown 恢复后就会丢掉中间继续输入的内容。
     const editor = event.currentTarget;
     const cursorPos = getCaretOffsetOf(editor);
-    const liveComposerDraft = resolveComposerHistoryDraft({
-      activeAgentId: activeAgentIdRef.current,
-      livePromptByAgent: livePromptByAgentRef.current,
-      renderedPrompt: prompt,
-    });
+    const liveComposerDraft = getLivePrompt(activeAgentIdRef.current ?? "");
     const { isFirstLine, isLastLine } = getComposerHistoryLineBounds(
       liveComposerDraft,
       cursorPos,
@@ -5356,11 +5223,7 @@ export function App() {
     if (event.key === "Escape") {
       const el = event.currentTarget;
       const cursor = getCaretOffsetOf(el);
-      const liveComposerPrompt = resolveComposerHistoryDraft({
-        activeAgentId: activeAgentIdRef.current,
-        livePromptByAgent: livePromptByAgentRef.current,
-        renderedPrompt: prompt,
-      });
+      const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
       const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
       setPrompt(result.text);
       setComposerCursor(result.cursor);
@@ -5383,8 +5246,8 @@ export function App() {
     }
   }
 
-  const isAgentStarting = activeAgent?.status === "starting";
-  const composerDisabled = !activeAgent || isAgentStarting;
+  const agentStarting = isAgentStarting(activeAgent);
+  const composerDisabled = !activeAgent || agentStarting;
   // isCompacting / 本地 compacting 也算 busy：压缩期间禁止再发消息，并显示停止区语义。
   const isAgentBusy = Boolean(
     activeAgent &&
@@ -5423,22 +5286,23 @@ export function App() {
   /** 流式/运行相关的时间线展示状态：App 侧聚合为单一对象传给 MessageListContent，
    *  用 useMemo 保证只有任一输入真正变化时才重建引用——流式期间 App 每次重渲染
    *  （~50ms delta + 侧栏等无关状态变化）不能让对象每帧新建，否则 memo 失效整树重渲染。
-   *  MessageListContent 的比较器按内容比较（sameMessageStreamState），
-   *  即使这里漏列依赖，字段变化仍能被比较器捕获。 */
+   *  聚合与内容比较器同处 streamStateSelector 模块（buildStreamState /
+   *  areStreamStatesEqual），字段形状与比较逻辑不跨文件漂移。 */
   const streamState = useMemo(
-    () => ({
-      streamingMessageId,
-      agentRunning: isAgentBusy,
-      statusRunning: activeAgent?.status === "running",
-      isAwaitingAssistant,
-      showThinking: settings.showThinking,
-      activeThinking,
-      thinkingStartedAt: activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined,
-      isExecutingTool: activeRuntimeState?.isExecutingTool,
-      isStreaming: activeRuntimeState?.isStreaming,
-      cancellingUi,
-      activeUiAskRequestId: activeUiAsk?.requestId,
-    }),
+    () =>
+      buildStreamState({
+        streamingMessageId,
+        agentRunning: isAgentBusy,
+        statusRunning: isAgentExactlyRunning(activeAgent),
+        isAwaitingAssistant,
+        showThinking: settings.showThinking,
+        activeThinking,
+        thinkingStartedAt: activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined,
+        isExecutingTool: activeRuntimeState?.isExecutingTool,
+        isStreaming: activeRuntimeState?.isStreaming,
+        cancellingUi,
+        activeUiAskRequestId: activeUiAsk?.requestId,
+      }),
     [
       streamingMessageId,
       isAgentBusy,
@@ -5542,21 +5406,19 @@ export function App() {
     // 发送前从 DOM 直读文本，避免 contentEditable 的 IME 组合期间 handleInput 被锁导致 ref 落后于 DOM
     if (!override && targetAgentId) {
       const domText = (composerTextareaRef.current?.textContent ?? "").replace(/\u200B/g, "");
-      if (domText) livePromptByAgentRef.current[targetAgentId] = domText;
+      if (domText) stageLivePrompt(targetAgentId, domText);
     }
-    const livePrompt = override?.message ?? (targetAgentId
-      ? (livePromptByAgentRef.current[targetAgentId] ?? prompt)
-      : prompt);
+    const livePrompt = override?.message ?? getLivePrompt(targetAgentId ?? "");
     const attachedImagesSnapshot = override?.images ?? attachedImages;
     const agentMode = override?.agentMode ?? currentComposerAgentMode;
     if (
-      (!override && isAgentStarting) ||
+      (!override && agentStarting) ||
       !targetAgentId ||
       (!livePrompt.trim() && attachedImagesSnapshot.length === 0)
     )
       return;
     const message = livePrompt;
-    if (!override) delete livePromptByAgentRef.current[targetAgentId];
+    if (!override) stageLivePrompt(targetAgentId);
     const images = attachedImagesSnapshot.length > 0 ? attachedImagesSnapshot : undefined;
 
     const trimmedMessage = message.trim();
@@ -5567,7 +5429,7 @@ export function App() {
     // 与底栏“压缩”按钮同一实现：走 agents.compact RPC，而不是把 /compact 当普通 prompt 发给模型。
     if (/^\/compact(?:\s|$)/i.test(trimmedMessage)) {
       const compactPrompt = trimmedMessage.replace(/^\/compact\s*/i, "").trim();
-      setPromptForAgent(targetAgentId, "");
+      setLivePrompt(targetAgentId, "");
       setAttachedImagesForAgent(targetAgentId, []);
       setSuggestionsOpen(false);
       // 清空 contentEditable 显示（仅清 ref 时 DOM 可能残留 /compact 文本）
@@ -5581,10 +5443,14 @@ export function App() {
     // 保存到当前 Agent 的历史记录（按会话路径键持久化到 localStorage，重启后可恢复）
     if (message.trim() && !message.startsWith("!")) {
       const key = historyKeyForAgentId(targetAgentId);
-      const prev = promptHistoryRef.current[key] ?? [];
-      const filtered = prev.filter(cmd => cmd !== message.trim());
-      promptHistoryRef.current[key] = [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT);
-      savePromptHistory();
+      setPromptHistory((current) => {
+        const prev = current[key] ?? [];
+        const filtered = prev.filter(cmd => cmd !== message.trim());
+        return {
+          ...current,
+          [key]: [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT),
+        };
+      });
     }
 
     // 重置历史导航状态
@@ -5599,7 +5465,7 @@ export function App() {
     autoScrollRef.current = true;
     // Viewer 首条是独立快照，不消费恢复期间新写入真实 Agent 的第二条草稿。
     if (!override) {
-      setPromptForAgent(targetAgentId, "");
+      setLivePrompt(targetAgentId, "");
       setAttachedImagesForAgent(targetAgentId, []);
     }
     setBusyDraftByAgent((current) => {
@@ -5642,7 +5508,7 @@ export function App() {
     };
     if (isAgentBusy) {
       if (!enqueueQueuedPrompt(targetAgentId, queuedPromptSnapshot)) {
-        setPromptForAgent(targetAgentId, (current) =>
+        setLivePrompt(targetAgentId, (current) =>
           [message, current].filter((text) => text.trim()).join("\n\n"),
         );
         if (images) {
@@ -5670,7 +5536,7 @@ export function App() {
     }
     if (!accepted) {
       // 首条失败时恢复到第二条草稿之前；不要预写 live ref，否则会重复拼接。
-      setPromptForAgent(targetAgentId, (current) =>
+      setLivePrompt(targetAgentId, (current) =>
         [message, current].filter((text) => text.trim()).join("\n\n"),
       );
       if (images) {
@@ -5691,18 +5557,16 @@ export function App() {
 
   async function sendPromptAsFollowUp() {
     const targetAgentId = activeAgentId;
-    const livePrompt = targetAgentId
-      ? (livePromptByAgentRef.current[targetAgentId] ?? prompt)
-      : prompt;
+    const livePrompt = getLivePrompt(targetAgentId ?? "");
     if (
-      isAgentStarting ||
+      agentStarting ||
       !targetAgentId ||
       (!livePrompt.trim() && attachedImages.length === 0)
     )
       return;
     const message = livePrompt;
     // 在任何 await 之前清掉实时草稿，防止双击/Enter 连发读取同一份消息。
-    delete livePromptByAgentRef.current[targetAgentId];
+    stageLivePrompt(targetAgentId);
     const images = attachedImages.length > 0 ? attachedImages : undefined;
     setAutoScroll(true);
     autoScrollRef.current = true;
@@ -5714,10 +5578,14 @@ export function App() {
     // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
     if (message.trim() && !message.startsWith("!")) {
       const key = historyKeyForAgentId(targetAgentId);
-      const prev = promptHistoryRef.current[key] ?? [];
-      const filtered = prev.filter(cmd => cmd !== message.trim());
-      promptHistoryRef.current[key] = [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT);
-      savePromptHistory();
+      setPromptHistory((current) => {
+        const prev = current[key] ?? [];
+        const filtered = prev.filter(cmd => cmd !== message.trim());
+        return {
+          ...current,
+          [key]: [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT),
+        };
+      });
     }
     // 重置历史导航状态
     setHistoryIndex(-1);
@@ -5745,7 +5613,7 @@ export function App() {
     };
     if (isAgentBusy) {
       if (!enqueueQueuedPrompt(targetAgentId, queuedPromptSnapshot)) {
-        setPromptForAgent(targetAgentId, (current) =>
+        setLivePrompt(targetAgentId, (current) =>
           [message, current].filter((text) => text.trim()).join("\n\n"),
         );
         if (images) {
@@ -5768,8 +5636,8 @@ export function App() {
       return;
     }
     if (!accepted) {
-      livePromptByAgentRef.current[targetAgentId] = message;
-      setPromptForAgent(targetAgentId, (current) =>
+      stageLivePrompt(targetAgentId, message);
+      setLivePrompt(targetAgentId, (current) =>
         [message, current].filter((text) => text.trim()).join("\n\n"),
       );
       if (images) {
@@ -6059,9 +5927,7 @@ export function App() {
     if (paths.length === 0) return;
     const el = composerTextareaRef.current;
     const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-    const liveComposerPrompt = activeAgentIdRef.current
-      ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-      : prompt;
+    const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
     // 含空格路径写成 @"C:\Users\a b\file.txt"；工作区目录追加尾斜杠，避免 @src 被当成智能体。
     const refText = paths
       .map((p) => {
@@ -6366,13 +6232,18 @@ export function App() {
     }
   }
 
-  async function switchBranch(branch: string) {
-    if (!activeProjectId || !branch || branch === gitInfo.current) return;
+  /** 当前项目分支信息（统一 store 的读取视图）：composer 分支展示 / GitPanel 首帧种子 / 切换守卫共用。 */
+  const activeGitInfo: GitBranchInfo = activeProjectId
+    ? (branchInfoByProject[activeProjectId] ?? { current: null, branches: [] })
+    : { current: null, branches: [] };
+
+  async function switchBranch(branch: string): Promise<GitBranchInfo | void> {
+    if (!activeProjectId || !branch || branch === activeGitInfo.current) return;
     setSwitchingBranch(branch);
     try {
       const next = await api.git.checkout(activeProjectId, branch);
-      setGitInfo(next);
-      setBranchByProject((prev) => ({ ...prev, [activeProjectId]: next.current }));
+      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: next }));
+      return next;
     } catch (error) {
       showToast(
         t("app.branchSwitchFailed", {
@@ -6383,27 +6254,28 @@ export function App() {
       const refreshed = await api.git
         .branches(activeProjectId)
         .catch(() => ({ current: null, branches: [] }));
-      setGitInfo(refreshed);
-      setBranchByProject((prev) => ({ ...prev, [activeProjectId]: refreshed.current }));
+      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: refreshed }));
+      return refreshed;
     } finally {
       setSwitchingBranch(null);
     }
   }
 
-  async function createBranch(branchName: string) {
+  async function createBranch(branchName: string): Promise<GitBranchInfo | void> {
     if (!activeProjectId || !branchName.trim()) return;
     setSwitchingBranch(branchName);
     try {
       const next = await api.git.createBranch(activeProjectId, branchName);
-      setGitInfo(next);
-      setBranchByProject((prev) => ({ ...prev, [activeProjectId]: next.current }));
+      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: next }));
       showToast(t("app.branchCreated", { branch: branchName }), 2500);
+      return next;
     } catch (error) {
       showToast(
         t("app.branchCreateFailed", {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
+      return undefined;
     } finally {
       setSwitchingBranch(null);
     }
@@ -6628,7 +6500,7 @@ export function App() {
           const next = Math.min(440, Math.max(100, startListWidth + delta));
           latestListWidth = next;
           setListCollapsed(next <= 120);
-          setListWidth(next);
+          setListWidthState(next);
         } else {
           const minDrawerWidth = drawerPinned ? 220 : 180;
           const next = Math.min(
@@ -6637,7 +6509,7 @@ export function App() {
           );
           latestDrawerWidth = next;
           setDrawerCollapsed(!drawerPinned && next <= 190);
-          setDrawerWidth(next);
+          setDrawerWidthState(next);
         }
       });
     }
@@ -6650,8 +6522,8 @@ export function App() {
       document.body.classList.remove("is-list-resizing");
       // 拖拽结束一次性持久化（避免高频写 localStorage）；
       // 折叠状态下保存展开宽度（折叠状态本身已由列表记忆持久化）
-      savePanelWidth(LIST_WIDTH_STORAGE_KEY, Math.max(100, latestListWidth));
-      savePanelWidth(DRAWER_WIDTH_STORAGE_KEY, Math.max(180, latestDrawerWidth) || 320);
+      setListWidth(Math.max(100, Math.round(latestListWidth)));
+      setDrawerWidth(Math.max(180, Math.round(latestDrawerWidth)) || 320);
     }
 
     document.body.classList.add("is-resizing");
@@ -6698,7 +6570,7 @@ export function App() {
 
   function toggleListCollapsed() {
     const nextCollapsed = !listCollapsed;
-    if (!nextCollapsed) setListWidth(DEFAULT_LIST_WIDTH);
+    if (!nextCollapsed) setListWidthState(DEFAULT_LIST_WIDTH);
     if (nextCollapsed) {
       (document.activeElement as HTMLElement | null)?.blur();
     }
@@ -6768,7 +6640,7 @@ export function App() {
             className="window-control"
             aria-label={t("app.windowMinimize")}
             title={t("app.windowMinimize")}
-            onClick={() => api.app.minimizeWindow()}
+            onClick={() => api.app.windowControl("minimize")}
           >
             <Minus size={13} strokeWidth={2.2} aria-hidden="true" />
           </button>
@@ -6777,7 +6649,7 @@ export function App() {
             className="window-control"
             aria-label={t("app.windowToggleMaximize")}
             title={t("app.windowToggleMaximize")}
-            onClick={() => api.app.toggleMaximizeWindow()}
+            onClick={() => api.app.windowControl("toggle-maximize")}
           >
             <Square size={11} strokeWidth={2} aria-hidden="true" />
           </button>
@@ -6786,7 +6658,7 @@ export function App() {
             className="window-control close"
             aria-label={t("app.windowClose")}
             title={t("app.windowClose")}
-            onClick={() => api.app.closeWindow()}
+            onClick={() => api.app.windowControl("close")}
           >
             <X size={14} strokeWidth={2.2} aria-hidden="true" />
           </button>
@@ -7092,7 +6964,7 @@ export function App() {
                         {t("app.worktreeMainWorkspace")}
                       </span>
                       <span className="worktree-branch-chip">
-                        {branchByProject[project.id] ?? t("app.worktreeBranchLoading")}
+                        {branchInfoByProject[project.id]?.current ?? t("app.worktreeBranchLoading")}
                       </span>
                     </button>
                   </div>
@@ -7844,7 +7716,7 @@ export function App() {
             </div>
           </div>
           <div
-            className={`chat-header-actions${activeAgent?.status === "starting" ? " loading" : ""}`}
+            className={`chat-header-actions${isAgentStarting(activeAgent) ? " loading" : ""}`}
           >
             <>
               {/* {activeAgent?.id && (
@@ -7865,7 +7737,7 @@ export function App() {
                   <div className="session-combo" ref={sessionComboRef}>
                     <button
                       className="session-combo-trigger"
-                      disabled={!activeProjectId || isAgentStarting}
+                      disabled={!activeProjectId || agentStarting}
                       title={t("app.newSession")}
                       onClick={() => {
                         if (activeAgentId) {
@@ -7895,7 +7767,7 @@ export function App() {
                       </button>
                       <div className="session-combo-divider" />
                       <button
-                        disabled={activeAgent?.status !== "running"}
+                        disabled={!isAgentExactlyRunning(activeAgent)}
                         onClick={() => {
                           abortAgent();
                           setSessionActionsOpen(false);
@@ -7906,7 +7778,7 @@ export function App() {
                       {!isLanWeb && (
                         <button
                           disabled={
-                            activeAgent?.status === "starting" ||
+                            isAgentStarting(activeAgent) ||
                             restartingAgentId === activeAgentId ||
                             Boolean(
                               activeAgentId &&
@@ -7924,8 +7796,8 @@ export function App() {
                             setRestartingAgentId(restartingAgent.id);
                             setSessionActionsOpen(false);
                             // 重启会在主进程中短暂移除旧 Agent；这里保留原位置的 starting 占位，避免自动选中同项目下一个 Agent。
-                            pendingAgentsRef.current = [
-                              ...pendingAgentsRef.current.filter(
+                            updatePendingAgents((current) => [
+                              ...current.filter(
                                 (agent) => agent.id !== restartingAgent.id,
                               ),
                               {
@@ -7934,15 +7806,15 @@ export function App() {
                                 pendingKind: "restart",
                                 pendingStartedAt: Date.now(),
                               },
-                            ];
-                            setPendingAgents(pendingAgentsRef.current);
+                            ]);
                             try {
                               const tab =
                                 await api.agents.restart(restartingAgent.id);
-                              pendingAgentsRef.current = pendingAgentsRef.current.filter(
-                                (agent) => agent.id !== restartingAgent.id,
+                              updatePendingAgents((current) =>
+                                current.filter(
+                                  (agent) => agent.id !== restartingAgent.id,
+                                ),
                               );
-                              setPendingAgents(pendingAgentsRef.current);
                               setActiveAgentId((current) =>
                                 current === restartingAgent.id ? tab.id : current,
                               );
@@ -7955,13 +7827,13 @@ export function App() {
                               showToast(t("app.agentRestarted"), 2000);
                             } catch (error) {
                               // 重启失败时保留原 Agent 卡片并标记错误，避免用户当前上下文被兜底切走。
-                              pendingAgentsRef.current = pendingAgentsRef.current.map(
-                                (agent) =>
+                              updatePendingAgents((current) =>
+                                current.map((agent) =>
                                   agent.id === restartingAgent.id
                                     ? { ...agent, status: "error" }
                                     : agent,
+                                ),
                               );
-                              setPendingAgents(pendingAgentsRef.current);
                               showToast(error instanceof Error ? error.message : String(error), 5000);
                             } finally {
                               setRestartingAgentId((current) =>
@@ -8030,7 +7902,7 @@ export function App() {
           {/* Agent 启动时显示骨架屏；消息尚未到达时继续展示，避免闪空
                Agent 状态已是 idle 时不再显示，即使消息还未到达，
                避免 "正在启动 Agent" 在启动完成后仍卡住。 */}
-          {(activeAgent?.status === "starting" || (activeAgent?.status !== "idle" && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id))) ? (
+          {(isAgentStarting(activeAgent) || (!isAgentIdle(activeAgent) && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id))) ? (
             <div className="history-loading">
               <div className="history-loading-placeholder">
                 <div className="skeleton-bubble" />
@@ -8714,7 +8586,7 @@ export function App() {
               validSessionRefs={validSessionRefs}
               caretRef={pendingComposerCaretRef}
               placeholder={
-                isAgentStarting
+                agentStarting
                   ? t("app.agentStartingPlaceholder")
                   : !activeAgent
                     ? t("app.composerNoAgentPlaceholder")
@@ -8735,7 +8607,7 @@ export function App() {
               onChange={(newValue, cursor) => {
                 const targetAgentId = activeAgentIdRef.current;
                 if (targetAgentId) {
-                  setPromptFromNativeInput(targetAgentId, newValue);
+                  setNativePrompt(targetAgentId, newValue, chipsKeyOf);
                 }
                 if (targetAgentId) {
                   setBusyDraftByAgent((current) => {
@@ -8794,9 +8666,7 @@ export function App() {
                 onClose={() => {
                   const el = composerTextareaRef.current;
                   const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-                  const liveComposerPrompt = activeAgentIdRef.current
-                    ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-                    : prompt;
+                  const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
                   const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
                   setPrompt(result.text);
                   setComposerCursor(result.cursor);
@@ -8809,9 +8679,7 @@ export function App() {
                 onPick={(value) => {
                   const el = composerTextareaRef.current;
                   const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-                  const liveComposerPrompt = activeAgentIdRef.current
-                    ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-                    : prompt;
+                  const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
                   const result = applySuggestion(liveComposerPrompt, cursor, value);
                   setPrompt(result.text);
                   setComposerCursor(result.cursor);
@@ -8831,7 +8699,7 @@ export function App() {
                   <button
                     type="button"
                     className={`composer-bar-btn${currentComposerAgentMode === "plan" ? " active" : ""}`}
-                    disabled={isAgentBusy || isAgentStarting}
+                    disabled={isAgentBusy || agentStarting}
                     onClick={() => setComposerModePickerOpen(true)}
                     title={t("app.composerModeTitle")}
                   >
@@ -8851,7 +8719,7 @@ export function App() {
                 <button
                   type="button"
                   className="composer-bar-btn icon"
-                  disabled={isAgentBusy || isAgentStarting}
+                  disabled={isAgentBusy || agentStarting}
                   onClick={openPromptTemplatePicker}
                   title={t("app.promptTemplatePickerTitle")}
                 >
@@ -8860,7 +8728,7 @@ export function App() {
                 <button
                   type="button"
                   className="composer-bar-btn icon"
-                  disabled={isAgentBusy || isAgentStarting}
+                  disabled={isAgentBusy || agentStarting}
                   onClick={handleAttachFile}
                   title={t("app.attachFileDesc")}
                 >
@@ -8887,7 +8755,7 @@ export function App() {
                   state={activeRuntimeState}
                   activeAgentId={activeAgentId}
                   isAgentBusy={isAgentBusy}
-                  isAgentStarting={isAgentStarting}
+                  isAgentStarting={agentStarting}
                   compacting={compacting}
                   onOpenModelPicker={openModelPicker}
                   onOpenThinkingPicker={() => setThinkingPickerOpen(true)}
@@ -8896,16 +8764,16 @@ export function App() {
               </div>
               <div className="composer-bottom-right">
                 {/* 当前项目分支只读展示：放右侧发送区前，纯文本样式无边框阴影。 */}
-                {gitInfo.current && (
+                {activeGitInfo.current && (
                   <span
                     className="composer-bar-branch"
                     title={t("app.branchCurrent", {
-                      branch: gitInfo.current,
-                      count: gitInfo.branches.length,
+                      branch: activeGitInfo.current,
+                      count: activeGitInfo.branches.length,
                     })}
                   >
                     <GitBranch size={12} strokeWidth={1.8} aria-hidden="true" />
-                    <span className="composer-bar-branch-name">{gitInfo.current}</span>
+                    <span className="composer-bar-branch-name">{activeGitInfo.current}</span>
                   </span>
                 )}
                 {/* 队列/发送按钮：有内容时才显示行为选择器（靠左） */}
@@ -8969,7 +8837,7 @@ export function App() {
                 {!isAgentBusy && !keepBusyDraftControls && !showBusySendControls && (
                   <button
                     type="button"
-                    disabled={isAgentStarting || (!activeAgentId) || (!prompt.trim() && attachedImages.length === 0)}
+                    disabled={agentStarting || (!activeAgentId) || (!prompt.trim() && attachedImages.length === 0)}
                     className="composer-bar-btn send"
                     onClick={() => void sendPrompt()}
                     title={t("app.send")}
@@ -9162,8 +9030,7 @@ export function App() {
                         git={api.git}
                         onOpenCommitFileDiff={openCommitFileDiff}
                         onOpenWorkspaceFileDiff={openWorkspaceFileDiff}
-                        branches={gitInfo.branches}
-                        currentBranch={gitInfo.current}
+                        initialBranchInfo={activeGitInfo}
                         onSwitchBranch={switchBranch}
                         onCreateBranch={createBranch}
                       />

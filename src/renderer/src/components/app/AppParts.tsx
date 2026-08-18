@@ -48,6 +48,7 @@ import {
 	sameChatMessageForRender,
 } from "./AppUtils";
 import { getComposerEnterIntent } from "../../composerBehavior";
+import { computeThinkingTiming } from "../../utils/thinkingTiming";
 
 // Mermaid 库体积数 MB，仅在真正出现 mermaid 代码块时才动态加载，
 // 避免随渲染进程常驻、放大内存占用并在流式期间抢占主线程。
@@ -3676,13 +3677,22 @@ export const TurnRow = memo(function TurnRow(props: {
 	const executionItemsWithFinalThinking = useMemo(() => {
 		const items = [...executionItems];
 		if (hasFinalThinking && finalThinkingTxt && props.showThinking) {
+			// 单一计时链（computeThinkingTiming）：startedAt 为 message.thinkingStartedAt →
+			// streamingThinkingStartedAt → run.startedAt，endedAt 为 thinkingEndedAt →
+			// timestamp；run.endedAt 是模块签名外的显式尾部回退（见 thinkingTiming 变化报告）。
+			const timing = computeThinkingTiming(
+				finalMessageItem?.message,
+				props.streamingThinkingStartedAt,
+				run.startedAt,
+				Date.now(),
+			);
 			const thinkingItem: ThinkingGroupItem = {
 				kind: "thinking-group",
 				id: `final-thinking-${finalMessageItem?.message.id ?? run.id}`,
 				messages: finalMessageItem?.message ? [finalMessageItem.message] : [],
 				text: finalThinkingTxt,
-				startedAt: finalMessageItem?.message.thinkingStartedAt ?? props.streamingThinkingStartedAt ?? run.startedAt,
-				endedAt: finalMessageItem?.message.thinkingEndedAt ?? finalMessageItem?.message.timestamp ?? run.endedAt,
+				startedAt: timing.startedAt ?? run.startedAt,
+				endedAt: timing.endedAt ?? run.endedAt,
 			};
 			items.push(thinkingItem);
 		}
@@ -3764,13 +3774,20 @@ export const TurnRow = memo(function TurnRow(props: {
 				props.showThinking &&
 				last.message.thinking?.trim()
 			) {
+				const streamingThinkingTiming = computeThinkingTiming(
+					last.message,
+					props.streamingThinkingStartedAt,
+					run.startedAt,
+					Date.now(),
+				);
 				const thinkingBlock: ThinkingGroupItem = {
 					kind: "thinking-group",
 					id: `streaming-thinking-${last.message.id}`,
 					messages: [last.message],
 					text: stripAnsi(last.message.thinking),
-					startedAt: last.message.thinkingStartedAt ?? props.streamingThinkingStartedAt ?? run.startedAt,
-					endedAt: last.message.thinkingEndedAt ?? last.message.timestamp ?? run.endedAt,
+					// 与已完成分支同一计时链：computeThinkingTiming + run.endedAt 显式尾部回退。
+					startedAt: streamingThinkingTiming.startedAt ?? run.startedAt,
+					endedAt: streamingThinkingTiming.endedAt ?? run.endedAt,
 				};
 				return [...allItems.slice(0, -1), thinkingBlock, last];
 			}

@@ -21,6 +21,7 @@ import type {
 } from "../../../shared/types";
 import type { PiDesktopApi } from "../../../shared/api";
 import { isReplacementForPendingAgent, type PendingAgentTab } from "../agentListDisplay";
+import { migrateAgentRecord } from "./useAgentLifecycle";
 import { mergeAgentRuntimeState } from "../utils/agentRuntimeState";
 import { translateAgentErrorMessage } from "../utils/agentErrors";
 import { showNotice } from "../utils/notice";
@@ -84,6 +85,9 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	activeAgentIdRef.current = activeAgentId;
 	const agentsRef = useRef<AgentTab[]>(agents);
 	agentsRef.current = agents;
+	/** messagesByAgent 的同步镜像：挂载一次的 IPC 监听器（onMessages）需要读取最新消息缓存。 */
+	const messagesByAgentRef = useRef<Record<string, ChatMessage[]>>({});
+	messagesByAgentRef.current = messagesByAgent;
 	// pendingAgentsRef 不做 .current = pendingAgents 同步：createAgent 路径直接写 ref（先于 setState），
 	// 随后 setState 触发重渲染时会用 ref 中已更新的值，避免占位 Agent 闪烁。
 	const pendingAgentsRef = useRef<PendingAgentTab[]>([]);
@@ -132,6 +136,47 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		: [];
 
 	// ===== Actions（纯逻辑，无 UI 副作用） =====
+
+	/**
+	 * 更新 pending 占位 Agent 列表。
+	 * pendingAgentsRef 与 state 是双写镜像（createAgent 路径先写 ref 再 setState，
+	 * 避免占位 Agent 闪烁）；调用方只表达"列表变成什么"，
+	 * ref/state 同步由本 op 承载。
+	 */
+	function updatePendingAgents(
+		updater: (current: PendingAgentTab[]) => PendingAgentTab[],
+	) {
+		const next = updater(pendingAgentsRef.current);
+		pendingAgentsRef.current = next;
+		setPendingAgents(next);
+	}
+
+	/**
+	 * 写入指定 agent 的消息缓存。
+	 * messagesByAgentRef 是 messagesByAgent 的同步镜像（挂载一次的 onMessages
+	 * 监听器经 ref 读取最新缓存）；本 op 是唯一 sanctioned 写入路径，
+	 * 镜像同步是 hook 内部实现细节。
+	 */
+	function setAgentMessages(
+		agentId: string,
+		messages: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[]),
+	) {
+		setMessagesByAgent((current) => ({
+			...current,
+			[agentId]:
+				typeof messages === "function" ? messages(current[agentId] ?? []) : messages,
+		}));
+	}
+
+	/** 按 replacementById 迁移、按 draftIds 裁剪全部 agent 的消息缓存（agent 替换时调用）。 */
+	function migrateAgentMessages(
+		replacementById: Map<string, string>,
+		draftIds: Set<string>,
+	) {
+		setMessagesByAgent((current) =>
+			migrateAgentRecord(current, replacementById, draftIds),
+		);
+	}
 
 	/**
 	 * 合并传入的 runtime state 到对应 agent 的缓存。
@@ -331,26 +376,20 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		sessionsByProject,
 		sessionLoadingByProject,
 		sessionErrorByProject,
-		// setters
+		// setters（经 op 写入的切片不暴露裸 setter：pending/messages/runtimeState/sessionError）
 		setAgents,
-		setPendingAgents,
 		setActiveAgentId,
 		setActiveAgentByProject,
-		setMessagesByAgent,
-		setRuntimeStateByAgent,
 		setSessions,
 		setSessionsByProject,
 		setSessionLoadingByProject,
-		setSessionErrorByProject,
-		// refs
+		// refs（挂载一次的监听器/异步路径需要最新值；会话扫描内部序号仅 hook 内部使用）
 		agentsRef,
 		activeAgentIdRef,
+		messagesByAgentRef,
 		pendingAgentsRef,
 		runtimeStateByAgentRef,
 		agentStatusByAgentRef,
-		sessionRequestByProjectRef,
-		sessionRefreshRunningRef,
-		sessionRefreshPendingRef,
 		displayAgentsRef,
 		// computed
 		displayAgents,
@@ -364,5 +403,8 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		editMessage,
 		refreshSessions,
 		refreshProjectSessions,
+		updatePendingAgents,
+		setAgentMessages,
+		migrateAgentMessages,
 	};
 }

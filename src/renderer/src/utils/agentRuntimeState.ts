@@ -91,3 +91,38 @@ export function isAgentStreaming(
 ): boolean {
   return Boolean(agent?.status === "running" || runtimeState?.isStreaming);
 }
+
+/** 生命周期态恰为 running：区别于 isAgentBusy 的宽松语义，驱动精确的“正在运行”判断。 */
+export function isAgentExactlyRunning(
+  agent: { status?: AgentStatus } | undefined,
+): boolean {
+  return agent?.status === "running";
+}
+
+/** 生命周期态为 starting（进程启动中，不可交互）。 */
+export function isAgentStarting(
+  agent: { status?: AgentStatus } | undefined,
+): boolean {
+  return agent?.status === "starting";
+}
+
+/** 生命周期态为 idle（空闲、可接收新指令）。 */
+export function isAgentIdle(
+  agent: { status?: AgentStatus } | undefined,
+): boolean {
+  return agent?.status === "idle";
+}
+
+/** 生命周期态为 running 或 idle：活跃可交互的 agent（排除 starting/error/closed）。 */
+export function isAgentActiveOrIdle(
+  agent: { status?: AgentStatus } | undefined,
+): boolean {
+  return agent?.status === "running" || agent?.status === "idle";
+}
+
+/** 生命周期态为 running 或 starting：运行中或正在启动（非终态、非空闲）。 */
+export function isAgentActiveOrStarting(
+  agent: { status?: AgentStatus } | undefined,
+): boolean {
+  return agent?.status === "running" || agent?.status === "starting";
+}

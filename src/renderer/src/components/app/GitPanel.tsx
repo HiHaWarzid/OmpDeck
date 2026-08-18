@@ -33,6 +33,7 @@ import type {
   BranchDiffResult,
   CommitDetail,
   CommitEntry,
+  GitBranchInfo,
   GitChangedFile,
   GitFileStatus,
   GitResourceGroupType,
@@ -48,6 +49,7 @@ import { t, type TranslationKey } from "../../i18n";
  */
 type GitServiceFacade = Pick<
   PiDesktopApi["git"],
+  | "branches"
   | "commitLog"
   | "commitDetail"
   | "branchCompare"
@@ -80,12 +82,12 @@ type GitPanelProps = {
     group: GitResourceGroupType,
     path: string,
   ) => void | Promise<void>;
-  branches: string[];
-  currentBranch: string | null;
-  /** 切换分支 */
-  onSwitchBranch?: (branch: string) => void;
-  /** 创建新分支 */
-  onCreateBranch?: (branchName: string) => void;
+  /** 初始分支信息（App 统一 store 的最新值，避免面板首帧空白）；面板随后自持刷新。 */
+  initialBranchInfo?: GitBranchInfo;
+  /** 切换分支：约定返回最新分支信息（App 侧 checkout 结果），便于面板自持状态即时更新。 */
+  onSwitchBranch?: (branch: string) => Promise<GitBranchInfo | void>;
+  /** 创建新分支：约定返回最新分支信息（App 侧 createBranch 结果）。 */
+  onCreateBranch?: (branchName: string) => Promise<GitBranchInfo | void>;
 };
 
 type PaneId = "changes" | "graph" | "compare";
@@ -900,6 +902,71 @@ export function GitPanel(props: GitPanelProps) {
   const [paneState, setPaneState] = useState<PaneState>(() =>
     readPaneState(props.projectId),
   );
+  /** 分支列表自持状态：面板打开时以 initialBranchInfo 作首帧，随后自拉取/自刷新，
+   *  不再依赖 App 逐帧透传 branches/currentBranch props。 */
+  const [branchInfo, setBranchInfo] = useState<GitBranchInfo>(
+    props.initialBranchInfo ?? { current: null, branches: [] },
+  );
+
+  /**
+   * 拉取最新分支信息。与 refresh() 的 status 拉取解耦：checkout/create/commit 后
+   * 单独刷新分支列表，避免重跑整棵文件 status。
+   */
+  const refreshBranches = useCallback(async () => {
+    const projectId = props.projectId;
+    try {
+      const next = await props.git.branches(projectId);
+      if (projectId !== projectIdRef.current) return;
+      // 分支可能在外部终端/IDE 中切换，只在状态真的变化时更新，避免不必要重渲染。
+      setBranchInfo((current) =>
+        current.current === next.current &&
+        current.branches.join("\n") === next.branches.join("\n")
+          ? current
+          : next,
+      );
+    } catch {
+      if (projectId === projectIdRef.current) {
+        setBranchInfo({ current: null, branches: [] });
+      }
+    }
+  }, [props.git, props.projectId]);
+
+  // 项目切换/面板挂载：以 App 统一 store 的最新值作首帧并立即拉取一次权威数据。
+  useEffect(() => {
+    setBranchInfo(props.initialBranchInfo ?? { current: null, branches: [] });
+    void refreshBranches();
+    // initialBranchInfo 只在项目切换时作为种子使用，后续同步由 refreshBranches 自持，
+    // 故不列入依赖，避免 App store 每次变化都重复拉取。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.projectId, refreshBranches]);
+
+  // 窗口可见时 10s 轮询分支（与 App 侧 composer 分支展示同频）：面板打开期间
+  // 外部终端/IDE 切换分支也能及时反映。
+  useEffect(() => {
+    if (!props.projectId) return;
+    let timer: number | undefined;
+    const start = () => {
+      if (timer) return;
+      void refreshBranches();
+      timer = window.setInterval(() => void refreshBranches(), 10_000);
+    };
+    const stop = () => {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+    onVisibility();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [props.projectId, refreshBranches]);
 
   useEffect(() => {
     const element = panelRef.current;
@@ -1180,6 +1247,8 @@ export function GitPanel(props: GitPanelProps) {
       if (projectId !== projectIdRef.current) return;
       setCommitMessage("");
       await refresh();
+      // 提交可能伴随分支状态变化（如合入删除分支），面板自持分支数据同步拉取。
+      void refreshBranches();
     } catch (caught) {
       if (projectId === projectIdRef.current) setError(errorMessage(caught));
     } finally {
@@ -1339,20 +1408,20 @@ export function GitPanel(props: GitPanelProps) {
           className="git-branch-trigger"
           onClick={() => setBranchOpen((v) => !v)}
           title={
-            props.currentBranch
+            branchInfo.current
               ? t("app.branchCurrent", {
-                  branch: props.currentBranch,
-                  count: props.branches.length,
+                  branch: branchInfo.current,
+                  count: branchInfo.branches.length,
                 })
               : undefined
           }
         >
           <GitBranch size={14} />
           <span className="git-branch-label">
-            {props.currentBranch || t("app.branchNone")}
+            {branchInfo.current || t("app.branchNone")}
           </span>
-          {props.branches.length > 0 && (
-            <span className="git-branch-badge">{props.branches.length}</span>
+          {branchInfo.branches.length > 0 && (
+            <span className="git-branch-badge">{branchInfo.branches.length}</span>
           )}
           <ChevronDown
             size={12}
@@ -1387,17 +1456,24 @@ export function GitPanel(props: GitPanelProps) {
         )}
         {branchOpen && (
           <div className="git-branch-dropdown">
-            {props.branches.map((branch) => (
+            {branchInfo.branches.map((branch) => (
               <button
                 key={branch}
-                className={`git-branch-item${branch === props.currentBranch ? " active" : ""}`}
+                className={`git-branch-item${branch === branchInfo.current ? " active" : ""}`}
                 onClick={() => {
-                  if (branch !== props.currentBranch)
-                    props.onSwitchBranch?.(branch);
+                  if (branch !== branchInfo.current) {
+                    // 切换后采纳 App 返回的最新分支信息；无返回（异常路径）时自拉取一次。
+                    void Promise.resolve(props.onSwitchBranch?.(branch)).then(
+                      (next) => {
+                        if (next) setBranchInfo(next);
+                        else void refreshBranches();
+                      },
+                    );
+                  }
                   setBranchOpen(false);
                 }}
               >
-                {branch === props.currentBranch && (
+                {branch === branchInfo.current && (
                   <Check size={14} className="git-branch-check" />
                 )}
                 <span>{branch}</span>
@@ -1416,7 +1492,12 @@ export function GitPanel(props: GitPanelProps) {
                   onChange={(e) => setNewBranchName(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && newBranchName.trim()) {
-                      props.onCreateBranch?.(newBranchName.trim());
+                      void Promise.resolve(
+                        props.onCreateBranch?.(newBranchName.trim()),
+                      ).then((next) => {
+                        if (next) setBranchInfo(next);
+                        else void refreshBranches();
+                      });
                       setBranchCreating(false);
                       setNewBranchName("");
                       setBranchOpen(false);
@@ -1432,7 +1513,12 @@ export function GitPanel(props: GitPanelProps) {
                   className="git-branch-create-confirm"
                   disabled={!newBranchName.trim()}
                   onClick={() => {
-                    props.onCreateBranch?.(newBranchName.trim());
+                    void Promise.resolve(
+                      props.onCreateBranch?.(newBranchName.trim()),
+                    ).then((next) => {
+                      if (next) setBranchInfo(next);
+                      else void refreshBranches();
+                    });
                     setBranchCreating(false);
                     setNewBranchName("");
                     setBranchOpen(false);
@@ -1573,7 +1659,7 @@ export function GitPanel(props: GitPanelProps) {
               <textarea
                 className="git-scm-input"
                 placeholder={t("git.commitPlaceholder", {
-                  branch: props.currentBranch ?? "HEAD",
+                  branch: branchInfo.current ?? "HEAD",
                 })}
                 value={commitMessage}
                 onChange={(event) => setCommitMessage(event.target.value)}
@@ -1730,8 +1816,8 @@ export function GitPanel(props: GitPanelProps) {
         commitLog={props.git.commitLog}
         commitDetail={props.git.commitDetail}
         onOpenCommitFileDiff={props.onOpenCommitFileDiff}
-        branches={props.branches}
-        currentBranch={props.currentBranch}
+        branches={branchInfo.branches}
+        currentBranch={branchInfo.current}
         open={paneState.open.graph}
         height={paneState.heights.graph}
         onToggle={() => togglePane("graph")}
@@ -1747,7 +1833,7 @@ export function GitPanel(props: GitPanelProps) {
 
       <CompareChanges
         projectId={props.projectId}
-        branches={props.branches}
+        branches={branchInfo.branches}
         branchCompare={props.git.branchCompare}
         open={paneState.open.compare}
         height={paneState.heights.compare}

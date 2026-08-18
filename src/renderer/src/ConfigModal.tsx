@@ -1,4 +1,5 @@
 import { showNotice } from "./utils/notice";
+import { isAgentActiveOrIdle } from "./utils/agentRuntimeState";
 import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { PiDesktopApi } from "../../shared/api";
 import { AuthTab } from "./config/AuthTab";
@@ -470,9 +471,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 		try {
 			const agents = await api.agents.list();
 			// 只刷新状态为 running 或 idle 的活跃 Agent（排除 closed/error/starting）
-			const activeAgents = agents.filter(
-				(agent) => agent.status === "running" || agent.status === "idle",
-			);
+			const activeAgents = agents.filter(isAgentActiveOrIdle);
 			if (activeAgents.length === 0) return;
 
 			let refreshed = 0;

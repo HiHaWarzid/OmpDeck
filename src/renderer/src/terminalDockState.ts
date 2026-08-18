@@ -154,26 +154,8 @@ export function projectTerminalSessionKey(cwd: string): string {
 	return `cwd:${normalized}`;
 }
 
-export function loadTerminalHeight(fallback: number): number {
-	try {
-		const raw = localStorage.getItem(TERMINAL_HEIGHT_STORAGE_KEY);
-		if (raw == null) return fallback;
-		const value = Number(raw);
-		if (!Number.isFinite(value) || value < TERMINAL_HEIGHT_MIN) return fallback;
-		return value;
-	} catch {
-		// localStorage 不可用时退回默认高度，不影响主流程
-		return fallback;
-	}
-}
-
-export function saveTerminalHeight(height: number): void {
-	try {
-		localStorage.setItem(
-			TERMINAL_HEIGHT_STORAGE_KEY,
-			String(Math.max(TERMINAL_HEIGHT_MIN, Math.round(height))),
-		);
-	} catch {
-		// 配额/隐私模式失败时静默忽略；高度仍在本会话内存中有效
-	}
-}
+/**
+ * 高度持久化（TERMINAL_HEIGHT_STORAGE_KEY）收敛到 hooks/usePersistedState
+ * （App 侧 usePersistedState + parse 校验/clamp）；本模块只保留 key/min 契约，
+ * loadTerminalHeight/saveTerminalHeight 成对 helper 已删除。
+ */

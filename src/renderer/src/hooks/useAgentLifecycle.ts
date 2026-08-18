@@ -8,14 +8,22 @@
  * - migratePerAgentState: onState 推送时一次性迁移所有 per-agent 状态
  * - commitPendingToReal: createAgent 成功时将 pending 草稿迁移到真实 tab
  *
- * 所有 state 值、setter 和 ref 都透传给 App.tsx，现有调用点零感知。
+ * 接口深度：prompt 的 ref/state 双写镜像、images 的 ref 镜像、终端 Dock 的
+ * 函数式更新均收敛为意图命名的 op（setLivePrompt / setNativePrompt /
+ * stageLivePrompt / getLivePrompt / setAttachedImagesForAgent /
+ * setTerminalDockOpen / setTerminalDockCollapsed / pruneTerminalDock），
+ * 调用方不感知 ref 与 state 的选择。
  */
 import { useCallback, useRef, useState } from "react";
 import type { ImageContent } from "../../../shared/types";
 import type { QueuedPromptSnapshot } from "../utils/queuedPromptQueue";
-import { migrateQueuedPrompts } from "../utils/queuedPromptQueue";
+import { createQueuedPromptStore, type QueuedPromptStore } from "../utils/queuedPromptStore";
+import { usePersistedState } from "./usePersistedState";
 import {
 	migrateTerminalDockAgentState,
+	pruneTerminalDockState,
+	setTerminalDockCollapsed as applyTerminalDockCollapsed,
+	setTerminalDockOpen as applyTerminalDockOpen,
 	type TerminalDockStateByOwner,
 } from "../terminalDockState";
 import type { DrawerPanel } from "../components/app/AppParts";
@@ -40,10 +48,25 @@ export function migrateAgentRecord<T>(
 	return next;
 }
 
-export function useAgentLifecycle() {
+export interface UseAgentLifecycleOptions {
+	/**
+	 * 草稿文本变化回调（App 注入：同步 hasComposerText / composerBangMode 布尔状态）。
+	 * plain 打字只走 live ref 不触发重渲染，程序化设置（建议选择/历史恢复/发送清空）
+	 * 与 chips 翻转发起重渲染时由 App 借此刷新按钮态。hook 内部经 ref 调用，
+	 * 保证挂载一次的回调闭包也能拿到最新实现。
+	 */
+	onPromptTextChange?: (text: string) => void;
+}
+
+export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
+	const onPromptTextChangeRef = useRef(options.onPromptTextChange);
+	onPromptTextChangeRef.current = options.onPromptTextChange;
+
 	// ── prompt 草稿（按 agent 隔离） ──
 	// promptByAgent 仅驱动 RichInput chip 渲染；livePromptByAgentRef 始终保持最新，
 	// 发送路径从 ref 读取，避免每键触发 App 重渲染。
+	// ref/state 双写完全由本 hook 的 op 承载：调用方只表达意图
+	// （setLivePrompt / setNativePrompt / stageLivePrompt / getLivePrompt）。
 	const [promptByAgent, setPromptByAgent] = useState<Record<string, string>>({});
 	const livePromptByAgentRef = useRef<Record<string, string>>({});
 
@@ -57,10 +80,16 @@ export function useAgentLifecycle() {
 	attachedImagesByAgentRef.current = attachedImagesByAgent;
 
 	// ── 排队中的 prompt（按 agent 隔离） ──
-	// ref 是 drain 的同步数据源：React 批量 state 更新期间也能原子 claim，
-	// 避免 tool-end 与 idle 两条状态边沿把同一条消息提交两次。
+	// 队列的唯一事实来源是 queuedPromptStore：每个 op（claim/enqueue/resolve/
+	// retract/discard/migrate）原子推进 FSM 并恰好回调一次 onUpdate 回填 React state，
+	// 不再需要 ref/state 双写；drain 循环从 store.state 同步读取当前队列。
 	const [queuedPrompts, setQueuedPrompts] = useState<Record<string, QueuedPrompt[]>>({});
-	const queuedPromptsRef = useRef<Record<string, QueuedPrompt[]>>({});
+	const queuedPromptStoreRef = useRef<QueuedPromptStore | null>(null);
+	if (queuedPromptStoreRef.current === null) {
+		// setQueuedPrompts 跨渲染稳定，初始化时捕获即可；store 对象本身引用稳定。
+		queuedPromptStoreRef.current = createQueuedPromptStore({}, setQueuedPrompts);
+	}
+	const queuedPromptStore = queuedPromptStoreRef.current;
 
 	// ── 终端 Dock 状态（按 owner 隔离：agent 或 project） ──
 	const [terminalDockStateByOwner, setTerminalDockStateByOwner] =
@@ -72,13 +101,138 @@ export function useAgentLifecycle() {
 	>({});
 
 	// ── prompt 历史（按 agent 隔离，localStorage 持久化） ──
-	const promptHistoryRef = useRef<Record<string, string[]>>({});
+	// 存储键/迁移逻辑沿用 App 原实现（pid:prompt-history，JSON 整表存取）；
+	// 读-写-ref 同步由 usePersistedState 统一承载，savePromptHistory/loadPromptHistory
+	// 等成对 helper 不再需要。
+	const PROMPT_HISTORY_STORAGE_KEY = "pid:prompt-history";
+	const [promptHistory, setPromptHistory, promptHistoryRef] =
+		usePersistedState<Record<string, string[]>>(PROMPT_HISTORY_STORAGE_KEY, {}, {
+			// 历史是 Record<string, string[]>；JSON 解析出非对象（损坏/旧数据）时回退空表。
+			parse: (raw) =>
+				raw && typeof raw === "object" && !Array.isArray(raw)
+					? (raw as Record<string, string[]>)
+					: undefined,
+		});
 	/** 跟踪哪些 agent 已经用会话消息重建过 prompt history；重启/替换时清除标记 */
 	const promptHistoryInitedRef = useRef<Set<string>>(new Set());
 
 	// ── 客户端队列 flush 锁（按 agent 隔离） ──
 	/** 避免 tool-end 与 idle 并发投递导致同一条 queued prompt 被提交两次 */
 	const queueFlushByAgentRef = useRef<Set<string>>(new Set());
+
+	// ===== Per-agent 草稿/状态 ops（ref 与 state 的同步是内部实现细节） =====
+
+	/**
+	 * 读取指定 agent 的实时草稿：优先 live ref（始终保持最新），
+	 * promptByAgent 兜底（chips 翻转后未写 ref 的瞬态为空）。
+	 */
+	function getLivePrompt(agentId: string): string {
+		return livePromptByAgentRef.current[agentId] ?? promptByAgent[agentId] ?? "";
+	}
+
+	/**
+	 * 程序化设置草稿（建议选择、历史恢复、发送后清空、失败回填等）：写 live ref +
+	 * 同步 state（触发 RichInput chip 渲染与受控检查）+ 通知 App 更新布尔状态。
+	 * 返回实际生效的文本，便于调用方继续处理。
+	 */
+	function setLivePrompt(
+		agentId: string,
+		value: string | ((current: string) => string),
+	): string {
+		const previous = livePromptByAgentRef.current[agentId] ?? "";
+		const nextValue = typeof value === "function" ? value(previous) : value;
+		if (nextValue) livePromptByAgentRef.current[agentId] = nextValue;
+		else delete livePromptByAgentRef.current[agentId];
+		setPromptByAgent((current) => {
+			if (!nextValue) {
+				const next = { ...current };
+				delete next[agentId];
+				return next;
+			}
+			return { ...current, [agentId]: nextValue };
+		});
+		onPromptTextChangeRef.current?.(nextValue);
+		return nextValue;
+	}
+
+	/**
+	 * RichInput 原生输入路径：只写 live ref（普通按键不触发 state 更新），
+	 * 仅在 chips 形态变化或空/非空翻转时才同步 state（驱动 chip 重渲染）。
+	 * chipsKeyOf 由 App 注入（依赖 validCommandNames/validFilePaths/validSessionRefs），
+	 * hook 只比较 key 是否变化，不感知 chips 细节。
+	 */
+	function setNativePrompt(
+		agentId: string,
+		value: string,
+		chipsKeyOf?: (text: string) => string,
+	): string {
+		if (value) livePromptByAgentRef.current[agentId] = value;
+		else delete livePromptByAgentRef.current[agentId];
+		const oldValue = promptByAgent[agentId] ?? "";
+		const oldChipsKey = chipsKeyOf ? chipsKeyOf(oldValue) : oldValue;
+		const newChipsKey = chipsKeyOf ? chipsKeyOf(value) : value;
+		const isEmptyChanged = Boolean(oldValue) !== Boolean(value);
+		if (oldChipsKey !== newChipsKey || isEmptyChanged) {
+			setPromptByAgent((current) => {
+				if (!value) {
+					const next = { ...current };
+					delete next[agentId];
+					return next;
+				}
+				return { ...current, [agentId]: value };
+			});
+		}
+		onPromptTextChangeRef.current?.(value);
+		return value;
+	}
+
+	/**
+	 * 仅更新 live ref（不碰 state、不回调）：发送路径的 DOM 直读同步
+	 * 与发送前/失败回填前的临时草稿暂存。text 为空/省略时清除。
+	 */
+	function stageLivePrompt(agentId: string, text?: string | null) {
+		if (text) livePromptByAgentRef.current[agentId] = text;
+		else delete livePromptByAgentRef.current[agentId];
+	}
+
+	/**
+	 * 设置 agent 的附加图片（ref + state 双写镜像；函数式更新以 ref 为基线，
+	 * 避免异步粘贴回调读到陈旧闭包）。
+	 */
+	function setAttachedImagesForAgent(
+		agentId: string,
+		value: ImageContent[] | ((current: ImageContent[]) => ImageContent[]),
+	) {
+		const current = attachedImagesByAgentRef.current;
+		const previous = current[agentId] ?? [];
+		const nextValue = typeof value === "function" ? value(previous) : value;
+		const next = { ...current };
+		if (nextValue.length === 0) delete next[agentId];
+		else next[agentId] = nextValue;
+		attachedImagesByAgentRef.current = next;
+		setAttachedImagesByAgent(next);
+	}
+
+	/** 展开/收起指定 owner（agent 或 project）的终端 Dock。 */
+	function setTerminalDockOpen(ownerKey: string, open: boolean) {
+		setTerminalDockStateByOwner((current) =>
+			applyTerminalDockOpen(current, ownerKey, open),
+		);
+	}
+
+	/** 折叠/展开指定 owner（agent 或 project）的终端 Dock。 */
+	function setTerminalDockCollapsed(ownerKey: string, collapsed: boolean) {
+		setTerminalDockStateByOwner((current) =>
+			applyTerminalDockCollapsed(current, ownerKey, collapsed),
+		);
+	}
+
+	/** 按存活 agent/project 集合裁剪终端 Dock 状态（项目/agent 变化 effect 调用）。 */
+	function pruneTerminalDock(liveAgentIds: Set<string>, liveProjectIds: Set<string>) {
+		setTerminalDockStateByOwner((current) =>
+			pruneTerminalDockState(current, liveAgentIds, liveProjectIds),
+		);
+	}
 
 	/**
 	 * Agent 替换时原子迁移所有 per-agent 状态切片。
@@ -122,18 +276,23 @@ export function useAgentLifecycle() {
 			);
 			// 发送中的条目必须保持 sending，直到对应 IPC promise 明确完成。
 			// 普通 state 推送（包括 sendPrompt 先发出的 running）不能把它重新开放为可撤回。
-			const nextQueued = migrateQueuedPrompts(
-				queuedPromptsRef.current,
-				replacementById,
-				draftIds,
-			);
-			queuedPromptsRef.current = nextQueued;
-			setQueuedPrompts(nextQueued);
+			// 迁移走 store 原子 op：只复制确定未投递的 pending/failed 项，
+			// 并按 draftIds 裁剪已关闭 agent 的队列。
+			queuedPromptStore.migrate(replacementById, draftIds);
 			// 重启/替换 agent 时清除 prompt history 重建标记，等待 onMessages 重新从会话重建
 			for (const [oldAgentId] of replacementById) {
 				promptHistoryInitedRef.current.delete(oldAgentId);
-				delete promptHistoryRef.current[oldAgentId];
 			}
+			// 按 agentId 键存的匿名会话历史随之移除（会话路径键保留）；经 setter 落库。
+			setPromptHistory((current) => {
+				let next = current;
+				for (const [oldAgentId] of replacementById) {
+					if (!(oldAgentId in current)) continue;
+					if (next === current) next = { ...current };
+					delete next[oldAgentId];
+				}
+				return next;
+			});
 			// 清理已关闭/替换 agent 的 flush 锁
 			for (const [oldAgentId] of replacementById) {
 				queueFlushByAgentRef.current.delete(oldAgentId);
@@ -175,25 +334,28 @@ export function useAgentLifecycle() {
 	);
 
 	return {
-		// prompt 草稿
-		promptByAgent,
-		setPromptByAgent,
-		livePromptByAgentRef,
-		// 附加图片
+		// prompt 草稿（ref/state 双写收敛为 op + selector）
+		getLivePrompt,
+		setLivePrompt,
+		setNativePrompt,
+		stageLivePrompt,
+		// 附加图片（ref 镜像为内部实现细节）
 		attachedImagesByAgent,
-		setAttachedImagesByAgent,
-		attachedImagesByAgentRef,
+		setAttachedImagesForAgent,
 		// 排队 prompt
 		queuedPrompts,
-		setQueuedPrompts,
-		queuedPromptsRef,
-		// 终端 Dock
+		queuedPromptStore,
+		// 终端 Dock（状态写入收敛为 op）
 		terminalDockStateByOwner,
-		setTerminalDockStateByOwner,
+		setTerminalDockOpen,
+		setTerminalDockCollapsed,
+		pruneTerminalDock,
 		// 抽屉 pinned
 		drawerPinnedByProject,
 		setDrawerPinnedByProject,
 		// prompt 历史
+		promptHistory,
+		setPromptHistory,
 		promptHistoryRef,
 		promptHistoryInitedRef,
 		// flush 锁
