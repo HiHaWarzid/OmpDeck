@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { ipcChannels, ipcTable, mainOnlyChannels } from "./ipc";
+import { ipcChannels, ipcTable, mainOnlyChannels, type IpcOpEntry } from "./ipc";
 
 const VALID_KINDS = ["invoke", "subscribe", "send", "sendSync", "local"];
 const CHANNEL_RE = /^[a-z0-9-]+:[a-z0-9-]+$/;
@@ -43,10 +43,7 @@ describe("IPC 通道表契约", () => {
 		expect(keys.length).toBe(tableChannels.size);
 	});
 
-	test("死通道已清理、裸串通道已入表", () => {
-		expect(ipcChannels.skillStoreGet).toBeUndefined();
-		expect(ipcChannels.feishuQrCode).toBeUndefined();
-		expect(ipcChannels.feishuAutoGroup).toBeUndefined();
+	test("裸串通道已入表（死通道清理由 subscribeEmitParity 的死通道注册表承接）", () => {
 		expect(ipcChannels.agentsCommands).toBe("agents:commands");
 	});
 
@@ -57,14 +54,38 @@ describe("IPC 通道表契约", () => {
 		expect(ipcChannels.appToggleDevTools).toBe("app:toggle-devtools");
 	});
 
-	test("双用途通道只派生一个键", () => {
-		// pet:preview-mode 同时是 invoke（setPreviewMode）与 subscribe（onPreviewMode）
+	test("双用途通道配对显式化：pairKey 条目共享通道、只派生一个键", () => {
+		// 由表推导（取代手写 pet:preview-mode / agents:runtime-state 两条硬编码）：
+		// 每个 pairKey 恰两方（invoke + subscribe），共享同一通道，且该通道只派生一个扁平键。
+		const pairs = new Map<string, Array<{ ns: string; member: string; entry: IpcOpEntry }>>();
+		for (const [ns, members] of Object.entries(ipcTable)) {
+			for (const [member, entry] of Object.entries(members)) {
+				if (!entry.pairKey) continue;
+				const list = pairs.get(entry.pairKey) ?? [];
+				list.push({ ns, member, entry });
+				pairs.set(entry.pairKey, list);
+			}
+		}
+		expect(pairs.size, "表中应存在双用途配对（历史：pet:preview-mode、agents:runtime-state）").toBeGreaterThan(0);
+		// 历史已声明的配对名保持派生形态（它们是表的直接事实，若通道改名此处同步失败）
 		expect(ipcChannels.petPreviewMode).toBe("pet:preview-mode");
-		// agents:runtime-state 同时是 invoke（runtimeState）与 subscribe（onRuntimeState）
 		expect(ipcChannels.agentsRuntimeState).toBe("agents:runtime-state");
+		for (const [pairKey, entries] of pairs) {
+			expect(entries, `pairKey ${pairKey} 应恰两方`).toHaveLength(2);
+			expect(entries.map((e) => e.entry.kind).sort(), `pairKey ${pairKey} 应为 invoke+subscribe 对`).toEqual([
+				"invoke",
+				"subscribe",
+			]);
+			const [a, b] = entries;
+			expect(a.entry.channel, `pairKey ${pairKey} 应共享同一 channel`).toBe(b.entry.channel);
+			const derivedKeys = Object.entries(ipcChannels)
+				.filter(([, value]) => value === a.entry.channel)
+				.map(([key]) => key);
+			expect(derivedKeys, `${pairKey} 双用途通道应只派生一个键`).toHaveLength(1);
+		}
 	});
 
-	test("总通道数 = 265（262 旧键 - 3 死通道 + 1 新增 agents:commands + 5 afk 命名空间）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(265);
+	test("总通道数 = 260（263 - 3：删 browser:open-external，窗口三通道 minimize/toggle-maximize/close 收敛为 app:window-control）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(260);
 	});
 });

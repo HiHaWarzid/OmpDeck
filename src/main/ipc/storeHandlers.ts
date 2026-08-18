@@ -3,7 +3,7 @@
  * 搜索/详情/导入逻辑均含 inline fetch；导入操作委托给 PromptManager / SkillManager / XuePromptManager。
  * 返回 HandlerMap 由 registerIpcHandlers 统一注册（通道名/协议取自通道表）。
  */
-import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import { ipcTable, type IpcHandlerMap, type SkillHubSearchPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
 import type {
 	PiPromptTemplateSummary,
@@ -304,9 +304,10 @@ export function registerStoreHandlers(deps: StoreHandlerDeps): StoreHandlerMaps 
 		// ── Skills.sh（https://www.skills.sh） ─────────────────────────
 		skillHub: {
 			/** 搜索 Skills.sh 注册中心 */
-			search: async (_event, opts) => {
-				// skillHub.search 是 pack 成员：preload 将 (query, page, pageSize, sortBy, order) 打包为单对象，按已知形状收窄
-				const { query, limit = 50 } = opts as { query: string; limit?: number };
+			search: async (_event, opts: SkillHubSearchPayload) => {
+				// pack 只打包 (query, page, pageSize, sortBy, order)；limit 未打包，固定 50
+				const { query } = opts;
+				const limit = 50;
 				try {
 					const response = await fetch(
 						`https://www.skills.sh/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,

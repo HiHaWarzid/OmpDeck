@@ -5,8 +5,6 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import type {
 	AgentTab,
-	AgentRuntimeState,
-	AvailableModel,
 	AppSettings,
 	ChatMessage,
 	CreateAgentInput,
@@ -15,10 +13,29 @@ import type {
 	SendPromptResult,
 	SessionSummary,
 } from "../../shared/types";
+import type { PiDesktopApi } from "../../shared/api";
+import { messageStreamVersion } from "../../shared/messageStreamVersion";
 
 type WebServiceSettings = Pick<
 	AppSettings,
 	"webServiceEnabled" | "webServiceHost" | "webServicePort"
+>;
+
+/**
+ * Web 服务对 Agent 运行时操作/读取的依赖面（W6-18）：直接派生自 PiDesktopApi['agents']
+ * 的成员类型（Pick），不再手抄签名 —— agents 命名空间（或底层 AgentManager）任何成员
+ * 改名/签名变更都会让本文件或下方漂移护栏在编译期失败，而不是让 web 服务带着旧签名
+ * 悄悄漂移。
+ */
+type WebServiceAgentDeps = Pick<
+	PiDesktopApi["agents"],
+	| "runtimeState"
+	| "cycleModel"
+	| "availableModels"
+	| "setModel"
+	| "refreshModels"
+	| "cycleThinking"
+	| "setThinking"
 >;
 
 type WebServiceDependencies = {
@@ -26,17 +43,33 @@ type WebServiceDependencies = {
 	listAgents: () => AgentTab[];
 	listSessions: (projectId: string) => Promise<SessionSummary[]>;
 	getMessages: (agentId: string) => ChatMessage[];
+	/**
+	 * 以下三个成员故意用 web 端点语义命名（create/sendPrompt/stopAgent），对应
+	 * agents 命名空间的 create/prompt/stop —— 名称映射是 web 面的刻意选择，签名
+	 * 仍以 agents 命名空间为准。
+	 */
 	createAgent: (input: CreateAgentInput) => Promise<AgentTab>;
 	sendPrompt: (input: SendPromptInput) => Promise<SendPromptResult>;
 	stopAgent: (agentId: string) => Promise<void>;
-	runtimeState: (agentId: string) => Promise<AgentRuntimeState>;
-	cycleModel: (agentId: string) => Promise<AgentRuntimeState>;
-	availableModels: (agentId: string) => Promise<AvailableModel[]>;
-	setModel: (agentId: string, provider: string, modelId: string) => Promise<AgentRuntimeState>;
-	refreshModels: (agentId: string) => Promise<AgentRuntimeState>;
-	cycleThinking: (agentId: string) => Promise<AgentRuntimeState>;
-	setThinking: (agentId: string, level: string) => Promise<AgentRuntimeState>;
-};
+} & WebServiceAgentDeps;
+
+/**
+ * 编译期漂移护栏（W6-18）：把 agents 命名空间的真实成员形状（按名取型，改名即
+ * 编译失败）与 web 声明的依赖成员做结构性比对。若未来有人把上面 WebServiceAgentDeps
+ * 改回手写签名并引入偏差（成员缺失、参型不同），或 agents 命名空间删除了这些成员，
+ * 下面这条赋值断言直接编译失败。
+ */
+type AgentsNamespace = PiDesktopApi["agents"];
+type _WebAgentDepsDriftGuard = {
+	runtimeState: AgentsNamespace["runtimeState"];
+	cycleModel: AgentsNamespace["cycleModel"];
+	availableModels: AgentsNamespace["availableModels"];
+	setModel: AgentsNamespace["setModel"];
+	refreshModels: AgentsNamespace["refreshModels"];
+	cycleThinking: AgentsNamespace["cycleThinking"];
+	setThinking: AgentsNamespace["setThinking"];
+} extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
+const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
 export class WebServiceManager {
 	private server: Server | null = null;
@@ -226,9 +259,10 @@ export class WebServiceManager {
 	/**
 	 * /api/state 序列化缓存：web UI 每 600ms 轮询一次，流式期间消息逐条增长，
 	 * 每次都全量 JSON.stringify 所有 agent 全部消息是主进程 CPU 大头。
-	 * 指纹覆盖 agents 状态与每个 agent 消息数组的（长度、末条 id/timestamp/文本长度），
-	 * 覆盖流式追加、工具消息就地更新（timestamp 变化）、消息增删；
+	 * 指纹覆盖 agents 状态与每个 agent 消息流的版本（见 shared/messageStreamVersion：
+	 * 长度 + 末条 id/timestamp/文本长度），覆盖流式追加、末条就地更新、消息增删；
 	 * 指纹未变（轮询间隔内无新内容）时直接复用上次的 JSON 字符串。
+	 * 与主进程 messageDirtyFrom/replaceFrom 增量推送互补（下标级 vs 内容签名级）。
 	 */
 	private statePayloadCache: { fingerprint: string; payload: string } | null = null;
 
@@ -237,16 +271,7 @@ export class WebServiceManager {
 		const fingerprint = agents
 			.map((agent) => {
 				const messages = this.deps.getMessages(agent.id);
-				const last = messages[messages.length - 1];
-				return [
-					agent.id,
-					agent.status,
-					agent.title,
-					messages.length,
-					last?.id ?? "",
-					last?.timestamp ?? 0,
-					last?.text?.length ?? 0,
-				].join(":");
+				return [agent.id, agent.status, agent.title, messageStreamVersion(messages)].join(":");
 			})
 			.join("|");
 		if (this.statePayloadCache && this.statePayloadCache.fingerprint === fingerprint) {

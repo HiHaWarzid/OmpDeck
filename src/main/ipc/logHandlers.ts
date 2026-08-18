@@ -27,8 +27,8 @@ export function registerLogHandlers(deps: LogHandlerDeps): LogHandlerMaps {
 
 	return {
 		logs: {
-			// logs.list 是 pack 成员：preload 侧打包保证 query 始终是对象（query ?? {}），按已知形状收窄
-			list: async (_event, query) => appLogger.list((query ?? {}) as AppLogQuery),
+			// logs.list 是 pack 成员：payload 类型由通道表 pack 派生（query ?? {} 默认值在 pack 侧完成）
+			list: async (_event, payload: AppLogQuery) => appLogger.list(payload),
 			clear: async () => appLogger.clear(),
 			openFolder: async () => appLogger.openFolder(),
 			/** 获取 app 日志文件总大小 */

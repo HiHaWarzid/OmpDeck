@@ -3,7 +3,7 @@
  * 包含 `agentsTrustResponse`（物理位于此块，逻辑属于 agents 命名空间）。
  * 返回 HandlerMap 由 registerIpcHandlers 统一注册。
  */
-import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
+import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
 import type { AgentManager } from "../pi/AgentManager";
@@ -91,43 +91,33 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				});
 				return result;
 			},
-			// 远程拉取 provider 模型列表（pack 成员：preload 侧打包保证 payload 为单对象）
-			fetchModels: async (_event, payload) => {
-				// pack 打包形态固定（{ baseUrl, apiKey, apiType? }），此处按已知形状收窄
-				const p = payload as { baseUrl: string; apiKey: string; apiType?: string };
+			// 远程拉取 provider 模型列表（pack 成员：payload 类型由通道表 pack 派生）
+			fetchModels: async (_event, payload: FetchModelsPayload) => {
 				const result = await configManager.fetchProviderModels(
-					p.baseUrl,
-					p.apiKey,
-					p.apiType,
+					payload.baseUrl,
+					payload.apiKey,
+					payload.apiType,
 				);
 				void appLogger.info("config", "Provider models fetched", {
-					baseUrl: p.baseUrl,
-					apiType: p.apiType,
+					baseUrl: payload.baseUrl,
+					apiType: payload.apiType,
 					modelCount: Array.isArray(result) ? result.length : undefined,
 				});
 				return result;
 			},
 			// 快速测试 provider 连接（pack 成员）
-			testProvider: async (_event, payload) => {
-				// pack 打包形态固定（{ baseUrl, apiKey, modelId, apiType?, headers? }），此处按已知形状收窄
-				const p = payload as {
-					baseUrl: string;
-					apiKey: string;
-					modelId: string;
-					apiType?: string;
-					headers?: Record<string, string>;
-				};
+			testProvider: async (_event, payload: TestProviderPayload) => {
 				const result = await configManager.testProviderConnection(
-					p.baseUrl,
-					p.apiKey,
-					p.modelId,
-					p.apiType,
-					p.headers,
+					payload.baseUrl,
+					payload.apiKey,
+					payload.modelId,
+					payload.apiType,
+					payload.headers,
 				);
 				void appLogger.info("config", "Provider connection tested", {
-					baseUrl: p.baseUrl,
-					apiType: p.apiType,
-					modelId: p.modelId,
+					baseUrl: payload.baseUrl,
+					apiType: payload.apiType,
+					modelId: payload.modelId,
 					success: result.success,
 					error: result.error,
 				});

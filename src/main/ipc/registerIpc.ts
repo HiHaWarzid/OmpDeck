@@ -10,6 +10,8 @@ import { ipcTable, type IpcOpEntry } from "../../shared/ipc";
  *
  * 接受多个模块的 map 并按命名空间深合并：同一命名空间可能被多个模块分担
  * （如 app.rendererLog 在 logHandlers、app 其余在 appHandlers），合并时逐成员覆盖。
+ * 谁允许注册哪个命名空间由 namespaceOwnership.ts 的 NAMESPACE_OWNERS 声明，
+ * ipcParity.test.ts 强制校验——新表成员只能加到已声明的宿主模块。
  */
 export type IpcHandlerFn = (...args: never[]) => unknown;
 export type IpcHandlerMaps = Record<string, Record<string, IpcHandlerFn>>;
