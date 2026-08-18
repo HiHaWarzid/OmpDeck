@@ -82,7 +82,8 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				return sessionScanner.readSessionMeta(filePath);
 			},
 			readChatMessages: async (_event, filePath: string) => {
-				// SessionScanner 统一处理本地/WSL 文件读取；消息转换与压缩归档完全复用 AgentManager。
+				// 统一文件读取（SessionScanner→SessionFileOps 处理本地/WSL 路径）；
+				// 消息转换与压缩归档走 AgentManager 的单条 JSONL→ChatMessage 管线。
 				const content = await sessionScanner.readSessionRawText(filePath);
 				return agentManager.readSessionDisplayMessages(filePath, "_viewer", content);
 			},

@@ -72,6 +72,12 @@ import {
   updateActiveToolCalls,
   type ActiveToolCallState,
 } from "../../shared/toolRuntimeState";
+import {
+	ABORT_SETTLED_FALLBACK_MS,
+	AGENT_SETTLED_TIMEOUT_MS,
+	normalizePiBoolean,
+	resolveSettle,
+} from "./settleReducer";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { ConfigManager } from "../config/ConfigManager";
 import type { RpcLogger } from "../logging/RpcLogger";
@@ -103,13 +109,6 @@ export class AgentManager {
 	/** 流式 emit 合并窗口（毫秒）。50ms 兼顾流畅度与传输量，肉眼几乎无延迟。 */
 	private static readonly MESSAGE_FLUSH_INTERVAL_MS = 50;
 	/**
-	 * agent_end / 压缩完成后到最终空闲检查的延迟（毫秒）。
-	 * 旧 pi 有 agent_settled 事件可立即恢复 idle；omp 没有该事件，用短延迟 +
-	 * get_state 校验（isStreaming/isCompacting/pendingMessageCount）确认无后续工作。
-	 * 延迟过短会频繁查询 get_state，过长则 agent 完成后 UI 长时间停在 running。
-	 */
-	private static readonly AGENT_SETTLED_TIMEOUT_MS = 1200;
-	/**
 	 * 超过该大小的历史会话跳过 get_messages RPC，改为直接从 JSONL 文件尾部读取最近 N 条消息。
 	 * pi 当前不支持 limit/cursor，40MB JSONL 会以单行大 JSON 返回，主进程 JSON.parse 会短暂冻结整个应用。
 	 * 文件直接读取仅解析近尾部少量消息，避免大会话加载导致的界面冻结。
@@ -136,8 +135,6 @@ export class AgentManager {
 	 * 变更流（AFK 编排器按增量消费）；diff 上次已发表值，只发实际变化的 agent。
 	 */
 	private readonly lastEmittedTabStatus = new Map<string, AgentStatus>();
-	/** abort settled 兜底超时：覆盖多数管道残留，同时不让“立刻重发”永久卡死。 */
-	private static readonly ABORT_SETTLED_FALLBACK_MS = 1500;
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
 	private readonly pendingTrustRequests = new Map<string, { resolve: (choice: ProjectTrustChoice) => void }>();
 	/**
@@ -1491,10 +1488,11 @@ export class AgentManager {
 			thinkingLevel: state?.thinkingLevel ?? state?.thinking_level,
 			// omp 的 get_state 布尔字段可能是字符串（"true"/"false"），truthy 判定会
 			// 把 "false" 当成真值，导致响应完成后 isStreaming/isCompacting 永远为真、
-			// 空闲检查无法通过、左下角三点指示器卡住。这里严格归一化为布尔。
-			isStreaming: state?.isStreaming === true,
+			// 空闲检查无法通过、左下角三点指示器卡住。这里与 settleReducer 共用同一
+			// normalizePiBoolean 严格归一化（`=== true`，字符串/undefined/其它 truthy 一律 false）。
+			isStreaming: normalizePiBoolean(state?.isStreaming),
 			isCompacting:
-				state?.isCompacting === true ||
+				normalizePiBoolean(state?.isCompacting) ||
 				runtime.rpcCompacting ||
 				runtime.compacting,
 			/** 工具执行状态从本地追踪，无需 Pi 进程查询 */
@@ -1835,10 +1833,20 @@ export class AgentManager {
 			// 先查一次 runtime state 确认 stream 状态
 			try {
 				const state = await this.getRuntimeState(agentId);
-				if (state.isStreaming || state.isCompacting) {
+				// 复用 settleReducer 的 poll 语义做即时复核：isStreaming/isCompacting
+				// 的严格归一化与忙碌裁定与 settle 决策收敛到同一判定器。
+				// timeoutMs=0：即时检查（无 settle 窗口概念），reducer 仅区分
+				// undefined（未安排轮询）与有值（有权给结论），0 允许立即判定。
+				const decision = resolveSettle({
+					isStreaming: state.isStreaming,
+					hasPendingGetState: state.isCompacting,
+					now: Date.now(),
+					timeoutMs: 0,
+				});
+				if (decision.decision === "stay-running") {
 					throw new Error("BUSY_STREAMING: Agent is streaming, please wait");
 				}
-				// isExecutingTool 时也视为 busy
+				// isExecutingTool 时也视为 busy（保留独立错误信息，便于 UI 区分展示）
 				if (state.isExecutingTool) {
 					throw new Error("BUSY_TOOL: Agent is executing a tool, please wait");
 				}
@@ -3083,7 +3091,19 @@ export class AgentManager {
 				clearTimeout(runtime.settleCheckTimer);
 				runtime.settleCheckTimer = undefined;
 			}
-			if (runtime.tab.status !== "error" && runtime.tab.status !== "closed") {
+			// 事件路径：settledAt 已到 → settleReducer 无条件收口 idle（reason 'event'）。
+			// 保持原有的 error/closed 守卫与无条件收口语义，转移判定收敛到同一决策器；
+			// 事件分支不依赖 isStreaming/gate/polling，故只传 settledAt/now。
+			const settleDecision = resolveSettle({
+				isStreaming: undefined,
+				now: Date.now(),
+				settledAt: Date.now(),
+			});
+			if (
+				settleDecision.decision === "idle" &&
+				runtime.tab.status !== "error" &&
+				runtime.tab.status !== "closed"
+			) {
 				// agent_settled 是 Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry
 				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
 				// 语义事件：仅当本次把 busy 状态收口为 idle 时发 settled——若 omp 兜底
@@ -3928,19 +3948,21 @@ export class AgentManager {
 	 * agent_end / auto_compaction_end 后调用；延迟后通过 get_state 校验
 	 * （isStreaming/isCompacting/pendingMessageCount）确认 pi 已无工作才置 idle，
 	 * 因此提前检查不会误判压缩中或 queued follow-up 为完成。
+	 * 窗口时长收敛在 settleReducer.AGENT_SETTLED_TIMEOUT_MS。
 	 */
 	private scheduleSettleCheck(runtime: AgentRuntime, agentId: string) {
 		clearTimeout(runtime.settleCheckTimer);
 		runtime.settleCheckTimer = setTimeout(() => {
 			runtime.settleCheckTimer = undefined;
 			void this.markIdleIfPiReportsNoWork(agentId);
-		}, AgentManager.AGENT_SETTLED_TIMEOUT_MS);
+		}, AGENT_SETTLED_TIMEOUT_MS);
 		runtime.settleCheckTimer.unref?.();
 	}
 
 	private async markIdleIfPiReportsNoWork(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime || runtime.tab.status !== "running") return;
+		// 本地忙碌信号：命中任一即无需 RPC 查询（保持原提前返回，省一次 get_state）。
 		if (runtime.pendingUIRequests.size > 0) return;
 		if (runtime.rpcCompacting || runtime.compacting) return;
 		if (runtime.activeAssistantMessageId !== undefined) return;
@@ -3959,13 +3981,31 @@ export class AgentManager {
 		};
 		// omp 返回 queuedMessageCount，旧 pi 用 pendingMessageCount：两者都读，任一非零都视为仍有排队消息
 		const queued = (state.pendingMessageCount ?? 0) + (state.queuedMessageCount ?? 0);
-		// 布尔字段严格判定：omp 可能以字符串形式返回（"false" truthy），
-		// 宽松判定会让空闲检查永远无法通过，UI 停在 running。
+		// 统一收口到 settleReducer：isStreaming 严格归一化、gate 封印（wait）、
+		// 远端忙碌信号与 abort 兜底截止的裁定全部在单一决策器里完成。
+		const decision = resolveSettle({
+			isStreaming: state.isStreaming,
+			hasPendingGetState: normalizePiBoolean(state.isCompacting) || queued > 0,
+			gateWaitingAbort: runtime.streamGate.waitingForAbortSettled,
+			now: Date.now(),
+			abortFallbackDeadline: this.abortFallbackDeadline(runtime),
+			// 轮询已触发（无论 100ms 扩展命令窗口还是 1200ms settle 窗口）：
+			// timeoutMs 有值即有权给出 no-work 结论。
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		// stay-running / wait 一律不产生转移。wait 是本次语义修正点：abort 封印中
+		// poll 不得越过 gate 抢先置 idle 发 settled（原实现不查 gate 会误发）。
 		if (
-			state.isStreaming === true ||
-			state.isCompacting === true ||
-			queued > 0
+			decision.decision === "stay-running" ||
+			decision.decision === "wait"
 		) return;
+		if (decision.reason === "abort-fallback") {
+			// 封印窗口已超时（兜底定时器已/即将解封）：按 settled 解封即可。
+			// 不置 idle、不发 settled——abort 已把 status 置 idle，settled 通知留给
+			// 真实 agent_settled 或重发后的正常收口，避免 abort 误报完成。
+			this.noteAgentAbortSettled(runtime);
+			return;
+		}
 
 		runtime.tab.status = "idle";
 		runtime.streamingThinking = "";
@@ -4023,7 +4063,15 @@ export class AgentManager {
 	/** abort 后的 agent_settled：结束 waiting，必要时解封 pending start。 */
 	private noteAgentAbortSettled(runtime: AgentRuntime) {
 		this.clearAbortSettledFallback(runtime);
+		runtime.abortSettledAt = undefined;
 		runtime.streamGate = noteAbortSettled(runtime.streamGate);
+	}
+
+	/** abort 兜底定时器的截止时刻（abort 时刻 + ABORT_SETTLED_FALLBACK_MS）；无 abort 记录时 undefined。 */
+	private abortFallbackDeadline(runtime: AgentRuntime): number | undefined {
+		return runtime.abortSettledAt !== undefined
+			? runtime.abortSettledAt + ABORT_SETTLED_FALLBACK_MS
+			: undefined;
 	}
 
 	/**
@@ -4032,6 +4080,9 @@ export class AgentManager {
 	 */
 	private scheduleAbortSettledFallback(runtime: AgentRuntime) {
 		this.clearAbortSettledFallback(runtime);
+		// 记录 abort 时刻，作为 reducer 的 abortFallbackDeadline 输入（settle-check
+		// 轮询与兜底定时器共用同一截止；每次 abort 刷新）。
+		runtime.abortSettledAt = Date.now();
 		const agentId = runtime.tab.id;
 		const timer = setTimeout(() => {
 			// 定时器触发时 agent 可能已被 stop 删除；重新查询，避免操作已脱离 map 的 runtime。
@@ -4040,9 +4091,19 @@ export class AgentManager {
 			current.abortSettledFallbackTimer = undefined;
 			// 仅在仍 waiting 时生效；正常 settled 路径会先 clear 定时器。
 			if (current.streamGate.waitingForAbortSettled) {
-				this.noteAgentAbortSettled(current);
+				// 定时器触发即兜底截止已到：经 reducer 判定为 idle/abort-fallback 才解封，
+				// 与 markIdleIfPiReportsNoWork 共用同一 gate 判定。
+				const decision = resolveSettle({
+					isStreaming: undefined,
+					gateWaitingAbort: true,
+					now: Date.now(),
+					abortFallbackDeadline: this.abortFallbackDeadline(current) ?? Date.now(),
+				});
+				if (decision.decision === "idle" && decision.reason === "abort-fallback") {
+					this.noteAgentAbortSettled(current);
+				}
 			}
-		}, AgentManager.ABORT_SETTLED_FALLBACK_MS);
+		}, ABORT_SETTLED_FALLBACK_MS);
 		timer.unref?.();
 		runtime.abortSettledFallbackTimer = timer;
 	}
@@ -4246,6 +4307,8 @@ type AgentRuntime = {
 	// abort 流式闸门（按 generation 封印残留 delta）
 	streamGate: StreamGateState;
 	abortSettledFallbackTimer?: NodeJS.Timeout;
+	/** 最近一次 abort 的时刻（ms）：+ ABORT_SETTLED_FALLBACK_MS 即 settleReducer 的 abortFallbackDeadline。 */
+	abortSettledAt?: number;
 	/** omp 无 agent_settled 事件时的最终空闲检查定时器（agent_end/压缩结束后调度） */
 	settleCheckTimer?: NodeJS.Timeout;
 

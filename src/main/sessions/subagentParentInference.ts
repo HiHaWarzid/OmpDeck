@@ -45,3 +45,37 @@ export function inferParentCandidatesFromPath(
 
   return candidates;
 }
+
+// ── 子会话置信度打分（纯函数） ────────────────────────────
+
+/**
+ * 子会话置信度打分输入：readSummary 扫描中采集的各信号。
+ * 全部为布尔/可选字符串，打分本身不触达文件系统，便于单测。
+ */
+export interface SubagentSignalInput {
+  /** 路径布局推断出父会话（强信号） */
+  pathInferred: boolean;
+  /** 显式 customType: "*.child-session" 标记（强信号） */
+  customMarker: boolean;
+  /** 最近一条 session_info 的名称（弱信号：以 "subagent-" 开头） */
+  sessionName: string | undefined;
+  /** session header 中的 parentSession 引用（弱信号） */
+  parentSessionRef: string | undefined;
+}
+
+/**
+ * 子会话置信度打分：强信号 2 分，弱信号 1 分。
+ * 兼容不同扩展的子会话存储方式（路径布局 / 显式标记 / 命名模式 / header 引用），
+ * ≥ SUBAGENT_CONFIDENCE_THRESHOLD 判定为子会话。
+ */
+export function scoreSubagentConfidence(input: SubagentSignalInput): number {
+  let score = 0;
+  if (input.pathInferred) score += 2;
+  if (input.customMarker) score += 2;
+  if (input.sessionName?.startsWith("subagent-")) score += 1;
+  if (input.parentSessionRef) score += 1;
+  return score;
+}
+
+/** 子会话判定置信度阈值：≥ 此分数判定为子会话（SessionScanner.readSummary 使用）。 */
+export const SUBAGENT_CONFIDENCE_THRESHOLD = 2;

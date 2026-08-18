@@ -1,5 +1,5 @@
-import { readdir, unlink, rename as fsRename, rm, mkdir, writeFile } from "node:fs/promises";
-import { join, relative, dirname } from "node:path";
+import { readdir } from "node:fs/promises";
+import { join, relative } from "node:path";
 import type { FileTreeNode } from "../../shared/types";
 
 const ignoredNames = new Set([".git", "node_modules", "dist", "build", ".next", "coverage", ".venv", "__pycache__"]);
@@ -7,6 +7,10 @@ const ignoredNames = new Set([".git", "node_modules", "dist", "build", ".next", 
 // 文件侧边栏需要能展示常见前端/桌面项目的深层源码目录；保留上限是为了避免误打开超大仓库时递归读取拖慢 UI。
 const DEFAULT_FILE_TREE_MAX_DEPTH = 12;
 
+/**
+ * 文件树：只负责把磁盘目录结构转成侧边栏所需的 FileTreeNode 列表。
+ * 读写/创建/删除/重命名等单点 fs 操作属薄封装，由 fileHandlers 直接调用 node:fs。
+ */
 export class FileSystemService {
   async listTree(root: string, maxDepth = DEFAULT_FILE_TREE_MAX_DEPTH): Promise<FileTreeNode[]> {
     return this.readDirectory(root, root, 0, maxDepth);
@@ -45,34 +49,5 @@ export class FileSystemService {
       if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
-  }
-
-  /** 删除文件或空目录；非空目录需要递归删除 */
-  async delete(targetPath: string, recursive = false): Promise<void> {
-    const stat = await import("node:fs/promises").then((m) => m.stat(targetPath));
-    if (stat.isDirectory()) {
-      await rm(targetPath, { recursive: true, force: true });
-    } else {
-      await unlink(targetPath);
-    }
-  }
-
-  /** 重命名文件或目录 */
-  async rename(targetPath: string, newName: string): Promise<string> {
-    const parent = dirname(targetPath);
-    const newPath = join(parent, newName);
-    await fsRename(targetPath, newPath);
-    return newPath;
-  }
-
-  /** 在指定目录下创建文件或文件夹 */
-  async create(parentDir: string, name: string, type: "file" | "directory"): Promise<string> {
-    const fullPath = join(parentDir, name);
-    if (type === "directory") {
-      await mkdir(fullPath, { recursive: true });
-    } else {
-      await writeFile(fullPath, "", "utf8");
-    }
-    return fullPath;
   }
 }

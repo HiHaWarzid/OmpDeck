@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { inferParentCandidatesFromPath } from "./subagentParentInference";
+import {
+  inferParentCandidatesFromPath,
+  scoreSubagentConfidence,
+  SUBAGENT_CONFIDENCE_THRESHOLD,
+} from "./subagentParentInference";
 
 const WIN_ROOT = "c:/users/ethanzhang/.omp/agent/sessions";
 const POSIX_ROOT = "/home/ethan/.omp/agent/sessions";
@@ -62,4 +66,92 @@ test("不超出扫描根：项目目录层级是最后一个候选层级", () =>
     "C:\\Users\\EthanZhang\\.omp\\agent\\sessions\\proj\\stem.jsonl",
     "C:\\Users\\EthanZhang\\.omp\\agent\\sessions\\proj.jsonl",
   ]);
+});
+
+// ── scoreSubagentConfidence ──────────────────────────────
+
+test("无任何信号得分 0，低于阈值", () => {
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: false,
+      customMarker: false,
+      sessionName: undefined,
+      parentSessionRef: undefined,
+    }),
+    0,
+  );
+  assert.ok(0 < SUBAGENT_CONFIDENCE_THRESHOLD);
+});
+
+test("强信号（路径推断 / custom 标记）各 2 分，任一即达阈值", () => {
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: true,
+      customMarker: false,
+      sessionName: undefined,
+      parentSessionRef: undefined,
+    }),
+    2,
+  );
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: false,
+      customMarker: true,
+      sessionName: undefined,
+      parentSessionRef: undefined,
+    }),
+    2,
+  );
+});
+
+test("弱信号（subagent- 名称 / parentSession header）各 1 分，需叠加才达阈值", () => {
+  const nameOnly = scoreSubagentConfidence({
+    pathInferred: false,
+    customMarker: false,
+    sessionName: "subagent-writer",
+    parentSessionRef: undefined,
+  });
+  const headerOnly = scoreSubagentConfidence({
+    pathInferred: false,
+    customMarker: false,
+    sessionName: undefined,
+    parentSessionRef: "abc123",
+  });
+  assert.equal(nameOnly, 1);
+  assert.equal(headerOnly, 1);
+  assert.ok(nameOnly < SUBAGENT_CONFIDENCE_THRESHOLD);
+  // 两个弱信号叠加达到阈值
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: false,
+      customMarker: false,
+      sessionName: "subagent-writer",
+      parentSessionRef: "abc123",
+    }),
+    SUBAGENT_CONFIDENCE_THRESHOLD,
+  );
+});
+
+test("非 subagent- 前缀的名称与空引用不计分", () => {
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: false,
+      customMarker: false,
+      sessionName: "main-agent-chat",
+      parentSessionRef: "",
+    }),
+    0,
+  );
+});
+
+test("分数可叠加：强 + 弱信号求和", () => {
+  assert.equal(
+    scoreSubagentConfidence({
+      pathInferred: true,
+      customMarker: true,
+      sessionName: "subagent-x",
+      parentSessionRef: "xyz",
+    }),
+    6,
+  );
 });
