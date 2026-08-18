@@ -68,6 +68,8 @@ function loadSessionScanner(homePath) {
 	const localFileAdapter = loadTranspiledModule("src/main/fs/adapters/localFileAdapter.ts");
 	const wslFileAdapter = loadTranspiledModule("src/main/fs/adapters/wslFileAdapter.ts");
 	const subagentParentInference = loadTranspiledModule("src/main/sessions/subagentParentInference.ts");
+	// W4：文件操作拆分到 SessionFileOps（rename/copy/delete/read 族），SessionScanner 委托给注入实例。
+	const sessionFileOps = loadTranspiledModule("src/main/sessions/SessionFileOps.ts");
 	const sandbox = {
 		AbortController,
 		AbortSignal,
@@ -91,6 +93,7 @@ function loadSessionScanner(homePath) {
 			if (id === "../fs/adapters/localFileAdapter") return localFileAdapter;
 			if (id === "../fs/adapters/wslFileAdapter") return wslFileAdapter;
 			if (id === "./subagentParentInference") return subagentParentInference;
+			if (id === "./SessionFileOps") return sessionFileOps;
 			return require(id);
 		},
 	};

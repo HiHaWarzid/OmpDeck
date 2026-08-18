@@ -40,7 +40,11 @@ test("drawer keeps its content mounted through the layout transition", () => {
   );
   assert.match(app, /drawer && !drawerCollapsed \? drawerWidth : 0/);
   // 抽屉宽度改为可拖拽的 drawerWidth 状态（默认 320，localStorage 持久化跨重启记忆）。
-  assert.match(app, /loadPanelWidth\(DRAWER_WIDTH_STORAGE_KEY, 320, 180, 560\)/);
+  // W5：loadPanelWidth 成对 helper 收敛为 usePersistedState（parse 负责读时 clamp 180-560）。
+  assert.match(
+    app,
+    /usePersistedState<number>\(\s*DRAWER_WIDTH_STORAGE_KEY,\s*320,\s*\{[\s\S]*?Math\.min\(560, Math\.max\(180, Math\.round\(raw\)\)\)/,
+  );
 });
 
 test("file rows use the integer control line-height token", () => {

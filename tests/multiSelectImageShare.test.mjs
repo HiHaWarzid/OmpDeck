@@ -12,10 +12,13 @@ function loadAppUtils() {
       target: ts.ScriptTarget.ES2022,
     },
   });
-  // AppUtils 唯一的运行时导入是 ./RichInput（其余为 type-only，转译后消除）；
-  // 被测的 getMultiSelectImageCaptureIds 不依赖 formatFilePathRef，用最小 stub 即可。
+  // AppUtils 的运行时导入只有 ./RichInput 与 ../../utils/thinkingTiming（其余为
+  // type-only，转译后消除）；被测的 getMultiSelectImageCaptureIds 不依赖两者，
+  // 用最小 stub 即可。thinkingTiming 由 W5 引入（getMultiSelectImageCaptureIds 之外
+  // 的思考计时工具函数使用）。
   const require = (id) => {
     if (id === "./RichInput") return { formatFilePathRef: () => "" };
+    if (id === "../../utils/thinkingTiming") return { computeThinkingTiming: () => 0 };
     throw new Error(`unexpected import in AppUtils: ${id}`);
   };
   const sandbox = { exports: {}, require, location: { href: "file:///Users/test/app" } };

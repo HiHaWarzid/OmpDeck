@@ -127,6 +127,8 @@ function loadAgentManager() {
 	registry["./messageTimeline"] = loadModule("src/main/pi/messageTimeline.ts", "messageTimeline.ts");
 	registry["./streamGate"] = loadModule("src/main/pi/streamGate.ts", "streamGate.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
+	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
+	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");
 	// AgentManager 引入 ../perf（src/main/perf.ts，纯诊断模块，无内部依赖）；
 	// 测试文件自身的 require 会把 "../perf" 解析到仓库根目录，必须显式注入。
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");

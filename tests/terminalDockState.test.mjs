@@ -136,15 +136,19 @@ test("project terminal session key normalizes cwd", () => {
 });
 
 test("loads and saves global terminal height", () => {
-	const {
-		loadTerminalHeight,
-		saveTerminalHeight,
-		TERMINAL_HEIGHT_MIN,
-	} = loadTerminalDockStateModule();
+	// W5：高度持久化（TERMINAL_HEIGHT_STORAGE_KEY + 下限钳制）收敛到 App.tsx 的
+	// usePersistedState 接线（parse: raw >= TERMINAL_HEIGHT_MIN ? round : undefined），
+	// terminalDockState.ts 只保留 key/min 契约常量。此处断言契约常量仍在，
+	// 持久化行为由 App.tsx 的 usePersistedState 调用承担。
+	const { TERMINAL_HEIGHT_STORAGE_KEY, TERMINAL_HEIGHT_MIN } =
+		loadTerminalDockStateModule();
+	assert.equal(TERMINAL_HEIGHT_STORAGE_KEY, "pid:terminal-dock-height");
+	assert.equal(TERMINAL_HEIGHT_MIN, 120);
 
-	assert.equal(loadTerminalHeight(220), 220);
-	saveTerminalHeight(320);
-	assert.equal(loadTerminalHeight(220), 320);
-	saveTerminalHeight(TERMINAL_HEIGHT_MIN - 10);
-	assert.equal(loadTerminalHeight(220), TERMINAL_HEIGHT_MIN);
+	// 迁移后的接线契约：App.tsx 用该 key 调 usePersistedState，且钳制语义保留。
+	const appSource = readFileSync("src/renderer/src/App.tsx", "utf8");
+	assert.match(
+		appSource,
+		/usePersistedState<number>\(\s*TERMINAL_HEIGHT_STORAGE_KEY,\s*COMPOSER_DEFAULT_TERMINAL_HEIGHT,[\s\S]*?TERMINAL_HEIGHT_MIN/,
+	);
 });

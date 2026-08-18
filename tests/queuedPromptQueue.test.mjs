@@ -107,12 +107,15 @@ test("App keeps native typing responsive with a live draft ref", () => {
   assert.match(lifecycleSource, /const livePromptByAgentRef = useRef<Record<string, string>>\(\{\}\)/);
   // useTransition/startPromptTransition 已移除：RichInput contentEditable 自行管理 DOM，
   // React state 仅用于 chip 重渲染，不再需要 transition 包裹
-  assert.match(appSource, /function setPromptFromNativeInput\(agentId: string, value: string\)/);
-  assert.match(appSource, /const livePrompt = targetAgentId[\s\S]*?livePromptByAgentRef\.current\[targetAgentId\] \?\? prompt/);
+  // W5：原生输入的 live 草稿写入收敛为 useAgentLifecycle op——App 只读 activeAgentIdRef
+  // 后经 setPrompt 包装调用 setLivePrompt，不持有 livePromptByAgentRef 细节。
+  assert.match(appSource, /function setPrompt\(value: string \| \(\(current: string\) => string\)\) \{[\s\S]*?if \(targetAgentId\) setLivePrompt\(targetAgentId, value\);/);
+  assert.match(appSource, /const prompt = promptAgentKey \? getLivePrompt\(promptAgentKey\) : "";/);
   assert.match(appSource, /if \(suggestionsOpen\) setComposerCursor\(cursor\)/);
   assert.match(appSource, /queuedPrompt\.behavior === "direct" \? undefined : queuedPrompt\.behavior/);
-  assert.match(appSource, /const currentDraft =[\s\S]*?livePromptByAgentRef\.current\[agentId\] \?\? promptByAgent\[agentId\]/);
-  assert.match(appSource, /setPromptForAgent\(request\.agentId, text\)/);
+  // W5：retract 恢复草稿读取迁移到 getLivePrompt op（App 不再直接读 ref）
+  assert.match(appSource, /const currentDraft = getLivePrompt\(agentId\);/);
+  assert.match(appSource, /setLivePrompt\(request\.agentId, text\);/);
   // migrateAgentRecord 调用已迁移到 useAgentLifecycle hook 的 migratePerAgentState
   assert.match(lifecycleSource, /livePromptByAgentRef\.current = migrateAgentRecord/);
   // sendBehaviorMenuOpen 条件从三合一拆为嵌套：外层 showBusySendControls && hasComposerContent，内层 sendBehaviorMenuOpen
@@ -133,9 +136,11 @@ test("queue drain is serialized and waits for an ordered raw tool-end event", ()
   assert.match(agentManagerSource, /updateActiveToolCalls/);
   assert.match(toolRuntimeStateSource, /calls\.delete\(event\.toolCallId\)/);
   assert.match(toolRuntimeStateSource, /completedBatch: event\.type === "end" && current\.size > 0 && calls\.size === 0/);
-  assert.match(appSource, /claimIdleHead\(queuedPromptsRef\.current, agentId\)/);
-  assert.match(appSource, /claimNextSteerPrompt\(queuedPromptsRef\.current, agentId\)/);
-  assert.match(appSource, /resolveClaimedPrompt/);
+  // W5：队列 claim/resolve 收敛到 queuedPromptStore（单一状态源），
+  // claimIdleHead/claimNextSteer 直接以 agentId 调用，resolve 承载结果回写。
+  assert.match(appSource, /queuedPromptStore\.claimIdleHead\(agentId\)/);
+  assert.match(appSource, /queuedPromptStore\.claimNextSteer\(agentId\)/);
+  assert.match(appSource, /queuedPromptStore\.resolve\(/);
   assert.doesNotMatch(appSource, /queuedPrompt\.status === "sending"\s*\? \{ \.\.\.queuedPrompt, status: "pending"/);
   assert.match(queueStateSource, /prompt\.status !== "sending" && prompt\.status !== "unknown"/);
 });

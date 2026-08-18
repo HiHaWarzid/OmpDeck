@@ -9,6 +9,8 @@ const app = readFileSync("src/renderer/src/App.tsx", "utf8");
 const api = readFileSync("src/shared/api.ts", "utf8");
 const main = readFileSync("src/main/index.ts", "utf8");
 const gitService = readFileSync("src/main/git/GitService.ts", "utf8");
+// W3：git spawn 执行细节收敛到 CommandRunner.runGit（超时默认 GIT_TIMEOUT_MS）。
+const gitRunner = readFileSync("src/main/utils/CommandRunner.ts", "utf8");
 // Git IPC 与 app 级 IPC 处理器已从 src/main/index.ts 拆到 ipc/ 下的独立模块。
 const gitHandlers = readFileSync("src/main/ipc/gitHandlers.ts", "utf8");
 const appHandlers = readFileSync("src/main/ipc/appHandlers.ts", "utf8");
@@ -162,9 +164,12 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.doesNotMatch(panel, /mutationTimerRef/);
     assert.doesNotMatch(panel, /setTimeout\([\s\S]*?mutationRunningRef\.current = false/);
     assert.match(gitService, /const GIT_MUTATION_TIMEOUT_MS = 30_000;/);
-    // 所有 git spawn 统一经 runGit 执行器（超时/缓冲/stderr 归一化收敛），
-    // 变异与校验命令的超时保证由 runGit 默认提供，push/pull/fetch 保留 4 倍超时。
-    assert.match(gitService, /timeout: options\.timeout \?\? GIT_MUTATION_TIMEOUT_MS/);
+    // 所有 git spawn 统一经 CommandRunner.runGit 执行器（超时/缓冲/stderr 归一化收敛），
+    // GitService 私有 runGit 只做参数名映射（RunGitOptions.timeout → timeoutMs），
+    // 变异与校验命令的默认超时保证由 CommandRunner（GIT_TIMEOUT_MS）提供，
+    // push/pull/fetch 保留 4 倍超时。
+    assert.match(gitService, /timeoutMs: options\.timeout,/);
+    assert.match(gitRunner, /timeoutMs: options\.timeoutMs \?\? GIT_TIMEOUT_MS/);
     assert.equal((gitService.match(/execFileAsync\("git"/g) ?? []).length, 0, "git 命令必须经 runGit，不得散落直接 spawn");
     assert.match(gitService, /timeout: GIT_MUTATION_TIMEOUT_MS \* 4/);
   });

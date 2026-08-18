@@ -26,10 +26,24 @@ function loadSkillManagerModule() {
 			target: ts.ScriptTarget.ES2022,
 		},
 	});
+	// W3：frontmatter 解析/序列化收敛到 manifests/FrontmatterManifest（无运行时依赖），
+	// 沙箱 require 需显式映射该相对 TS 模块（node 不解析无扩展名相对导入）。
+	const frontmatterSource = readFileSync("src/main/manifests/FrontmatterManifest.ts", "utf8");
+	const { outputText: frontmatterOutput } = ts.transpileModule(frontmatterSource, {
+		compilerOptions: {
+			module: ts.ModuleKind.CommonJS,
+			target: ts.ScriptTarget.ES2022,
+		},
+	});
+	const frontmatterSandbox = { exports: {}, require: (id) => require(id) };
+	vm.runInNewContext(frontmatterOutput, frontmatterSandbox, {
+		filename: "FrontmatterManifest.ts",
+	});
 	const sandbox = {
 		exports: {},
 		require: (id) => {
 			if (id === "electron") return { shell: { openPath: async () => "" } };
+			if (id === "../manifests/FrontmatterManifest") return frontmatterSandbox.exports;
 			return require(id);
 		},
 	};

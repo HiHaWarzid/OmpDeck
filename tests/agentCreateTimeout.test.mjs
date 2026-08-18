@@ -10,7 +10,13 @@ test("agent creation uses a bounded timeout instead of leaving pending agents fo
 	assert.match(source, /api\.agents\.create\(\{ projectId, sessionPath, title, noSession \}\)/);
 	assert.match(source, /AGENT_CREATE_TIMEOUT_MS/);
 	assert.match(source, /t\("app\.agentCreateTimeout"\)/);
-	assert.match(source, /pendingAgentsRef\.current = pendingAgentsRef\.current\.filter/);
+	// W5：pending 占位的增删统一收敛到 useAgentSessions.updatePendingAgents（ref/state 双写），
+	// 成功与失败路径都用 filter 移除占位，保证 pending 生命周期有界。
+	// 正则容忍换行与尾部逗号（源码 4590-4624 为 `current.filter(...,\n);` 风格）。
+	assert.match(
+		source,
+		/updatePendingAgents\(\(current\) =>\s*current\.filter\(\(agent\) => agent\.id !== pendingTab\.id\)[\s\S]{0,40}?\);/,
+	);
 	assert.match(source, /showToast\(e instanceof Error \? e\.message : String\(e\), 5000\)/);
 });
 
@@ -24,7 +30,7 @@ test("fresh agent creation registers the pending tab before selecting it", () =>
 	);
 	assert.ok(
 		createAgentSource.indexOf(
-			"pendingAgentsRef.current = [...pendingAgentsRef.current, pendingTab]",
+			"updatePendingAgents((current) => [...current, pendingTab])",
 		) < createAgentSource.indexOf("setActiveAgentId(pendingTab.id)"),
 	);
 });

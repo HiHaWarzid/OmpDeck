@@ -9,6 +9,13 @@ test("user message edit handler does not keep the initial empty active agent", (
 		"src/renderer/src/hooks/useAgentSessions.ts",
 		"utf8",
 	);
+	// W5：live prompt 的 ref/state 双写收敛到 useAgentLifecycle（getLivePrompt/setLivePrompt）——
+	// “编辑前从 live ref 读 previous、写入 nextValue” 的安全模式现位于 setLivePrompt 内部，
+	// 保证编辑/发送路径总是以该 agent 自己的最新草稿为基准（而非渲染作用域的陈旧值）。
+	const lifecycleSource = readFileSync(
+		"src/renderer/src/hooks/useAgentLifecycle.ts",
+		"utf8",
+	);
 
 	assert.match(
 		hookSource,
@@ -16,6 +23,9 @@ test("user message edit handler does not keep the initial empty active agent", (
 	);
 	assert.match(hookSource, /activeAgentIdRef\.current = activeAgentId;/);
 	assert.match(source, /const targetAgentId = activeAgentIdRef\.current;/);
-	assert.match(source, /const previous = livePromptByAgentRef\.current\[targetAgentId\] \?\? "";/);
-	assert.match(source, /\[targetAgentId\]: nextValue/);
+	assert.match(
+		lifecycleSource,
+		/const previous = livePromptByAgentRef\.current\[agentId\] \?\? "";/,
+	);
+	assert.match(lifecycleSource, /const nextValue = typeof value === "function" \? value\(previous\) : value;/);
 });

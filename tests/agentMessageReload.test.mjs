@@ -14,9 +14,16 @@ test("selecting an agent pulls its messages when the cache is empty (restart gap
     app,
     /function ensureAgentMessagesLoaded\(agentId: string\) \{[\s\S]*?if \(messagesByAgent\[agentId\]\) return;/,
   );
+  // 全量拉取经 resolveFullPullResult 走与 onMessages 自愈路径相同的代数守卫
+  // （messageDeltaSeqRef 未前进才写入），再以 setAgentMessages 落缓存、重建 prompt history。
   assert.match(
     app,
-    /void api\.agents\s*\n\s*\.getMessages\(agentId\)[\s\S]*?setMessagesByAgent\(\(current\) => \(\{ \.\.\.current, \[agentId\]: messages \}\)/,
+    /void api\.agents\s*\n\s*\.getMessages\(agentId\)[\s\S]*?setAgentMessages\(agentId, pull\.messages\)/,
+  );
+  // 拉取期间有更新的 delta 到达时不得覆盖（seq 守卫 + 已切走不写入）。
+  assert.match(
+    app,
+    /if \(messageDeltaSeqRef\.current\[agentId\] !== seqAtRequest\) return;/,
   );
   // 侧栏 agent 行 / 子会话行 / 会话恢复（existingAgent）/ 宠物跳转 四条路径都接入。
   assert.match(
