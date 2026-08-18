@@ -750,6 +750,37 @@ const previewOverrides: NamespaceOverrides = {
 			return () => undefined;
 		}) as (callback: (payload: AgentMessagesDelta) => void) => () => void,
 	},
+	clipboard: {
+		/**
+		 * 预览/浏览器模式无主进程：回退到 Web Clipboard API（fire-and-forget，
+		 * 契约同步返回 void，与 preload 覆盖层一致）。navigator.clipboard 在
+		 * 非安全上下文或无焦点时不可用，此时回退 document.execCommand("copy")；
+		 * 仍失败则静默吞掉 —— utils/clipboard.ts 调用方同样只做 best-effort。
+		 */
+		writeText: (text: string) => {
+			void (async () => {
+				try {
+					if (navigator.clipboard?.writeText) {
+						await navigator.clipboard.writeText(text);
+						return;
+					}
+				} catch {
+					// fall through 到 execCommand
+				}
+				const textarea = document.createElement("textarea");
+				textarea.value = text;
+				textarea.style.position = "fixed";
+				textarea.style.opacity = "0";
+				document.body.append(textarea);
+				textarea.select();
+				try {
+					document.execCommand("copy");
+				} finally {
+					textarea.remove();
+				}
+			})();
+		},
+	},
 	perf: {
 		enabled: false,
 	},

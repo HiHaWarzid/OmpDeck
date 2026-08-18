@@ -14,6 +14,7 @@ import type { GitService } from "../git/GitService";
 import type { WorktreeService } from "../git/WorktreeService";
 import type { AppLogger } from "../logging/AppLogger";
 import type { WslEnvironment } from "../wsl/WslPaths";
+import { createProjectGuard, projectNotFoundError } from "./withProjectGuard";
 
 interface ProjectHandlerDeps {
 	projectStore: ProjectStore;
@@ -47,6 +48,7 @@ export function registerProjectHandlers(deps: ProjectHandlerDeps): ProjectHandle
 		getActiveWslEnvironment,
 		syncWslEnvironment,
 	} = deps;
+	const { resolveProject } = createProjectGuard(projectStore);
 
 	// 获取当前环境过滤后的项目列表（WSL 模式只显示 WSL 项目，Chat 始终显示）
 	const getVisibleProjects = (): Project[] => {
@@ -101,8 +103,7 @@ export function registerProjectHandlers(deps: ProjectHandlerDeps): ProjectHandle
 			},
 
 			toggleWorktreeEnabled: async (_event, projectId: string) => {
-				const existing = projectStore.get(projectId);
-				if (!existing) throw new Error(`Project not found: ${projectId}`);
+				const existing = resolveProject(projectId);
 				// 即将启用时先校验是否 git 仓库；非 git 项目开启工作区模式没有意义，
 				// 只会看到空列表并在创建时报错，这里提前给出明确错误让前端提示用户。
 				if (!existing.worktreeEnabled) {
@@ -112,7 +113,7 @@ export function registerProjectHandlers(deps: ProjectHandlerDeps): ProjectHandle
 					}
 				}
 				const project = await projectStore.toggleWorktreeEnabled(projectId);
-				if (!project) throw new Error(`Project not found: ${projectId}`);
+				if (!project) throw projectNotFoundError(projectId);
 				// 开启 worktree 模式时，自动注册已有的 git worktree
 				if (project.worktreeEnabled) {
 					try {

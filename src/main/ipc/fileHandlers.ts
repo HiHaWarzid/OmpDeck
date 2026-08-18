@@ -1,17 +1,17 @@
 /**
  * File IPC handler：文件树浏览/读写/创建/删除/重命名/复制/移动 + 在资源管理器中打开。
  * WSL 模式下通过 `toWindowsPath` 将 Linux 路径转为 Windows 可访问路径。
- * `browserOpenExternal` 物理位于此块，使用 shell.openExternal 打开系统浏览器。
  */
 import { shell } from "electron";
-import { basename, join } from "node:path";
-import { cp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { cp, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
 import type { AppSettings } from "../../shared/types";
 import type { ProjectStore } from "../projects/ProjectStore";
 import type { FileSystemService } from "../fs/FileSystemService";
 import type { AppLogger } from "../logging/AppLogger";
+import { createProjectGuard } from "./withProjectGuard";
 
 interface FileHandlerDeps {
 	projectStore: ProjectStore;
@@ -22,11 +22,11 @@ interface FileHandlerDeps {
 
 type FileHandlerMaps = {
 	files: IpcHandlerMap<typeof ipcTable.files, PiDesktopApi["files"]>;
-	browser: IpcHandlerMap<typeof ipcTable.browser, PiDesktopApi["browser"]>;
 };
 
 export function registerFileHandlers(deps: FileHandlerDeps): FileHandlerMaps {
 	const { projectStore, fileSystemService, settingsStore, appLogger } = deps;
+	const { resolveProject } = createProjectGuard(projectStore);
 
 	// 将 WSL Linux 路径转为 Windows 可访问的路径（/mnt/c → C:\，/home/... → \\wsl$\<distro>\...）
 	const toWindowsPath = (linuxPath: string): string => {
@@ -46,11 +46,8 @@ export function registerFileHandlers(deps: FileHandlerDeps): FileHandlerMaps {
 
 	return {
 		files: {
-			list: async (_event, projectId: string) => {
-				const project = projectStore.get(projectId);
-				if (!project) throw new Error(`Project not found: ${projectId}`);
-				return fileSystemService.listTree(project.path);
-			},
+			list: async (_event, projectId: string) =>
+				fileSystemService.listTree(resolveProject(projectId).path),
 			open: async (_event, path: string) => {
 				const error = await shell.openPath(toWindowsPath(path));
 				// Electron 通过返回字符串报告打开失败；显式抛出后前端才能提示路径不存在或系统无法打开。
@@ -90,18 +87,29 @@ export function registerFileHandlers(deps: FileHandlerDeps): FileHandlerMaps {
 				void appLogger.info("file", "File written", { path, bytes: Buffer.byteLength(content, "utf8") });
 			},
 			delete: async (_event, path: string, recursive?: boolean) => {
-				await fileSystemService.delete(path, recursive);
+				const targetStat = await stat(path);
+				if (targetStat.isDirectory()) {
+					await rm(path, { recursive: true, force: true });
+				} else {
+					await unlink(path);
+				}
 				void appLogger.info("file", "File deleted", { path, recursive: Boolean(recursive) });
 			},
 			rename: async (_event, path: string, newName: string) => {
-				const result = await fileSystemService.rename(path, newName);
-				void appLogger.info("file", "File renamed", { path, newName, result });
-				return result;
+				const newPath = join(dirname(path), newName);
+				await rename(path, newPath);
+				void appLogger.info("file", "File renamed", { path, newName, result: newPath });
+				return newPath;
 			},
 			create: async (_event, parentDir: string, name: string, type: "file" | "directory") => {
-				const result = await fileSystemService.create(parentDir, name, type);
-				void appLogger.info("file", "File/folder created", { parentDir, name, type, result });
-				return result;
+				const fullPath = join(parentDir, name);
+				if (type === "directory") {
+					await mkdir(fullPath, { recursive: true });
+				} else {
+					await writeFile(fullPath, "", "utf8");
+				}
+				void appLogger.info("file", "File/folder created", { parentDir, name, type, result: fullPath });
+				return fullPath;
 			},
 			copy: async (_event, sourcePaths: string[], targetDir: string) => {
 				const results: string[] = [];
@@ -140,12 +148,6 @@ export function registerFileHandlers(deps: FileHandlerDeps): FileHandlerMaps {
 					}
 				}
 				return results;
-			},
-		},
-		browser: {
-			openExternal: async (_event, url: string) => {
-				// shell.openExternal 使用系统默认浏览器打开链接，可控且安全。
-				await shell.openExternal(url);
 			},
 		},
 	};
