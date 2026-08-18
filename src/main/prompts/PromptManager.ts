@@ -9,6 +9,11 @@ import type {
 	PiPromptTemplateSummary,
 } from "../../shared/types";
 import type { WslEnvironment } from "../wsl/WslPaths";
+import {
+	normalizeName,
+	parseFrontmatter,
+	resolveWslHome,
+} from "../manifests/FrontmatterManifest";
 
 function makeBuiltinContent(name: string, body: string): string {
 	return `---\ndescription: ${name}\n---\n\n${body}`;
@@ -187,7 +192,7 @@ export class PromptManager {
 
 	/** 将 prompt 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
 	configureWsl(environment: WslEnvironment | null) {
-		this.promptsDir = join(environment?.windowsHome ?? homedir(), ".omp", "agent", "prompts");
+		this.promptsDir = join(resolveWslHome(homedir(), environment), ".omp", "agent", "prompts");
 	}
 
 	getDir(): string {
@@ -212,7 +217,7 @@ export class PromptManager {
 		}
 		const raw = await readFile(fullPath, "utf8").catch(() => "");
 		if (!raw) return null;
-		const frontmatter = this.parseFrontmatter(raw);
+		const frontmatter = parseFrontmatter(raw);
 		const description = frontmatter.description ?? raw.split(/\r?\n/).find((line) => line.trim()) ?? "";
 		const summary: PiPromptTemplateSummary = {
 			name,
@@ -268,7 +273,7 @@ export class PromptManager {
 	}
 
 	async create(input: CreatePiPromptTemplateInput): Promise<PiPromptTemplateSummary> {
-		const name = this.normalizeName(input.name);
+		const name = normalizeName(input.name);
 		if (!name) throw new Error("模板名称不能为空，且至少包含一个字母或数字");
 		const description = input.description.trim();
 		if (!description) throw new Error("模板描述不能为空");
@@ -314,7 +319,7 @@ export class PromptManager {
 	): Promise<PiPromptTemplateSummary> {
 		const projectPromptsDir = join(projectPath, ".omp", "prompts");
 		await mkdir(projectPromptsDir, { recursive: true });
-		const name = this.normalizeName(input.name);
+		const name = normalizeName(input.name);
 		if (!name) throw new Error("模板名称不能为空，且至少包含一个字母或数字");
 		const description = input.description.trim();
 		if (!description) throw new Error("模板描述不能为空");
@@ -362,25 +367,10 @@ export class PromptManager {
 		await writeFile(filePath, content, "utf8");
 	}
 
-	private parseFrontmatter(raw: string): Record<string, string> {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		const result: Record<string, string> = {};
-		if (!match) return result;
-		for (const line of match[1].split(/\r?\n/)) {
-			const index = line.indexOf(":");
-			if (index === -1) continue;
-			const key = line.slice(0, index).trim();
-			let value = line.slice(index + 1).trim();
-			value = value.replace(/^['\"]|['\"]$/g, "");
-			if (key) result[key] = value;
-		}
-		return result;
-	}
-
 	/** 重命名全局模板：将 <oldName>.md 重命名为 <newName>.md */
 	async rename(oldName: string, newName: string): Promise<PiPromptTemplateSummary> {
-		const normalizedOld = this.normalizeName(oldName);
-		const normalizedNew = this.normalizeName(newName);
+		const normalizedOld = normalizeName(oldName);
+		const normalizedNew = normalizeName(newName);
 		if (!normalizedOld || !normalizedNew) throw new Error("模板名称不能为空");
 		if (normalizedOld === normalizedNew) throw new Error("新旧名称相同");
 
@@ -392,7 +382,7 @@ export class PromptManager {
 		await rename(oldPath, newPath);
 		// 读取新文件内容返回摘要
 		const raw = await readFile(newPath, "utf8");
-		const frontmatter = this.parseFrontmatter(raw);
+		const frontmatter = parseFrontmatter(raw);
 		const description = frontmatter.description ?? "";
 		return {
 			name: normalizedNew,
@@ -407,8 +397,8 @@ export class PromptManager {
 	/** 重命名项目级模板 */
 	async renameInProject(projectPath: string, oldName: string, newName: string): Promise<PiPromptTemplateSummary> {
 		const projectPromptsDir = join(projectPath, ".omp", "prompts");
-		const normalizedOld = this.normalizeName(oldName);
-		const normalizedNew = this.normalizeName(newName);
+		const normalizedOld = normalizeName(oldName);
+		const normalizedNew = normalizeName(newName);
 		if (!normalizedOld || !normalizedNew) throw new Error("模板名称不能为空");
 		if (normalizedOld === normalizedNew) throw new Error("新旧名称相同");
 
@@ -419,7 +409,7 @@ export class PromptManager {
 
 		await rename(oldPath, newPath);
 		const raw = await readFile(newPath, "utf8");
-		const frontmatter = this.parseFrontmatter(raw);
+		const frontmatter = parseFrontmatter(raw);
 		const description = frontmatter.description ?? "";
 		return {
 			name: normalizedNew,
@@ -429,16 +419,5 @@ export class PromptManager {
 			userCreated: true,
 			scope: "project",
 		};
-	}
-
-	/** 规范化模板名称：保留 Unicode 字母（含中文等非拉丁文字）、数字和连字符，其余替换为连字符 */
-	private normalizeName(value: string): string {
-		return value
-			.trim()
-			// 替换非（Unicode 字母/数字/连字符）的字符为连字符
-			.replace(/[^\p{L}\p{N}-]/gu, "-")
-			.replace(/-+/g, "-")
-			.replace(/^-|-$/g, "")
-			.toLowerCase();
 	}
 }

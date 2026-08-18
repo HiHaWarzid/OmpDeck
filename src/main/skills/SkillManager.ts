@@ -19,8 +19,15 @@ import type {
 	PiSkillSummary,
 } from "../../shared/types";
 import type { WslEnvironment } from "../wsl/WslPaths";
-
-const SKILL_FILE = "SKILL.md";
+import {
+	SKILL_FILE,
+	normalizeName,
+	parseFrontmatter,
+	resolveWslHome,
+	setFrontmatterBoolean,
+	setFrontmatterName,
+	validateManifest,
+} from "../manifests/FrontmatterManifest";
 
 /**
  * 管理 omp 全局 Skill 目录。
@@ -35,7 +42,7 @@ export class SkillManager {
 
 	/** 将 skill 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
 	configureWsl(environment: WslEnvironment | null) {
-		this.locations = this.buildLocations(environment?.windowsHome ?? homedir());
+		this.locations = this.buildLocations(resolveWslHome(homedir(), environment));
 	}
 
 	private buildLocations(home: string): PiSkillLocation[] {
@@ -73,7 +80,7 @@ export class SkillManager {
 
 	async create(input: CreatePiSkillInput): Promise<PiSkillSummary> {
 		const location = this.requireLocation(input.locationId);
-		const name = this.normalizeSkillName(input.name);
+		const name = normalizeName(input.name);
 		const description = input.description.trim();
 		if (!name) throw new Error("Skill 名称不能为空，且至少包含一个字母或数字");
 		if (!description) throw new Error("Skill 描述不能为空");
@@ -93,7 +100,7 @@ export class SkillManager {
 	async toggle(skillPath: string, enabled: boolean): Promise<PiSkillSummary> {
 		const skill = await this.findByPath(skillPath);
 		const raw = await readFile(skill.path, "utf8");
-		const next = this.setFrontmatterBoolean(raw, "disable-model-invocation", !enabled);
+		const next = setFrontmatterBoolean(raw, "disable-model-invocation", !enabled);
 		await writeFile(skill.path, next, "utf8");
 		return this.findByPath(skill.path);
 	}
@@ -184,10 +191,10 @@ export class SkillManager {
 		type: PiSkillSummary["type"],
 	): Promise<PiSkillSummary> {
 		const raw = await readFile(skillPath, "utf8").catch(() => "");
-		const frontmatter = this.parseFrontmatter(raw);
+		const frontmatter = parseFrontmatter(raw);
 		const name = String(frontmatter.name ?? "").trim();
 		const description = String(frontmatter.description ?? "").trim();
-		const warnings = this.validateSkill(name, description);
+		const warnings = validateManifest({ name, description });
 		return {
 			id: `${location.id}:${skillPath}`,
 			name: name || dirname(skillPath).split(/[\\/]/).pop() || "未命名 Skill",
@@ -203,51 +210,10 @@ export class SkillManager {
 		};
 	}
 
-	private parseFrontmatter(raw: string) {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		const result: Record<string, string> = {};
-		if (!match) return result;
-		for (const line of match[1].split(/\r?\n/)) {
-			const index = line.indexOf(":");
-			if (index === -1) continue;
-			const key = line.slice(0, index).trim();
-			let value = line.slice(index + 1).trim();
-			value = value.replace(/^['\"]|['\"]$/g, "");
-			if (key) result[key] = value;
-		}
-		return result;
-	}
-
-	private setFrontmatterBoolean(raw: string, key: string, value: boolean) {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		if (!match) return `---\n${key}: ${value}\n---\n\n${raw}`;
-		const lines = match[1].split(/\r?\n/);
-		let changed = false;
-		const nextLines = lines.map((line) => {
-			if (!line.trim().startsWith(`${key}:`)) return line;
-			changed = true;
-			return `${key}: ${value}`;
-		});
-		if (!changed) nextLines.push(`${key}: ${value}`);
-		return raw.replace(match[0], `---\n${nextLines.join("\n")}\n---`);
-	}
-
-	private validateSkill(name: string, description: string) {
-		const warnings: string[] = [];
-		if (!name) warnings.push("缺少 name");
-		if (name && !/^[\p{L}\p{N}]+(?:-[\p{L}\p{N}]+)*$/u.test(name)) {
-			warnings.push("name 只能包含字母（含中文等）、数字和单个连字符");
-		}
-		if (name.length > 64) warnings.push("name 超过 64 个字符");
-		if (!description) warnings.push("缺少 description，omp 不会加载该 skill");
-		if (description.length > 1024) warnings.push("description 超过 1024 个字符");
-		return warnings;
-	}
-
 	/** 重命名 Skill：重命名目录并更新 SKILL.md 中的 name 字段 */
 	async rename(skillPath: string, newName: string): Promise<PiSkillSummary> {
 		const skill = await this.findByPath(skillPath);
-		const normalizedNew = this.normalizeSkillName(newName);
+		const normalizedNew = normalizeName(newName);
 		if (!normalizedNew) throw new Error("Skill 名称不能为空");
 
 		const displayName = newName.trim();
@@ -260,7 +226,7 @@ export class SkillManager {
 
 		// 更新 SKILL.md 中的 name frontmatter
 		const raw = await readFile(skill.path, "utf8");
-		const updated = this.setFrontmatterName(raw, displayName);
+		const updated = setFrontmatterName(raw, displayName);
 		await writeFile(skill.path, updated, "utf8");
 
 		await rename(oldDir, newDir);
@@ -275,23 +241,6 @@ export class SkillManager {
 			skill.type,
 		);
 		return reloaded;
-	}
-
-	/** 更新 frontmatter 中的 name 字段 */
-	private setFrontmatterName(raw: string, name: string): string {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		if (!match) return `---\nname: ${name}\n---\n\n${raw}`;
-		const lines = match[1].split(/\r?\n/);
-		const nextLines = lines.map((line) => {
-			if (line.trim().startsWith("name:")) return `name: ${name}`;
-			return line;
-		});
-		return raw.replace(match[0], `---\n${nextLines.join("\n")}\n---`);
-	}
-
-	/** 规范化 Skill 名称：保留 Unicode 字母（含中文等）、数字和连字符 */
-	private normalizeSkillName(value: string) {
-		return value.trim().toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 	}
 
 	private requireLocation(id: PiSkillLocation["id"]) {

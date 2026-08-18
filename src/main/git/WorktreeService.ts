@@ -1,11 +1,11 @@
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { rm, realpath } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import type { WorktreeEntry } from "../../shared/types";
+import { runGit } from "../utils/CommandRunner";
 
-const execFileAsync = promisify(execFile);
+/** WIP 快照 commit 前缀（ADR-0003 的规则常量唯一事实源；Orchestrator 从这里读取） */
+export const AFK_WIP_PREFIX = "[afk-wip]";
 
 /**
  * 管理 git worktree 的创建、查询、删除。
@@ -13,6 +13,10 @@ const execFileAsync = promisify(execFile);
  * 工作树目录创建在项目目录的同级位置（标准 git worktree 行为）：
  * {dirname(projectPath)}/{slug}，目录名与分支名一致，
  * 用户可以直接在文件管理器中找到 worktree 文件。
+ *
+ * 本服务所有 git 调用都经 CommandRunner.runGit（默认超时 30s、缓冲 32MB、stderr 归一化），
+ * 修复历史裸 execFileAsync 无超时导致 `git worktree add` 卡死 UI 的问题；探测型失败
+ * 用 allowFailure 或 catch 降级，语义与改造前一致。
  */
 export class WorktreeService {
 	/**
@@ -21,11 +25,7 @@ export class WorktreeService {
 	 */
 	async list(projectPath: string): Promise<WorktreeEntry[]> {
 		try {
-			const { stdout } = await execFileAsync(
-				"git",
-				["worktree", "list", "--porcelain"],
-				{ cwd: projectPath },
-			);
+			const stdout = await runGit(projectPath, ["worktree", "list", "--porcelain"]);
 			return this.parseWorktreeList(stdout, projectPath);
 		} catch {
 			// 非 git 目录或 git 未安装
@@ -50,14 +50,10 @@ export class WorktreeService {
 		const { worktreeDir, branch } = await this.allocateWorktreeTarget(projectPath, parentDir, baseSlug);
 
 		// 创建 worktree（仅创建目录结构，不 checkout），再 reset --hard 填充内容。
-		await execFileAsync(
-			"git",
-			["worktree", "add", "--no-checkout", "-b", branch, worktreeDir],
-			{ cwd: projectPath },
-		);
+		await runGit(projectPath, ["worktree", "add", "--no-checkout", "-b", branch, worktreeDir]);
 
 		try {
-			await execFileAsync("git", ["reset", "--hard"], { cwd: worktreeDir });
+			await runGit(worktreeDir, ["reset", "--hard"]);
 		} catch (error) {
 			// reset 失败时清理刚创建的 worktree，避免残留半初始化目录。
 			await this.remove(worktreeDir, projectPath).catch(() => false);
@@ -103,11 +99,7 @@ export class WorktreeService {
 			throw new Error(`AFK 目录已被其他分支占用：${worktreeDir}（${dirOccupied.branch}）`);
 		}
 
-		const branchExists = await execFileAsync(
-			"git",
-			["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-			{ cwd: projectPath },
-		)
+		const branchExists = await runGit(projectPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
 			.then(() => true)
 			.catch(() => false);
 
@@ -118,13 +110,13 @@ export class WorktreeService {
 			if (existsSync(worktreeDir)) {
 				return { path: worktreeDir, branch, reused: true };
 			}
-			await execFileAsync("git", ["worktree", "add", "--no-checkout", worktreeDir, branch], { cwd: projectPath });
+			await runGit(projectPath, ["worktree", "add", "--no-checkout", worktreeDir, branch]);
 			try {
-				await execFileAsync("git", ["reset", "--hard"], { cwd: worktreeDir });
+				await runGit(worktreeDir, ["reset", "--hard"]);
 			} catch (error) {
 				// 挂载失败：只摘除 worktree、不删分支——分支上可能有 [afk-wip] WIP，
 				// 不能走 remove()（其 branch === 目录名 判定会 branch -D 抹掉 WIP，违反 ADR-0003）。
-				await execFileAsync("git", ["worktree", "remove", "--force", worktreeDir], { cwd: projectPath }).catch(() => undefined);
+				await runGit(projectPath, ["worktree", "remove", "--force", worktreeDir]).catch(() => undefined);
 				await rm(worktreeDir, { recursive: true, force: true }).catch(() => undefined);
 				throw error;
 			}
@@ -138,9 +130,9 @@ export class WorktreeService {
 
 		// 全新创建：复用现有 create 的步骤（--no-checkout -b + reset --hard）。
 		// 不能走 allocateWorktreeTarget——它目录/分支碰撞即抛错，与 AFK 的复用语义冲突。
-		await execFileAsync("git", ["worktree", "add", "--no-checkout", "-b", branch, worktreeDir], { cwd: projectPath });
+		await runGit(projectPath, ["worktree", "add", "--no-checkout", "-b", branch, worktreeDir]);
 		try {
-			await execFileAsync("git", ["reset", "--hard"], { cwd: worktreeDir });
+			await runGit(worktreeDir, ["reset", "--hard"]);
 		} catch (error) {
 			// reset 失败时清理刚创建的 worktree（与 create() 一致；此分支是本方法刚建的，无 WIP 可丢）。
 			await this.remove(worktreeDir, projectPath).catch(() => false);
@@ -161,7 +153,7 @@ export class WorktreeService {
 		const branch = entry.branch;
 
 		try {
-			await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd: projectPath });
+			await runGit(projectPath, ["worktree", "remove", "--force", worktreePath]);
 		} catch {
 			// git 的记录可能已损坏；后续仍尝试清理目录，但不吞掉路径保护。
 		}
@@ -176,7 +168,7 @@ export class WorktreeService {
 		// 对外部 worktree 尽量保守，只在“分支名等于目录名”时认为是 OmpDeck 创建的同名工作区。
 		const worktreeDirName = basename(worktreePath);
 		if (branch?.startsWith("ompdeck/") || branch?.startsWith("pideck/") || branch === worktreeDirName) {
-			await execFileAsync("git", ["branch", "-D", branch], { cwd: projectPath }).catch(() => undefined);
+			await runGit(projectPath, ["branch", "-D", branch]).catch(() => undefined);
 		}
 
 		return true;
@@ -191,12 +183,12 @@ export class WorktreeService {
 		// ADR-0003：删 worktree 前必须先把未提交改动快照成 [afk-wip] commit，留在 afk 分支供重跑复用。
 		// 工作树干净时跳过（无变更不产生 commit）；快照失败则中止删除——宁可保留 worktree
 		// 等重跑复用，也不裸删抹掉进度（崩溃/超时场景，见 CONTEXT.md Retry）。
-		const { stdout } = await execFileAsync("git", ["status", "--porcelain"], { cwd: worktreePath });
+		const stdout = await runGit(worktreePath, ["status", "--porcelain"]);
 		if (stdout.trim()) {
-			await execFileAsync("git", ["add", "-A"], { cwd: worktreePath });
+			await runGit(worktreePath, ["add", "-A"]);
 			// commit 失败忽略（无变更 / 钩子拦截 / 作者配置缺失）：WIP 快照 best-effort，
 			// 不因快照失败阻塞删除流程。
-			await execFileAsync("git", ["commit", "-m", `[afk-wip] #${ticketRef}`], { cwd: worktreePath })
+			await runGit(worktreePath, ["commit", "-m", `${AFK_WIP_PREFIX} #${ticketRef}`])
 				.catch(() => undefined);
 		}
 		// 快照完成后才允许裸删：remove() 内部就是 worktree remove --force + rm -rf + branch -D
@@ -209,8 +201,36 @@ export class WorktreeService {
 	 */
 	async gcBranch(projectPath: string, branch: string): Promise<void> {
 		// ADR-0006 分支 GC：PR 合并由人确认后删除远程分支；分支可能已被别人删过 → 失败忽略。
-		await execFileAsync("git", ["push", "origin", "--delete", branch], { cwd: projectPath })
+		await runGit(projectPath, ["push", "origin", "--delete", branch])
 			.catch(() => undefined);
+	}
+
+	/**
+	 * ADR-0003：缺 git author 时写 repo local config（不动全局），保证 [afk-wip] WIP 快照可提交。
+	 * 由 Orchestrator 在派发前调用；worktree 与主工作区共享同一 .git/config，local 配置一次生效。
+	 */
+	async ensureGitAuthor(projectPath: string): Promise<void> {
+		const name = (await runGit(projectPath, ["config", "user.name"], { allowFailure: true })).trim();
+		const email = (await runGit(projectPath, ["config", "user.email"], { allowFailure: true })).trim();
+		if (!name) {
+			await runGit(projectPath, ["config", "user.name", "AFK Agent"]).catch(() => undefined);
+		}
+		if (!email) {
+			await runGit(projectPath, ["config", "user.email", "afk@ompdeck.local"]).catch(() => undefined);
+		}
+	}
+
+	/**
+	 * 超时/崩溃路径的 WIP 快照提交（ADR-0003，WIP 归属本服务）：让工作树干净、重跑可复用；
+	 * 无变更/钩子拦截/作者缺失时忽略失败（best-effort，不阻断失败流程）。
+	 */
+	async commitWip(worktreePath: string, ticketRef: number): Promise<void> {
+		try {
+			await runGit(worktreePath, ["add", "-A"]);
+			await runGit(worktreePath, ["commit", "-m", `${AFK_WIP_PREFIX} #${ticketRef}`]);
+		} catch {
+			// 无变更 / 钩子拦截 / 作者缺失：best-effort，不阻断失败流程
+		}
 	}
 
 	/**
@@ -225,7 +245,7 @@ export class WorktreeService {
 		if (existsSync(worktreeDir)) {
 			throw new Error(`工作区目录已存在：${worktreeDir}`);
 		}
-		const ref = await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: projectPath })
+		const ref = await runGit(projectPath, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`])
 			.then(() => true)
 			.catch(() => false);
 		if (ref) {

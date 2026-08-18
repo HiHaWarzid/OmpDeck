@@ -1,8 +1,9 @@
 /**
- * AFK IPC handler（afk:status / afk:start / afk:stop）。
- * subscribe 成员（onStatusChanged / onTicketCompleted）不在此注册——它们是主进程主动推送
- * （ipcChannels.afkStatusChanged / afkTicketCompleted，由 AfkOrchestrator 经 getMainWindow
+ * AFK IPC handler（afk:status / afk:terminate）。
+ * subscribe 成员（onStatusChanged）不在此注册——它是主进程主动推送
+ * （ipcChannels.afkStatusChanged，由 AfkOrchestrator 经 getMainWindow
  * 推给 renderer），与 feishuHandlers.broadcastBotsChanged 的推送模式一致。
+ * 启停走设置（applySettings 热更新），不再暴露 afk:start/afk:stop。
  */
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
@@ -22,13 +23,9 @@ export function registerAfkHandlers(deps: AfkHandlerDeps): AfkHandlerMaps {
 		afk: {
 			/** 快照：运行态 + 历史归档 */
 			status: async () => orchestrator.getState(),
-			/** 启用/恢复轮询（enabled 持久化在 AppSettings.afk） */
-			start: async () => {
-				await orchestrator.start();
-			},
-			/** 停用：停止轮询与新任务派发；已在跑的任务保持运行到终态 */
-			stop: async () => {
-				await orchestrator.stop();
+			/** 终止单任务（stop agent + failed 收口 + needs-info 回写） */
+			terminate: async (_event, taskId: number) => {
+				await orchestrator.terminate(taskId);
 			},
 		},
 	};

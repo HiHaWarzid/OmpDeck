@@ -14,39 +14,19 @@
  * - 崩溃恢复：重启读 afk-state.json；agent 存活 → needs-review 等人，死亡 → 强清留 WIP → failed
  */
 import { app, type BrowserWindow } from "electron";
-import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
 import { ipcChannels } from "../../shared/ipc";
-import type { AfkSettings, AfkState, AfkTask, AfkTaskStatus, Project } from "../../shared/types";
+import type { AfkState, AfkTask, AfkTaskStatus, AppSettings, Project } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { ProjectStore } from "../projects/ProjectStore";
 import type { SettingsStore } from "../settings/SettingsStore";
-import type { WorktreeService } from "../git/WorktreeService";
-import {
-	claim,
-	completeIssue,
-	createPr,
-	failIssue,
-	getCurrentUser,
-	getIssueBody,
-	listReadyForAgent,
-	type AfkTicket,
-} from "./ticketSources";
+import { AFK_WIP_PREFIX, type WorktreeService } from "../git/WorktreeService";
+import { runGit } from "../utils/CommandRunner";
+import { GhTicketSource, type AfkTicket, type TicketSource } from "./ticketSources";
 
-const execFileAsync = promisify(execFile);
-
-/** 轮询间隔缺省 60s（与 settings.ts afk 注释一致） */
-const DEFAULT_POLL_INTERVAL_MS = 60_000;
-/** 单任务预算缺省 30min（CONTEXT.md Timeout，AppSettings 可配） */
-const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 /** 历史归档保留 30 天（handoff：afk-state.json 滚动清理） */
 const ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-/** WIP 快照 commit 前缀（ADR-0003，与 WorktreeService 统一） */
-const AFK_WIP_PREFIX = "[afk-wip]";
-/** git 本地命令超时 */
-const GIT_TIMEOUT_MS = 30_000;
 
 export type AfkOrchestratorDeps = {
 	agentManager: AgentManager;
@@ -54,6 +34,8 @@ export type AfkOrchestratorDeps = {
 	projectStore: ProjectStore;
 	settingsStore: SettingsStore;
 	getMainWindow: () => BrowserWindow | null;
+	/** 工单源（gh CLI 实现）；测试注入 FakeTicketSource 驱动状态机（ADR-0001 可测试性） */
+	ticketSource?: TicketSource;
 };
 
 /** 状态为活跃（不可再派发同 ticket）的任务状态集合 */
@@ -69,6 +51,7 @@ export class AfkOrchestrator {
 	private readonly projectStore: ProjectStore;
 	private readonly settingsStore: SettingsStore;
 	private readonly getMainWindow: () => BrowserWindow | null;
+	private readonly ticketSource: TicketSource;
 	/** 持久化文件 userData/afk-state.json（同 SettingsStore 的 userData 获取方式） */
 	private readonly stateFilePath = join(app.getPath("userData"), "afk-state.json");
 
@@ -86,6 +69,8 @@ export class AfkOrchestrator {
 		this.projectStore = deps.projectStore;
 		this.settingsStore = deps.settingsStore;
 		this.getMainWindow = deps.getMainWindow;
+		// 缺省 gh 实现：main/index.ts 的构造入参不变（新增字段可选）
+		this.ticketSource = deps.ticketSource ?? GhTicketSource;
 
 		// 语义事件订阅（#2 杠杆点）：settled = agent 停止工作的权威完成信号；
 		// statusChanged === "error" = 失败信号。不轮询 addStateListener 快照。
@@ -107,10 +92,15 @@ export class AfkOrchestrator {
 		return { ...this.state, tasks: [...this.state.tasks] };
 	}
 
-	/** 启用/恢复轮询（afk:start）：持久化 enabled 到 AppSettings.afk，立即扫一次 + 定时轮询。 */
+	/**
+	 * 启用/恢复轮询：持久化 enabled 到 AppSettings.afk，立即扫一次 + 定时轮询。
+	 * 不再暴露为 IPC（afk:start 已删）：启动自动恢复（index.ts）与测试直接调用；
+	 * 运行期启停统一走 applySettings（settings-save 热更新）。
+	 */
 	async start(): Promise<void> {
 		await this.initPromise;
-		const afk = this.getAfkSettings();
+		// 设置形状已由 SettingsStore 归一化（迁移/校验/默认补齐），直接读权威值
+		const afk = this.settingsStore.get().afk;
 		// 启用开关持久化：设置页与中心页共用 AppSettings.afk.enabled 同一事实源
 		if (!afk.enabled) {
 			await this.settingsStore.update({ afk: { ...afk, enabled: true } });
@@ -121,7 +111,7 @@ export class AfkOrchestrator {
 		void this.poll(); // 启动立即扫一次，不等第一个 interval
 	}
 
-	/** 停用（afk:stop）：停止轮询与新任务派发；已在跑的任务保持到终态（事件路径仍收口）。 */
+	/** 停用：停止轮询与新任务派发；已在跑的任务保持到终态（事件路径仍收口）。 */
 	async stop(): Promise<void> {
 		await this.initPromise;
 		if (this.pollTimer) {
@@ -129,11 +119,45 @@ export class AfkOrchestrator {
 			this.pollTimer = null;
 		}
 		this.state.enabled = false;
-		const afk = this.getAfkSettings();
+		const afk = this.settingsStore.get().afk;
 		if (afk.enabled) {
 			await this.settingsStore.update({ afk: { ...afk, enabled: false } });
 		}
 		await this.saveState();
+	}
+
+	/**
+	 * 设置热更新（settings-save 路径调用，见 appHandlers settings.update 的 afk 分支）：
+	 * - enabled 置位 → 按最新 pollIntervalMs 重排定时器并立即扫一轮
+	 * - enabled 清除 → 停表（已在跑任务保持运行，事件路径照常收口）
+	 * - targetProjectIds 变更 → 下一轮 poll 生效（targetProjects 每轮读设置）
+	 * 与 start()/stop() 的差别：设置已由调用方落库，这里不写盘、不重复持久化。
+	 */
+	async applySettings(settings: Pick<AppSettings, "afk">): Promise<void> {
+		await this.initPromise;
+		const afk = settings.afk;
+		this.state.enabled = afk.enabled;
+		if (afk.enabled) {
+			this.schedulePolling(afk.pollIntervalMs);
+			void this.poll();
+		} else if (this.pollTimer) {
+			clearInterval(this.pollTimer);
+			this.pollTimer = null;
+		}
+		await this.saveState();
+	}
+
+	/**
+	 * 终止单任务（afk:terminate，面板「终止」按钮，取代裸 agents.stop）：
+	 * 停止 agent → failed 收口（ADR-0005 needs-info 回写）+ WIP 快照提交、worktree 保留
+	 * （ADR-0003，等同超时路径：人工终止不丢工作成果，供重跑复用）。
+	 * 幂等：非 queued/running 任务直接返回（settled/error 路径可能已抢先收口）。
+	 */
+	async terminate(taskId: number): Promise<void> {
+		await this.initPromise;
+		const task = this.state.tasks.find((item) => item.ticketRef === taskId);
+		if (!task || (task.status !== "queued" && task.status !== "running")) return;
+		await this.failTask(task, "用户终止：手动停止了 AFK 任务", { keepWorktree: true });
 	}
 
 	// ── 初始化 / 崩溃恢复 / 持久化 ──
@@ -149,7 +173,7 @@ export class AfkOrchestrator {
 		await this.loadState();
 		this.rollArchive();
 		await this.recoverInterruptedTasks();
-		this.state.enabled = this.getAfkSettings().enabled;
+		this.state.enabled = this.settingsStore.get().afk.enabled;
 		await this.saveState();
 		if (this.state.enabled) {
 			this.schedulePolling();
@@ -194,17 +218,18 @@ export class AfkOrchestrator {
 			const alive = task.agentId
 				? this.agentManager.list().some((tab) => tab.id === task.agentId)
 				: false;
+			const project = this.resolveProject(task);
 			if (alive) {
 				// agent 进程存活（如 orchestrator 重载而 agentManager 未重启）：标 needs-review 等人，
 				// 不判死、不动 worktree——agent 仍在工作，终态由后续事件路径（settled/error）收口
 				task.status = "needs-review";
+				task.ticketUrl = await this.computeTicketUrl(task, project);
 				this.pushStatusChanged(task);
 				continue;
 			}
 			// agent 不存在（应用重启）或 queued 未派发：强清 worktree 留 WIP，issue 回写 needs-info
 			task.errorSummary = "崩溃恢复：应用重启时任务未完成";
 			// 项目按任务绑定解析（多项目下每个任务可属不同项目，不能用单一当前目标项目）
-			const project = this.resolveProject(task);
 			if (project && task.worktreePath) {
 				await this.worktreeService
 					.removeWithWip(task.worktreePath, project.path, task.ticketRef)
@@ -213,13 +238,14 @@ export class AfkOrchestrator {
 			}
 			if (project) {
 				try {
-					await failIssue(project.path, task.ticketRef, task.errorSummary);
+					await this.ticketSource.failIssue(project.path, task.ticketRef, task.errorSummary);
 				} catch (error) {
 					console.error("[AFK] 崩溃恢复回写 issue 失败:", errorMessage(error));
 				}
 			}
 			task.status = "failed";
 			task.endedAt = Date.now();
+			task.ticketUrl = await this.computeTicketUrl(task, project);
 			this.pushStatusChanged(task);
 		}
 	}
@@ -243,19 +269,20 @@ export class AfkOrchestrator {
 			const projects = this.targetProjects();
 			if (projects.length === 0) return;
 			for (const project of projects) {
-				const tickets = await listReadyForAgent(project.path);
+				const tickets = await this.ticketSource.listReadyForAgent(project.path);
 				// 认领基准 = gh 认证账户 @me（AFK Identity）；gh api user 失败时保守跳过所有已认领 ticket
-				const me = await getCurrentUser(project.path).catch(() => null);
+				const me = await this.ticketSource.getCurrentUser(project.path).catch(() => null);
 				for (const ticket of tickets) {
 					if (!this.isClaimable(ticket, me)) continue;
 					try {
-						await claim(project.path, ticket.number);
+						await this.ticketSource.claim(project.path, ticket.number);
 					} catch (error) {
 						// 认领失败（网络/权限/未认证）：本轮跳过该 ticket，不派发
 						console.warn("[AFK] 认领 ticket 失败:", ticket.number, errorMessage(error));
 						continue;
 					}
-					await this.dispatch(ticket, project);
+					// 认领时间戳：任务时间线起点（dispatch 内同时登记 createdAt/startedAt）
+					await this.dispatch(ticket, project, Date.now());
 					return; // 派发完成即结束本轮（串行：一次只派一个）
 				}
 			}
@@ -287,22 +314,28 @@ export class AfkOrchestrator {
 	 * → spawn agent（cwd 指向 worktree，瞬时会话）→ sendPrompt（brief 原样）。
 	 * 链路任一步失败 → 统一 failed（failTask 内 best-effort 回写 needs-info）。
 	 */
-	private async dispatch(ticket: AfkTicket, project: Project): Promise<void> {
+	private async dispatch(ticket: AfkTicket, project: Project, claimedAt: number): Promise<void> {
 		const task: AfkTask = {
 			ticketRef: ticket.number,
 			title: ticket.title,
 			projectId: project.id,
 			status: "running",
-			startedAt: Date.now(),
+			createdAt: claimedAt,
+			claimedAt,
+			startedAt: claimedAt,
 		};
 		this.state.tasks.push(task);
+		// 工单地址：git remote 反查仓库基址拼装（Project 无 remote 字段）。网络失败或
+		// 缺 remote → undefined（面板「打开工单」禁用，与旧 prUrl 反推不可用时的行为一致）。
+		task.ticketUrl = await this.computeTicketUrl(task, project);
 		this.pushStatusChanged(task);
 		try {
 			// ADR-0003：保证 [afk-wip] commit 可提交——目标项目缺 git author 时写 repo local config
-			await this.ensureGitAuthor(project.path);
+			await this.worktreeService.ensureGitAuthor(project.path);
 			const created = await this.worktreeService.createAfk(project.path, ticket.number, ticket.title);
 			task.worktreePath = created.path;
 			task.branch = created.branch;
+			task.worktreeAt = Date.now();
 			// 显式 projectStore.add 登记子项目；复用同路径时 add 幂等（path 查重更新）
 			await this.projectStore.add(created.path, project.id);
 			const tab = await this.agentManager.create({
@@ -312,7 +345,7 @@ export class AfkOrchestrator {
 				cwd: created.path,
 			});
 			task.agentId = tab.id;
-			const body = await getIssueBody(project.path, ticket.number);
+			const body = await this.ticketSource.getIssueBody(project.path, ticket.number);
 			const result = await this.agentManager.sendPrompt({
 				agentId: tab.id,
 				message: this.buildBrief(ticket, body),
@@ -367,7 +400,7 @@ export class AfkOrchestrator {
 						.removeWithWip(task.worktreePath, projectPath, task.ticketRef)
 						.catch(() => undefined);
 					await this.removeChildProjectRecord(task.worktreePath, project.id);
-					await completeIssue(projectPath, task.ticketRef, undefined);
+					await this.ticketSource.completeIssue(projectPath, task.ticketRef, undefined);
 					task.status = "complete";
 				} else {
 					await this.pushBranch(projectPath, task.branch);
@@ -375,21 +408,20 @@ export class AfkOrchestrator {
 						.removeWithWip(task.worktreePath, projectPath, task.ticketRef)
 						.catch(() => undefined);
 					await this.removeChildProjectRecord(task.worktreePath, project.id);
-					const pr = await createPr(
+					const pr = await this.ticketSource.createPr(
 						projectPath,
 						task.branch,
 						this.prTitle(task),
 						this.buildPrBody(task, realCommits),
 					);
 					task.prUrl = pr.url;
-					await completeIssue(projectPath, task.ticketRef, pr.url);
+					await this.ticketSource.completeIssue(projectPath, task.ticketRef, pr.url);
 					task.status = "pr-pending";
 				}
 			}
 			task.endedAt = Date.now();
+			// 完成即一次状态变更推送：prUrl 已回填，pushStatusChanged 内顺带兜底 ticketUrl
 			this.pushStatusChanged(task);
-			// ticket 完成推送（PR 已建 / 重标 ready-for-human）：PR tab 与任务历史监听
-			this.pushTicketCompleted(task);
 		} catch (error) {
 			// 完成路径异常（push/PR/重标失败）：failed + needs-info（failTask 内 best-effort 回写），
 			// 避免 ticket 滞留 ready-for-agent 被下轮 poll 循环重派
@@ -435,7 +467,7 @@ export class AfkOrchestrator {
 			if (opts.keepWorktree) {
 				// 超时路径：WIP 快照提交、worktree 保留（ADR-0003），等重跑复用或 TTL 后 GC
 				if (project && task.worktreePath) {
-					await this.commitWip(task.worktreePath, task.ticketRef);
+					await this.worktreeService.commitWip(task.worktreePath, task.ticketRef);
 				}
 			} else if (project && task.worktreePath) {
 				await this.worktreeService
@@ -446,7 +478,7 @@ export class AfkOrchestrator {
 			if (project) {
 				// best-effort：回写失败不阻断终态；needs-info 防循环重派（ADR-0005）
 				try {
-					await failIssue(project.path, task.ticketRef, errorSummary);
+					await this.ticketSource.failIssue(project.path, task.ticketRef, errorSummary);
 				} catch (error) {
 					console.error("[AFK] 回写 issue 失败:", errorMessage(error));
 				}
@@ -461,7 +493,7 @@ export class AfkOrchestrator {
 
 	/** 超时检查（poll 内调用，不挂 per-task 定时器）：startedAt + timeoutMs 过期 → failed（保留 WIP）。 */
 	private async checkTimeouts(): Promise<void> {
-		const afk = this.getAfkSettings();
+		const afk = this.settingsStore.get().afk;
 		const now = Date.now();
 		for (const task of this.state.tasks) {
 			if (task.status !== "running" || !task.startedAt) continue;
@@ -473,62 +505,19 @@ export class AfkOrchestrator {
 		}
 	}
 
-	// ── git 操作（Orchestrator 自持最小 git 面；stderr 归一化同 GitService.runGit） ──
+	// ── git 操作（统一经 CommandRunner.runGit：超时 30s 默认/缓冲 32MB/stderr 归一化/ENOENT 归类） ──
 
-	private async runGit(
-		cwd: string,
-		args: string[],
-		options: { allowFailure?: boolean; timeout?: number } = {},
-	): Promise<string> {
-		try {
-			const { stdout } = await execFileAsync("git", args, {
-				cwd,
-				timeout: options.timeout ?? GIT_TIMEOUT_MS,
-				maxBuffer: 32 * 1024 * 1024,
-			});
-			return stdout;
-		} catch (error) {
-			if (options.allowFailure) return "";
-			// execFile 的 error.message 不含 stderr，而 git 失败原因在 stderr（冲突/认证拒绝）
-			const execError = error as { stderr?: string };
-			const detail = execError.stderr?.trim() || errorMessage(error);
-			throw new Error(`git ${args[0] ?? "command"} failed: ${detail}`);
-		}
-	}
-
-	/** ADR-0003：缺 git author 时写 repo local config（不动全局），保证 WIP 快照可提交。 */
-	private async ensureGitAuthor(projectPath: string): Promise<void> {
-		const name = (await this.runGit(projectPath, ["config", "user.name"], { allowFailure: true })).trim();
-		const email = (await this.runGit(projectPath, ["config", "user.email"], { allowFailure: true })).trim();
-		if (!name) {
-			await this.runGit(projectPath, ["config", "user.name", "AFK Agent"]).catch(() => undefined);
-		}
-		if (!email) {
-			await this.runGit(projectPath, ["config", "user.email", "afk@ompdeck.local"]).catch(() => undefined);
-		}
-	}
-
-	/** 超时/崩溃路径的 WIP 快照提交（ADR-0003）：让工作树干净、重跑可复用；无变更时忽略失败。 */
-	private async commitWip(worktreePath: string, ticketRef: number): Promise<void> {
-		try {
-			await this.runGit(worktreePath, ["add", "-A"]);
-			await this.runGit(worktreePath, ["commit", "-m", `${AFK_WIP_PREFIX} #${ticketRef}`]);
-		} catch {
-			// 无变更 / 钩子拦截 / 作者缺失：best-effort，不阻断失败流程
-		}
-	}
-
-	/** 推分支并设上游：git push -u origin {branch}（cwd 为项目主工作区）。 */
+	/** 推分支并设上游：git push -u origin {branch}（cwd 为项目主工作区）；网络大调用覆盖 120s 超时。 */
 	private async pushBranch(projectPath: string, branch: string): Promise<void> {
-		await this.runGit(projectPath, ["push", "-u", "origin", branch], { timeout: 120_000 });
+		await runGit(projectPath, ["push", "-u", "origin", branch], { timeoutMs: 120_000 });
 	}
 
 	/**
-	 * ADR-0006 PR 卫生：分支相对 main 的提交列表，过滤 [afk-wip] WIP 快照。
+	 * ADR-0006 PR 卫生：分支相对 main 的提交列表，过滤 [afk-wip] WIP 快照（AFK_WIP_PREFIX 见 WorktreeService）。
 	 * 返回真实提交的 subject 列表（供 PR body 引用）；空数组 = 无真实提交 → 不开 PR。
 	 */
 	private async listRealCommits(projectPath: string, branch: string): Promise<string[]> {
-		const stdout = await this.runGit(projectPath, ["log", "main..branch", "--format=%s"]);
+		const stdout = await runGit(projectPath, ["log", "main..branch", "--format=%s"]);
 		return stdout
 			.split("\n")
 			.map((line) => line.trim())
@@ -542,7 +531,7 @@ export class AfkOrchestrator {
 	 * 工单扫描按列表顺序进行，认领第一个可认领的（全局仍一次一个任务）。
 	 */
 	private targetProjects(): Project[] {
-		const ids = this.getAfkSettings().targetProjectIds;
+		const ids = this.settingsStore.get().afk.targetProjectIds;
 		const projects: Project[] = [];
 		for (const id of ids) {
 			const project = this.projectStore.get(id);
@@ -564,36 +553,14 @@ export class AfkOrchestrator {
 	}
 
 	/**
-	 * 读 AFK 配置（带运行时防御）：旧 settings.json 可能缺失 afk 字段或字段非法
-	 * （顶层浅合并导致 afk 整体被旧值替换）——非法时回落默认值。
+	 * 目标项目列表由 SettingsStore 归一化后的 afk 配置驱动（形状保证，见 normalizeAfkSettings）。
+	 * intervalMs 缺省读设置（start/init 路径）；applySettings 传最新值（设置已落库，避免时序依赖）。
 	 */
-	private getAfkSettings(): AfkSettings {
-		const raw = this.settingsStore.get().afk;
-		const pollIntervalMs =
-			Number.isFinite(raw.pollIntervalMs) && raw.pollIntervalMs > 0
-				? raw.pollIntervalMs
-				: DEFAULT_POLL_INTERVAL_MS;
-		const timeoutMs =
-			Number.isFinite(raw.timeoutMs) && raw.timeoutMs > 0 ? raw.timeoutMs : DEFAULT_TIMEOUT_MS;
-		// B 方案多项目迁移：新配置是数组；旧 settings.json 若仍是单值 targetProjectId，自动迁移为数组。
-		// 运行时旧存档形状与 AfkSettings 不符（TS 只认新契约），具名收窄读取旧字段。
-		const legacyRaw = raw as unknown as { targetProjectId?: string };
-		const targetProjectIds = Array.isArray(raw.targetProjectIds)
-			? raw.targetProjectIds
-			: (legacyRaw.targetProjectId ? [legacyRaw.targetProjectId] : []);
-		return {
-			enabled: raw.enabled === true,
-			targetProjectIds,
-			pollIntervalMs,
-			timeoutMs,
-		};
-	}
-
-	private schedulePolling(): void {
+	private schedulePolling(intervalMs?: number): void {
 		if (this.pollTimer) clearInterval(this.pollTimer);
 		this.pollTimer = setInterval(() => {
 			void this.poll();
-		}, this.getAfkSettings().pollIntervalMs);
+		}, intervalMs ?? this.settingsStore.get().afk.pollIntervalMs);
 		this.pollTimer.unref?.();
 	}
 
@@ -637,14 +604,54 @@ export class AfkOrchestrator {
 	}
 
 	private pushStatusChanged(task: AfkTask): void {
+		// 兜底：旧存档/remote 缺失时从 prUrl 反推工单地址（面板不再自行推导）
+		this.attachTicketUrl(task);
 		const win = this.getMainWindow();
 		if (!win || win.isDestroyed()) return;
 		win.webContents.send(ipcChannels.afkStatusChanged, task);
 	}
 
-	private pushTicketCompleted(task: AfkTask): void {
-		const win = this.getMainWindow();
-		if (!win || win.isDestroyed()) return;
-		win.webContents.send(ipcChannels.afkTicketCompleted, task);
+	// ── 工单地址（ticketUrl）──
+
+	/**
+	 * 计算并回填 task.ticketUrl：已有值直接复用；否则从 git remote 反查仓库基址拼
+	 * {webBase}/issues/{ticketRef}。Project 类型无 remote 字段（类型见 shared/types/project.ts），
+	 * 仓库定位经 git remote get-url origin 读取；失败/缺 remote → undefined（面板禁用按钮）。
+	 */
+	private async computeTicketUrl(
+		task: AfkTask,
+		project: Project | undefined,
+	): Promise<string | undefined> {
+		if (task.ticketUrl) return task.ticketUrl;
+		if (task.prUrl) {
+			this.attachTicketUrl(task);
+			return task.ticketUrl;
+		}
+		if (!project) return undefined;
+		const remote = await runGit(project.path, ["remote", "get-url", "origin"], {
+			timeoutMs: 10_000,
+		}).catch(() => "");
+		const webBase = remoteToWebBase(remote);
+		if (!webBase) return undefined;
+		task.ticketUrl = `${webBase}/issues/${task.ticketRef}`;
+		return task.ticketUrl;
 	}
+
+	/** 同步兜底：prUrl 已存在时从 PR 地址反推工单地址（旧面板 deriveTicketUrl 的等价物）。 */
+	private attachTicketUrl(task: AfkTask): void {
+		if (task.ticketUrl || !task.prUrl) return;
+		const match = /^(https?:\/\/[^/]+\/[^/]+\/[^/]+)\/pull\/\d+/.exec(task.prUrl);
+		if (match) task.ticketUrl = `${match[1]}/issues/${task.ticketRef}`;
+	}
+}
+
+/** git remote 归一化为 Web 仓库基址（https://host/owner/repo）。支持 https、git@、ssh:// 形态；其余返回 undefined。 */
+function remoteToWebBase(remote: string): string | undefined {
+	const trimmed = remote.trim().replace(/\.git$/, "");
+	if (!trimmed) return undefined;
+	const https = /^https?:\/\/(.+)$/.exec(trimmed);
+	if (https) return `https://${https[1]}`;
+	const ssh = /^(?:ssh:\/\/)?git@([^/:]+)[:/](.+)$/.exec(trimmed);
+	if (ssh) return `https://${ssh[1]}/${ssh[2]}`;
+	return undefined;
 }

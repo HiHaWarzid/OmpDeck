@@ -60,7 +60,10 @@ function isActiveStatus(status: AfkTaskStatus): boolean {
 	return status === "queued" || status === "running";
 }
 
-/** 统计卡计数：活跃=queued+running；待合并=pr-pending；needs-review 属 complete 后人审阶段，不落入 4 卡 */
+/**
+ * 统计卡计数：活跃=queued+running；待合并=pr-pending；needs-review 属 complete 后人审阶段，不落入 4 卡。
+ * 列表级聚合（Orchestrator 推送单任务增量，无法代算），保留在面板。
+ */
 function countByStatus(tasks: AfkTask[]) {
 	let active = 0;
 	let complete = 0;
@@ -75,9 +78,9 @@ function countByStatus(tasks: AfkTask[]) {
 	return { active, complete, failed, prPending };
 }
 
-/** 排序：活跃置顶（running 先于 queued），组内按起始时间新→旧；无时间戳的排最后 */
+/** 排序：活跃置顶（running 先于 queued），组内按创建时间新→旧；无时间戳的排最后 */
 function sortTasks(tasks: AfkTask[]): AfkTask[] {
-	const taskTime = (task: AfkTask) => task.startedAt ?? task.endedAt ?? 0;
+	const taskTime = (task: AfkTask) => task.createdAt ?? task.startedAt ?? task.endedAt ?? 0;
 	return [...tasks].sort((a, b) => {
 		const aActive = isActiveStatus(a.status);
 		const bActive = isActiveStatus(b.status);
@@ -88,8 +91,8 @@ function sortTasks(tasks: AfkTask[]): AfkTask[] {
 		return taskTime(b) - taskTime(a);
 	});
 }
-
-/** 耗时展示：h/m/s 缩写，中英文通用（不引入新 i18n 键） */
+/**
+ * 耗时展示：h/m/s 缩写，中英文通用（不引入新 i18n 键） */
 function formatDuration(ms: number): string {
 	if (!Number.isFinite(ms) || ms < 0) return "";
 	const totalSeconds = Math.floor(ms / 1000);
@@ -99,17 +102,6 @@ function formatDuration(ms: number): string {
 	if (h > 0) return `${h}h ${m}m`;
 	if (m > 0) return `${m}m ${s}s`;
 	return `${s}s`;
-}
-
-/**
- * AfkTask 契约定稿无 repo 字段；从 prUrl 推断 GitHub 仓库前缀拼工单地址
- * （https://github.com/{owner}/{repo}/pull/{n} → .../issues/{ticketRef}）。
- * 失败任务无 PR → 无法定位仓库，返回 undefined（对应按钮禁用）。
- */
-function deriveTicketUrl(task: AfkTask): string | undefined {
-	if (!task.prUrl) return undefined;
-	const match = /^(https?:\/\/[^/]+\/[^/]+\/[^/]+)\/pull\/\d+/.exec(task.prUrl);
-	return match ? `${match[1]}/issues/${task.ticketRef}` : undefined;
 }
 
 /** 订阅事件推送的单任务更新：按 ticketRef 覆盖/插入（不整体替换，避免列表闪烁） */
@@ -132,8 +124,9 @@ type TimelineStep = {
 };
 
 /**
- * 生命周期时间线。AfkTask 无 createdAt 字段，created/worktree 节点无独立时间戳，
- * 时间用 startedAt 近似；PR 创建与 complete 终态同批，用 endedAt 近似。
+ * 生命周期时间线。Orchestrator 已按阶段回填真实时间戳（createdAt/claimedAt/worktreeAt/
+ * startedAt/endedAt），此处直接取字段；旧 afk-state.json 存档缺新字段（可选）时对应节点
+ * 不显示时间，结构不变。
  */
 function buildTimeline(task: AfkTask): TimelineStep[] {
 	const failed = task.status === "failed";
@@ -141,12 +134,12 @@ function buildTimeline(task: AfkTask): TimelineStep[] {
 		{
 			key: "created",
 			label: t("afk.timeline.created"),
-			time: task.startedAt != null ? formatTime(task.startedAt) : undefined,
+			time: task.claimedAt != null ? formatTime(task.claimedAt) : undefined,
 		},
 		{
 			key: "worktree",
 			label: t("afk.timeline.worktree"),
-			time: task.startedAt != null ? formatTime(task.startedAt) : undefined,
+			time: task.worktreeAt != null ? formatTime(task.worktreeAt) : undefined,
 		},
 		{
 			key: "running",
@@ -236,8 +229,9 @@ function TaskRow(props: {
 
 /**
  * AFK 中心页套件：全屏 Modal + 3 tab（总览/任务/PR 待合并）+ 页内详情抽屉。
- * 数据流：打开时拉一次快照，之后订阅 afk:status-changed / afk:ticket-completed 增量更新；
- * 手动刷新重新 status()。终止单任务复用 agents.stop(agentId)（契约无 afk 维度 stop）。
+ * 数据流：打开时拉一次快照，之后订阅 afk:status-changed 增量更新（单订阅通道，终态与
+ * PR 完成同走此通道）；手动刷新重新 status()。终止单任务走 afk:terminate
+ * （Orchestrator stop agent + failed 收口 + needs-info 回写，取代裸 agents.stop）。
  */
 export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPanelProps) {
 	const [state, setState] = useState<AfkState>({ tasks: [], enabled: false });
@@ -248,7 +242,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 	const [detailTicketRef, setDetailTicketRef] = useState<number | null>(null);
 	/** 「已合并」两步确认：先点标记，再点确认 */
 	const [confirmMergedRef, setConfirmMergedRef] = useState<number | null>(null);
-	/** 「终止」两步确认：先点终止武装，3s 内再点确认才 stop（防误触杀 agent） */
+	/** 「终止」两步确认：先点终止武装，3s 内再点确认才 terminate（防误触杀 agent） */
 	const [terminateArmed, setTerminateArmed] = useState<number | null>(null);
 	const [terminating, setTerminating] = useState(false);
 
@@ -275,15 +269,12 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 		if (!open) return;
 		setLoading(true);
 		void refresh();
+		// 单订阅通道：终态（含 PR 完成）同走 afk:status-changed 增量更新
 		const offStatus = window.piDesktop.afk.onStatusChanged((task) => {
-			setState((prev) => upsertTask(prev, task));
-		});
-		const offCompleted = window.piDesktop.afk.onTicketCompleted((task) => {
 			setState((prev) => upsertTask(prev, task));
 		});
 		return () => {
 			offStatus();
-			offCompleted();
 		};
 	}, [open, refresh]);
 
@@ -348,9 +339,9 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 				return;
 			}
 			setTerminating(true);
-			void window.piDesktop.agents
-				.stop(task.agentId)
-				// 终止后的任务状态由 Orchestrator 语义事件（status-changed）推送，无需本地改写
+			void window.piDesktop.afk
+				.terminate(task.ticketRef)
+				// 终止后的任务状态由 Orchestrator 语义事件（afk:status-changed）推送，无需本地改写
 				.catch((error) => {
 					showNotice(
 						`${t("afk.detail.terminate")} ${t("common.error")}: ${
@@ -546,14 +537,14 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 											<Button buttonSize="sm" onClick={() => openExternal(prUrl)}>
 												{t("afk.detail.openPr")}
 											</Button>
-											{(() => {
-												const url = deriveTicketUrl(task);
-												return url ? (
-													<Button buttonSize="sm" onClick={() => openExternal(url)}>
-														{t("afk.detail.openTicket")}
-													</Button>
-												) : null;
-											})()}
+											{task.ticketUrl ? (
+												<Button
+													buttonSize="sm"
+													onClick={() => task.ticketUrl && openExternal(task.ticketUrl)}
+												>
+													{t("afk.detail.openTicket")}
+												</Button>
+											) : null}
 											{confirmMergedRef === task.ticketRef ? (
 												<span className="afk-pr-confirm">
 													<Button buttonSize="sm" variant="danger" onClick={confirmMerged}>
@@ -644,7 +635,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 
 						<footer className="afk-detail-actions">
 							{(() => {
-								const url = deriveTicketUrl(detailTask);
+								const url = detailTask.ticketUrl;
 								return (
 									<Button
 										buttonSize="sm"

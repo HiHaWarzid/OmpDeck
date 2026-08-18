@@ -1,5 +1,6 @@
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron";
 import type { PiDesktopApi } from "./api";
+import type { AppLogQuery } from "./types";
 
 /**
  * IPC 通道表 —— 整个 IPC 接缝的唯一事实源。
@@ -20,14 +21,49 @@ import type { PiDesktopApi } from "./api";
  */
 export type IpcOpKind = "invoke" | "subscribe" | "send" | "sendSync" | "local";
 
-export interface IpcOpEntry {
+/**
+ * subscribe 通道的推送来源模块（主进程内实际 webContents.send / emit 该通道的位置）。
+ * 每个 subscribe 条目必须声明 pushFrom；subscribeEmitParity.test.ts 会逐一核对
+ * 命名模块源码里存在该通道的发送引用（字面量或 ipcChannels.<key> 派生引用），
+ * 声明了却无人推送的通道（死通道）直接 CI 失败。
+ * 命名约定：模块短名（kebab）→ src/main 下文件路径的映射见该测试的 PUSH_SOURCE_FILES。
+ */
+export type IpcPushSource =
+	| "agent-manager"
+	| "feishu-bridge"
+	| "feishu-handlers"
+	| "pet-index"
+	| "pet-patrol"
+	| "pet-state-bridge"
+	| "terminal-manager"
+	| "update-manager"
+	| "settings-store"
+	| "link-opener"
+	| "project-handlers"
+	| "afk-orchestrator"
+	| "main-index";
+
+export interface IpcOpEntry<Args extends unknown[] = unknown[], Packed = unknown> {
 	readonly channel?: string;
 	readonly kind: IpcOpKind;
 	/**
-	 * preload 侧参数打包：把成员函数参数打包成 invoke 的实参列表（默认原样展开）。
-	 * 仅 preload 消费；带 pack 的成员主进程 handler 签名退化为宽松类型（见 IpcHandlerMap）。
+	 * subscribe 条目必填：主进程推送来源模块。非 subscribe 条目不得声明。
+	 * 防止“通道已注册却无人推送”的死通道（见 subscribeEmitParity.test.ts）。
 	 */
-	readonly pack?: (...args: unknown[]) => readonly unknown[];
+	readonly pushFrom?: IpcPushSource;
+	/**
+	 * 双用途通道配对键：同一通道上 invoke（渲染层主动拉取）+ subscribe（主进程推送）成对出现时，
+	 * 两个条目声明同一 pairKey（约定值 = 共享通道名），使配对在表内显式化，
+	 * 取代“靠通道名巧合推断配对关系”的隐式耦合（原 '双用途通道' 注释手法）。
+	 * 每个 pairKey 必须有且仅有这 2 个条目（invoke + subscribe），且共享同一 channel。
+	 */
+	readonly pairKey?: string;
+	/**
+	 * preload 侧参数打包：把成员函数参数（Args）折叠成单元素 payload `[Packed]` 作为 invoke 实参
+	 * （默认原样展开）。Packed 同时约束主进程 handler 收到的 payload 类型（见 IpcHandlerMap）；
+	 * 全表 pack 均折叠为单对象，故返回类型固定为单元素元组。
+	 */
+	pack?(...args: Args): [Packed];
 	/**
 	 * preload 覆盖层实现标记：生成器跳过该成员，由 preload 的 apiOverrides 提供实现
 	 * （非 IPC 成员、sendSync 同步读取、fire-and-forget 等特殊形态）。
@@ -35,6 +71,31 @@ export interface IpcOpEntry {
 	 */
 	readonly override?: boolean;
 }
+
+/** skillHub.search 打包 payload：由 (query, page, pageSize, sortBy, order) 折叠为单对象。 */
+export type SkillHubSearchPayload = {
+	query: string;
+	page?: number;
+	pageSize?: number;
+	sortBy?: string;
+	order?: string;
+};
+
+/** config.fetchModels 打包 payload：由 (baseUrl, apiKey, apiType) 折叠为单对象。 */
+export type FetchModelsPayload = {
+	baseUrl: string;
+	apiKey: string;
+	apiType?: string;
+};
+
+/** config.testProvider 打包 payload：由 (baseUrl, apiKey, modelId, apiType, headers) 折叠为单对象。 */
+export type TestProviderPayload = {
+	baseUrl: string;
+	apiKey: string;
+	modelId: string;
+	apiType?: string;
+	headers?: Record<string, string>;
+};
 
 export type IpcTable = {
 	readonly [Ns in keyof PiDesktopApi]: {
@@ -56,7 +117,7 @@ export const ipcTable = {
 		add: { channel: "projects:add", kind: "invoke" },
 		remove: { channel: "projects:remove", kind: "invoke" },
 		reorder: { channel: "projects:reorder", kind: "invoke" },
-		onChanged: { channel: "projects:changed", kind: "subscribe" },
+		onChanged: { channel: "projects:changed", kind: "subscribe", pushFrom: "main-index" },
 		listRoot: { channel: "projects:list-root", kind: "invoke" },
 		listWorktreeChildren: { channel: "projects:list-worktree-children", kind: "invoke" },
 		toggleWorktreeEnabled: { channel: "projects:toggle-worktree-enabled", kind: "invoke" },
@@ -165,7 +226,11 @@ export const ipcTable = {
 		validateConnection: { channel: "wsl:validate-connection", kind: "invoke" },
 	},
 	logs: {
-		list: { channel: "logs:list", kind: "invoke", pack: (query) => [query ?? {}] },
+		list: {
+			channel: "logs:list",
+			kind: "invoke",
+			pack: (query?: AppLogQuery): [AppLogQuery] => [query ?? {}],
+		},
 		clear: { channel: "logs:clear", kind: "invoke" },
 		openFolder: { channel: "logs:open-folder", kind: "invoke" },
 		/** 获取 app 日志文件总大小 */
@@ -188,17 +253,16 @@ export const ipcTable = {
 		checkUpdate: { channel: "app:check-update", kind: "invoke" },
 		downloadUpdate: { channel: "app:download-update", kind: "invoke" },
 		installUpdate: { channel: "app:install-update", kind: "invoke" },
-		onUpdateProgress: { channel: "app:update-progress", kind: "subscribe" },
+		onUpdateProgress: { channel: "app:update-progress", kind: "subscribe", pushFrom: "update-manager" },
 		feedbackEnvironment: { channel: "app:feedback-environment", kind: "invoke" },
 		openExternal: { channel: "app:open-external", kind: "invoke" },
-		onOpenInBrowser: { channel: "app:open-in-browser", kind: "subscribe" },
+		onOpenInBrowser: { channel: "app:open-in-browser", kind: "subscribe", pushFrom: "link-opener" },
 		restart: { channel: "app:restart", kind: "invoke" },
 		visionTest: { channel: "vision:test", kind: "invoke" },
 		rendererLog: { channel: "renderer:log", kind: "invoke" },
-		minimizeWindow: { channel: "app:window-minimize", kind: "invoke" },
-		toggleMaximizeWindow: { channel: "app:window-toggle-maximize", kind: "invoke" },
+		/** 窗口控制动作表（minimize/toggle-maximize/close 三通道收敛为单通道，W6-7） */
+		windowControl: { channel: "app:window-control", kind: "invoke" },
 		toggleAlwaysOnTopWindow: { channel: "app:window-toggle-always-on-top", kind: "invoke" },
-		closeWindow: { channel: "app:window-close", kind: "invoke" },
 		toggleDevTools: { channel: "app:toggle-devtools", kind: "invoke" },
 	},
 	skills: {
@@ -235,7 +299,13 @@ export const ipcTable = {
 		search: {
 			channel: "skill-hub:search",
 			kind: "invoke",
-			pack: (query, page, pageSize, sortBy, order) => [{ query, page, pageSize, sortBy, order }],
+			pack: (
+				query: string,
+				page?: number,
+				pageSize?: number,
+				sortBy?: string,
+				order?: string,
+			): [SkillHubSearchPayload] => [{ query, page, pageSize, sortBy, order }],
 		},
 		detail: { channel: "skill-hub:detail", kind: "invoke" },
 		install: { channel: "skill-hub:install", kind: "invoke" },
@@ -257,7 +327,7 @@ export const ipcTable = {
 		get: { channel: "settings:get", kind: "invoke" },
 		update: { channel: "settings:update", kind: "invoke" },
 		testPiProxy: { channel: "settings:test-pi-proxy", kind: "invoke" },
-		onApplyWindow: { channel: "settings:apply-window", kind: "subscribe" },
+		onApplyWindow: { channel: "settings:apply-window", kind: "subscribe", pushFrom: "settings-store" },
 	},
 	config: {
 		getModels: { channel: "config:get-models", kind: "invoke" },
@@ -276,13 +346,21 @@ export const ipcTable = {
 		fetchModels: {
 			channel: "config:fetch-models",
 			kind: "invoke",
-			pack: (baseUrl, apiKey, apiType) => [{ baseUrl, apiKey, apiType }],
+			pack: (baseUrl: string, apiKey: string, apiType?: string): [FetchModelsPayload] => [
+				{ baseUrl, apiKey, apiType },
+			],
 		},
 		/** 快速测试 provider 连接：发送一条最小请求验证 baseUrl/apiKey/模型 是否正常 */
 		testProvider: {
 			channel: "config:test-provider",
 			kind: "invoke",
-			pack: (baseUrl, apiKey, modelId, apiType, headers) => [{ baseUrl, apiKey, modelId, apiType, headers }],
+			pack: (
+				baseUrl: string,
+				apiKey: string,
+				modelId: string,
+				apiType?: string,
+				headers?: Record<string, string>,
+			): [TestProviderPayload] => [{ baseUrl, apiKey, modelId, apiType, headers }],
 		},
 	},
 	agents: {
@@ -305,8 +383,8 @@ export const ipcTable = {
 		reload: { channel: "agents:reload", kind: "invoke" },
 		restart: { channel: "agents:restart", kind: "invoke" },
 		compact: { channel: "agents:compact", kind: "invoke" },
-		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），见 onRuntimeState
-		runtimeState: { channel: "agents:runtime-state", kind: "invoke" },
+		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），配对见 onRuntimeState
+		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state" },
 		cycleModel: { channel: "agents:cycle-model", kind: "invoke" },
 		availableModels: { channel: "agents:available-models", kind: "invoke" },
 		setModel: { channel: "agents:set-model", kind: "invoke" },
@@ -315,31 +393,31 @@ export const ipcTable = {
 		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke" },
 		setThinking: { channel: "agents:set-thinking", kind: "invoke" },
 		commands: { channel: "agents:commands", kind: "invoke" },
-		onState: { channel: "agents:state", kind: "subscribe" },
+		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 桌面宠物点击跳转：主进程通知主窗切换到活跃 Agent tab */
-		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe" },
-		onMessages: { channel: "agents:message", kind: "subscribe" },
-		onLog: { channel: "agents:log", kind: "subscribe" },
+		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe", pushFrom: "pet-index" },
+		onMessages: { channel: "agents:message", kind: "subscribe", pushFrom: "agent-manager" },
+		onLog: { channel: "agents:log", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 流式思考内容更新，agent 忙碌时实时推送当前思考文本 */
-		onThinking: { channel: "agents:thinking", kind: "subscribe" },
+		onThinking: { channel: "agents:thinking", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 主进程 → 渲染进程的轻量 toast 通知（如 abort 已请求停止） */
-		onNotice: { channel: "agents:notice", kind: "subscribe" },
+		onNotice: { channel: "agents:notice", kind: "subscribe", pushFrom: "agent-manager" },
 		/** RPC 日志，用于调试 */
-		onRpcLog: { channel: "agents:rpc-log", kind: "subscribe" },
-		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe" },
+		onRpcLog: { channel: "agents:rpc-log", kind: "subscribe", pushFrom: "agent-manager" },
+		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
 		/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
-		onUiRequest: { channel: "agents:ui-request", kind: "subscribe" },
+		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 渲染进程 → 主进程，传递用户在 UI 请求中的响应（选中的选项、输入的文本等） */
 		sendUiResponse: { channel: "agents:ui-response", kind: "invoke" },
 		notifyAsk: { channel: "agents:notify-ask", kind: "invoke" },
 		/** 项目信任确认：主进程 → 渲染进程，启动 Agent 前请求用户对含 .pi 资源的项目做信任决策 */
-		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe" },
+		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 项目信任确认：渲染进程 → 主进程，回传用户的信任选择（trust-remember/trust-session/deny） */
 		respondTrustRequest: { channel: "agents:trust-response", kind: "invoke" },
 	},
 	pet: {
 		/** 宠物窗监听主进程推送的聚合状态 */
-		onState: { channel: "pet:state", kind: "subscribe" },
+		onState: { channel: "pet:state", kind: "subscribe", pushFrom: "pet-state-bridge" },
 		/** 列出可用宠物包（内置 + petdex） */
 		list: { channel: "pet:list", kind: "invoke" },
 		/** 开关宠物 */
@@ -351,16 +429,16 @@ export const ipcTable = {
 		/** 点击宠物跳转活跃 Agent */
 		focusAgent: { channel: "pet:focus-agent", kind: "invoke" },
 		/** 主进程 → 宠物窗：推送当前选中宠物的 manifest（含 spritesheetUrl），切换宠物时热加载 */
-		onSprite: { channel: "pet:current-sprite", kind: "subscribe" },
+		onSprite: { channel: "pet:current-sprite", kind: "subscribe", pushFrom: "pet-index" },
 		/** 宠物窗 → 主进程：拉取当前选中宠物的 manifest（挂载时主动拉取，避免推送竞态丢失） */
 		getCurrent: { channel: "pet:get-current", kind: "invoke" },
 		/** 主进程 → 宠物窗：推送通知气泡（出错/完成时宠物头顶弹窗） */
-		onNotify: { channel: "pet:notify", kind: "subscribe" },
-		/** 设置页 → 主进程 → 宠物窗：预览动画行（测试用）——双用途通道，见 onPreviewMode */
-		setPreviewMode: { channel: "pet:preview-mode", kind: "invoke" },
-		onPreviewMode: { channel: "pet:preview-mode", kind: "subscribe" },
+		onNotify: { channel: "pet:notify", kind: "subscribe", pushFrom: "pet-state-bridge" },
+		/** 设置页 → 主进程 → 宠物窗：预览动画行（测试用）——双用途通道，配对见 onPreviewMode */
+		setPreviewMode: { channel: "pet:preview-mode", kind: "invoke", pairKey: "pet:preview-mode" },
+		onPreviewMode: { channel: "pet:preview-mode", kind: "subscribe", pushFrom: "pet-index", pairKey: "pet:preview-mode" },
 		/** 主进程 → 宠物窗：推送窗口能力探测结果（透明/穿透/自由定位） */
-		onCaps: { channel: "pet:caps", kind: "subscribe" },
+		onCaps: { channel: "pet:caps", kind: "subscribe", pushFrom: "pet-index" },
 		/** 调试：发送测试通知弹窗 */
 		testNotify: { channel: "pet:test-notify", kind: "invoke" },
 		/** 双击宠物触发逗弄：主进程注入一次 jumping 后恢复真实聚合态 */
@@ -382,8 +460,8 @@ export const ipcTable = {
 		resize: { channel: "terminal:resize", kind: "invoke" },
 		close: { channel: "terminal:close", kind: "invoke" },
 		shells: { channel: "terminal:shells", kind: "invoke" },
-		onData: { channel: "terminal:data", kind: "subscribe" },
-		onExit: { channel: "terminal:exit", kind: "subscribe" },
+		onData: { channel: "terminal:data", kind: "subscribe", pushFrom: "terminal-manager" },
+		onExit: { channel: "terminal:exit", kind: "subscribe", pushFrom: "terminal-manager" },
 	},
 	feishu: {
 		connect: { channel: "feishu:connect", kind: "invoke" },
@@ -392,7 +470,7 @@ export const ipcTable = {
 		disconnect: { channel: "feishu:disconnect", kind: "invoke" },
 		connectByBot: { channel: "feishu:connect-by-bot", kind: "invoke" },
 		statusRequest: { channel: "feishu:status-request", kind: "invoke" },
-		onStatus: { channel: "feishu:status", kind: "subscribe" },
+		onStatus: { channel: "feishu:status", kind: "subscribe", pushFrom: "feishu-bridge" },
 		botsList: { channel: "feishu:bots-list", kind: "invoke" },
 		botAdd: { channel: "feishu:bot-add", kind: "invoke" },
 		botRemove: { channel: "feishu:bot-remove", kind: "invoke" },
@@ -402,10 +480,10 @@ export const ipcTable = {
 		bindingsList: { channel: "feishu:bindings-list", kind: "invoke" },
 		bindingRemove: { channel: "feishu:binding-remove", kind: "invoke" },
 		bindingUpdate: { channel: "feishu:binding-update", kind: "invoke" },
-		onMessages: { channel: "feishu:messages", kind: "subscribe" },
-		onBindingsChanged: { channel: "feishu:bindings-changed", kind: "subscribe" },
-		onWhoamiResult: { channel: "feishu:whoami-result", kind: "subscribe" },
-		onBotsChanged: { channel: "feishu:bots-changed", kind: "subscribe" },
+		onMessages: { channel: "feishu:messages", kind: "subscribe", pushFrom: "feishu-bridge" },
+		onBindingsChanged: { channel: "feishu:bindings-changed", kind: "subscribe", pushFrom: "feishu-bridge" },
+		onWhoamiResult: { channel: "feishu:whoami-result", kind: "subscribe", pushFrom: "feishu-bridge" },
+		onBotsChanged: { channel: "feishu:bots-changed", kind: "subscribe", pushFrom: "feishu-handlers" },
 		/** 获取指定 Agent 绑定的飞书 Bot ID */
 		sessionBotGet: { channel: "feishu:session-bot-get", kind: "invoke" },
 		/** 设置指定 Agent 使用的飞书 Bot ID */
@@ -415,12 +493,10 @@ export const ipcTable = {
 	afk: {
 		/** 快照：运行态 + 历史归档（AfkState） */
 		status: { channel: "afk:status", kind: "invoke" },
-		start: { channel: "afk:start", kind: "invoke" },
-		stop: { channel: "afk:stop", kind: "invoke" },
-		/** 语义事件：任务状态变更推送（AfkTask） */
-		onStatusChanged: { channel: "afk:status-changed", kind: "subscribe" },
-		/** 语义事件：ticket complete 推送（PR 已建/重标 ready-for-human） */
-		onTicketCompleted: { channel: "afk:ticket-completed", kind: "subscribe" },
+		/** 终止单任务（stop agent + failed 收口 + needs-info 回写；面板「终止」按钮，取代裸 agents.stop） */
+		terminate: { channel: "afk:terminate", kind: "invoke" },
+		/** 语义事件：任务状态变更推送（AfkTask；终态与 PR 完成同走此通道，单一订阅入口） */
+		onStatusChanged: { channel: "afk:status-changed", kind: "subscribe", pushFrom: "afk-orchestrator" },
 	},
 	dialog: {
 		/** 打开系统原生文件/文件夹选择器，返回选中路径列表 */
@@ -433,9 +509,6 @@ export const ipcTable = {
 	perf: {
 		// 非 IPC：PIDECK_PERF=1 环境标志，实现走覆盖层
 		enabled: { kind: "local", override: true },
-	},
-	browser: {
-		openExternal: { channel: "browser:open-external", kind: "invoke" },
 	},
 	scratchPad: {
 		list: { channel: "scratch-pad:list", kind: "invoke" },
@@ -506,14 +579,14 @@ export const ipcChannels: Readonly<Record<string, string>> = (() => {
 
 /**
  * 主进程 handler 签名映射：由 api 命名空间类型生成。
- * - invoke 成员 → ipcMain.handle 的 handler（参数来自成员函数签名；带 pack 的成员退化为宽松签名）
+ * - invoke 成员 → ipcMain.handle 的 handler（参数来自成员函数签名；带 pack 的成员按表的 [Packed] 给 payload 定型）
  * - subscribe/send/sendSync/local 成员不产生 handle handler
  *   （subscribe 是主进程推送；send/sendSync 走 ipcMain.on，见 IpcOnMap / 模块内手写）
  */
 export type IpcHandlerMap<TTableNs, TApiNs> = {
 	[M in keyof TTableNs as TTableNs[M] extends { kind: "invoke" } ? M : never]:
-		TTableNs[M] extends { pack: (...args: unknown[]) => readonly unknown[] }
-			? (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown
+		TTableNs[M] extends { pack: (...args: infer _PackArgs) => [infer Packed] }
+			? (event: IpcMainInvokeEvent, ...args: [Packed]) => unknown
 			: M extends keyof TApiNs
 				? TApiNs[M] extends (...args: never[]) => unknown
 					? (event: IpcMainInvokeEvent, ...args: Parameters<TApiNs[M]>) => ReturnType<TApiNs[M]>

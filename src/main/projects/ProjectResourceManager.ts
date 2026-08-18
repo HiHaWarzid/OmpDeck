@@ -9,8 +9,14 @@ import type {
 	Project,
 	ProjectResourceListResult,
 } from "../../shared/types";
-
-const SKILL_FILE = "SKILL.md";
+import {
+	SKILL_FILE,
+	normalizeName,
+	parseFrontmatter,
+	setFrontmatterBoolean,
+	setFrontmatterName,
+	validateManifest,
+} from "../manifests/FrontmatterManifest";
 
 type ProjectProvider = (projectId: string) => Project | undefined;
 
@@ -33,7 +39,7 @@ export class ProjectResourceManager {
 	async createSkill(input: CreateProjectSkillInput): Promise<PiSkillSummary> {
 		const project = this.requireProject(input.projectId);
 		const location = this.skillLocations(project)[0];
-		const normalizedName = this.normalizeSkillName(input.name);
+		const normalizedName = normalizeName(input.name);
 		if (!normalizedName) throw new Error("Skill 名称只能包含小写字母、数字和连字符");
 		// 保留用户原始输入作为显示名；标准化名仅用于目录/文件路径，SKILL.md 内存原始名
 		// 这样 readSkill/refresh 后 UI 展示的是用户输入的原始名称，不会被 normalizeSkillName 截断。
@@ -52,7 +58,7 @@ export class ProjectResourceManager {
 			"utf8",
 		);
 		// 直接构造返回结果，避免 re-read 解析偏差
-		const warnings = this.validateSkill(normalizedName, description);
+		const warnings = validateManifest({ name: normalizedName, description });
 		return {
 			id: `${location.id}:${skillPath}`,
 			name: displayName,
@@ -82,7 +88,7 @@ export class ProjectResourceManager {
 		const skill = await this.findSkill(project, skillPath);
 		this.assertInsideProject(project, skill.path);
 		const raw = await readFile(skill.path, "utf8");
-		const next = this.setFrontmatterBoolean(raw, "disable-model-invocation", !enabled);
+		const next = setFrontmatterBoolean(raw, "disable-model-invocation", !enabled);
 		await writeFile(skill.path, next, "utf8");
 		// 重新读取文件，获取最新 frontmatter 状态
 		return this.readSkill(skill.path, this.skillLocations(project).find((l) => l.id === skill.sourceId) ?? this.skillLocations(project)[0], skill.type);
@@ -156,10 +162,10 @@ export class ProjectResourceManager {
 		type: PiSkillSummary["type"],
 	): Promise<PiSkillSummary> {
 		const raw = await readFile(skillPath, "utf8").catch(() => "");
-		const frontmatter = this.parseFrontmatter(raw);
+		const frontmatter = parseFrontmatter(raw);
 		const name = String(frontmatter.name ?? "").trim();
 		const description = String(frontmatter.description ?? "").trim();
-		const warnings = this.validateSkill(name, description);
+		const warnings = validateManifest({ name, description });
 		return {
 			id: `${location.id}:${skillPath}`,
 			name: name || dirname(skillPath).split(/[\\/]/).pop() || "未命名 Skill",
@@ -241,7 +247,7 @@ export class ProjectResourceManager {
 	async renameSkill(projectId: string, skillPath: string, newName: string): Promise<PiSkillSummary> {
 		const project = this.requireProject(projectId);
 		const skill = await this.findSkill(project, skillPath);
-		const normalizedNew = this.normalizeSkillName(newName);
+		const normalizedNew = normalizeName(newName);
 		if (!normalizedNew) throw new Error("Skill 名称不能为空");
 
 		const displayName = newName.trim();
@@ -255,7 +261,7 @@ export class ProjectResourceManager {
 
 		// 更新 SKILL.md 中的 name frontmatter
 		const raw = await readFile(skill.path, "utf8");
-		const updated = this.setFrontmatterName(raw, displayName);
+		const updated = setFrontmatterName(raw, displayName);
 		await writeFile(skill.path, updated, "utf8");
 
 		await rename(oldDir, newDir);
@@ -263,18 +269,6 @@ export class ProjectResourceManager {
 		// 重命名后重新读取
 		const newSkillPath = join(newDir, skill.path.split(/[\\/]/).pop()!);
 		return this.readSkill(newSkillPath, this.skillLocations(project).find((l) => newSkillPath.startsWith(l.path)) ?? this.skillLocations(project)[0], skill.type);
-	}
-
-	/** 更新 frontmatter 中的 name 字段 */
-	private setFrontmatterName(raw: string, name: string): string {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		if (!match) return `---\nname: ${name}\n---\n\n${raw}`;
-		const lines = match[1].split(/\r?\n/);
-		const nextLines = lines.map((line) => {
-			if (line.trim().startsWith("name:")) return `name: ${name}`;
-			return line;
-		});
-		return raw.replace(match[0], `---\n${nextLines.join("\n")}\n---`);
 	}
 
 	private async findSkill(project: Project, skillPath: string) {
@@ -291,50 +285,5 @@ export class ProjectResourceManager {
 		if (rel.startsWith("..") || rel === "" || resolve(root, rel) !== target) {
 			throw new Error("资源路径不在项目目录内，已拒绝操作");
 		}
-	}
-
-	private parseFrontmatter(raw: string) {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		const result: Record<string, string> = {};
-		if (!match) return result;
-		for (const line of match[1].split(/\r?\n/)) {
-			const index = line.indexOf(":");
-			if (index === -1) continue;
-			const key = line.slice(0, index).trim();
-			let value = line.slice(index + 1).trim();
-			value = value.replace(/^[\'"]|[\'"]$/g, "");
-			if (key) result[key] = value;
-		}
-		return result;
-	}
-
-	private validateSkill(name: string, description: string) {
-		const warnings: string[] = [];
-		if (!name) warnings.push("缺少 name");
-		if (name && !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
-			warnings.push("name 只能包含小写字母、数字和单个连字符");
-		}
-		if (name.length > 64) warnings.push("name 超过 64 个字符");
-		if (!description) warnings.push("缺少 description，omp 不会加载该 skill");
-		if (description.length > 1024) warnings.push("description 超过 1024 个字符");
-		return warnings;
-	}
-
-	private setFrontmatterBoolean(raw: string, key: string, value: boolean) {
-		const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-		if (!match) return `---\n${key}: ${value}\n---\n\n${raw}`;
-		const lines = match[1].split(/\r?\n/);
-		let changed = false;
-		const nextLines = lines.map((line) => {
-			if (!line.trim().startsWith(`${key}:`)) return line;
-			changed = true;
-			return `${key}: ${value}`;
-		});
-		if (!changed) nextLines.push(`${key}: ${value}`);
-		return raw.replace(match[0], `---\n${nextLines.join("\n")}\n---`);
-	}
-
-	private normalizeSkillName(value: string) {
-		return value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 	}
 }

@@ -1,16 +1,12 @@
-import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, open, readlink, realpath, unlink } from "node:fs/promises";
-import { promisify } from "node:util";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GitBranchInfo, CommitDetail, CommitEntry, GitRef, BranchDiffResult, GitChangedFile, GitFileStatus, GitCommitFileDiff, GitResourceGroupType, GitWorkspaceFileDiff } from "../../shared/types";
 import { GitStatus } from "../../shared/types";
 import type { GitResource, GitResourceGroups } from "../../shared/types";
+import { runGit } from "../utils/CommandRunner";
 
-const execFileAsync = promisify(execFile);
 const GIT_MUTATION_TIMEOUT_MS = 30_000;
-/** git 可执行文件名（统一经 runGit 调用；不经字面量散落 spawn，便于收敛审计）。 */
-const GIT_EXECUTABLE = "git";
 
 type RunGitOptions = {
 	/** 探测型命令：失败返回空串而非抛错（isGitRepo/readBlob 等调用方自行降级） */
@@ -102,25 +98,17 @@ export class GitService {
 	}
 
 	/**
-	 * git 命令执行器：收敛全部 spawn 的超时/缓冲/stderr 错误归一化。
-	 * execFile 的 error.message 不含 stderr，而 git 的失败原因在 stderr（如 checkout 冲突、
-	 * push 认证拒绝）——统一把 stderr 并入错误消息，避免渲染层只看到 "Command failed"。
+	 * git 命令执行器：统一经 CommandRunner.runGit（超时 30s 默认/缓冲 32MB/stderr 归一化/
+	 * ENOENT 归类/allowFailure 全收敛），本方法只做参数名映射（RunGitOptions.timeout → timeoutMs），
+	 * 公共方法面与 per-op 超时/缓冲覆盖行为保持不变。
+	 * execFile 错误对象的 stderr 已由 CommandRunner 并入错误消息（如 checkout 冲突、push 认证拒绝）。
 	 */
 	private async runGit(cwd: string, args: string[], options: RunGitOptions = {}): Promise<string> {
-		try {
-			const { stdout } = await execFileAsync(GIT_EXECUTABLE, args, {
-				cwd,
-				timeout: options.timeout ?? GIT_MUTATION_TIMEOUT_MS,
-				maxBuffer: options.maxBuffer ?? 32 * 1024 * 1024,
-			});
-			return stdout;
-		} catch (error) {
-			if (options.allowFailure) return "";
-			// execFile 错误对象的 stderr 字段未被 node 类型暴露；具名 const 收窄读取。
-			const execError = error as { stderr?: string };
-			const detail = execError.stderr?.trim() || (error instanceof Error ? error.message : String(error));
-			throw new Error(`git ${args[0] ?? "command"} failed: ${detail}`);
-		}
+		return runGit(cwd, args, {
+			allowFailure: options.allowFailure,
+			maxBuffer: options.maxBuffer,
+			timeoutMs: options.timeout,
+		});
 	}
 
 	/** 将 renderer 提供的 commit-ish 安全解析为完整 SHA，后续命令只接收 hash。 */

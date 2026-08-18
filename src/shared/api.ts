@@ -115,6 +115,14 @@ export interface ProjectsApi {
 	toggleWorktreeEnabled: (projectId: string) => Promise<Project | null>;
 	chooseChatPath: () => Promise<string | null>;
 	setChatPath: (path: string) => Promise<Project | null>;
+	/**
+	 * 「有哪些模型」三处表面之一（W6-7 记录，本波不删）：
+	 *  - projects.listModels：项目级模型缓存（pi --list-models，按项目）；
+	 *  - agents.availableModels：单个 agent 运行时的模型列表；
+	 *  - config.getModels + config.fetchModels：models.json 配置 / provider 在线拉取。
+	 * 三者缓存与用途不同（项目 vs 运行态 vs 配置编辑），语义不等价，合并需先理清
+	 * 缓存层级；留待后续波次评估，这里仅标注重叠。
+	 */
 	listModels: (projectId?: string) => Promise<AvailableModel[]>;
 }
 
@@ -156,6 +164,15 @@ export interface SessionsApi {
 	copy: (projectId: string, filePath: string) => Promise<{ cancelled?: boolean; sessionPath?: string }>;
 	exportHtml: (projectId: string, filePath: string) => Promise<{ path: string }>;
 	delete: (filePath: string) => Promise<void>;
+	/**
+	 * 会话文件读取家族（W6-7 记录，不合并）：五个成员都在读同一 JSONL 会话格式，
+	 * 但析取视角不同 —— 列表快照（readMessages 精简三元组）/ 用户提示提取
+	 * （readUserPrompts，prompt 历史重建）/ 元数据（readSessionMeta）/ 完整消息
+	 * （readChatMessages，渲染层消息缓存）/ 单条全文（readMessageFullText，
+	 * 按 agent 读追加消息文件）。实现分散在 sessionScanner（文件扫描/摘要）与
+	 * agentManager（运行中会话写入）两侧，各自有缓存与增量语义；合并成一个
+	 * 统一读取器需要先统一游标/缓存模型，属真实服务面收敛，留待未来波次。
+	 */
 	readMessages: (filePath: string) => Promise<Array<{ role: string; content: string; timestamp: number }>>;
 	readUserPrompts: (filePath: string, maxCount?: number) => Promise<string[]>;
 	readSessionMeta: (filePath: string) => Promise<{ provider?: string; modelId?: string; thinkingLevel?: string }>;
@@ -257,10 +274,12 @@ export interface AppApi {
 	restart: () => Promise<void>;
 	visionTest: (config: { baseUrl: string; apiKey: string }) => Promise<{ ok: boolean; models?: string[]; error?: string }>;
 	rendererLog: (level: AppLogLevel, scope: string, message: string, detail?: unknown) => Promise<void>;
-	minimizeWindow: () => Promise<void>;
-	toggleMaximizeWindow: () => Promise<void>;
+	/**
+	 * 窗口控制动作表（W6-7）：minimize / toggle-maximize / close 三个单成员通道收敛为一个
+	 * 动作成员；toggleAlwaysOnTop/toggleDevTools 保持独立（各自带返回值，形态不同）。
+	 */
+	windowControl: (action: "minimize" | "toggle-maximize" | "close") => Promise<void>;
 	toggleAlwaysOnTopWindow: () => Promise<boolean>;
-	closeWindow: () => Promise<void>;
 	toggleDevTools: () => Promise<boolean>;
 }
 
@@ -323,6 +342,13 @@ export interface ExtensionsApi {
 	update: () => Promise<PiCliUpdateResult>;
 }
 
+/**
+ * 类型化设置表面：AppSettings 强类型读写（SettingsStore，含热更新副作用：代理/主题/
+ * Web 服务/宠物联动）。与 config.getSettings/saveSettings/saveRaw（settings.json 原始
+ * JSON 文件级读写，ConfigModal 编辑器用）并行存在 —— 边界：settings.* = 应用语义 +
+ * 副作用；config.* = 文件内容编辑。W6-7 记录，不合并（两套都是真实服务面，合并有
+ * 回归风险，留待未来波次）。
+ */
 export interface SettingsApi {
 	get: () => Promise<AppSettings>;
 	update: (patch: Partial<AppSettings>) => Promise<AppSettings>;
@@ -333,10 +359,16 @@ export interface SettingsApi {
 export interface ConfigApi {
 	getModels: () => Promise<{ raw: string; parsed: { providers: Record<string, unknown> }; diagnostic?: ConfigFileDiagnostic }>;
 	getAuth: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
+	/**
+	 * settings.json 原始文件级读取（ConfigModal 编辑器）。与 settings.get（typed
+	 * AppSettings + 热更新副作用）并行 —— 这边返回 raw/parsed/diagnostic，供编辑器
+	 * 展示与诊断；界别见 SettingsApi 注释（W6-7 记录，不合并）。
+	 */
 	getSettings: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	getTrust: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
 	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
+	/** 原始 settings.json 写回（编辑器保存）；语义同 getSettings —— 文件级，无类型化副作用。 */
 	saveSettings: (settings: Record<string, unknown>) => Promise<{ valid: boolean; error?: string }>;
 	/** 原子设置 omp 默认供应商/默认模型，返回是否写入成功 */
 	setDefaultModel: (provider: string, modelId: string) => Promise<{ valid: boolean; error?: string }>;
@@ -386,6 +418,21 @@ export interface AgentsApi {
 	prepareResend: (agentId: string, messageId: string) => Promise<{ text: string; images?: ImageContent[] }>;
 	reload: (agentId: string) => Promise<void>;
 	restart: (agentId: string) => Promise<AgentTab>;
+	/**
+	 * 运行态变更家族（compact/cycleModel/setModel/refreshModels/cycleThinking/setThinking）：
+	 * 每个成员独立保留，不收敛为 agents.runtimeCommand(agentId, cmd, arg?) 动作表（W6-7 决策，
+	 * 证据见下）。六个通道会随 AgentManager 一起变，但合并成动作表会用 union 参数换来
+	 * 更糟的调用面：
+	 *  - 参数形态各异：无参（cycle/refresh）、双参（setModel(provider, modelId)）、
+	 *    单参（setThinking(level)）、可选参（compact(prompt?)）——union 动作对象在每个
+	 *    调用点都要构造 payload 对象，丢失按成员命名的可发现性与每个调用点的精确参数类型；
+	 *  - browserApi（内置浏览器模式）把每个成员一一映射到独立 REST 端点
+	 *    （/cycle-model、/model、/refresh-models、/cycle-thinking、/thinking，payload 各异），
+	 *    收敛会让 web 客户端从「成员→端点 一对一」退化成动作 switch，且违反 W6-18
+	 *    「不改 web HTTP 行为」约束；
+	 *  - 六者返回值都是 AgentRuntimeState，合并无返回类型收益。
+	 * 已评估，SKIP 收敛 — 保持六成员，改 API 面时与 AgentManager/WebServiceManager 同步。
+	 */
 	compact: (agentId: string, prompt?: string) => Promise<AgentRuntimeState>;
 	runtimeState: (agentId: string) => Promise<AgentRuntimeState>;
 	cycleModel: (agentId: string) => Promise<AgentRuntimeState>;
@@ -505,11 +552,6 @@ export interface PerfApi {
 	enabled: boolean;
 }
 
-/** 内置浏览器 */
-export interface BrowserApi {
-	openExternal: (url: string) => Promise<void>;
-}
-
 export interface ScratchPadApi {
 	list: () => Promise<DraftMeta[]>;
 	create: () => Promise<DraftMeta>;
@@ -523,14 +565,10 @@ export interface ScratchPadApi {
 export interface AfkApi {
 	/** 快照：运行态 + 历史归档 */
 	status: () => Promise<AfkState>;
-	/** 启用/恢复轮询（设置变更后调用；enabled 持久化在 AppSettings.afk） */
-	start: () => Promise<void>;
-	/** 停用：停止轮询与新任务派发；已在跑的任务保持运行到终态 */
-	stop: () => Promise<void>;
-	/** 语义事件订阅：任务状态变更（AfkTask） */
+	/** 终止单任务：停止 agent、failed 收口（保留 WIP worktree）、回写 needs-info（面板「终止」按钮） */
+	terminate: (taskId: number) => Promise<void>;
+	/** 语义事件订阅：任务状态变更（AfkTask；含终态与 PR 完成推送） */
 	onStatusChanged: (callback: (task: AfkTask) => void) => () => void;
-	/** 语义事件订阅：ticket complete（PR 已建） */
-	onTicketCompleted: (callback: (task: AfkTask) => void) => () => void;
 }
 
 export interface PiDesktopApi {
@@ -564,7 +602,6 @@ export interface PiDesktopApi {
 	dialog: DialogApi;
 	clipboard: ClipboardApi;
 	perf: PerfApi;
-	browser: BrowserApi;
 	scratchPad: ScratchPadApi;
 	afk: AfkApi;
 }

@@ -26,6 +26,7 @@ import type { SettingsStore } from "../settings/SettingsStore";
 import type { WebServiceManager } from "../web/WebServiceManager";
 import type { PiLocator } from "../pi/PiLocator";
 import type { PetSystem } from "../pet";
+import type { AfkOrchestrator } from "../afk/AfkOrchestrator";
 import type { WslEnvironment } from "../wsl/WslPaths";
 import { applyDesktopProxy } from "../settings/DesktopProxy";
 import { testPiProxy } from "../pi/PiProxyTester";
@@ -47,6 +48,8 @@ interface AppHandlerDeps {
 	restartApp: () => void;
 	getPetSystem: () => PetSystem | null;
 	getWebServiceManager: () => WebServiceManager | undefined;
+	/** AFK 编排器（settings-save 时热更新 afk 启停/目标/间隔） */
+	getAfkOrchestrator?: () => AfkOrchestrator | undefined;
 	// 顶层函数 dep（定义留在 index.ts）
 	openExternalUrl: (url: string, forceSystem?: boolean) => Promise<void>;
 	syncWslEnvironment: (settings: AppSettings) => Promise<WslEnvironment | null>;
@@ -121,16 +124,21 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				// 统一清理 + relaunch；清理失败不能拦住重启，否则应用会卡死在"点了没反应"
 				restartApp();
 			},
-			minimizeWindow: async () => {
+			windowControl: async (_event, action: "minimize" | "toggle-maximize" | "close") => {
 				const win = getMainWindow();
 				if (!win || win.isDestroyed()) return;
-				win.minimize();
-			},
-			toggleMaximizeWindow: async () => {
-				const win = getMainWindow();
-				if (!win || win.isDestroyed()) return;
-				if (win.isMaximized()) win.unmaximize();
-				else win.maximize();
+				switch (action) {
+					case "minimize":
+						win.minimize();
+						break;
+					case "toggle-maximize":
+						if (win.isMaximized()) win.unmaximize();
+						else win.maximize();
+						break;
+					case "close":
+						win.close();
+						break;
+				}
 			},
 			toggleAlwaysOnTopWindow: async () => {
 				const win = getMainWindow();
@@ -139,11 +147,6 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				// floating 适合工具型桌面窗口；跨平台由 Electron 映射到各系统的置顶层级。
 				win.setAlwaysOnTop(next, "floating");
 				return next;
-			},
-			closeWindow: async () => {
-				const win = getMainWindow();
-				if (!win || win.isDestroyed()) return;
-				win.close();
 			},
 			toggleDevTools: async () => {
 				const win = getMainWindow();
@@ -253,6 +256,11 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				// WSL 设置变更时同步更新会话扫描器和配置管理器
 				if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
 					await syncWslEnvironment(settings);
+				}
+				// AFK 设置热更新：enabled/targetProjectIds/pollIntervalMs 即刻生效，无需重启
+				// （运行中的任务保持不动；启用即恢复轮询，停用即停表，目标/间隔下一轮生效）
+				if ("afk" in patch) {
+					deps.getAfkOrchestrator?.()?.applySettings(settings);
 				}
 				return settings;
 			},

@@ -890,6 +890,7 @@ function registerIpc() {
 			restartApp,
 			getPetSystem: () => petSystem,
 			getWebServiceManager: () => webServiceManager,
+			getAfkOrchestrator: () => afkOrchestrator,
 			openExternalUrl,
 			syncWslEnvironment,
 			applyNativeThemeSource,

@@ -1647,17 +1647,17 @@ function SettingsModalContent(props: SettingsModalProps) {
 										{afkProjectOptions.length === 0 ? (
 											<span className="setting-hint">{t("afk.targetProjectPlaceholder")}</span>
 										) : (
-											// B 方案多项目轮转：checkbox 列表（项目数量少，不用 SelectField 多选定制）
+											// B 方案多项目轮转：checkbox 列表（项目数量少，不用 SelectField 多选定制）。
+											// SettingsStore 归一化保证 targetProjectIds 恒为数组（normalizeAfkSettings），无需兜底。
 											afkProjectOptions.map((option) => {
-												// 旧 settings.json 可能缺 targetProjectIds（浅合并历史数据），空数组兜底，避免渲染崩溃
-												const selected = (draftSettings.afk.targetProjectIds ?? []).includes(option.value);
+												const selected = draftSettings.afk.targetProjectIds.includes(option.value);
 												return (
 													<label key={option.value} className="afk-project-option">
 														<input
 															type="checkbox"
 															checked={selected}
 															onChange={(event) => {
-																const current = draftSettings.afk.targetProjectIds ?? [];
+																const current = draftSettings.afk.targetProjectIds;
 																const next = event.target.checked
 																	? [...current, option.value]
 																	: current.filter((id) => id !== option.value);

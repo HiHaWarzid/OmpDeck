@@ -1,16 +1,11 @@
 /**
  * AFK 工单源：GitHub Issues（via gh CLI，ADR-0002）。
  * gh 由 git remote 自动推断仓库——所有命令都在目标项目 cwd 运行。
- * 本模块是纯函数薄封装，便于单测；错误统一 throw（Orchestrator 捕获后标 failed），
- * 错误消息含 stderr 归一化（参照 GitService.runGit），并区分「gh 未安装」与「未认证」。
+ * 本模块是纯函数薄封装，便于单测；错误统一 throw（Orchestrator 捕获后标 failed）。
+ * 执行细节（超时/缓冲/stderr 归一化/ENOENT 归类）统一走 CommandRunner.runGh，
+ * 本模块只保留自己的职责面：gh 认证失败（exit 4 / auth/401 提示）附加登录指引。
  */
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
-
-/** gh 网络操作默认超时（list/createPr 等大调用单独加长） */
-const GH_TIMEOUT_MS = 30_000;
+import { CommandError, runGh as runGhBase } from "../utils/CommandRunner";
 
 /** 待派发工单的归一化形状（从 gh issue list --json 提取） */
 export type AfkTicket = {
@@ -25,9 +20,11 @@ export type AfkTicket = {
 };
 
 /**
- * gh 命令执行器：收敛超时/缓冲/stderr 错误归一化。
- * execFile 的 error.message 不含 stderr，而 gh 的失败原因在 stderr（认证/网络/权限）——
- * 统一并入错误消息；ENOENT（gh 未安装）单独归类给出安装指引。
+ * gh 命令执行器：转发给 CommandRunner.runGh（默认超时 30s、缓冲 16MB、stderr 归一化、
+ * ENOENT 归类附安装指引），并叠加 AFK 特有的认证提示——
+ * gh 未认证时 exit code=4 或 stderr 出现 auth/401/not logged in/login required 提示
+ * （gh 文档：4 = authentication required），附加「请先运行 gh auth login」指引。
+ * CommandRunner 刻意不复制该提示（其他调用方不需要），认证语义保留在本模块。
  */
 async function runGh(
 	cwd: string,
@@ -35,30 +32,50 @@ async function runGh(
 	options: { allowFailure?: boolean; timeout?: number } = {},
 ): Promise<string> {
 	try {
-		const { stdout } = await execFileAsync("gh", args, {
-			cwd,
-			timeout: options.timeout ?? GH_TIMEOUT_MS,
-			maxBuffer: 16 * 1024 * 1024,
+		return await runGhBase(cwd, args, {
+			allowFailure: options.allowFailure,
+			timeoutMs: options.timeout,
 		});
-		return stdout;
 	} catch (error) {
-		if (options.allowFailure) return "";
-		const execError = error as { stderr?: string; code?: unknown };
-		// gh 未安装：ENOENT 时 error.message 只有 "spawn gh ENOENT"，需要给用户可执行的指引
-		if (execError.code === "ENOENT") {
-			throw new Error("gh CLI 未安装或不在 PATH，请先安装 GitHub CLI（https://cli.github.com）后重试");
+		if (error instanceof CommandError) {
+			const needsAuth =
+				error.code === 4 || /auth|401|not logged in|login required/i.test(error.message);
+			if (needsAuth) {
+				throw new Error(`${error.message}（请先运行 gh auth login 完成 GitHub 认证）`);
+			}
 		}
-		const detail = execError.stderr?.trim() || (error instanceof Error ? error.message : String(error));
-		// gh 认证失败：exit code 4 或 stderr 提示 auth/401（gh 文档：4 = authentication required）
-		const needsAuth =
-			execError.code === 4 || /auth|401|not logged in|login required/i.test(detail);
-		const hint = needsAuth ? "（请先运行 gh auth login 完成 GitHub 认证）" : "";
-		throw new Error(`gh ${args[0] ?? "command"} failed: ${detail}${hint}`);
+		throw error;
 	}
 }
 
 /**
- * 列出目标仓库待派发的工单（Selection 规则，CONTEXT.md）：
+/**
+ * AFK 工单源接口：Orchestrator 依赖的完整 gh 面（ADR-0001 显式 Orchestrator 的可测试性杠杆）。
+ * 所有方法都以目标项目 cwd 为锚点（gh 由 git remote 推断仓库），错误 throw（调用方标 failed）。
+ * 测试注入 FakeTicketSource 即可驱动状态机，无需真实网络。
+ */
+export interface TicketSource {
+	listReadyForAgent(cwd: string): Promise<AfkTicket[]>;
+	getIssueBody(cwd: string, number: number): Promise<string>;
+	getCurrentUser(cwd: string): Promise<string>;
+	claim(cwd: string, number: number): Promise<void>;
+	completeIssue(cwd: string, number: number, prUrl?: string): Promise<void>;
+	failIssue(cwd: string, number: number, summary: string): Promise<void>;
+	createPr(cwd: string, branch: string, title: string, body: string): Promise<{ url: string }>;
+}
+
+/** 生产实现：以 gh CLI 为后端（ADR-0002）。函数导出保留（IPC/其他模块可独立引用）。 */
+export const GhTicketSource: TicketSource = {
+	listReadyForAgent,
+	getIssueBody,
+	getCurrentUser,
+	claim,
+	completeIssue,
+	failIssue,
+	createPr,
+};
+
+/** 列出目标仓库待派发的工单（Selection 规则，CONTEXT.md）：
  * `gh issue list --state open --label ready-for-agent`，在项目 cwd 运行。
  */
 export async function listReadyForAgent(cwd: string): Promise<AfkTicket[]> {

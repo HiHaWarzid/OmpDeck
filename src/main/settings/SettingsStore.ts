@@ -2,7 +2,7 @@ import { app, BrowserWindow, Menu } from "electron";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createDefaultExternalEditorSettings, type AppSettings } from "../../shared/types";
+import { createDefaultExternalEditorSettings, type AfkSettings, type AppSettings } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
 
 /** 桌面端 settings.json（userData），与 pi agent settings 分离 */
@@ -87,6 +87,40 @@ function readPiAgentShowThinking(): boolean | undefined {
 	}
 	piShowThinkingCache = { value, at: now };
 	return value;
+}
+
+/**
+ * afk 块归一化的输入形状：兼容旧 settings.json 的 targetProjectId 单值字段
+ * （61f67408 数组化之前是 targetProjectId: string，读盘后与 AfkSettings 新契约不符，
+ * 具名收窄读取旧字段，迁移到数组）。
+ */
+export type AfkSettingsInput = Partial<AfkSettings> & { targetProjectId?: string };
+
+/**
+ * afk 块归一化（单一事实源）：旧 settings.json 可能缺字段/字段非法
+ * （顶层浅合并历史数据、targetProjectId 单值旧迁移、数值为 0/负数/NaN）——
+ * 统一补齐默认、迁移数组、校验非法值，保证下游（Orchestrator/SettingsModal）拿到的
+ * targetProjectIds 恒为 string[]、数值恒为正数。
+ * load() 与 update() 都经此归一，内存态与磁盘态一致。
+ */
+export function normalizeAfkSettings(raw: AfkSettingsInput): AfkSettings {
+  const fallback = defaultSettings.afk;
+  // 数组优先；旧单值 targetProjectId 迁移为数组；其余非法形状回落空数组
+  const targetProjectIds = Array.isArray(raw.targetProjectIds)
+    ? raw.targetProjectIds.filter((value): value is string => typeof value === "string")
+    : typeof raw.targetProjectId === "string" && raw.targetProjectId
+      ? [raw.targetProjectId]
+      : [];
+  // 正数钳制：非法数值（0/负/NaN）回落默认，避免 poll/超时预算被写坏
+  const positive = (value: number | undefined, fallbackValue: number): number =>
+    Number.isFinite(value) && (value as number) > 0 ? (value as number) : fallbackValue;
+  return {
+    ...fallback,
+    enabled: raw.enabled === true,
+    targetProjectIds,
+    pollIntervalMs: positive(raw.pollIntervalMs, fallback.pollIntervalMs),
+    timeoutMs: positive(raw.timeoutMs, fallback.timeoutMs),
+  };
 }
 
 const defaultSettings: AppSettings = {
@@ -218,11 +252,9 @@ export class SettingsStore {
         ...parsed,
         // afk 与 externalEditors 都是嵌套对象：顶层浅合并会用磁盘旧值整体替换默认值，
         // 后续新增字段（如 targetProjectIds）会随默认值一起丢失 → 渲染/运行时报 undefined。
-        // 逐字段补默认，保证字段演进对旧 settings.json 兼容。
-        afk: {
-          ...defaultSettings.afk,
-          ...(parsed.afk ?? {}),
-        },
+        // afk 统一走 normalizeAfkSettings（含逐字段补默认 + 旧 targetProjectId 迁移 + 非法值校验），
+        // externalEditors 逐字段补默认。
+        afk: normalizeAfkSettings(parsed.afk ?? {}),
         externalEditors: {
           ...createDefaultExternalEditorSettings(),
           ...(parsed.externalEditors ?? {}),
@@ -261,8 +293,13 @@ export class SettingsStore {
 
   async update(patch: Partial<AppSettings>) {
     // showThinking 完全由 pi agent 的 hideThinkingBlock 控制，不允许通过桌面设置修改
-    const { showThinking: _, ...safePatch } = patch;
-    this.settings = { ...this.settings, ...safePatch };
+    const { showThinking: _, afk, ...safePatch } = patch;
+    this.settings = {
+      ...this.settings,
+      ...safePatch,
+      // afk 块同样归一化：renderer/其他模块提交的 patch 不绕过旧字段迁移与非法值校验
+      ...(afk !== undefined ? { afk: normalizeAfkSettings(afk) } : {}),
+    };
     this.lastGetResult = null;
     // 写盘防抖：连续操作（收藏模型切换、连续开关设置）合并为一次全量写。
     // 内存态立即生效，磁盘写入延迟 150ms；退出路径由 flushSave 兜底。
