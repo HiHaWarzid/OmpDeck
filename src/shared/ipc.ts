@@ -81,11 +81,13 @@ export type SkillHubSearchPayload = {
 	order?: string;
 };
 
-/** config.fetchModels 打包 payload：由 (baseUrl, apiKey, apiType) 折叠为单对象。 */
+/** config.fetchModels 打包 payload：由 (baseUrl, apiKey, apiType, headers) 折叠为单对象。 */
 export type FetchModelsPayload = {
 	baseUrl: string;
 	apiKey: string;
 	apiType?: string;
+	/** 透传 provider 自定义请求头（尤其 User-Agent），供识别 User-Agent 的网关使用。 */
+	headers?: Record<string, string>;
 };
 
 /** config.testProvider 打包 payload：由 (baseUrl, apiKey, modelId, apiType, headers) 折叠为单对象。 */
@@ -346,8 +348,8 @@ export const ipcTable = {
 		fetchModels: {
 			channel: "config:fetch-models",
 			kind: "invoke",
-			pack: (baseUrl: string, apiKey: string, apiType?: string): [FetchModelsPayload] => [
-				{ baseUrl, apiKey, apiType },
+			pack: (baseUrl: string, apiKey: string, apiType?: string, headers?: Record<string, string>): [FetchModelsPayload] => [
+				{ baseUrl, apiKey, apiType, headers },
 			],
 		},
 		/** 快速测试 provider 连接：发送一条最小请求验证 baseUrl/apiKey/模型 是否正常 */

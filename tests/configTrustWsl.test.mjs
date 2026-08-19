@@ -89,3 +89,36 @@ test("retains case-insensitive matching for native Windows trust keys", async ()
 	await manager.setProjectTrustDecision("C:\\Repo", true);
 	assert.equal(await manager.getProjectTrustDecision("c:\\repo\\child"), true);
 });
+
+test("buildModelsRequest honors provider User-Agent override for OpenAI gateways", () => {
+	const { ConfigManager } = loadConfigManager();
+	const manager = new ConfigManager("C:\\OmpDeck\\config");
+
+	// 未配自定义 UA：应注入 SDK 默认 UA（模拟 pi 的 OpenAI JS SDK）
+	const defaultReq = manager.buildModelsRequest(
+		"https://puppyrouter.com/v1",
+		"sk-test",
+		"openai-responses",
+	);
+	assert.equal(
+		defaultReq[0].headers["User-Agent"],
+		"OpenAI/JS 6.26.0",
+		"default: SDK UA injected",
+	);
+
+	// 配置了自定义 User-Agent（如拦截 SDK UA 的中转网关）：必须保留覆盖值，
+	// 不能退回 SDK UA，否则 PuppyRouter 等网关注册 403 "Your request was blocked."。
+	const overrideReq = manager.buildModelsRequest(
+		"https://puppyrouter.com/v1",
+		"sk-test",
+		"openai-responses",
+		{ "User-Agent": "curl/8.0.0" },
+	);
+	assert.equal(
+		overrideReq[0].headers["User-Agent"],
+		"curl/8.0.0",
+		"override UA wins over SDK UA",
+	);
+	assert.equal(overrideReq[0].url, "https://puppyrouter.com/v1/models");
+});
+

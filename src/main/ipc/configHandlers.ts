@@ -97,6 +97,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 					payload.baseUrl,
 					payload.apiKey,
 					payload.apiType,
+					payload.headers,
 				);
 				void appLogger.info("config", "Provider models fetched", {
 					baseUrl: payload.baseUrl,

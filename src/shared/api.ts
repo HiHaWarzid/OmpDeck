@@ -376,7 +376,7 @@ export interface ConfigApi {
 	export: () => Promise<string>;
 	import: (packageJson: string) => Promise<{ valid: boolean; error?: string }>;
 	/** 从 provider 的 baseUrl + apiKey 拉取可用模型列表 */
-	fetchModels: (baseUrl: string, apiKey: string, apiType?: string) => Promise<{
+	fetchModels: (baseUrl: string, apiKey: string, apiType?: string, headers?: Record<string, string>) => Promise<{
 		success: boolean;
 		models?: Array<{ id: string; name?: string }>;
 		error?: string;

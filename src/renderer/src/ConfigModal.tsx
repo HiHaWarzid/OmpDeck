@@ -657,6 +657,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 				provider.baseUrl,
 				provider.apiKey,
 				provider.api as string | undefined,
+				getProviderHeaders(provider.headers),
 			);
 			if (result.success && result.models) {
 				setFetchedModels((prev) => ({
