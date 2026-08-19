@@ -16,6 +16,7 @@ const PRESET_PROVIDERS = [
 	{ value: "groq", label: "Groq", env: "GROQ_API_KEY", url: "https://console.groq.com/keys" },
 	{ value: "cerebras", label: "Cerebras", env: "CEREBRAS_API_KEY", url: "https://cloud.cerebras.ai/" },
 	{ value: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY", url: "https://openrouter.ai/keys" },
+	{ value: "puppyrouter", label: "PuppyRouter", env: "PUPPYROUTER_API_KEY", url: "https://puppyrouter.com" },
 	{ value: "together", label: "Together AI", env: "TOGETHER_API_KEY", url: "https://api.together.ai/" },
 	{ value: "fireworks", label: "Fireworks AI", env: "FIREWORKS_API_KEY", url: "https://fireworks.ai/api-keys" },
 	{ value: "huggingface", label: "Hugging Face", env: "HF_TOKEN", url: "https://huggingface.co/settings/tokens" },

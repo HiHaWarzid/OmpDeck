@@ -104,6 +104,10 @@ export const KNOWN_PROVIDER_ENDPOINTS: Record<
 	"groq": { baseUrl: "https://api.groq.com/openai/v1", apiType: "openai-completions" },
 	"cerebras": { baseUrl: "https://api.cerebras.ai/v1", apiType: "openai-completions" },
 	"openrouter": { baseUrl: "https://openrouter.ai/api/v1", apiType: "openai-completions" },
+	// PuppyRouter：统一多模型 API 中转网关。官方 Codex 线路为 OpenAI Responses 风格，
+	// Base URL 必须包含 /v1、不能追加 /responses（客户端自行拼接）；OmpDeck 会话原样使用 baseUrl，
+	// 因此写完整 /v1 地址。模型 ID 以官网控制台为准（站点文档示例 gpt-5.5）。
+	"puppyrouter": { baseUrl: "https://puppyrouter.com/v1", apiType: "openai-responses" },
 	"together": { baseUrl: "https://api.together.xyz/v1", apiType: "openai-completions" },
 	"fireworks": { baseUrl: "https://api.fireworks.ai/inference/v1", apiType: "openai-completions" },
 	"huggingface": { baseUrl: "https://api-inference.huggingface.co/v1", apiType: "openai-completions" },
