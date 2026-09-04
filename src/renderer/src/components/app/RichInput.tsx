@@ -321,19 +321,36 @@ function collectChipRanges(root: HTMLElement): { start: number; end: number }[] 
 	return chips;
 }
 
-/** 纯文本偏移 → DOM Range 定位。 */
+/**
+ * 纯文本偏移 → DOM Range 定位。
+ * chip（contenteditable=false）不在 runs 里，光标永远停在其前后文本节点上。
+ * 因此 offset 可能落在「两个相邻 chip 之间」「chip 前无文本」「chip 后无文本」的
+ * 空当里——此时按就近原则选择 chip 边界一侧的文本节点，绝不能 fallback 到
+ * 最后一个文本节点末尾（那会把光标从行中拽到行尾/把 @ 前的正文跳过去）。
+ */
 function resolveOffset(
 	runs: TextNodeRun[],
 	offset: number,
 ): { node: Node; offset: number } | null {
 	if (runs.length === 0) return null;
+	// 常规：offset 落在某文本节点区间内（含空节点），直接命中。
 	for (const run of runs) {
 		if (offset >= run.start && offset <= run.end) {
 			return { node: run.node, offset: offset - run.start };
 		}
 	}
-	const last = runs[runs.length - 1];
-	return { node: last.node, offset: last.node.nodeValue?.length ?? 0 };
+	// 空当（chip 边界）：找 offset 前最近的 run，把光标放它末尾；
+	// 若 offset 在所有 run 之前（文本以 chip 开头），放第一个 run 的开头。
+	let prevRun: TextNodeRun | null = null;
+	for (const run of runs) {
+		if (run.end <= offset) prevRun = run;
+		else break;
+	}
+	if (prevRun) {
+		return { node: prevRun.node, offset: prevRun.node.nodeValue?.length ?? 0 };
+	}
+	const first = runs[0];
+	return { node: first.node, offset: 0 };
 }
 
 /** 将光标放置在给定的 DOM 位置。 */

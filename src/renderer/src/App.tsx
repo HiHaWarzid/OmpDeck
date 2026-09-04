@@ -178,7 +178,6 @@ import {
   applySuggestion,
   buildOutline,
   buildSuggestionItems,
-  clearSuggestionTrigger,
   detectTrigger,
   displayPath,
   flattenFiles,
@@ -1560,6 +1559,12 @@ export function App() {
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
   // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
   const pendingComposerCaretRef = useRef<number | null>(null);
+  /**
+   * 用户主动 ESC/关闭建议面板后置 true：这条 @/& 查询被拒绝，之后无论继续
+   * 打字还是移动光标，面板都不再为它弹出；仅当用户再次输入新的 @/&（明确想
+   * 用触发功能）时复位（见 handleComposerKeyDown）。
+   */
+  const suggestionsDismissedRef = useRef(false);
   const projectDragPreventClickRef = useRef(false);
 
   // ===== 飞书桥接 =====
@@ -5098,9 +5103,29 @@ export function App() {
     setTerminalHeight(Math.max(TERMINAL_HEIGHT_MIN, Math.round(height)));
   }
 
+  /**
+   * 用户主动拒绝当前 @/& 建议：只关面板、不动输入。
+   * 此后该查询不再唤起面板，直到用户再次输入新的 @/&（见 handleComposerKeyDown）。
+   */
+  function dismissSuggestions() {
+    setSuggestionsOpen(false);
+    suggestionsDismissedRef.current = true;
+  }
+
   function handleComposerKeyDown(
     event: React.KeyboardEvent<HTMLDivElement>,
   ) {
+    // ESC 关闭后 suppressed：用户再次按下 @/& 触发键 = 明确开始一条新查询，
+    // 复位 dismissed，让本次输入的面板正常弹出。
+    // IME 合成中（key 为 Process/Dead）与普通字符编辑不算；只认触发键本身。
+    if (
+      suggestionsDismissedRef.current &&
+      !event.nativeEvent.isComposing &&
+      event.keyCode !== 229 &&
+      (event.key === "@" || event.key === "&" || event.key === "/")
+    ) {
+      suggestionsDismissedRef.current = false;
+    }
     if (suggestionsOpen && suggestionItems.length > 0) {
       if (event.key === "ArrowDown") {
         event.preventDefault();
@@ -5142,15 +5167,9 @@ export function App() {
       }
       if (event.key === "Escape") {
         event.preventDefault();
-        const el = event.currentTarget;
-        const cursor = getCaretOffsetOf(el);
-        const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-        const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
-        setPrompt(result.text);
-        setPrompt(result.text);
-        setComposerCursor(result.cursor);
-        pendingComposerCaretRef.current = result.cursor;
-        setSuggestionsOpen(false);
+        // 只关面板、不动输入：@/& 及已输入内容全部保留。
+        // 记录 dismissed：ESC 后在同一 @ 查询里继续打字不再弹回（见 onChange）。
+        dismissSuggestions();
         requestAnimationFrame(() => {
           composerTextareaRef.current?.focus();
         });
@@ -5221,19 +5240,19 @@ export function App() {
     }
 
     if (event.key === "Escape") {
-      const el = event.currentTarget;
-      const cursor = getCaretOffsetOf(el);
-      const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-      const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
-      setPrompt(result.text);
-      setComposerCursor(result.cursor);
-      setSuggestionsOpen(false);
-      // 如果正在历史导航,ESC 退出并恢复原始输入
+      // 面板已关（或空面板）时的兜底 ESC。
+      // 如果正在历史导航,ESC 退出并恢复原始输入 —— 内容是整体替换，
+      // 不属于"拒绝某条 @ 查询"，不启动 dismissed 抑制。
       if (historyNavigating) {
+        setSuggestionsOpen(false);
         setPrompt(savedPrompt);
         setHistoryIndex(-1);
         setHistoryNavigating(false);
         setSavedPrompt("");
+      } else {
+        // 空面板/面板已关但输入里仍有残留 @/&：同样视为用户拒绝该查询，
+        // 置 dismissed 抑制后续打字弹回（见 onChange）。
+        dismissSuggestions();
       }
     }
     const enterIntent = getComposerEnterIntent(event, settings.sendShortcut);
@@ -5467,6 +5486,8 @@ export function App() {
     if (!override) {
       setLivePrompt(targetAgentId, "");
       setAttachedImagesForAgent(targetAgentId, []);
+      // 发送清空：上一轮的 dismissed 抑制随文本一起作废，新输入从头开始。
+      suggestionsDismissedRef.current = false;
     }
     setBusyDraftByAgent((current) => {
       if (!current[targetAgentId]) return current;
@@ -8602,6 +8623,12 @@ export function App() {
               }
               onFocus={() => {
                 // 仅当光标处存在 @ / 触发器时才打开建议框,避免聚焦即弹空菜单。
+                // ESC/手动关闭后（dismissed）：面板保持关闭；只有用户再次输入
+                // @/& 触发键（见 handleComposerKeyDown）后才恢复正常唤起。
+                if (suggestionsDismissedRef.current) {
+                  setSuggestionsOpen(false);
+                  return;
+                }
                 setSuggestionsOpen(detectTrigger(prompt, composerCursor) !== null);
               }}
               onChange={(newValue, cursor) => {
@@ -8622,9 +8649,18 @@ export function App() {
                   });
                 }
                 if (suggestionsOpen) setComposerCursor(cursor);
-                const nextSuggestionsOpen = detectTrigger(newValue, cursor) !== null;
-                if (nextSuggestionsOpen !== suggestionsOpen) {
-                  setSuggestionsOpen(nextSuggestionsOpen);
+                const nextTrigger = detectTrigger(newValue, cursor);
+                const nextSuggestionsOpen = nextTrigger !== null;
+                // ESC/手动关闭后 suppressed：被拒的 @/& 查询不再唤起面板。
+                // 无论继续打字/空格/换行/删改都保持关闭——只关不弹；
+                // 复位唯一途径是用户再次按下 @/& 触发键（见 handleComposerKeyDown），
+                // 表示开始一条全新的 @/& 查询。
+                // 直接用 dismissed 判定而非 suggestionsOpen 闭包：ESC 后首个 input
+                // 可能早于 React 重渲染到达，闭包仍是旧值。
+                if (!suggestionsDismissedRef.current) {
+                  if (nextSuggestionsOpen !== suggestionsOpen) {
+                    setSuggestionsOpen(nextSuggestionsOpen);
+                  }
                 }
                 // 如果正在历史导航,检测到用户手动编辑内容则退出历史模式
                 if (historyNavigating) {
@@ -8664,14 +8700,9 @@ export function App() {
                 anchorStyle={suggestionAnchorStyle}
                 onSelectedIndexChange={setSelectedSuggestionIndex}
                 onClose={() => {
-                  const el = composerTextareaRef.current;
-                  const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-                  const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-                  const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
-                  setPrompt(result.text);
-                  setComposerCursor(result.cursor);
-                  pendingComposerCaretRef.current = result.cursor;
-                  setSuggestionsOpen(false);
+                  // 点 X 与 ESC 同语义：只关面板、保留输入；置 dismissed 抑制
+                  // 后续打字弹回（见 onChange / onCursorChange）。
+                  dismissSuggestions();
                   requestAnimationFrame(() => {
                     composerTextareaRef.current?.focus();
                   });

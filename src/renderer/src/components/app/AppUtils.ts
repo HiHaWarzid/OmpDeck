@@ -515,27 +515,6 @@ export function applySuggestion(
 	return { text, cursor: trigger.start + value.length + 1 };
 }
 
-/**
- * 关闭建议框时的文本处理。
- * 默认只关面板、不改输入——用户可能已在 @path 后继续写说明文字，
- * 若删掉从触发符到光标的整段，会把正文一起清掉（Esc 全没了）。
- * 仅当「触发后还没有任何有效查询」时（刚输入 @ / &）才去掉触发符本身，避免残留孤立符号。
- */
-export function clearSuggestionTrigger(
-	current: string,
-	cursor: number,
-): ComposerSuggestionResult {
-	const trigger = detectTrigger(current, cursor);
-	if (!trigger) return { text: current, cursor };
-	// 已有查询内容：保留全文，只表示关闭菜单
-	if (trigger.query.length > 0) {
-		return { text: current, cursor };
-	}
-	// 空触发符（单独的 @ / &）：去掉触发符，避免占位
-	const text = `${current.slice(0, trigger.start)}${current.slice(cursor)}`;
-	return { text, cursor: trigger.start };
-}
-
 export type SuggestionItem = {
 	key: string;
 	label: string;

@@ -34,7 +34,6 @@ import {
 	buildOutline,
 	detectTrigger,
 	applySuggestion,
-	clearSuggestionTrigger,
 	buildSuggestionItems,
 	mergeCommands,
 	matches,
