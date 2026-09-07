@@ -13703,6 +13703,24 @@ a.config-btn {
   max-width: 240px;
 }
 
+.config-provider-omp-default-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  font-weight: 500;
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  padding: 2px 8px;
+  border-radius: var(--radius-md);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .config-provider-actions {
   display: flex;
   gap: 4px;
@@ -14263,6 +14281,98 @@ a.config-btn {
 .config-xhigh-cell .config-combobox-menu button {
   font-size: var(--font-size-caption);
 }
+
+/* OMP 默认配置区：每个 provider 展开卡内的默认模型/思考档设置 */
+.config-omp-default-section {
+  margin: 0 16px 16px;
+  padding: 14px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-panel);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.config-omp-default-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.config-omp-default-title {
+  font-size: var(--font-size-control);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.config-badge {
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-secondary);
+  background: var(--color-bg-muted);
+  padding: 2px 8px;
+  border-radius: var(--radius-md);
+  font-weight: 500;
+}
+
+.config-badge-active {
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
+}
+
+.config-omp-default-current {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 24%, var(--color-border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-accent) 6%, transparent);
+  font-size: var(--font-size-caption);
+  color: var(--color-text-primary);
+}
+
+.config-omp-default-thinking {
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-business);
+}
+
+.config-omp-default-current .config-btn {
+  margin-left: auto;
+}
+
+.config-omp-default-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.config-omp-default-form .config-form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.config-omp-default-form .config-form-row label {
+  width: 96px;
+  flex-shrink: 0;
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+}
+
+.config-omp-default-form .config-combobox {
+  flex: 1;
+}
+
+.config-omp-default-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
 
 .config-auth-list {
   display: flex;

@@ -191,6 +191,15 @@ function ConfigModalContent(props: ConfigModalProps) {
 	const [modelsData, setModelsData] = useState<ModelsFile>({ providers: {} });
 	const [authData, setAuthData] = useState<AuthFile>({});
 	const [settingsData, setSettingsData] = useState<SettingsFile>({});
+	/**
+	 * 当前 omp settings.json 的默认模型配置（defaultProvider/defaultModel/
+	 * defaultThinkingLevel），供 ModelsTab 提供商卡片标记与快速设定默认。
+	 */
+	const [ompDefault, setOmpDefault] = useState<{
+		provider?: string;
+		model?: string;
+		thinkingLevel?: string;
+	}>({});
 	/** 自动发现的模型：auth-only 供应商通过已知端点获取的模型列表 */
 	const [discoveredModels, setDiscoveredModels] = useState<
 		Record<string, Array<{ id: string; name?: string }>>
@@ -310,11 +319,17 @@ function ConfigModalContent(props: ConfigModalProps) {
 			setConfigDiagnostic(null);
 			try {
 				if (target === "models") {
-					const res = await api.config.getModels();
+					// 并行读取 omp 权威全局配置（config.yml）中的默认模型，
+					// 供提供商卡片展示"当前是否为 OMP 默认"与快速设定。
+					const [res, ompDefaultRes] = await Promise.all([
+						api.config.getModels(),
+						api.config.getOmpDefault(),
+					]);
 					setModelsData(normalizeModelsFile(res.parsed));
 					setRawContent(res.raw);
 					setRawFileName("models.json");
 					setConfigDiagnostic(res.diagnostic ?? null);
+					setOmpDefault(ompDefaultRes);
 				} else if (target === "auth") {
 					const res = await api.config.getAuth();
 					setAuthData(res.parsed as AuthFile);
@@ -334,6 +349,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 					setRawContent(settingsRes.raw);
 					setRawFileName("settings.json");
 					setConfigDiagnostic(settingsRes.diagnostic ?? null);
+					// 默认模型权威源是 config.yml（omp 不再读 settings.json 的 modelRoles）
+					setOmpDefault(await api.config.getOmpDefault());
 
 					// 对于 auth 中有但 models 中没有模型的供应商，自动尝试获取模型列表
 					const authProviders = authRes.parsed as AuthFile;
@@ -519,6 +536,57 @@ function ConfigModalContent(props: ConfigModalProps) {
 	};
 
 	// ── Models 操作 ──────────────────────────────────────
+
+	/**
+	 * 设置 omp 默认供应商/模型（含可选思考等级）：经主进程原子写 settings.json，
+	 * 成功后同步本地 ompDefault 供卡片高亮，无需整页刷新。
+	 */
+	const handleSetOmpDefault = async (
+		provider: string,
+		model: string,
+		thinkingLevel?: string,
+	) => {
+		setSaving(true);
+		try {
+			const result = await api.config.setDefaultModel(provider, model, thinkingLevel);
+			if (!result.valid) {
+				setError(result.error ?? t("config.saveFailed"));
+				return;
+			}
+			setOmpDefault((current) => ({
+				...current,
+				provider,
+				model,
+				thinkingLevel:
+					thinkingLevel !== undefined ? thinkingLevel : current.thinkingLevel,
+			}));
+			onSaved();
+			showToast(t("config.ompDefaultSetToast", { provider, model }));
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e));
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	/** 清除 omp 默认模型角色与默认思考等级（config.yml 中的 modelRoles.default）。 */
+	const handleClearOmpDefault = async () => {
+		setSaving(true);
+		try {
+			const result = await api.config.clearOmpDefault();
+			if (!result.valid) {
+				setError(result.error ?? t("config.saveFailed"));
+				return;
+			}
+			setOmpDefault({});
+			onSaved();
+			showToast(t("config.ompDefaultCleared"));
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e));
+		} finally {
+			setSaving(false);
+		}
+	};
 
 	const handleAddProvider = () => {
 		const providerName = newProviderName.trim();
@@ -1508,6 +1576,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 							testResult={testResult}
 							testModelIdByProvider={testModelIdByProvider}
 							saving={saving}
+							ompDefault={ompDefault}
+							onSetOmpDefault={handleSetOmpDefault}
+							onClearOmpDefault={handleClearOmpDefault}
 							onToggleProvider={(name) =>
 								setExpandedProvider(expandedProvider === name ? null : name)
 							}

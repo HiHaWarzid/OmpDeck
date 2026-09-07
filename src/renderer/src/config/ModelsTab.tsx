@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Copy, ExternalLink, Trash2 } from "lucide-react";
-import { t } from "../i18n";
+import { Check, ChevronDown, ChevronRight, Copy, ExternalLink, Pin, Trash2 } from "lucide-react";
+import { t, type TranslationKey } from "../i18n";
 import type { ModelItem, ModelsFile } from "./configTypes";
 import { ApiTypeInput, ConfigSelect, SecretInput } from "./ConfigShared";
 import {
@@ -12,6 +12,21 @@ import {
 import { buildModelsFromFetchedSelection } from "./modelsUtils";
 
 type FetchedModel = { id: string; name?: string };
+
+/** defaultThinkingLevel 可选档位（与 omp 接受的集合一致，含 auto）。 */
+const OMP_DEFAULT_THINKING_LEVELS: Array<{
+	value: string;
+	labelKey: TranslationKey;
+}> = [
+	{ value: "off", labelKey: "thinking.levelLabel.off" },
+	{ value: "minimal", labelKey: "thinking.levelLabel.minimal" },
+	{ value: "low", labelKey: "thinking.levelLabel.low" },
+	{ value: "medium", labelKey: "thinking.levelLabel.medium" },
+	{ value: "high", labelKey: "thinking.levelLabel.high" },
+	{ value: "xhigh", labelKey: "thinking.levelLabel.xhigh" },
+	{ value: "max", labelKey: "thinking.levelLabel.max" },
+	{ value: "auto", labelKey: "config.ompDefaultThinkingAuto" },
+];
 
 const KNOWN_PROVIDER_FIELDS = new Set([
 	"baseUrl",
@@ -167,6 +182,20 @@ export function ModelsTab(props: {
 	} | null;
 	testModelIdByProvider: Record<string, string>;
 	saving: boolean;
+	/** 当前 omp settings.json 的默认模型配置（用于标记/预填默认区） */
+	ompDefault?: {
+		provider?: string;
+		model?: string;
+		thinkingLevel?: string;
+	};
+	/** 设为 omp 默认：写 defaultProvider/defaultModel（含可选默认思考等级） */
+	onSetOmpDefault: (
+		provider: string,
+		model: string,
+		thinkingLevel?: string,
+	) => void;
+	/** 清除 omp 默认供应商/模型/思考等级 */
+	onClearOmpDefault: () => void;
 	onToggleProvider: (name: string) => void;
 	onStartAddProvider: () => void;
 	onCancelAddProvider: () => void;
@@ -207,6 +236,13 @@ export function ModelsTab(props: {
 	const [showGuide, setShowGuide] = useState(false);
 	const [batchMode, setBatchMode] = useState(false);
 	const [selectedProviders, setSelectedProviders] = useState(new Set());
+	/**
+	 * 各 provider "设为 OMP 默认"区内的本地草稿（默认模型 + 思考档）。
+	 * 初值在渲染时从 props.ompDefault 派生，用户改动后存这里，点"设为默认"才写盘。
+	 */
+	const [ompDefaultDraftByProvider, setOmpDefaultDraftByProvider] = useState<
+		Record<string, { model: string; thinking: string }>
+	>({});
 	const setSelectedFetchedModels = (providerName: string, modelIds: string[]) => {
 		setSelectedFetchedModelIds((current) => ({
 			...current,
@@ -408,6 +444,47 @@ export function ModelsTab(props: {
 					)
 						? userAgentValue
 						: CUSTOM_USER_AGENT_VALUE;
+					// OMP 默认配置区：当前是否本 provider 是 omp 默认、草稿与可选模型/思考档。
+					const isOmpDefaultProvider = props.ompDefault?.provider === name;
+					const ompDefaultModel = isOmpDefaultProvider
+						? (props.ompDefault?.model ?? "")
+						: "";
+					const ompDefaultThinking = isOmpDefaultProvider
+						? (props.ompDefault?.thinkingLevel ?? "")
+						: "";
+					const ompModelOptions = provider.models.map((m) => ({
+						value: m.id,
+						label: m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id,
+					}));
+					// 草稿（用户改过）> 当前默认 > 该供应商第一个模型；思考档草稿 > 当前默认。
+					const ompModelDraft =
+						ompDefaultDraftByProvider[name]?.model ||
+						ompDefaultModel ||
+						ompModelOptions[0]?.value ||
+						"";
+					const ompThinkingDraft =
+						ompDefaultDraftByProvider[name]?.thinking ?? ompDefaultThinking;
+					const isSavingThis = props.saving;
+					const setOmpDefaultDraft = (patch: {
+						model?: string;
+						thinking?: string;
+					}) => {
+						setOmpDefaultDraftByProvider((current) => ({
+							...current,
+							[name]: {
+								model:
+									patch.model ??
+									(current[name]?.model ||
+										ompDefaultModel ||
+										ompModelOptions[0]?.value ||
+										""),
+								thinking:
+									patch.thinking ??
+									current[name]?.thinking ??
+									ompDefaultThinking,
+							},
+						}));
+					};
 					return (
 						<div
 							key={name}
@@ -453,6 +530,15 @@ export function ModelsTab(props: {
 										/>
 									) : (
 										<span className="config-provider-name">{name}</span>
+									)}
+									{isOmpDefaultProvider && (
+										<span
+											className="config-provider-omp-default-badge"
+											title={t("config.ompDefaultActive")}
+										>
+											<Pin size={12} strokeWidth={2} aria-hidden="true" />
+											{props.ompDefault?.model}
+										</span>
 									)}
 									<span className="config-provider-badge">
 										{t("config.count.models", {
@@ -1027,6 +1113,88 @@ export function ModelsTab(props: {
 												{t("config.emptyModels")}
 											</div>
 										)}
+									</div>
+
+									{/* OMP 默认配置区：把该供应商设为新建会话的默认，并选默认模型与思考档 */}
+									<div className="config-omp-default-section">
+										<div className="config-omp-default-header">
+											<span className="config-omp-default-title">
+												{t("config.ompDefaultTitle")}
+											</span>
+											{isOmpDefaultProvider ? (
+												<span className="config-badge config-badge-active">
+													{t("config.ompDefaultActive")}
+												</span>
+											) : (
+												<span className="config-badge">
+													{t("config.ompDefaultInactive")}
+												</span>
+											)}
+										</div>
+										{isOmpDefaultProvider && (
+											<div className="config-omp-default-current">
+												<strong>{ompDefaultModel}</strong>
+												{ompDefaultThinking && (
+													<span className="config-omp-default-thinking">
+														{t("config.ompDefaultThinkingLabel")}: {ompDefaultThinking}
+													</span>
+												)}
+												<button
+													type="button"
+													className="config-btn small"
+													onClick={props.onClearOmpDefault}
+													disabled={isSavingThis}
+												>
+													{t("config.ompDefaultClear")}
+												</button>
+											</div>
+										)}
+										<div className="config-omp-default-form">
+											<div className="config-form-row">
+												<label>{t("config.ompDefaultModelLabel")}</label>
+												<ConfigSelect
+													value={ompModelDraft}
+													options={ompModelOptions}
+													onChange={(value) =>
+														setOmpDefaultDraft({ model: value })
+													}
+													placeholder={t("config.ompDefaultModelPlaceholder")}
+												/>
+											</div>
+											<div className="config-form-row">
+												<label>{t("config.ompDefaultThinkingLabel")}</label>
+												<ConfigSelect
+													value={ompThinkingDraft}
+													options={[
+														{ value: "", label: t("config.ompDefaultThinkingUnset") },
+														...OMP_DEFAULT_THINKING_LEVELS.map((level) => ({
+															value: level.value,
+															label: t(level.labelKey),
+														})),
+													]}
+													onChange={(value) =>
+														setOmpDefaultDraft({ thinking: value })
+													}
+													placeholder={t("config.ompDefaultThinkingPlaceholder")}
+												/>
+											</div>
+											<div className="config-omp-default-actions">
+												<button
+													type="button"
+													className="config-btn primary small"
+													disabled={!ompModelDraft || isSavingThis}
+													onClick={() => {
+														props.onSetOmpDefault(
+															name,
+															ompModelDraft,
+															ompThinkingDraft || undefined,
+														);
+													}}
+												>
+													{t("config.ompDefaultSet")}
+												</button>
+											</div>
+										</div>
 									</div>
 								</div>
 							)}

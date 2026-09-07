@@ -644,7 +644,9 @@ const previewOverrides: NamespaceOverrides = {
 		saveModels: async () => ({ valid: true }),
 		saveAuth: async () => ({ valid: true }),
 		saveSettings: async () => ({ valid: true }),
+		getOmpDefault: async () => ({}),
 		setDefaultModel: async () => ({ valid: true }),
+		clearOmpDefault: async () => ({ valid: true }),
 		saveRaw: async () => ({ valid: true }),
 		export: async () =>
 			JSON.stringify({

@@ -4689,14 +4689,16 @@ export function App() {
   const [defaultModelKey, setDefaultModelKey] = useState<string | undefined>(undefined);
 
   async function openModelPicker() {
-    // 顺路读取 omp 默认供应商/模型，供弹框内“设为默认”按钮标记当前默认项；
-    // 两键不配对（缺一或为空）时视为未设置默认，不点亮任何行。
+    // 顺路读取 omp 默认模型（config.yml 的 modelRoles.default = "provider/modelId"），
+    // 供弹框内“设为默认”按钮标记当前默认项；未设置/无法解析时视为无默认。
     try {
-      const settingsRes = await api.config.getSettings();
-      const parsed = settingsRes.parsed as Record<string, unknown> | undefined;
-      const provider = typeof parsed?.defaultProvider === "string" ? parsed.defaultProvider : "";
-      const model = typeof parsed?.defaultModel === "string" ? parsed.defaultModel : "";
-      setDefaultModelKey(provider && model ? `${provider}/${model}` : undefined);
+      const ompDefault = await api.config.getOmpDefault();
+      // 比对用无思考后缀的 provider/modelId；思考档后缀只属于持久化格式
+      setDefaultModelKey(
+        ompDefault.provider && ompDefault.model
+          ? `${ompDefault.provider}/${ompDefault.model}`
+          : undefined,
+      );
     } catch {
       // 读取失败不阻塞弹框，仅视为无默认
       setDefaultModelKey(undefined);

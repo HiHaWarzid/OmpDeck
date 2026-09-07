@@ -82,7 +82,8 @@
     "@electron-toolkit/utils": "^4.0.0",
     "@larksuiteoapi/node-sdk": "^1.67.0",
     "node-pty": "^1.1.0",
-    "sql.js": "^1.14.1"
+    "sql.js": "^1.14.1",
+    "yaml": "^2.9.0"
   },
   "build": {
     "appId": "com.hihawarzid.omp-deck",

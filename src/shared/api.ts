@@ -370,8 +370,29 @@ export interface ConfigApi {
 	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
 	/** 原始 settings.json 写回（编辑器保存）；语义同 getSettings —— 文件级，无类型化副作用。 */
 	saveSettings: (settings: Record<string, unknown>) => Promise<{ valid: boolean; error?: string }>;
-	/** 原子设置 omp 默认供应商/默认模型，返回是否写入成功 */
-	setDefaultModel: (provider: string, modelId: string) => Promise<{ valid: boolean; error?: string }>;
+	/**
+	 * 读取 omp 权威全局配置（config.yml）中的默认模型角色与默认思考档。
+	 * 当前 omp 的全局 settings 源是 config.yml（"provider/modelId[:thinkingLevel]"），
+	 * 旧 settings.json 已不再被读取。
+	 */
+	getOmpDefault: () => Promise<{
+		selector?: string;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: string;
+	}>;
+	/**
+	 * 原子设置 omp 默认供应商/默认模型（可选默认思考等级），返回是否写入成功。
+	 * 写入 config.yml 的 modelRoles.default（"provider/modelId[:level]"）。
+	 * thinkingLevel 省略时保持已有的 defaultThinkingLevel 不变。
+	 */
+	setDefaultModel: (
+		provider: string,
+		modelId: string,
+		thinkingLevel?: string,
+	) => Promise<{ valid: boolean; error?: string }>;
+	/** 清除 config.yml 中的 omp 默认模型角色（modelRoles.default）与默认思考档 */
+	clearOmpDefault: () => Promise<{ valid: boolean; error?: string }>;
 	saveRaw: (fileName: string, rawJson: string) => Promise<{ valid: boolean; error?: string }>;
 	export: () => Promise<string>;
 	import: (packageJson: string) => Promise<{ valid: boolean; error?: string }>;

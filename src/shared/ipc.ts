@@ -339,8 +339,10 @@ export const ipcTable = {
 		saveModels: { channel: "config:save-models", kind: "invoke" },
 		saveAuth: { channel: "config:save-auth", kind: "invoke" },
 		saveSettings: { channel: "config:save-settings", kind: "invoke" },
-		/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write，避免渲染层并发覆盖 settings.json） */
+		getOmpDefault: { channel: "config:get-omp-default", kind: "invoke" },
+		/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write config.yml，避免渲染层并发覆盖） */
 		setDefaultModel: { channel: "config:set-default-model", kind: "invoke" },
+		clearOmpDefault: { channel: "config:clear-omp-default", kind: "invoke" },
 		saveRaw: { channel: "config:save-raw", kind: "invoke" },
 		export: { channel: "config:export", kind: "invoke" },
 		import: { channel: "config:import", kind: "invoke" },

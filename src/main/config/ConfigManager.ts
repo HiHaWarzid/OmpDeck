@@ -4,6 +4,7 @@ import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
 import { net } from "electron";
+import { parseDocument } from "yaml";
 import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
 import {
@@ -385,6 +386,153 @@ export class ConfigManager {
 	): Promise<ConfigValidationResult> {
 		await this.writeJsonFile("settings.json", settings);
 		return { valid: true };
+	}
+
+	// ── omp 权威全局配置 config.yml ─────────────────────
+	// 当前 omp 以 ~/.omp/agent/config.yml（YAML）为全局 settings 权威源，
+	// settings.json 只是历史迁移遗留、不再被读取；模型角色（modelRoles）与
+	// 默认思考等级必须写 config.yml 才会生效。
+
+	/** 读 omp config.yml 原文；文件不存在返回 null（含 config.yaml 回退）。 */
+	async readOmpConfigYaml(): Promise<string | null> {
+		for (const name of ["config.yml", "config.yaml"]) {
+			const filePath = join(this.configDir, name);
+			try {
+				if (!existsSync(filePath)) continue;
+				return await readFile(filePath, "utf-8");
+			} catch {
+				// 单个文件读失败继续尝试下一个
+			}
+		}
+		return null;
+	}
+
+	/** config.yml 的写入文件名（优先已存在的 config.yml，否则默认 config.yml）。 */
+	private ompConfigYamlName(): string {
+		return existsSync(join(this.configDir, "config.yaml"))
+			? "config.yaml"
+			: "config.yml";
+	}
+
+	/**
+	 * 读取 config.yml 中默认模型角色与默认思考档。
+	 * modelRoles.default 形如 "provider/modelId[:thinkingLevel]"。
+	 * 文件缺失/解析失败返回空对象，不抛错。
+	 */
+	async readOmpDefaultModel(): Promise<{
+		selector?: string;
+		provider?: string;
+		model?: string;
+		thinkingLevel?: string;
+	}> {
+		try {
+			const raw = await this.readOmpConfigYaml();
+			if (raw === null) return {};
+			const parsed = parseDocument(raw).toJS() as Record<string, unknown> | null;
+			if (!parsed || typeof parsed !== "object") return {};
+			const roles =
+				parsed.modelRoles &&
+				typeof parsed.modelRoles === "object" &&
+				!Array.isArray(parsed.modelRoles)
+					? (parsed.modelRoles as Record<string, unknown>)
+					: {};
+			const selector = typeof roles.default === "string" ? roles.default : "";
+			if (!selector) return {};
+			// 拆 "provider/modelId[:level]"：provider 不含 "/"，model id 自身可含 "/"
+			const sepIdx = selector.indexOf(":");
+			const base = sepIdx > 0 ? selector.slice(0, sepIdx) : selector;
+			const suffix = sepIdx > 0 ? selector.slice(sepIdx + 1) : "";
+			const slashIdx = base.indexOf("/");
+			if (slashIdx <= 0) return { selector };
+			const thinkingLevel =
+				suffix || (typeof parsed.defaultThinkingLevel === "string" ? parsed.defaultThinkingLevel : undefined);
+			return {
+				selector,
+				provider: base.slice(0, slashIdx),
+				model: base.slice(slashIdx + 1),
+				thinkingLevel: thinkingLevel || undefined,
+			};
+		} catch {
+			return {};
+		}
+	}
+
+	/**
+	 * 原子更新 omp 默认模型（config.yml 的 modelRoles.default）。
+	 * 值为 "provider/modelId"，可选 ":thinkingLevel" 后缀（omp 模型角色持久化格式）。
+	 * 通过 yaml round-trip 改写，保留文件中的注释与其它键。
+	 */
+	async updateOmpDefaultModelRole(
+		selector: string,
+		thinkingLevel?: string,
+	): Promise<ConfigValidationResult> {
+		try {
+			await mkdir(this.configDir, { recursive: true });
+			const existing = await this.readOmpConfigYaml();
+			const doc = parseDocument(existing ?? "", { prettyErrors: true });
+			const effectiveValue = thinkingLevel && thinkingLevel.trim()
+				? `${selector}:${thinkingLevel.trim()}`
+				: selector;
+			doc.setIn(["modelRoles", "default"], effectiveValue);
+			const filePath = join(this.configDir, this.ompConfigYamlName());
+			await writeFile(filePath, doc.toString(), "utf8");
+			return { valid: true };
+		} catch (e) {
+			return {
+				valid: false,
+				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
+			};
+		}
+	}
+
+	/** 清除 config.yml 的 modelRoles.default（模型角色为空的块一并移除）。 */
+	async clearOmpDefaultModelRole(): Promise<ConfigValidationResult> {
+		try {
+			const existing = await this.readOmpConfigYaml();
+			if (existing === null) return { valid: true };
+			await mkdir(this.configDir, { recursive: true });
+			const doc = parseDocument(existing, { prettyErrors: true });
+			doc.deleteIn(["modelRoles", "default"]);
+			const rolesNode = doc.get("modelRoles");
+			if (
+				rolesNode &&
+				typeof rolesNode === "object" &&
+				!Array.isArray(rolesNode) &&
+				Object.keys(rolesNode as Record<string, unknown>).length === 0
+			) {
+				doc.delete("modelRoles");
+			}
+			// defaultThinkingLevel 一并清理，避免残留旧的默认思考档
+			doc.delete("defaultThinkingLevel");
+			const filePath = join(this.configDir, this.ompConfigYamlName());
+			await writeFile(filePath, doc.toString(), "utf8");
+			return { valid: true };
+		} catch (e) {
+			return {
+				valid: false,
+				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
+			};
+		}
+	}
+
+	/** 原子更新 config.yml 的 defaultThinkingLevel（默认思考档）。 */
+	async updateOmpDefaultThinkingLevel(
+		level: string,
+	): Promise<ConfigValidationResult> {
+		try {
+			await mkdir(this.configDir, { recursive: true });
+			const existing = await this.readOmpConfigYaml();
+			const doc = parseDocument(existing ?? "", { prettyErrors: true });
+			doc.set("defaultThinkingLevel", level.trim());
+			const filePath = join(this.configDir, this.ompConfigYamlName());
+			await writeFile(filePath, doc.toString(), "utf8");
+			return { valid: true };
+		} catch (e) {
+			return {
+				valid: false,
+				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
+			};
+		}
 	}
 
 	// ── 保存（源文件编辑） ────────────────────────────────

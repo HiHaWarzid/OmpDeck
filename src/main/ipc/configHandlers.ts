@@ -29,6 +29,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 			getModels: async () => configManager.getModelsConfig(),
 			getAuth: async () => configManager.getAuthConfig(),
 			getSettings: async () => configManager.getSettingsConfig(),
+			getOmpDefault: async () => configManager.readOmpDefaultModel(),
 			getTrust: async () => configManager.getTrustConfig(),
 			saveModels: async (_event, data) => {
 				// configManager 负责形状校验（返回 valid/error），边界只透传
@@ -55,23 +56,43 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				void appLogger.info("config", "Pi settings config saved", { keys: keyCount });
 				return result;
 			},
-			// 原子设置 omp 默认供应商/模型：先读当前 settings.json 再合并写回，
-			// 避免与设置页的整对象保存互相覆盖；默认模型必须与供应商成对写入，
-			// 否则 omp 会用旧 defaultProvider 去匹配新模型 id 导致配不上。
-			setDefaultModel: async (_event, provider: unknown, modelId: unknown) => {
+			// 原子设置 omp 默认模型：写 ~/.omp/agent/config.yml 的 modelRoles.default
+			// （"provider/modelId[:thinkingLevel]"）。当前 omp 的全局 settings 权威源是
+			// config.yml，旧的 settings.json 已不被读取；defaultProvider/defaultModel
+			// 单字段与 settings.json 均已废弃，仅作兼容展示，不再依赖其生效。
+			setDefaultModel: async (_event, provider: unknown, modelId: unknown, thinkingLevel: unknown) => {
 				const trimmedProvider = typeof provider === "string" ? provider.trim() : "";
 				const trimmedModel = typeof modelId === "string" ? modelId.trim() : "";
 				if (!trimmedProvider || !trimmedModel) {
 					return { valid: false, error: "provider 与 modelId 不能为空" };
 				}
-				const current = await configManager.getSettingsConfig();
-				const next = {
-					...current.parsed,
-					defaultProvider: trimmedProvider,
-					defaultModel: trimmedModel,
-				};
-				const result = await configManager.saveSettingsConfig(next);
-				void appLogger.info("config", "Default model set", { provider: trimmedProvider, model: trimmedModel, valid: result.valid });
+				const selector = `${trimmedProvider}/${trimmedModel}`;
+				const level = typeof thinkingLevel === "string" ? thinkingLevel.trim() : "";
+				// modelRoles.default 的 selector 内嵌思考档后缀（omp 原生持久化格式），
+				// 同时同步 defaultThinkingLevel，保证新建会话的模型与思考档都按默认生效。
+				const roleResult = await configManager.updateOmpDefaultModelRole(
+					selector,
+					level || undefined,
+				);
+				if (!roleResult.valid) return roleResult;
+				if (level) {
+					const levelResult = await configManager.updateOmpDefaultThinkingLevel(level);
+					if (!levelResult.valid) return levelResult;
+				}
+				void appLogger.info("config", "Default model set", {
+					provider: trimmedProvider,
+					model: trimmedModel,
+					thinkingLevel: level || undefined,
+					valid: true,
+				});
+				return { valid: true };
+			},
+			// 清除 omp 默认模型角色与默认思考档（config.yml）。
+			clearOmpDefault: async () => {
+				const result = await configManager.clearOmpDefaultModelRole();
+				if (result.valid) {
+					void appLogger.info("config", "Default model cleared", { valid: true });
+				}
 				return result;
 			},
 			saveRaw: async (_event, fileName, rawJson) => {
