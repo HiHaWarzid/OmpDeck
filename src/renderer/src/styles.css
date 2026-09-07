@@ -11979,19 +11979,6 @@ body.is-composer-resizing .composer-resize-handle::after {
   font-family: var(--font-family-business);
   font-size: var(--font-size-micro);
 }
-.vision-model-image-mark {
-  flex: 0 0 auto;
-}
-.vision-model-image-mark.yes {
-  color: var(--color-accent);
-}
-.vision-model-image-mark.no {
-  color: var(--color-text-tertiary);
-}
-/* 目录确认不支持的模型整行置灰，直接不可选 */
-.ui-select-option:disabled .vision-model-option {
-  color: var(--color-text-tertiary);
-}
 
 /* 设置字段容器 */
 .setting-field {
