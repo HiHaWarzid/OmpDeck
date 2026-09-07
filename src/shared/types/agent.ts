@@ -58,6 +58,8 @@ export type AvailableModel = {
 	provider: string;
 	contextWindow?: number;
 	reasoning?: boolean;
+	/** 是否支持图片输入（pi --list-models 的 images 列）。缺省 = 能力未知（目录未收录/未上报）。 */
+	supportsImages?: boolean;
 };
 
 export type CreateAgentInput = {

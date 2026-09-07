@@ -11924,6 +11924,75 @@ body.is-composer-resizing .composer-resize-handle::after {
   background: var(--color-text-tertiary);
 }
 
+/* 视觉桥「从已配置模型中选择」：下拉 + 右侧刷新按钮同一行，
+   SelectField 宽度收窄让位给按钮，按钮贴齐输入框（label 高度对齐由行高保证） */
+.vision-preset-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.vision-preset-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* SelectField label 必填但本行 label/hint 由外层 setting-field 承担；隐藏其内部空 label span，
+   避免空行 + grid gap 把控件往下推、破坏与刷新按钮的对齐。 */
+.vision-preset-field .ui-field-label {
+  display: none;
+}
+.vision-preset-field .ui-select-control {
+  height: var(--control-height-lg);
+}
+.vision-preset-refresh {
+  flex: 0 0 auto;
+  /* 宽高与输入控件一致：同一 flex 行 + align-items:center → 与控件垂直完全对齐 */
+  width: var(--control-height-lg);
+  height: var(--control-height-lg);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-panel);
+  color: var(--color-text-secondary);
+}
+.vision-preset-refresh:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.vision-preset-refresh:disabled {
+  opacity: 0.5;
+}
+/* 下拉选项行：模型 ID 主展示 + provider 次展示 + 已确认视觉打标 */
+.vision-model-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.vision-model-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vision-model-provider {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+}
+.vision-model-image-mark {
+  flex: 0 0 auto;
+}
+.vision-model-image-mark.yes {
+  color: var(--color-accent);
+}
+.vision-model-image-mark.no {
+  color: var(--color-text-tertiary);
+}
+/* 目录确认不支持的模型整行置灰，直接不可选 */
+.ui-select-option:disabled .vision-model-option {
+  color: var(--color-text-tertiary);
+}
+
 /* 设置字段容器 */
 .setting-field {
   position: relative;
