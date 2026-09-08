@@ -22,3 +22,4 @@ export * from "./types/feishu";
 export * from "./types/app";
 export * from "./types/afk";
 export * from "./types/agentEvents";
+export * from "./types/ompRoles";

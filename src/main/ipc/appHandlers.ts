@@ -158,52 +158,6 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				win.webContents.openDevTools({ mode: "detach" });
 				return true;
 			},
-			visionTest: async (_event, config: unknown) => {
-				// 视觉桥连通性测试：GET {baseUrl}/models 验证端点与 API key（入参校验在边界）。
-				const c = config as {
-					baseUrl?: unknown;
-					apiKey?: unknown;
-				} | null;
-				const baseUrl = typeof c?.baseUrl === "string" ? c.baseUrl.trim().replace(/\/+$/, "") : "";
-				const apiKey = typeof c?.apiKey === "string" ? c.apiKey.trim() : "";
-				if (!baseUrl || !apiKey) {
-					return { ok: false, error: "请先填写端点与 API Key" };
-				}
-				try {
-					const controller = new AbortController();
-					const timer = setTimeout(() => controller.abort(), 15_000);
-					try {
-						const response = await fetch(`${baseUrl}/models`, {
-							headers: { Authorization: `Bearer ${apiKey}` },
-							signal: controller.signal,
-						});
-						if (!response.ok) {
-							const detail = await response.text().catch(() => "");
-							return {
-								ok: false,
-								error: `HTTP ${response.status}: ${detail.slice(0, 200)}`,
-							};
-						}
-						const data = (await response.json()) as { data?: unknown };
-						const modelIds = Array.isArray(data.data)
-							? data.data
-									.map((m) => (m && typeof m === "object" && "id" in m ? String(m.id) : ""))
-									.filter(Boolean)
-							: [];
-						return { ok: true, models: modelIds };
-					} finally {
-						clearTimeout(timer);
-					}
-				} catch (error) {
-					if (error instanceof Error && error.name === "AbortError") {
-						return { ok: false, error: "连接超时（15s）" };
-					}
-					return {
-						ok: false,
-						error: error instanceof Error ? error.message : String(error),
-					};
-				}
-			},
 		},
 		rpcLogs: {
 			/** 开关某 agent 的 RPC 日志记录 */

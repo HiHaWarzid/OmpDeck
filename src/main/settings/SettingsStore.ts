@@ -178,15 +178,6 @@ Gitmoji 对应关系：
   webServiceHost: "0.0.0.0",
   webServicePort: 8765,
   rpcTimeout: 600_000,
-  // 视觉桥默认关闭：需要用户在设置里配置 OpenAI 兼容端点与视觉模型后启用
-  visionBridge: {
-    enabled: false,
-    baseUrl: "",
-    apiKey: "",
-    model: "",
-    prompt: "请详细描述这张图片的内容，包括文字、图表、界面元素与操作步骤。",
-    timeoutMs: 120_000,
-  },
   linkOpenMode: "external",
   contentMaxWidth: 1400,
   maxEditorFileSizeMB: 5,

@@ -11924,60 +11924,182 @@ body.is-composer-resizing .composer-resize-handle::after {
   background: var(--color-text-tertiary);
 }
 
-/* 视觉桥「从已配置模型中选择」：下拉 + 右侧刷新按钮同一行，
-   SelectField 宽度收窄让位给按钮，按钮贴齐输入框（label 高度对齐由行高保证） */
-.vision-preset-row {
+/* 模型角色列表：每角色一行（tag + 名称/说明 + 当前模型 + 操作），行内悬停出现操作区 */
+.model-roles-list {
+  display: grid;
+  gap: var(--space-1);
+}
+.model-role-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.model-role-row:last-child {
+  border-bottom: 0;
+}
+.model-role-row-main {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-}
-.vision-preset-field {
-  flex: 1 1 auto;
+  gap: var(--space-3);
   min-width: 0;
 }
-/* SelectField label 必填但本行 label/hint 由外层 setting-field 承担；隐藏其内部空 label span，
-   避免空行 + grid gap 把控件往下推、破坏与刷新按钮的对齐。 */
-.vision-preset-field .ui-field-label {
-  display: none;
-}
-.vision-preset-field .ui-select-control {
-  height: var(--control-height-lg);
-}
-.vision-preset-refresh {
+.model-role-tag {
   flex: 0 0 auto;
-  /* 宽高与输入控件一致：同一 flex 行 + align-items:center → 与控件垂直完全对齐 */
-  width: var(--control-height-lg);
-  height: var(--control-height-lg);
-  border: 1px solid var(--color-border-subtle);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
   border-radius: var(--radius-sm);
-  background: var(--color-bg-panel);
+  background: var(--color-bg-muted);
+  border: 1px solid var(--color-border-subtle);
   color: var(--color-text-secondary);
 }
-.vision-preset-refresh:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  color: var(--color-text-primary);
-  background: var(--color-bg-hover);
-}
-.vision-preset-refresh:disabled {
-  opacity: 0.5;
-}
-/* 下拉选项行：模型 ID 主展示 + provider 次展示 + 已确认视觉打标 */
-.vision-model-option {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+.model-role-info {
+  display: grid;
+  gap: 2px;
   min-width: 0;
 }
-.vision-model-id {
+.model-role-info strong {
+  color: var(--color-text-primary);
+  font-size: var(--font-size-control);
+  font-weight: 500;
+}
+.model-role-info small {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.vision-model-provider {
-  flex: 0 0 auto;
-  color: var(--color-text-tertiary);
+.model-role-value {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.model-role-current {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-control);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.model-role-level {
   font-family: var(--font-family-business);
   font-size: var(--font-size-micro);
+  color: var(--color-accent);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+}
+.model-role-unset {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+}
+.model-role-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+}
+.model-roles-notice {
+  display: block;
+  margin-top: var(--space-3);
+  color: var(--color-accent);
+  font-size: var(--font-size-caption);
+}
+/* 角色行下方展开的模型选择弹层：绝对定位于行内，滚动上限防溢出 */
+.model-role-picker {
+  position: absolute;
+  right: var(--space-2);
+  top: calc(100% - var(--space-1));
+  z-index: 90;
+  width: min(420px, calc(100vw - 96px));
+}
+.model-roles-popup {
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-panel);
+  box-shadow: var(--shadow-popover);
+  overflow: hidden;
+}
+.model-roles-popup-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.model-roles-popup-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--control-height-sm);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-panel);
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-control);
+  color: var(--color-text-primary);
+}
+.model-roles-popup-search:focus-visible {
+  border-color: var(--color-accent);
+  box-shadow: var(--focus-ring);
+  outline: 0;
+}
+.model-roles-popup-close {
+  flex: 0 0 auto;
+}
+.model-roles-popup-list {
+  max-height: min(360px, calc(100vh - 200px));
+  overflow-y: auto;
+  padding: var(--space-1);
+  display: grid;
+  gap: 2px;
+}
+.model-roles-popup-empty {
+  padding: var(--space-4);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+  text-align: center;
+}
+.model-roles-popup-group-title {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-tertiary);
+}
+.model-roles-popup-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.model-roles-popup-item:hover {
+  background: var(--color-bg-hover);
+}
+.model-roles-popup-item-name {
+  font-size: var(--font-size-control);
+  color: var(--color-text-primary);
+}
+.model-roles-popup-item-id {
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
 }
 
 /* 设置字段容器 */

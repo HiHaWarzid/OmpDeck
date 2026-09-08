@@ -3,11 +3,17 @@
  * 包含 `agentsTrustResponse`（物理位于此块，逻辑属于 agents 命名空间）。
  * 返回 HandlerMap 由 registerIpcHandlers 统一注册。
  */
-import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type TestProviderPayload } from "../../shared/ipc";
+import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRolePayload, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
+import { OMP_MODEL_ROLES, type OmpModelRole } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
 import type { AgentManager } from "../pi/AgentManager";
 import type { AppLogger } from "../logging/AppLogger";
+
+/** 入参校验：role 必须是 omp 内置角色之一（IPC 边界收窄 unknown → OmpModelRole）。 */
+function isOmpModelRole(value: string): value is OmpModelRole {
+	return (OMP_MODEL_ROLES as readonly string[]).includes(value);
+}
 
 interface ConfigHandlerDeps {
 	configManager: ConfigManager;
@@ -92,6 +98,45 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				const result = await configManager.clearOmpDefaultModelRole();
 				if (result.valid) {
 					void appLogger.info("config", "Default model cleared", { valid: true });
+				}
+				return result;
+			},
+			// 读取 config.yml 全部模型角色（modelRoles.<role>）。
+			getOmpRoles: async () => configManager.readOmpModelRoles(),
+			// 原子设置某个模型角色：写 config.yml 的 modelRoles.<role>，
+			// selector 形如 "provider/modelId"，可选 ":thinkingLevel" 后缀。
+			setOmpRole: async (_event, payload: SetOmpRolePayload) => {
+				const role = payload.role.trim();
+				const selector = payload.selector.trim();
+				if (!isOmpModelRole(role)) {
+					return { valid: false, error: `未知的模型角色：${role}` };
+				}
+				if (!selector) {
+					return { valid: false, error: "selector 不能为空" };
+				}
+				const result = await configManager.updateOmpModelRole(
+					role,
+					selector,
+					payload.thinkingLevel?.trim() || undefined,
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model role set", {
+						role,
+						selector,
+						thinkingLevel: payload.thinkingLevel?.trim() || undefined,
+					});
+				}
+				return result;
+			},
+			// 清除 config.yml 的 modelRoles.<role>。
+			clearOmpRole: async (_event, role: unknown) => {
+				const trimmedRole = typeof role === "string" ? role.trim() : "";
+				if (!isOmpModelRole(trimmedRole)) {
+					return { valid: false, error: "role 不能为空或不是有效角色" };
+				}
+				const result = await configManager.clearOmpModelRole(trimmedRole);
+				if (result.valid) {
+					void appLogger.info("config", "Model role cleared", { role: trimmedRole });
 				}
 				return result;
 			},

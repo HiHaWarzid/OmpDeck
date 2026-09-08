@@ -89,18 +89,6 @@ export type AppSettings = {
 	installationType?: "portable" | "installed";
 	/** RPC 调用超时时间（毫秒），默认 600000（10 分钟），用于长时间运行的命令 */
 	rpcTimeout: number;
-	/** 视觉桥：给非视觉模型"眼睛"——发送图片消息时经 OpenAI 兼容端点转成文本描述注入上下文 */
-	visionBridge: {
-		enabled: boolean;
-		/** OpenAI 兼容 chat completions 端点，如 https://api.deepseek.com/v1 */
-		baseUrl: string;
-		apiKey: string;
-		model: string;
-		/** 转换提示词模板；{image} 会被替换为图片内容占位说明 */
-		prompt: string;
-		/** 单张图片转换超时（毫秒），默认 120000 */
-		timeoutMs: number;
-	};
 	/** 外部链接打开方式：external 使用系统默认浏览器，internal 使用应用内独立窗口 */
 	linkOpenMode: LinkOpenMode;
 	/** 内容区最大宽度（px），0 表示不限制（填满 chat-pane）。用于限制消息行宽，左右留白。 */

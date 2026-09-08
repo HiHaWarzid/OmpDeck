@@ -17,7 +17,7 @@ import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
-import { VisionBridgeTab } from "./VisionBridgeTab";
+import { ModelRolesTab } from "./ModelRolesTab";
 import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
@@ -25,7 +25,7 @@ const ZOOM_FACTOR_MIN = 0.8;
 const ZOOM_FACTOR_MAX = 1.5;
 const ZOOM_FACTOR_STEP = 0.05;
 
-type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage" | "vision" | "afk";
+type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet" | "storage" | "roles" | "afk";
 
 /** 代理相关字段：用于判断代理 tab 是否有未保存变更。 */
 const PROXY_FIELDS: (keyof AppSettings)[] = [
@@ -225,7 +225,7 @@ const SETTINGS_TABS: readonly SettingsTabId[] = [
 	"dev",
 	"pet",
 	"storage",
-	"vision",
+	"roles",
 	"afk",
 ];
 
@@ -491,8 +491,8 @@ function SettingsModalContent(props: SettingsModalProps) {
 			icon: <Trash2 size={16} />,
 		},
 		{
-			id: "vision",
-			label: t("settings.tabs.vision"),
+			id: "roles",
+			label: t("settings.tabs.roles"),
 			icon: <Eye size={16} />,
 		},
 		{
@@ -1623,12 +1623,9 @@ function SettingsModalContent(props: SettingsModalProps) {
 								onChange={updateDraft}
 							/>
 						)}
-						{/* ── 视觉桥 tab ── */}
-						{activeTab === "vision" && (
-							<VisionBridgeTab
-								settings={draftSettings}
-								onChange={updateDraft}
-							/>
+						{/* ── 模型角色 tab ── */}
+						{activeTab === "roles" && (
+							<ModelRolesTab />
 						)}
 						{/* ── AFK 编排 tab ── */}
 						{activeTab === "afk" && (

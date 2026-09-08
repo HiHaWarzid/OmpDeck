@@ -99,6 +99,13 @@ export type TestProviderPayload = {
 	headers?: Record<string, string>;
 };
 
+/** config.setOmpRole 打包 payload：由 (role, selector, thinkingLevel) 折叠为单对象。 */
+export type SetOmpRolePayload = {
+	role: string;
+	selector: string;
+	thinkingLevel?: string;
+};
+
 export type IpcTable = {
 	readonly [Ns in keyof PiDesktopApi]: {
 		readonly [M in keyof PiDesktopApi[Ns]]: IpcOpEntry;
@@ -260,7 +267,6 @@ export const ipcTable = {
 		openExternal: { channel: "app:open-external", kind: "invoke" },
 		onOpenInBrowser: { channel: "app:open-in-browser", kind: "subscribe", pushFrom: "link-opener" },
 		restart: { channel: "app:restart", kind: "invoke" },
-		visionTest: { channel: "vision:test", kind: "invoke" },
 		rendererLog: { channel: "renderer:log", kind: "invoke" },
 		/** 窗口控制动作表（minimize/toggle-maximize/close 三通道收敛为单通道，W6-7） */
 		windowControl: { channel: "app:window-control", kind: "invoke" },
@@ -343,6 +349,20 @@ export const ipcTable = {
 		/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write config.yml，避免渲染层并发覆盖） */
 		setDefaultModel: { channel: "config:set-default-model", kind: "invoke" },
 		clearOmpDefault: { channel: "config:clear-omp-default", kind: "invoke" },
+		/** 读取 omp 全部模型角色当前值（config.yml 的 modelRoles.<role>） */
+		getOmpRoles: { channel: "config:get-omp-roles", kind: "invoke" },
+		/** 原子设置 omp 某个模型角色（config.yml 的 modelRoles.<role>） */
+		setOmpRole: {
+			channel: "config:set-omp-role",
+			kind: "invoke",
+			pack: (
+				role: string,
+				selector: string,
+				thinkingLevel?: string,
+			): [SetOmpRolePayload] => [{ role, selector, thinkingLevel }],
+		},
+		/** 清除 omp 某个模型角色（config.yml 的 modelRoles.<role>） */
+		clearOmpRole: { channel: "config:clear-omp-role", kind: "invoke" },
 		saveRaw: { channel: "config:save-raw", kind: "invoke" },
 		export: { channel: "config:export", kind: "invoke" },
 		import: { channel: "config:import", kind: "invoke" },

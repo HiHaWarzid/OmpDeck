@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 260（263 - 3：删 browser:open-external，窗口三通道 minimize/toggle-maximize/close 收敛为 app:window-control）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(260);
+	test("总通道数 = 264（262 - 1 删 vision:test + 3 config 角色通道：get-omp-roles/set-omp-role/clear-omp-role）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(264);
 	});
 });

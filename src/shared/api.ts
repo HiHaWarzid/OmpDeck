@@ -61,6 +61,8 @@ import type {
 	NpmAvailabilityResult,
 	OpenCodeImportReport,
 	OpenCodeSessionSummary,
+	OmpModelRole,
+	OmpRolesState,
 	PetAggregateState,
 	PetManifest,
 	PetNotification,
@@ -272,7 +274,6 @@ export interface AppApi {
 	openExternal: (url: string, forceSystem?: boolean) => Promise<void>;
 	onOpenInBrowser: (callback: (url: string) => void) => () => void;
 	restart: () => Promise<void>;
-	visionTest: (config: { baseUrl: string; apiKey: string }) => Promise<{ ok: boolean; models?: string[]; error?: string }>;
 	rendererLog: (level: AppLogLevel, scope: string, message: string, detail?: unknown) => Promise<void>;
 	/**
 	 * 窗口控制动作表（W6-7）：minimize / toggle-maximize / close 三个单成员通道收敛为一个
@@ -393,6 +394,19 @@ export interface ConfigApi {
 	) => Promise<{ valid: boolean; error?: string }>;
 	/** 清除 config.yml 中的 omp 默认模型角色（modelRoles.default）与默认思考档 */
 	clearOmpDefault: () => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 config.yml 全部模型角色当前值（modelRoles.<role>，9 个内置角色） */
+	getOmpRoles: () => Promise<OmpRolesState>;
+	/**
+	 * 原子设置某个 omp 模型角色（config.yml 的 modelRoles.<role>）。
+	 * selector = "provider/modelId"，thinkingLevel 可选追加 ":level" 后缀。
+	 */
+	setOmpRole: (
+		role: OmpModelRole,
+		selector: string,
+		thinkingLevel?: string,
+	) => Promise<{ valid: boolean; error?: string }>;
+	/** 清除 config.yml 中某个 omp 模型角色（modelRoles.<role>） */
+	clearOmpRole: (role: OmpModelRole) => Promise<{ valid: boolean; error?: string }>;
 	saveRaw: (fileName: string, rawJson: string) => Promise<{ valid: boolean; error?: string }>;
 	export: () => Promise<string>;
 	import: (packageJson: string) => Promise<{ valid: boolean; error?: string }>;

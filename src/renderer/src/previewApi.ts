@@ -162,14 +162,6 @@ let previewSettings: AppSettings = {
 	webServiceHost: "0.0.0.0",
 	webServicePort: 8765,
 	rpcTimeout: 600_000,
-	visionBridge: {
-		enabled: false,
-		baseUrl: "",
-		apiKey: "",
-		model: "",
-		prompt: "",
-		timeoutMs: 120_000,
-	},
 	linkOpenMode: "external",
 	contentMaxWidth: 1400,
 	maxEditorFileSizeMB: 5,
@@ -460,7 +452,6 @@ const previewOverrides: NamespaceOverrides = {
 				searchedDirs: [],
 			},
 		}),
-		visionTest: async () => ({ ok: true, models: [] }),
 		rendererLog: async (level, scope, message, detail) => {
 			console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
 				`[${scope}] ${message}`,

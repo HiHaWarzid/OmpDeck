@@ -4,9 +4,11 @@ import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
 import { net } from "electron";
-import { parseDocument } from "yaml";
+import { parseDocument, type Document } from "yaml";
 import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
+import type { OmpModelRole, OmpRolesState } from "../../shared/types/ompRoles";
+import { OMP_MODEL_ROLES } from "../../shared/types/ompRoles";
 import {
 	ensureOpenAiVersionPath,
 	needsSessionBaseUrlVersionHint,
@@ -415,9 +417,72 @@ export class ConfigManager {
 	}
 
 	/**
-	 * 读取 config.yml 中默认模型角色与默认思考档。
+	 * 读取 config.yml 的 modelRoles 全部角色当前值。
+	 * selector 形如 "provider/modelId[:thinkingLevel]"；未配置的角色返回空 assignment。
+	 * 文件缺失/解析失败返回全空 map，不抛错。
+	 */
+	async readOmpModelRoles(): Promise<OmpRolesState> {
+		// 空态：每个角色都是未配置的 assignment（先构造，成功路径上覆写）
+		const emptyRoles: OmpRolesState = {
+			default: { selector: "" },
+			smol: { selector: "" },
+			slow: { selector: "" },
+			vision: { selector: "" },
+			plan: { selector: "" },
+			commit: { selector: "" },
+			tiny: { selector: "" },
+			task: { selector: "" },
+			advisor: { selector: "" },
+		};
+		try {
+			const raw = await this.readOmpConfigYaml();
+			const parsed =
+				raw === null
+					? null
+					: (parseDocument(raw).toJS() as Record<string, unknown> | null);
+			const roles =
+				parsed && typeof parsed === "object" && !Array.isArray(parsed)
+					? parsed.modelRoles
+					: undefined;
+			const rolesMap =
+				roles && typeof roles === "object" && !Array.isArray(roles)
+					? (roles as Record<string, unknown>)
+					: {};
+			const rolesState: OmpRolesState = { ...emptyRoles };
+			for (const role of OMP_MODEL_ROLES) {
+				const selector =
+					typeof rolesMap[role] === "string" ? rolesMap[role] : "";
+				if (selector) rolesState[role] = this.parseRoleSelector(selector);
+			}
+			return rolesState;
+		} catch {
+			return emptyRoles;
+		}
+	}
+
+	/** 解析 "provider/modelId[:thinkingLevel]" 为结构化 assignment。provider 不含 "/"；model id 自身可含 "/"。 */
+	private parseRoleSelector(selector: string): {
+		selector: string;
+		provider: string;
+		modelId: string;
+		thinkingLevel?: string;
+	} {
+		const sepIdx = selector.indexOf(":");
+		const base = sepIdx > 0 ? selector.slice(0, sepIdx) : selector;
+		const suffix = sepIdx > 0 ? selector.slice(sepIdx + 1) : "";
+		const slashIdx = base.indexOf("/");
+		if (slashIdx <= 0) return { selector, provider: "", modelId: base };
+		return {
+			selector,
+			provider: base.slice(0, slashIdx),
+			modelId: base.slice(slashIdx + 1),
+			thinkingLevel: suffix || undefined,
+		};
+	}
+
+	/**
+	 * 读取 config.yml 中默认模型角色与默认思考档（兼容旧调用方：委托 readOmpModelRoles）。
 	 * modelRoles.default 形如 "provider/modelId[:thinkingLevel]"。
-	 * 文件缺失/解析失败返回空对象，不抛错。
 	 */
 	async readOmpDefaultModel(): Promise<{
 		selector?: string;
@@ -427,30 +492,26 @@ export class ConfigManager {
 	}> {
 		try {
 			const raw = await this.readOmpConfigYaml();
-			if (raw === null) return {};
-			const parsed = parseDocument(raw).toJS() as Record<string, unknown> | null;
-			if (!parsed || typeof parsed !== "object") return {};
-			const roles =
-				parsed.modelRoles &&
-				typeof parsed.modelRoles === "object" &&
-				!Array.isArray(parsed.modelRoles)
-					? (parsed.modelRoles as Record<string, unknown>)
-					: {};
-			const selector = typeof roles.default === "string" ? roles.default : "";
-			if (!selector) return {};
-			// 拆 "provider/modelId[:level]"：provider 不含 "/"，model id 自身可含 "/"
-			const sepIdx = selector.indexOf(":");
-			const base = sepIdx > 0 ? selector.slice(0, sepIdx) : selector;
-			const suffix = sepIdx > 0 ? selector.slice(sepIdx + 1) : "";
-			const slashIdx = base.indexOf("/");
-			if (slashIdx <= 0) return { selector };
-			const thinkingLevel =
-				suffix || (typeof parsed.defaultThinkingLevel === "string" ? parsed.defaultThinkingLevel : undefined);
+			const parsed =
+				raw === null
+					? null
+					: (parseDocument(raw).toJS() as Record<string, unknown> | null);
+			const thinkingLevelDefault =
+				parsed && typeof parsed === "object" && !Array.isArray(parsed)
+					? parsed.defaultThinkingLevel
+					: undefined;
+			const all = await this.readOmpModelRoles();
+			const role = all.default;
+			if (!role.selector) return {};
 			return {
-				selector,
-				provider: base.slice(0, slashIdx),
-				model: base.slice(slashIdx + 1),
-				thinkingLevel: thinkingLevel || undefined,
+				selector: role.selector,
+				provider: role.provider,
+				model: role.modelId,
+				thinkingLevel:
+					role.thinkingLevel ||
+					(typeof thinkingLevelDefault === "string"
+						? thinkingLevelDefault
+						: undefined),
 			};
 		} catch {
 			return {};
@@ -458,41 +519,41 @@ export class ConfigManager {
 	}
 
 	/**
-	 * 原子更新 omp 默认模型（config.yml 的 modelRoles.default）。
+	 * 原子设置 omp 某个模型角色（config.yml 的 modelRoles.<role>）。
 	 * 值为 "provider/modelId"，可选 ":thinkingLevel" 后缀（omp 模型角色持久化格式）。
 	 * 通过 yaml round-trip 改写，保留文件中的注释与其它键。
 	 */
-	async updateOmpDefaultModelRole(
+	async updateOmpModelRole(
+		role: OmpModelRole,
 		selector: string,
 		thinkingLevel?: string,
+	): Promise<ConfigValidationResult> {
+		return this.writeOmpModelRole(role, (doc) => {
+			const effectiveValue = thinkingLevel && thinkingLevel.trim()
+				? `${selector}:${thinkingLevel.trim()}`
+				: selector;
+			doc.setIn(["modelRoles", role], effectiveValue);
+		});
+	}
+
+	/** 清除 config.yml 的 modelRoles.<role>（整块为空时 modelRoles 一并移除）。 */
+	async clearOmpModelRole(role: OmpModelRole): Promise<ConfigValidationResult> {
+		return this.writeOmpModelRole(role, (doc) => {
+			doc.deleteIn(["modelRoles", role]);
+		});
+	}
+
+	/** 通用角色写盘：回调修改 yaml doc，写回前清空孤儿 modelRoles 块。 */
+	private async writeOmpModelRole(
+		role: OmpModelRole,
+		mutate: (doc: Document) => void,
 	): Promise<ConfigValidationResult> {
 		try {
 			await mkdir(this.configDir, { recursive: true });
 			const existing = await this.readOmpConfigYaml();
 			const doc = parseDocument(existing ?? "", { prettyErrors: true });
-			const effectiveValue = thinkingLevel && thinkingLevel.trim()
-				? `${selector}:${thinkingLevel.trim()}`
-				: selector;
-			doc.setIn(["modelRoles", "default"], effectiveValue);
-			const filePath = join(this.configDir, this.ompConfigYamlName());
-			await writeFile(filePath, doc.toString(), "utf8");
-			return { valid: true };
-		} catch (e) {
-			return {
-				valid: false,
-				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
-			};
-		}
-	}
-
-	/** 清除 config.yml 的 modelRoles.default（模型角色为空的块一并移除）。 */
-	async clearOmpDefaultModelRole(): Promise<ConfigValidationResult> {
-		try {
-			const existing = await this.readOmpConfigYaml();
-			if (existing === null) return { valid: true };
-			await mkdir(this.configDir, { recursive: true });
-			const doc = parseDocument(existing, { prettyErrors: true });
-			doc.deleteIn(["modelRoles", "default"]);
+			mutate(doc);
+			// modelRoles 被清空时删除整块，避免写残留空对象
 			const rolesNode = doc.get("modelRoles");
 			if (
 				rolesNode &&
@@ -502,8 +563,8 @@ export class ConfigManager {
 			) {
 				doc.delete("modelRoles");
 			}
-			// defaultThinkingLevel 一并清理，避免残留旧的默认思考档
-			doc.delete("defaultThinkingLevel");
+			// 清 default 时同步清 defaultThinkingLevel，避免残留旧的默认思考档
+			if (role === "default") doc.delete("defaultThinkingLevel");
 			const filePath = join(this.configDir, this.ompConfigYamlName());
 			await writeFile(filePath, doc.toString(), "utf8");
 			return { valid: true };
@@ -513,6 +574,22 @@ export class ConfigManager {
 				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
 			};
 		}
+	}
+
+	/**
+	 * 原子更新 omp 默认模型（config.yml 的 modelRoles.default）——default 角色的
+	 * 便捷别名，委托 updateOmpModelRole。仅保留给既有调用方（老模型选择器入口）。
+	 */
+	async updateOmpDefaultModelRole(
+		selector: string,
+		thinkingLevel?: string,
+	): Promise<ConfigValidationResult> {
+		return this.updateOmpModelRole("default", selector, thinkingLevel);
+	}
+
+	/** 清除 config.yml 的 modelRoles.default（default 角色的便捷别名，委托 clearOmpModelRole）。 */
+	async clearOmpDefaultModelRole(): Promise<ConfigValidationResult> {
+		return this.clearOmpModelRole("default");
 	}
 
 	/** 原子更新 config.yml 的 defaultThinkingLevel（默认思考档）。 */

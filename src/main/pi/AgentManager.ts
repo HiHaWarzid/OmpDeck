@@ -58,7 +58,6 @@ import {
 	takeActiveEntryId,
 } from "./sessionEntryIds";
 import { SessionJsonl } from "./sessionJsonl";
-import { describeImage, isVisionBridgeReady } from "../vision/VisionBridge";
 import { LatestByKeyEmitter } from "./LatestByKeyEmitter";
 
 /**
@@ -1017,32 +1016,6 @@ export class AgentManager {
 		const alreadyBusy = runtime.tab.status === "running";
 		const statusBeforePrompt = runtime.tab.status;
 		const promptDeliveryBehavior = input.streamingBehavior ?? (alreadyBusy ? "steer" : undefined);
-
-		// 视觉桥：启用时把图片转成文本描述注入 agentMessage（内部指令，不进 UI 气泡）。
-		// 图片仍作为 images 传给 RPC——模型支持视觉时不受影响，描述只是补充上下文；
-		// 单张转换失败不阻断发送（appLogger 留痕），避免视觉桥故障卡住用户消息。
-		const visionBridgeConfig = this.settingsStore.get().visionBridge;
-		if (hasImages && isVisionBridgeReady(visionBridgeConfig)) {
-			const descriptions = await Promise.all(
-				input.images!.map((image) => describeImage(visionBridgeConfig, image)),
-			);
-			const okTexts = descriptions
-				.filter((d): d is { ok: true; text: string } => d.ok)
-				.map((d) => d.text);
-			const failed = descriptions.filter((d): d is { ok: false; error: string } => !d.ok);
-			if (failed.length > 0) {
-				void this.appLogger?.warn("vision", "Vision bridge failed for some images", {
-					agentId: input.agentId,
-					failed: failed.map((f) => f.error),
-				});
-			}
-			if (okTexts.length > 0) {
-				const bridgeNote = okTexts
-					.map((text, i) => `[图片 ${i + 1} 描述]\n${text}`)
-					.join("\n\n");
-				agentMessage = `${agentMessage}\n\n${bridgeNote}`;
-			}
-		}
 
 		// 在设置状态为 running 之前检查进程是否还活着，避免进程崩溃后状态不一致
 		if (!runtime.process.isRunning()) {
