@@ -17,7 +17,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
-import { OMP_MODEL_ROLES, type OmpModelRole } from "../../../../shared/types/ompRoles";
+import { OMP_MODEL_ROLES, formatRoleSelector, type OmpModelRole } from "../../../../shared/types/ompRoles";
 import type { AvailableModel } from "../../../../shared/types";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
@@ -199,14 +199,15 @@ export function ModelRolesTab() {
 		setSavingRole(role);
 		setNotice(null);
 		try {
-			const result = await window.piDesktop.config.setOmpRole(role, `${model.provider}/${model.id}`);
+			const selector = formatRoleSelector(model.provider, model.id);
+			const result = await window.piDesktop.config.setOmpRole(role, selector);
 			if (result.valid) {
 				setRoles((prev) => {
 					if (!prev) return prev;
 					return {
 						...prev,
 						[role]: {
-							selector: `${model.provider}/${model.id}`,
+							selector,
 							provider: model.provider,
 							modelId: model.id,
 						},

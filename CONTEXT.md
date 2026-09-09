@@ -3,7 +3,6 @@
 > 记录 OmpDeck AFK 自动编排功能的领域术语（ubiquitous language）。
 > AFK = 应用内"挂机"模式：无值守情况下，按 GitHub 工单自动派发 pi Agent 到隔离 worktree 完成 T1 级编码任务。
 > 维护规则：术语敲定时更新；不可逆决策见 `docs/adr/`。
-
 ## 术语
 
 ### Ticket（工单）
@@ -85,3 +84,49 @@ worktree 只继承项目仓库**已提交**的 `AGENTS.md`/`.omp/skills`。AFK *
 - `success` 判定（留给 review）。
 - 工单内容质量（brief 由 issue 作者负责）。
 - 跨多 ticket 的任务依赖编排（P0 单 ticket 串行）。
+
+---
+
+# 会话工作区（Renderer 领域术语）
+
+> 第二领域：渲染层「会话工作区」深化模块（源自架构评审候选 1，design-it-twice 定案 C+B 混合）。
+> 记录深化模块的稳定命名；AFK 术语不受影响。维护规则同上：术语敲定时更新。
+
+## 术语
+
+### SessionWorkspace（会话工作区）
+渲染层深模块：单一 store 实例 + 内部 reducer 切片，统一持有"按 agent 的会话交互状态"。吸收 `App()` 内 ~166 useState、15 张 per-agent 键控 map 与镜像 ref。store 纯（零 I/O、零订阅）；hook 层订阅 agent 运行时事件并 dispatch。
+
+### Focus（焦点）
+会话工作区的**单一选中态**：`tab`（存活/恢复的会话条目）或 `project`（空态作用域）。替代 `activeAgentId` + `activeProjectId` 双态。焦点由 store 派生，绝不复制进条目状态。用户意图操作**绑定焦点、不带 key**；事件驱动操作带显式 key。
+
+### SessionEntry（条目）
+每个焦点会话的 UI 状态单元（draft/composer 模式/streaming/runtime/时长/锚点……）。生命周期**绑定 agent tab 成员关系**：tab 移除或会话关闭 → 整条目 dispose（杀定时器）。一个条目一条记录，杜绝 map 漂移。
+
+### Slice（切片）
+每关注点一个纯 reducer 文件（`slices/<name>.ts`）+ 读侧 hook（`hooks/use<Name>.ts`），manifest 汇总。切片互不 import 对方 reducer；跨切片读值经 store 快照。现有纯模块（`agentRuntimeState`/`messageDeltaResolver`/`thinkingState`/`queuedPromptStore`/`terminalDockState`）原样充当内部 reducer，零 fork。
+
+### 未纳入
+侧栏展开/折叠持久化（localStorage 关注点）、全局 chrome（窗口/主题/宠物/飞书指示器）**不属于**会话工作区；rpcLogs 走模块级环形缓冲独立订阅，不进 store（store 只存控制台开关布尔）。
+滚动/自动锚点机制（autoScroll + ResizeObserver/MutationObserver + rAF）与终端 Dock 挂载/关闭动画 FSM（mounted/closing/timer）是 **DOM 几何适配器**，不迁入 store：store 保持纯，几何时序竞态留在组件层（切片 3+4 评估结论，未来仅当出现可单测的纯滚动策略时再抽 ops）。终端 Dock 的开合/折叠状态已由 `useAgentLifecycle` + 纯模块 `terminalDockState` 持有，不再重复收纳。
+
+---
+
+# OMP 配置领域（主进程术语）
+
+> 第三领域：omp 全局配置文件语义（源自架构评审候选 3/5，scout 实锤
+> @oh-my-pi/pi-coding-agent 键语义）。维护规则同上。
+
+## 术语
+
+### OmpRoles（模型角色分配）
+config.yml 的 `modelRoles.<role>`（default/smol/slow/vision/plan/commit/tiny/task/advisor）。值 = Selector（可含档位后缀）。由 `OmpRolesStore` 独占读写；`ConfigManager` 只做委托。
+
+### Selector（选择器）
+落盘格式 `provider/modelId[:thinkingLevel]`（冒号后缀 = 显式档，该角色生效时优先于顶层 defaultThinkingLevel；default 无后缀才回退顶层键）。解析/拼装为 shared 契约 `parseRoleSelector`/`formatRoleSelector`（`shared/types/ompRoles.ts`），双端共用。**config.yml 是 omp 全局权威源**；settings.json 仅当 config.yml 缺失时被 omp 一次性消费（迁移后改名 .bak）——OmpDeck 的旧 defaultThinkingLevel 只填空迁移进 config.yml，此后停写 settings.json 档位。
+
+### OMP 默认（Omp 默认角色）
+`modelRoles.default` + 顶层 `defaultThinkingLevel` 两个 schema 槽位一起构成"默认模型 + 默认思考档"。`OmpRolesStore.applyDefault` 单次文档变更写双槽位（原两次串行全文件 RMW 的撕裂窗口在此关闭）。
+
+### TrustStore（信任决策存储）
+trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` 开头小写、posix 保大小写），父目录决策继承到子目录。`decide()` 编排：干净项目自动写信任；true 放行；false/未记录 → **ask 注入**（弹窗适配器在 AgentManager：requestId/60s/headless 拒绝），remember 落盘 / session 本次 approve / deny 本次 no-approve（false 永不落盘，下次可重选）。

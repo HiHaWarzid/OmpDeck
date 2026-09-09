@@ -81,12 +81,17 @@ test("busy composer keeps stop and queued-send controls separate", () => {
   assert.match(appSource, /className="send-behavior-toggle"/);
   assert.match(appSource, /className="send-behavior-primary"/);
   assert.match(appSource, /className="send-behavior-chevron"/);
-  assert.match(appSource, /const \[busyDraftByAgent, setBusyDraftByAgent\] = useState<Record<string, boolean>>/);
+  // 切片 1：busyDraft 从 App 内 state map 迁入 workspace store（composer 切片）
+  assert.match(appSource, /const activeBusyDraft = activeWorkspaceComposer\?\.busyDraft \?\? false;/);
+  assert.match(appSource, /const clearBusyDraftForAgent = \(agentId: string\) =>/);
+  assert.match(appSource, /const latchBusyDraftForAgent = \(agentId: string\) =>/);
   assert.match(appSource, /const showBusySendControls = isAgentBusy \|\| keepBusyDraftControls/);
   assert.match(appSource, /\{showBusySendControls && hasComposerContent && \(/);
   // ternary 改为独立 && 条件：idle 且无草稿时显示普通发送按钮
   assert.match(appSource, /!isAgentBusy && !keepBusyDraftControls && !showBusySendControls && \(/);
-  assert.match(appSource, /if \(!isAgentBusy \|\| current\[activeAgentId\]\) return current;/);
+  // busyDraft 门禁语义迁入 store：内容清空释放 / 忙碌且有内容才锁定（reducer 同值空转）
+  assert.match(appSource, /if \(!hasComposerContent\) clearBusyDraftForAgent\(activeAgentId\);/);
+  assert.match(appSource, /else if \(isAgentBusy\) latchBusyDraftForAgent\(activeAgentId\);/);
   assert.match(stylesSource, /\.send-behavior-menu-wrap \{[\s\S]*?gap: 8px;/);
   // .composer-footer 重命名为 .composer-bottom-bar，height 36px→28px，radius pill→sm
   assert.match(stylesSource, /\.composer-bottom-bar \.send-behavior-toggle \{[\s\S]*?height: 28px;[\s\S]*?background: var\(--color-accent\);[\s\S]*?border-radius: var\(--radius-sm\)/);

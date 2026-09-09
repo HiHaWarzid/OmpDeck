@@ -31,7 +31,8 @@ type AgentHandlerMaps = {
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
-		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk">;
+		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "respondTrustRequest">;
 };
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps {
@@ -284,6 +285,12 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
 				await agentManager.sendUIResponse(agentId, requestId, response);
 			},
+			/** 回传项目信任确认弹窗的用户选择，唤醒等待中的 Agent 创建流程（TrustStore.decide 的 ask 适配器）。 */
+			respondTrustRequest: async (
+				_event,
+				requestId: string,
+				choice: "trust-remember" | "trust-session" | "deny",
+			) => agentManager.respondTrustRequest(requestId, choice),
 		},
 	};
 }

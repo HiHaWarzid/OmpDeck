@@ -19,8 +19,8 @@ test("agent startup writes diagnostics across renderer IPC and pi launch boundar
 	assert.match(agentHandlersSource, /Agent create IPC received/);
 	assert.match(agentHandlersSource, /Agent create IPC completed/);
 	assert.match(mainSource, /Agent create requested/);
-	assert.match(mainSource, /Agent ensure trusted directory start/);
-	assert.match(mainSource, /Agent ensure trusted directory completed/);
+	assert.match(mainSource, /Agent trust decision start/);
+	assert.match(mainSource, /Agent trust decision completed/);
 	assert.match(mainSource, /Agent pi process start/);
 	assert.match(mainSource, /Agent get_state request start/);
 	assert.match(mainSource, /Agent get_state request completed/);

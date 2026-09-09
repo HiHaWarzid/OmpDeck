@@ -10,6 +10,7 @@ import {
   useCallback,
   useTransition,
   useDeferredValue,
+  useSyncExternalStore,
   type PointerEvent,
   type CSSProperties,
   type ReactNode,
@@ -130,14 +131,18 @@ import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
 import { reconcileAgentState } from "./utils/agentStateReconciliation";
-import { reduceThinkingUpdate } from "./utils/thinkingState";
+import { sessionWorkspaceStore } from "./workspace/store";
+import { composerActions } from "./workspace/slices/composerSlice";
+import { thinkingActions } from "./workspace/slices/thinkingSlice";
+import type { WorkspaceAction } from "./workspace/sessionWorkspace";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
   ConversationOutline,
-  DrawerContent,
+  FilesDrawer,
+  SessionsDrawer,
   EmptyState,
   EnvironmentDialog,
   FileContextMenu,
@@ -602,6 +607,57 @@ export function App() {
     promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
     migratePerAgentState, commitPendingToReal,
   } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
+  // ── 会话工作区（切片 1）：busyDraft / composer 模式迁入 workspace store ─────
+  // 条目成员关系 = 存活 agent tab（agents ∪ pendingAgents），键 = agentId。
+  // busyDraft 与模式随 tab 生灭重置，与迁移前按 agentId 键控的 map 语义逐点等价。
+  const workspaceSnapshot = useSyncExternalStore(
+    sessionWorkspaceStore.subscribe,
+    sessionWorkspaceStore.getSnapshot,
+  );
+  const activeWorkspaceEntry = activeAgentId
+    ? workspaceSnapshot.entries.get(activeAgentId)
+    : undefined;
+  const activeWorkspaceComposer = activeWorkspaceEntry?.data.composer;
+  const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
+  const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
+  /** 当前活跃 agent 的实时思考文本与起点（切片 2a：per-entry，镜像 ref 已删除）。 */
+  const activeThinking = activeWorkspaceEntry?.data.thinking.text ?? "";
+  const activeThinkingStartedAt = activeWorkspaceEntry?.data.thinking.startedAt;
+  /** 对活体 tab 条目 dispatch；条目缺失时先 join 自愈，避免成员同步的时序窗口。 */
+  const dispatchWorkspaceToAgent = (agentId: string, action: WorkspaceAction) => {
+    if (!sessionWorkspaceStore.has(agentId)) sessionWorkspaceStore.joinTab(agentId);
+    sessionWorkspaceStore.dispatchTo(agentId, action);
+  };
+  const setComposerAgentModeForAgent = (agentId: string, mode: ComposerAgentMode) => {
+    dispatchWorkspaceToAgent(agentId, composerActions.setMode(mode));
+  };
+  const setCurrentComposerAgentMode = (mode: ComposerAgentMode) => {
+    const targetAgentId = activeAgentIdRef.current;
+    if (!targetAgentId) return;
+    setComposerAgentModeForAgent(targetAgentId, mode);
+  };
+  /** busyDraft 释放：等价原「存在才删除」——reducer 对已 false 空转，不触发通知。 */
+  const clearBusyDraftForAgent = (agentId: string) => {
+    dispatchWorkspaceToAgent(agentId, composerActions.setBusyDraft(false));
+  };
+  /** busyDraft 置位：内容非空且 agent 忙碌时锁定分段发送控件（已 true 则空转）。 */
+  const latchBusyDraftForAgent = (agentId: string) => {
+    dispatchWorkspaceToAgent(agentId, composerActions.setBusyDraft(true));
+  };
+  // 成员同步 + 焦点同步：tab 加入/离开驱动条目 join/leave，选中 agent 驱动 Focus。
+  useEffect(() => {
+    const live = new Set<string>();
+    for (const agent of agents) live.add(agent.id);
+    for (const agent of pendingAgents) live.add(agent.id);
+    for (const id of live) {
+      if (!sessionWorkspaceStore.has(id)) sessionWorkspaceStore.joinTab(id);
+    }
+    for (const [key, entry] of sessionWorkspaceStore.getSnapshot().entries) {
+      if (entry.kind === "tab" && !live.has(key)) sessionWorkspaceStore.leave(key);
+    }
+    if (activeAgentId) sessionWorkspaceStore.activate(activeAgentId);
+    else sessionWorkspaceStore.clearFocus();
+  }, [agents, pendingAgents, activeAgentId]);
   // 切换 agent（新会话/恢复会话）时刷新设置，使 pi agent 的 hideThinkingBlock 立即生效
   useEffect(() => {
     if (activeAgentId) {
@@ -634,8 +690,6 @@ export function App() {
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 如果用户在 Agent 忙碌时开始撰写，保持分段发送控件，避免 Agent 恰好结束时按钮在手边消失。
-  const [busyDraftByAgent, setBusyDraftByAgent] = useState<Record<string, boolean>>({});
   const [sessionFeishuBotId, setSessionFeishuBotId] = useState<
     string | undefined
   >(undefined);
@@ -699,25 +753,10 @@ export function App() {
   const [agentDismissedWidgets, setAgentDismissedWidgets] = useState<
     Record<string, string[]>
   >(() => loadDismissedExtensionWidgets());
-  /** 输入框发送模式：normal 直接交给 agent，plan 通过隐藏标记触发 OmpDeck Plan Mode 扩展。 */
-  const [composerAgentModes, setComposerAgentModes] = useState<Record<string, ComposerAgentMode>>({});
-  /** 查看器模式的发送模式（仅在无 agent 时使用） */
-  // 侧栏选中态：当前活跃 Agent 对应的 session 路径（activeAgent 在后面定义，这里用函数式）
+  /** 侧栏选中态：当前活跃 Agent 对应的 session 路径（activeAgent 在后面定义，这里用函数式） */
   const displayedSidebarSessionPath = activeAgentId
     ? [...agents, ...pendingAgents].find((agent) => agent.id === activeAgentId)?.sessionPath
     : undefined;
-  const activeAgentComposerMode = activeAgentId
-    ? composerAgentModes[activeAgentId]
-    : undefined;
-  const currentComposerAgentMode = activeAgentComposerMode ?? "normal";
-  const setComposerAgentModeForAgent = (agentId: string, mode: ComposerAgentMode) => {
-    setComposerAgentModes((prev) => ({ ...prev, [agentId]: mode }));
-  };
-  const setCurrentComposerAgentMode = (mode: ComposerAgentMode) => {
-    const targetAgentId = activeAgentIdRef.current;
-    if (!targetAgentId) return;
-    setComposerAgentModeForAgent(targetAgentId, mode);
-  };
   /** Goal 状态 */
   const [goalText, setGoalText] = useState<string>("");
   const goalTextRef = useRef("");
@@ -746,19 +785,6 @@ export function App() {
     Record<string, { messages: Array<{ role: string; content: string }>; fullContext: boolean; selectedIndices: number[] }>
   >({});
 
-  const [streamingThinking, setStreamingThinking] = useState<
-    Record<string, string>
-  >({});
-  /** 每个 agent 流式思考的开始时间戳（首次 thinking 到达时记录），用于实时显示思考耗时 */
-  const [streamingThinkingStartedAt, setStreamingThinkingStartedAt] = useState<
-    Record<string, number>
-  >({});
-  // 流式思考状态的同步镜像：挂载一次的 onThinking 监听器需要读取最新缓存
-  // （reduceThinkingUpdate 的纯归约以 ref 快照为输入，见 utils/thinkingState）。
-  const streamingThinkingRef = useRef(streamingThinking);
-  streamingThinkingRef.current = streamingThinking;
-  const streamingThinkingStartedAtRef = useRef(streamingThinkingStartedAt);
-  streamingThinkingStartedAtRef.current = streamingThinkingStartedAt;
   /** 每个 agent 最后一次会话的开始时间(status 变为 running 时记录),用 ref 避免 effect 闭包陈旧 */
   const sessionStartByAgentRef = useRef<Record<string, number>>({});
   /** 每个 agent 最后一次会话的总时长(ms),仅在会话结束后更新 */
@@ -767,17 +793,6 @@ export function App() {
   >({});
   // 会话区不再维护独立的“修改文件摘要”卡片；diff 入口贴在 edit/write 工具调用处，
   // 避免会话输入框上方摘要与 Git 工作区状态/历史会话恢复互相干扰。
-  /** RPC 日志,用于调试 */
-  const [rpcLogs, setRpcLogs] = useState<
-    Array<{
-      id: string;
-      agentId: string;
-      direction: string;
-      summary: string;
-      data?: unknown;
-      time: number;
-    }>
-  >([]);
   const [search, setSearch] = useState("");
   // 侧栏过滤用延迟值：输入框即时响应，O(项目×会话) 的 filter/sort 派生计算
   // 降级为低优先级更新，避免搜索大量项目/会话时按键阻塞。
@@ -1931,10 +1946,6 @@ export function App() {
     return undefined;
   }, [activeAgent, activeRuntimeState, activeMessages]);
 
-  /** 当前活跃 agent 的实时思考文本 */
-  const activeThinking = activeAgentId
-    ? (streamingThinking[activeAgentId] ?? "")
-    : "";
   // PIDECK_PERF=1 帧率诊断：agent 运行/流式期间采样帧间隔，结束时输出 P50/P95（验收指标）。
   const isStreamingNow = isAgentStreaming(activeAgent, activeRuntimeState);
   useEffect(() => {
@@ -2495,24 +2506,10 @@ export function App() {
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
-      // 纯归约（相同文本跳过、首次非空记录开始时间、清空移除）收敛为
-      // utils/thinkingState.reduceThinkingUpdate（见同名测试）；
-      // 经 ref 快照读取最新缓存（监听器挂载一次），只在实际变化时 setState，
-      // 避免工具执行期间 50ms 节流推送触发 20Hz 全树重渲染。
-      const next = reduceThinkingUpdate(
-        {
-          thinkingByAgent: streamingThinkingRef.current,
-          startedAtByAgent: streamingThinkingStartedAtRef.current,
-        },
-        payload.agentId,
-        payload.thinking,
-      );
-      if (next.thinkingByAgent !== streamingThinkingRef.current) {
-        setStreamingThinking(next.thinkingByAgent);
-      }
-      if (next.startedAtByAgent !== streamingThinkingStartedAtRef.current) {
-        setStreamingThinkingStartedAt(next.startedAtByAgent);
-      }
+      // 纯归约（同文本空转、首次非空记起点、清空移除）收敛为 workspace thinking 切片；
+      // dispatch 直接落进 store 自身最新状态，原镜像 ref 双写（streamingThinkingRef /
+      // streamingThinkingStartedAtRef）随切片 2a 删除。reducer 同文本空转 = 20Hz 守卫。
+      dispatchWorkspaceToAgent(payload.agentId, thinkingActions.update(payload.thinking));
     });
     const offNotice = api.agents.onNotice((payload) => {
       const text =
@@ -4881,18 +4878,8 @@ export function App() {
     if (previous) {
       applyAgentRuntimeState(agentId, { ...previous, isStreaming: false });
     }
-    setStreamingThinking((current) => {
-      if (!(agentId in current)) return current;
-      const next = { ...current };
-      delete next[agentId];
-      return next;
-    });
-    setStreamingThinkingStartedAt((current) => {
-      if (!(agentId in current)) return current;
-      const next = { ...current };
-      delete next[agentId];
-      return next;
-    });
+    // thinking 切片：清空文本 + 移除起点（reducer 对已空状态空转）
+    dispatchWorkspaceToAgent(agentId, thinkingActions.update(""));
     await api.agents.abort(agentId);
     // 不调用 refreshRuntimeState：AgentManager.abort() 会通过 emitState 推送正确状态，
     // 避免后端 get_state 返回过时的 isStreaming: true 覆盖前端立刻设的 false。
@@ -5272,23 +5259,18 @@ export function App() {
   // 与图片附件；images 本身已是 state 变化即触发重渲染。
   const hasComposerContent = hasComposerText || attachedImages.length > 0;
   const keepBusyDraftControls = Boolean(
-    activeAgentId && hasComposerContent && busyDraftByAgent[activeAgentId],
+    activeAgentId && hasComposerContent && activeBusyDraft,
   );
   const showBusySendControls = isAgentBusy || keepBusyDraftControls;
 
   // 图片附件等非文本输入同样应锁定忙碌草稿控件；内容清空后再释放锁定。
   useEffect(() => {
     if (!activeAgentId) return;
-    setBusyDraftByAgent((current) => {
-      if (!hasComposerContent) {
-        if (!current[activeAgentId]) return current;
-        const next = { ...current };
-        delete next[activeAgentId];
-        return next;
-      }
-      if (!isAgentBusy || current[activeAgentId]) return current;
-      return { ...current, [activeAgentId]: true };
-    });
+    // busyDraft 门禁：仅在「有内容且忙」时置位锁定；agent 空闲不清除
+    // （控件要撑过 agent 恰好结束的窗口，见 keepBusyDraftControls 注释）。
+    // 只有内容清空/发送成功才释放。reducer 对同值空转，不触发通知。
+    if (!hasComposerContent) clearBusyDraftForAgent(activeAgentId);
+    else if (isAgentBusy) latchBusyDraftForAgent(activeAgentId);
   }, [activeAgentId, hasComposerContent, isAgentBusy]);
 
   // 已删除内置 goal 自动续接。
@@ -5310,7 +5292,7 @@ export function App() {
         isAwaitingAssistant,
         showThinking: settings.showThinking,
         activeThinking,
-        thinkingStartedAt: activeAgentId ? streamingThinkingStartedAt[activeAgentId] : undefined,
+        thinkingStartedAt: activeThinkingStartedAt,
         isExecutingTool: activeRuntimeState?.isExecutingTool,
         isStreaming: activeRuntimeState?.isStreaming,
         cancellingUi,
@@ -5324,7 +5306,7 @@ export function App() {
       settings.showThinking,
       activeThinking,
       activeAgentId,
-      streamingThinkingStartedAt,
+      activeThinkingStartedAt,
       activeRuntimeState?.isExecutingTool,
       activeRuntimeState?.isStreaming,
       cancellingUi,
@@ -5483,12 +5465,7 @@ export function App() {
       // 发送清空：上一轮的 dismissed 抑制随文本一起作废，新输入从头开始。
       suggestionsDismissedRef.current = false;
     }
-    setBusyDraftByAgent((current) => {
-      if (!current[targetAgentId]) return current;
-      const next = { ...current };
-      delete next[targetAgentId];
-      return next;
-    });
+    if (targetAgentId) clearBusyDraftForAgent(targetAgentId);
     setSuggestionsOpen(false);
     setSendBehaviorMenuOpen(false);
     // 发送后强制重置自动高度：避免粘贴多行内容后 scrollHeight 残留导致 composer 无法恢复默认高度。
@@ -5606,12 +5583,7 @@ export function App() {
     setHistoryIndex(-1);
     setHistoryNavigating(false);
     setSavedPrompt("");
-    setBusyDraftByAgent((current) => {
-      if (!current[targetAgentId]) return current;
-      const next = { ...current };
-      delete next[targetAgentId];
-      return next;
-    });
+    if (targetAgentId) clearBusyDraftForAgent(targetAgentId);
     setSuggestionsOpen(false);
     setSendBehaviorMenuOpen(false);
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
@@ -8631,16 +8603,9 @@ export function App() {
                   setNativePrompt(targetAgentId, newValue, chipsKeyOf);
                 }
                 if (targetAgentId) {
-                  setBusyDraftByAgent((current) => {
-                    if (!newValue.trim()) {
-                      if (!current[targetAgentId]) return current;
-                      const next = { ...current };
-                      delete next[targetAgentId];
-                      return next;
-                    }
-                    if (!isAgentBusy || current[targetAgentId]) return current;
-                    return { ...current, [targetAgentId]: true };
-                  });
+                  // busyDraft：内容清空即释放；忙碌且有内容则锁定分段发送控件
+                  if (!newValue.trim()) clearBusyDraftForAgent(targetAgentId);
+                  else if (isAgentBusy) latchBusyDraftForAgent(targetAgentId);
                 }
                 if (suggestionsOpen) setComposerCursor(cursor);
                 const nextTrigger = detectTrigger(newValue, cursor);
@@ -9118,20 +9083,12 @@ export function App() {
                         </div>
                       }
                     >
-                      <DrawerContent
-                        hideChrome
-                        panel="files"
+                      <FilesDrawer
                         files={files}
-                        sessions={[]}
-                        sessionsLoading={false}
                         expandedDirs={expandedDirs}
                         onToggleDirectory={toggleDirectory}
                         onCollapseAllDirectories={collapseAllDirectories}
                         onExpandAllDirectories={expandAllDirectories}
-                        pinned={drawerPinned}
-                        onTogglePin={toggleDrawerPinned}
-                        onCollapse={collapseDrawer}
-                        onClose={closeDrawer}
                         onFileContextMenu={(node, x, y) => {
                           setFileMenu({ node, x, y });
                           try {
@@ -9146,12 +9103,6 @@ export function App() {
                           const p = projects.find((p) => p.id === activeProjectId);
                           if (p) void api.files.open(p.path);
                         }}
-                        onRefreshSessions={() => undefined}
-                        onOpenSession={() => undefined}
-                        onRenameSession={async () => undefined}
-                        onCopySession={() => undefined}
-                        onExportSession={() => undefined}
-                        onDeleteSession={() => undefined}
                         onViewFile={viewFilePath}
                         onOpenFile={openFilePath}
                         onDropFiles={(targetDir, fileList) => {
@@ -9248,36 +9199,16 @@ export function App() {
               </div>
             }
           >
-            <DrawerContent
-              panel="sessions"
+            <SessionsDrawer
               project={sessionsProject}
-              files={files}
               sessions={(sessionsProjectId && sessionSourceFilter[sessionsProjectId]) ? sessions.filter(
                 (s) => !s.parentSessionPath && (sessionSourceFilter[sessionsProjectId]!)!.has(s.source ?? "pi"),
               ).concat(sessions.filter(s => s.parentSessionPath && (sessionSourceFilter[sessionsProjectId]!)!.has(s.source ?? "pi"))) : sessions}
               sessionsLoading={sessionHistoryLoading}
-              expandedDirs={expandedDirs}
-              onToggleDirectory={toggleDirectory}
-              onCollapseAllDirectories={collapseAllDirectories}
-              onExpandAllDirectories={expandAllDirectories}
               pinned={drawerPinned}
               onTogglePin={toggleDrawerPinned}
               onCollapse={collapseDrawer}
               onClose={closeDrawer}
-              onFileContextMenu={(node, x, y) => {
-                setFileMenu({ node, x, y });
-                try {
-                  const paths = api.files.getClipboardPaths();
-                  setHasClipboardFiles(paths.length > 0);
-                } catch { setHasClipboardFiles(false); }
-              }}
-              onRefreshFiles={() => {
-                refreshFiles(activeProjectId);
-              }}
-              onOpenFolder={() => {
-                const p = projects.find((p) => p.id === activeProjectId);
-                if (p) void api.files.open(p.path);
-              }}
               onRefreshSessions={() =>
                 refreshSessions(sessionsProjectId ?? activeProjectId)
               }
@@ -9300,9 +9231,6 @@ export function App() {
               }
               onExportSession={exportHistorySession}
               onDeleteSession={deleteHistorySession}
-              onViewFile={viewFilePath}
-              onOpenFile={openFilePath}
-              projectRoot={projects.find((p) => p.id === activeProjectId)?.path}
             />
           </LazyWrapper>
         ) : null}

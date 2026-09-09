@@ -914,7 +914,7 @@ function registerIpc() {
 		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
 		registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger }),
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
-		registerConfigHandlers({ configManager, agentManager, appLogger }),
+		registerConfigHandlers({ configManager, appLogger }),
 		registerClipboardHandlers(),
 		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
@@ -1013,6 +1013,9 @@ app.whenReady().then(async () => {
 	worktreeService = new WorktreeService();
 	piLocator = new PiLocator("omp");
 	configManager = new ConfigManager();
+	// 一次性 legacy 迁移：旧 settings.json 的 defaultThinkingLevel 只填空搬进
+	// config.yml（config.yml 是 omp 权威源）；失败不阻塞启动。
+	void configManager.migrateOmpLegacyDefaultThinkingLevel();
 	promptManager = new PromptManager();
 	xuePromptManager = new XuePromptManager();
 	skillManager = new SkillManager();

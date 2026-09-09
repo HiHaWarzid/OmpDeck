@@ -1,13 +1,11 @@
 /**
  * Config IPC handler：pi 配置文件读写/导入导出/provider 模型拉取/连接测试。
- * 包含 `agentsTrustResponse`（物理位于此块，逻辑属于 agents 命名空间）。
  * 返回 HandlerMap 由 registerIpcHandlers 统一注册。
  */
 import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRolePayload, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import { OMP_MODEL_ROLES, type OmpModelRole } from "../../shared/types/ompRoles";
+import { OMP_MODEL_ROLES, formatRoleSelector, type OmpModelRole } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
-import type { AgentManager } from "../pi/AgentManager";
 import type { AppLogger } from "../logging/AppLogger";
 
 /** 入参校验：role 必须是 omp 内置角色之一（IPC 边界收窄 unknown → OmpModelRole）。 */
@@ -17,18 +15,15 @@ function isOmpModelRole(value: string): value is OmpModelRole {
 
 interface ConfigHandlerDeps {
 	configManager: ConfigManager;
-	agentManager: AgentManager;
 	appLogger: AppLogger;
 }
 
 type ConfigHandlerMaps = {
 	config: IpcHandlerMap<typeof ipcTable.config, PiDesktopApi["config"]>;
-	// 项目信任确认：渲染进程回传用户选择，唤醒等待中的 Agent 创建流程（见 AgentManager.ensureProjectTrust）
-	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>, "respondTrustRequest">;
 };
 
 export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMaps {
-	const { configManager, agentManager, appLogger } = deps;
+	const { configManager, appLogger } = deps;
 
 	return {
 		config: {
@@ -72,19 +67,17 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				if (!trimmedProvider || !trimmedModel) {
 					return { valid: false, error: "provider 与 modelId 不能为空" };
 				}
-				const selector = `${trimmedProvider}/${trimmedModel}`;
+				// selector 落盘格式 "provider/modelId"（shared 契约，见 ompRoles.formatRoleSelector）
+				const selector = formatRoleSelector(trimmedProvider, trimmedModel);
 				const level = typeof thinkingLevel === "string" ? thinkingLevel.trim() : "";
-				// modelRoles.default 的 selector 内嵌思考档后缀（omp 原生持久化格式），
-				// 同时同步 defaultThinkingLevel，保证新建会话的模型与思考档都按默认生效。
-				const roleResult = await configManager.updateOmpDefaultModelRole(
+				// 原子设置 OMP 默认：单次文档变更写 modelRoles.default 与顶层
+				// defaultThinkingLevel 两个槽位（原两次串行全文件 RMW 的撕裂窗口
+				// 已收敛为 OmpRolesStore.applyDefault 的一次写）。
+				const roleResult = await configManager.applyOmpDefault(
 					selector,
 					level || undefined,
 				);
 				if (!roleResult.valid) return roleResult;
-				if (level) {
-					const levelResult = await configManager.updateOmpDefaultThinkingLevel(level);
-					if (!levelResult.valid) return levelResult;
-				}
 				void appLogger.info("config", "Default model set", {
 					provider: trimmedProvider,
 					model: trimmedModel,
@@ -95,7 +88,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 			},
 			// 清除 omp 默认模型角色与默认思考档（config.yml）。
 			clearOmpDefault: async () => {
-				const result = await configManager.clearOmpDefaultModelRole();
+				const result = await configManager.clearOmpDefault();
 				if (result.valid) {
 					void appLogger.info("config", "Default model cleared", { valid: true });
 				}
@@ -190,13 +183,6 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				});
 				return result;
 			},
-		},
-		agents: {
-			respondTrustRequest: async (
-				_event,
-				requestId: string,
-				choice: "trust-remember" | "trust-session" | "deny",
-			) => agentManager.respondTrustRequest(requestId, choice),
 		},
 	};
 }

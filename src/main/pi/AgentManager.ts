@@ -606,14 +606,15 @@ export class AgentManager {
 	}
 
 	/**
-	 * 读取 omp 全局 settings.json 中用户配置的默认思考级别（defaultThinkingLevel）。
+	 * 读取 omp config.yml 顶层 defaultThinkingLevel——config.yml 是 omp 全局权威源
+	 * （omp 只在 config.yml 缺失时消费 settings.json）；旧 settings.json 的档位由
+	 * 一次性迁移搬入 config.yml（只填空不覆盖，见 OmpRolesStore.migrateLegacy）。
 	 * 只接受 omp 认识的档位，返回 undefined 表示未配置或值无效，不向 RPC 转发。
 	 */
 	private async readConfiguredDefaultThinkingLevel(): Promise<string | undefined> {
 		try {
-			const { parsed } = await this.configManager.getSettingsConfig();
-			const level = parsed?.defaultThinkingLevel;
-			return typeof level === "string" && AgentManager.OMP_THINKING_LEVELS[level] === true
+			const level = await this.configManager.getOmpDefaultThinkingLevel();
+			return level !== undefined && AgentManager.OMP_THINKING_LEVELS[level] === true
 				? level
 				: undefined;
 		} catch {
@@ -3457,63 +3458,11 @@ export class AgentManager {
 	}
 
 	/**
-	 * pi 信任机制只对“含项目级 pi 资源”的项目触发，且 RPC 模式下 pi 的 project_trust 事件
-	 * hasUI 恒为 false、ctx.ui.select 不接 RPC UI 协议，无法弹窗。
-	 * 因此 pi-desktop 在启动 pi 进程前自行完成信任确认：干净项目自动信任并写入 trust.json；
-	 * 含 .omp/.agents 资源且未记录的项目弹窗让用户决策。
-	 */
-	private static readonly TRUST_REQUIRING_RESOURCE_FILES = [
-		"settings.json",
-		"extensions",
-		"skills",
-		"prompts",
-		"themes",
-		"SYSTEM.md",
-		"APPEND_SYSTEM.md",
-	] as const;
-
-	/**
-	 * 复刻 pi 的 hasTrustRequiringProjectResources：检查项目目录或其父目录是否存在
-	 * 需要信任才能加载的资源（.omp 下的配置/扩展/skills 等，或项目级 .agents/skills）。
-	 * 用户全局 ~/.agents/skills 视为可信，不触发信任确认。
-	 */
-	private hasTrustRequiringResources(hostCwd: string): boolean {
-		const configDir = join(hostCwd, ".omp");
-		if (
-			AgentManager.TRUST_REQUIRING_RESOURCE_FILES.some((file) => existsSync(join(configDir, file)))
-		) {
-			return true;
-		}
-		const userAgentsSkillsDir = join(
-			this.wslEnvironment?.windowsHome ?? homedir(),
-			".agents",
-			"skills",
-		);
-		let currentDir = hostCwd;
-		while (true) {
-			const agentsSkillsDir = join(currentDir, ".agents", "skills");
-			if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
-				return true;
-			}
-			const parentDir = dirname(currentDir);
-			if (parentDir === currentDir) return false;
-			currentDir = parentDir;
-		}
-	}
-
-	/**
-	 * 启动 pi 前完成项目信任确认。
-	 * - 无需信任资源的项目（干净项目）：自动写入 trust.json 标记信任，后续不再重复检查。
-	 * - 含信任资源的项目：已信任则放行；已显式拒绝则抛错；未记录则弹窗等待用户决策。
-	 */
-	/**
-	 * 启动 pi 前完成项目信任确认，返回需传给 pi 的信任覆盖指令。
-	 * - 无需信任资源的项目（干净项目）：自动写入 trust.json 标记信任。
-	 * - 已信任：放行，pi 查 trustStore 即可。
-	 * - 未记录或曾记 false：弹窗让用户选择。不持久化 false，保证下次仍可重新选择。
-	 *   - trust-remember：写 true，pi 信任加载资源。
-	 *   - trust-session：用 --approve 本次覆盖，不落盘。
-	 *   - deny：用 --no-approve 本次以不信任模式启动，pi 不加载项目级资源，Agent 仍可创建。
+	 * 启动 pi 前完成项目信任确认（决策矩阵收敛于 TrustStore.decide——探测/存储/
+	 * 编排全部模块化，本类只供弹窗适配器：requestId 注册表 + 60s/headless 拒绝，
+	 * 见 requestProjectTrust）。返回需传给 pi 的信任覆盖指令：
+	 * "approve"（trust-session 本次覆盖，不落盘）| "no-approve"（deny 不信任模式
+	 * 启动）| undefined（放行：已信任/remember 已落盘/干净项目自动信任）。
 	 */
 	private async ensureProjectTrust(project: Project): Promise<"approve" | "no-approve" | undefined> {
 		const cwd = this.wslEnvironment
@@ -3522,26 +3471,17 @@ export class AgentManager {
 		const hostCwd = this.wslEnvironment
 			? toWindowsHostPath(project.path, this.wslEnvironment)
 			: project.path;
-		if (!this.hasTrustRequiringResources(hostCwd)) {
-			// 干净项目：pi 无需加载项目级资源，pi-desktop 自动记入信任，避免每次创建 Agent 重复检查。
-			void this.appLogger?.info("agent", "Agent ensure trusted directory start", { cwd });
-			await this.configManager.ensureTrustedDirectory(cwd);
-			void this.appLogger?.info("agent", "Agent ensure trusted directory completed", { cwd });
-			return undefined;
-		}
-		const decision = await this.configManager.getProjectTrustDecision(cwd);
-		if (decision === true) return undefined;
-		// 未记录或曾记 false：弹窗让用户选择信任策略。不写 false，确保下次打开仍可重新决策。
-		const choice = await this.requestProjectTrust(cwd, project.name);
-		if (choice === "trust-remember") {
-			await this.configManager.setProjectTrustDecision(cwd, true);
-			return undefined;
-		}
-		if (choice === "trust-session") {
-			return "approve";
-		}
-		// deny：本次以不信任模式启动，pi 不加载项目级资源，Agent 仍可创建。
-		return "no-approve";
+		const trustStore = this.configManager.getTrustStore();
+		void this.appLogger?.info("agent", "Agent trust decision start", { cwd });
+		const result = await trustStore.decide({
+			cwd,
+			hostCwd,
+			projectName: project.name,
+			windowsHome: this.wslEnvironment?.windowsHome,
+			ask: async () => this.requestProjectTrust(cwd, project.name),
+		});
+		void this.appLogger?.info("agent", "Agent trust decision completed", { cwd, result });
+		return result;
 	}
 
 	/**

@@ -51,8 +51,9 @@ test("abort feedback is toast-only and seals stream generation", () => {
 	assert.match(settledBlock, /runtime\.recentlyAborted\s*=\s*false/);
 	assert.doesNotMatch(settledBlock, /openAgentStream/);
 
-	// 5) 前端 abort 立即清本地 thinking，并订阅 notice toast
-	assert.match(app, /setStreamingThinking\(/);
+	// 5) 前端 abort 立即清本地 thinking（切片 2a：dispatch 清空 thinking 切片），并订阅 notice toast
+	assert.match(app, /thinkingActions\.update\(""\)/);
+	assert.match(app, /dispatchWorkspaceToAgent\(agentId, thinkingActions\.update/);
 	assert.match(app, /api\.agents\.onNotice/);
 	assert.match(app, /showNotice\(/);
 });

@@ -34,6 +34,33 @@ function loadConfigManager() {
 			target: ts.ScriptTarget.ES2022,
 		},
 	});
+	// ConfigManager 值导入 ./OmpRolesStore 与 ./TrustStore（各自再导入 shared/
+	// 或 node 内建）；均以真实源码转译注入 + 共享的 fs/promises 假实现（EIO 语义：
+	// 首次读抛 ENOENT = 空存储，写操作收进 writes 供断言），避免测试文件自身的
+	// require 把相对路径解析到 tests/ 目录。
+	const sharedRoles = loadTranspiledModule("src/shared/types/ompRoles.ts");
+	const fsPromisesFake = {
+		mkdir: async () => {},
+		readFile: async () => {
+			if (content == null) {
+				const err = new Error("ENOENT");
+				err.code = "ENOENT";
+				throw err;
+			}
+			return content;
+		},
+		writeFile: async (filePath, nextContent) => {
+			content = nextContent;
+			writes.push({ filePath, content: nextContent });
+		},
+	};
+	const rolesStore = loadTranspiledModule("src/main/config/OmpRolesStore.ts", (id) => {
+		if (id === "../../shared/types/ompRoles") return sharedRoles;
+		return undefined;
+	}, { fsPromises: fsPromisesFake });
+	const trustStore = loadTranspiledModule("src/main/config/TrustStore.ts", (id) => {
+		return undefined;
+	}, { fsPromises: fsPromisesFake });
 	const sandbox = {
 		AbortController,
 		clearTimeout,
@@ -42,19 +69,9 @@ function loadConfigManager() {
 		setTimeout,
 		require: (id) => {
 			if (id === "./baseUrlPath") return loadBaseUrlPath();
-			if (id === "node:fs/promises") {
-				return {
-					mkdir: async () => {},
-					readFile: async () => {
-						if (content == null) throw new Error("ENOENT");
-						return content;
-					},
-					writeFile: async (filePath, nextContent) => {
-						content = nextContent;
-						writes.push({ filePath, content: nextContent });
-					},
-				};
-			}
+			if (id === "./OmpRolesStore") return rolesStore;
+			if (id === "./TrustStore") return trustStore;
+			if (id === "node:fs/promises") return fsPromisesFake;
 			if (id === "node:path") return path.win32;
 			if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
 			if (id === "electron") return { net: {} };
@@ -63,6 +80,32 @@ function loadConfigManager() {
 	};
 	vm.runInNewContext(outputText, sandbox, { filename: "ConfigManager.ts" });
 	return { ...sandbox.exports, getContent: () => content, writes };
+}
+
+/** 把源码 TS 转译为 CommonJS 后在 vm 沙箱执行；extraRequire 返回 undefined 时走真实 require。 */
+function loadTranspiledModule(sourcePath, extraRequire = () => undefined, options = {}) {
+	const { outputText } = ts.transpileModule(readFileSync(sourcePath, "utf8"), {
+		compilerOptions: {
+			module: ts.ModuleKind.CommonJS,
+			target: ts.ScriptTarget.ES2022,
+		},
+	});
+	const sandbox = {
+		exports: {},
+		process: { ...process, platform: "win32" },
+		setTimeout,
+		require: (id) => {
+			const mapped = extraRequire(id);
+			if (mapped) return mapped;
+			if (id === "node:fs/promises") return options.fsPromises ?? require(id);
+			if (id === "node:fs") return require(id);
+			if (id === "node:path") return path.win32;
+			if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
+			return require(id);
+		},
+	};
+	vm.runInNewContext(outputText, sandbox, { filename: sourcePath });
+	return sandbox.exports;
 }
 
 test("preserves POSIX WSL trust keys under Windows path semantics", async () => {

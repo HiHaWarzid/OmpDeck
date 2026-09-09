@@ -5337,31 +5337,16 @@ function clampOutlineTop(value: number) {
 	return Math.min(window.innerHeight - 92, Math.max(76, value));
 }
 
-export function DrawerContent(props: {
-	panel: DrawerPanel;
-	project?: Project;
+/** 文件抽屉：工具面板挂载（无内建 header，由外层 drawer-chrome Tab 接管 chrome）。 */
+export function FilesDrawer(props: {
 	files: FileTreeNode[];
-	sessions: SessionSummary[];
-	sessionsLoading?: boolean;
 	expandedDirs: Set<string>;
 	onToggleDirectory: (path: string) => void;
 	onCollapseAllDirectories: () => void;
 	onExpandAllDirectories?: () => void;
-	pinned: boolean;
-	onTogglePin: () => void;
-	onCollapse: () => void;
-	onClose: () => void;
-	/** 为 true 时隐藏内建 header（由右侧统一 Tab chrome 接管） */
-	hideChrome?: boolean;
 	onFileContextMenu: (node: FileTreeNode, x: number, y: number) => void;
 	onRefreshFiles: () => void;
 	onOpenFolder?: () => void;
-	onRefreshSessions: () => void;
-	onOpenSession: (session: SessionSummary) => void;
-	onRenameSession: (filePath: string, newName: string) => void;
-	onCopySession: (session: SessionSummary) => void | Promise<void>;
-	onExportSession: (session: SessionSummary) => void | Promise<void>;
-	onDeleteSession: (session: SessionSummary) => void | Promise<void>;
 	onOpenFile?: (path: string) => void;
 	onViewFile?: (path: string) => void;
 	onCreateItem?: (parentDir: string, name: string, type: "file" | "directory") => void;
@@ -5374,68 +5359,78 @@ export function DrawerContent(props: {
 	/** 内部拖拽移动文件到目标目录 */
 	onMoveFiles?: (sourcePaths: string[], targetDir: string) => void;
 }) {
-	const title =
-		props.panel === "files"
-			? t("drawer.files")
-			: props.project
-				? t("drawer.projectSessions", { name: props.project.name })
-				: t("drawer.historyTitle");
+	return (
+		<FilesPanel
+			files={props.files}
+			expandedDirs={props.expandedDirs}
+			onToggleDirectory={props.onToggleDirectory}
+			onCollapseAll={props.onCollapseAllDirectories}
+			onExpandAll={props.onExpandAllDirectories}
+			onFileContextMenu={props.onFileContextMenu}
+			onRefreshFiles={props.onRefreshFiles}
+			onOpenFolder={props.onOpenFolder}
+			onOpenFile={props.onOpenFile}
+			onViewFile={props.onViewFile}
+			onCreateItem={props.onCreateItem}
+			currentProjectRoot={props.projectRoot}
+			onDropFiles={props.onDropFiles}
+			onPasteFiles={props.onPasteFiles}
+			onMoveFiles={props.onMoveFiles}
+		/>
+	);
+}
+
+/** 会话历史抽屉：自带 header（标题/pin/close），只管会话列表——文件树由 FilesDrawer 独占。 */
+export function SessionsDrawer(props: {
+	project?: Project;
+	sessions: SessionSummary[];
+	sessionsLoading?: boolean;
+	pinned: boolean;
+	onTogglePin: () => void;
+	onCollapse: () => void;
+	onClose: () => void;
+	onRefreshSessions: () => void;
+	onOpenSession: (session: SessionSummary) => void;
+	onRenameSession: (filePath: string, newName: string) => void;
+	onCopySession: (session: SessionSummary) => void | Promise<void>;
+	onExportSession: (session: SessionSummary) => void | Promise<void>;
+	onDeleteSession: (session: SessionSummary) => void | Promise<void>;
+}) {
+	const title = props.project
+		? t("drawer.projectSessions", { name: props.project.name })
+		: t("drawer.historyTitle");
 	return (
 		<>
-			{/* 工具面板（文件等）由外层 drawer-chrome 提供 Tab 头，这里只在 sessions 等场景保留标题栏 */}
-			{!props.hideChrome && (
-				<div className="drawer-header">
-					<strong>{title}</strong>
-					<div className="drawer-header-actions">
-						<button
-							className={props.pinned ? "active" : ""}
-							title={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
-							aria-label={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
-							onClick={props.onTogglePin}
-						>
-							<Pin size={15} />
-						</button>
-						<button
-							disabled={props.pinned}
-							title={props.pinned ? t("drawer.pinnedCannotClose") : t("drawer.closePanel")}
-							aria-label={t("drawer.closePanel")}
-							onClick={props.onClose}
-						>
-							<X size={16} />
-						</button>
-					</div>
+			<div className="drawer-header">
+				<strong>{title}</strong>
+				<div className="drawer-header-actions">
+					<button
+						className={props.pinned ? "active" : ""}
+						title={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
+						aria-label={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
+						onClick={props.onTogglePin}
+					>
+						<Pin size={15} />
+					</button>
+					<button
+						disabled={props.pinned}
+						title={props.pinned ? t("drawer.pinnedCannotClose") : t("drawer.closePanel")}
+						aria-label={t("drawer.closePanel")}
+						onClick={props.onClose}
+					>
+						<X size={16} />
+					</button>
 				</div>
-			)}
-			{props.panel === "files" && (
-				<FilesPanel
-					files={props.files}
-					expandedDirs={props.expandedDirs}
-					onToggleDirectory={props.onToggleDirectory}
-					onCollapseAll={props.onCollapseAllDirectories}
-					onExpandAll={props.onExpandAllDirectories}
-					onFileContextMenu={props.onFileContextMenu}
-					onRefreshFiles={props.onRefreshFiles}
-					onOpenFolder={props.onOpenFolder}
-					onOpenFile={props.onOpenFile}
-					onViewFile={props.onViewFile}
-					onCreateItem={props.onCreateItem}
-					currentProjectRoot={props.projectRoot}
-					onDropFiles={props.onDropFiles}
-					onPasteFiles={props.onPasteFiles}
-					onMoveFiles={props.onMoveFiles}
-				/>
-			)}
-			{props.panel === "sessions" && (
-				<SessionsPanel
-					sessions={props.sessions}
-					onRefresh={props.onRefreshSessions}
-					onOpen={props.onOpenSession}
-					onRename={props.onRenameSession}
-					onCopy={props.onCopySession}
-					onExport={props.onExportSession}
-					onDelete={props.onDeleteSession}
-				/>
-			)}
+			</div>
+			<SessionsPanel
+				sessions={props.sessions}
+				onRefresh={props.onRefreshSessions}
+				onOpen={props.onOpenSession}
+				onRename={props.onRenameSession}
+				onCopy={props.onCopySession}
+				onExport={props.onExportSession}
+				onDelete={props.onDeleteSession}
+			/>
 		</>
 	);
 }

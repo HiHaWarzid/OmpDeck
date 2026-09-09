@@ -46,9 +46,7 @@ export const NAMESPACE_OWNERS: Record<Namespace, readonly string[]> = {
 	extensions: ["extensionHandlers"],
 	settings: ["appHandlers"],
 	config: ["configHandlers"],
-	// 拆分：agentHandlers 为主宿主；configHandlers 注册 agents.respondTrustRequest
-	// （项目信任确认的回传，物理上在 config 块，逻辑属于 agents 流程）。
-	agents: ["agentHandlers", "configHandlers"],
+	agents: ["agentHandlers"],
 	// PetSystem.handlerMaps（src/main/pet/index.ts），非独立 handler 模块文件。
 	pet: ["pet"],
 	terminal: ["terminalHandlers"],

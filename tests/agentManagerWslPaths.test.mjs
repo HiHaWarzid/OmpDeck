@@ -237,22 +237,32 @@ test("keeps switch_session RPC paths in Linux form", async () => {
 
 test("uses host paths for trust resource checks and Linux paths for trust keys", async () => {
 	const { AgentManager, calls, wslPaths } = loadAgentManager();
-	const trustedDirectories = [];
-	const manager = createManager(AgentManager, {
-		ensureTrustedDirectory: async (cwd) => { trustedDirectories.push(cwd); },
-	});
-	manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
+	// 信任决策已收敛到 TrustStore：AgentManager 只注入弹窗适配器，这里给真 store +
+	// 临时 trust 目录，断言 Linux cwd 键落盘、资源探测全走宿主（UNC）路径。
+	const { TrustStore } = await import("../src/main/config/TrustStore.ts");
+	const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+	const { join } = await import("node:path");
+	const { tmpdir } = await import("node:os");
+	const trustDir = mkdtempSync(join(tmpdir(), "agentmgr-trust-"));
+	try {
+		const store = new TrustStore({ resolveConfigDir: () => trustDir });
+		const manager = createManager(AgentManager, { getTrustStore: () => store });
+		manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
 
-	await manager.ensureProjectTrust({
-		id: "project",
-		name: "ba_cli",
-		path: "//wsl.localhost/Ubuntu-24.04/root/ba_cli",
-		lastOpenedAt: 1,
-	});
+		await manager.ensureProjectTrust({
+			id: "project",
+			name: "ba_cli",
+			path: "//wsl.localhost/Ubuntu-24.04/root/ba_cli",
+			lastOpenedAt: 1,
+		});
 
-	assert.equal(trustedDirectories[0], "/root/ba_cli");
-	assert.equal(
-		calls.existsSync.every((filePath) => filePath.startsWith("\\\\wsl.localhost\\Ubuntu-24.04\\")),
-		true,
-	);
+		const trust = JSON.parse(readFileSync(join(trustDir, "trust.json"), "utf8"));
+		assert.equal(trust["/root/ba_cli"], true);
+		assert.equal(
+			calls.existsSync.every((filePath) => filePath.startsWith("\\\\wsl.localhost\\Ubuntu-24.04\\")),
+			true,
+		);
+	} finally {
+		rmSync(trustDir, { recursive: true, force: true });
+	}
 });
