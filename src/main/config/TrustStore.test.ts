@@ -97,6 +97,17 @@ describe("resource probe", () => {
 	});
 });
 
+describe("importEntries", () => {
+	it("normalizes package keys in bulk and merges with existing entries", async () => {
+		const store = createStore();
+		await store.setDecision("C:\\Keep", true);
+		await store.importEntries({ "C:\\Work\\Proj": true, "C:\\Other": false });
+		expect(await store.getDecision("c:\\work\\proj\\sub")).toBe(true);
+		expect(await store.getDecision("C:\\Other")).toBe(false);
+		expect(await store.getDecision("C:\\Keep")).toBe(true);
+	});
+});
+
 describe("decide matrix", () => {
 	it("clean project auto-trusts without asking", async () => {
 		const store = createStore();

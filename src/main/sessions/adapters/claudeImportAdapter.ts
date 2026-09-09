@@ -3,12 +3,11 @@ import { basename, join } from "node:path";
 
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "../importPipeline";
 import {
-	cleanTitle,
-	extractPiText,
-	makeId,
-	normalizePath,
-	zeroUsage,
-} from "../importShared";
+	accumulateSummary,
+	PiJsonlWriter,
+	type WalkedMessage,
+} from "../importWalk";
+import { cleanTitle, extractPiText, makeId, normalizePath, zeroUsage } from "../importShared";
 
 /**
  * Claude 适配器：从 ~/.claude/projects/<project-dir>/ 下的 JSONL 文件读取会话。
@@ -24,152 +23,39 @@ type ParsedClaudeSession = {
 	};
 	entries: Array<Record<string, unknown>>;
 };
-
 export class ClaudeImportAdapter implements SourceAdapter {
 	readonly source = "claude" as const;
 	readonly filePrefix = "claude_";
 
-	constructor(private readonly claudeRoot: string) {}
+	private readonly claudeRoot: string;
+
+	constructor(claudeRoot: string) {
+		this.claudeRoot = claudeRoot;
+	}
 
 	/**
-	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
-	 * 计数与标题规则与 convert 完全一致（pushMessage 的过滤条件逐条镜像），
-	 * 一致性由 importPipeline.test.ts 的对照测试兜底。
+	 * 轻量摘要：分类器 + unify 摘要派生，不构造 pi JSONL 行。
+	 * 与 convert 消费同一中间表示（classifyClaudeEntries）——无镜像。
 	 */
 	summarize(
 		projectPath: string,
 		session: ParsedSession,
 	): { title: string; preview: string; messageCount: number } {
-		const entries = session.entries as Array<Record<string, unknown>>;
-		let title = "";
-		let preview = "";
-		let messageCount = 0;
-
-		for (const entry of entries) {
-			if (entry.type === "user") {
-				const message = entry.message as Record<string, unknown> | undefined;
-				const text = String(message?.content ?? "").trim();
-				// 与 convert 的 user 分支一致：text 非空才计一条；preview 取第一条非空文本
-				if (text) {
-					messageCount += 1;
-					if (!preview) preview = text.slice(0, 160);
-					if (!title) title = cleanTitle(text);
-				}
-				continue;
-			}
-			if (entry.type === "assistant") {
-				const message = entry.message as Record<string, unknown> | undefined;
-				if (!message) continue;
-				let hasContent = false;
-				const msgContent = message.content;
-				if (Array.isArray(msgContent)) {
-					for (const item of msgContent as Array<Record<string, unknown>>) {
-						if (item.type === "text") {
-							const text = String(item.text ?? "").trim();
-							if (text && !preview) preview = text.slice(0, 160);
-							hasContent = true;
-						} else if (item.type === "thinking" || item.type === "tool_use") {
-							hasContent = true;
-						}
-					}
-				}
-				// 与 convert 一致：content 非空才计一条
-				if (hasContent) messageCount += 1;
-				continue;
-			}
-			// tool_result 与 convert 一致：无条件计一条（输出为空也 push）
-			if (entry.type === "tool_result") {
-				messageCount += 1;
-			}
-		}
-
+		const summary = accumulateSummary(this.classifyEntries(session));
 		return {
-			title: title || cleanTitle(basename(session.sourcePath)) || "Claude 会话",
-			preview: preview || "Claude imported session",
-			messageCount,
+			title: summary.title || cleanTitle(basename(session.sourcePath)) || "Claude 会话",
+			preview: summary.preview || "Claude imported session",
+			messageCount: summary.messageCount,
 		};
 	}
 
-
-	convert(projectPath: string, session: ParsedSession): ConvertedSession {
-		const meta = session.meta as unknown as ParsedClaudeSession["meta"];
+	/**
+	 * 源条目分类器：Claude JSONL 条目 -> WalkedMessage[]（纯）。
+	 * 过滤/提取规则的唯一事实来源；convert 的行构造与 summarize 的计数都走它。
+	 */
+	private classifyEntries(session: ParsedSession): WalkedMessage[] {
 		const entries = session.entries as Array<Record<string, unknown>>;
-		const sessionId = meta.sessionId;
-		const timestamp = new Date(meta.firstTimestamp).toISOString();
-		const titleState = { title: "", preview: "" };
-		const lines: string[] = [];
-		let parentId: string | null = null;
-		let sequence = 0;
-		let messageCount = 0;
-
-		const pushEntry = (entry: Record<string, unknown>) => {
-			lines.push(JSON.stringify(entry));
-		};
-
-		const pushMessage = (
-			role: "user" | "assistant" | "toolResult",
-			content: unknown[],
-			extra: Record<string, unknown> = {},
-			timestampValue?: string,
-		) => {
-			if (content.length === 0) return;
-			const id = makeId(sessionId, sequence++);
-			const ts = timestampValue || new Date().toISOString();
-			pushEntry({
-				type: "message",
-				id,
-				parentId,
-				timestamp: ts,
-				message: {
-					role,
-					content,
-					timestamp: new Date(ts).getTime(),
-					...(role === "assistant" ? { usage: zeroUsage() } : {}),
-					...extra,
-				},
-			});
-			parentId = id;
-			messageCount += 1;
-
-			const text = extractPiText(content).trim();
-			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
-			if (role === "user" && text && !titleState.title) {
-				titleState.title = cleanTitle(text);
-			}
-		};
-
-		// 写入会话头
-		pushEntry({
-			type: "session",
-			version: 3,
-			id: sessionId,
-			timestamp,
-			cwd: projectPath,
-		});
-
-		pushEntry({
-			type: "claude_import",
-			version: 1,
-			claudeSessionId: sessionId,
-			sourcePath: session.sourcePath,
-			sourceMtime: session.sourceMtime,
-			sourceSize: session.sourceSize,
-			importedAt: new Date().toISOString(),
-		});
-
-		// Claude 历史没有记录模型名，假设使用 Claude 模型
-		const modelChangeId = makeId(sessionId, sequence++);
-		pushEntry({
-			type: "model_change",
-			id: modelChangeId,
-			parentId,
-			timestamp,
-			provider: "anthropic",
-			model: "anthropic/claude-sonnet-4",
-		});
-		parentId = modelChangeId;
-
-		// 转换消息
+		const messages: WalkedMessage[] = [];
 		for (const entry of entries) {
 			// 跳过非消息类型
 			if (entry.type === "file-history-snapshot") continue;
@@ -180,7 +66,11 @@ export class ClaudeImportAdapter implements SourceAdapter {
 				const message = entry.message as Record<string, unknown> | undefined;
 				const text = String(message?.content ?? "").trim();
 				if (text) {
-					pushMessage("user", [{ type: "text", text }], {}, entry.timestamp as string);
+					messages.push({
+						role: "user",
+						content: [{ type: "text", text }],
+						timestampValue: this.timestampOf(entry.timestamp),
+					});
 				}
 				continue;
 			}
@@ -213,17 +103,18 @@ export class ClaudeImportAdapter implements SourceAdapter {
 				}
 
 				if (content.length > 0) {
-					pushMessage(
-						"assistant",
+					messages.push({
+						role: "assistant",
 						content,
-						{
+						extra: {
 							api: "claude-import",
 							provider: "anthropic",
 							model: (message.model as string) || "claude-sonnet-4",
 							stopReason: (message.stop_reason as string) || "stop",
+							usage: zeroUsage(),
 						},
-						entry.timestamp as string,
-					);
+						timestampValue: this.timestampOf(entry.timestamp),
+					});
 				}
 				continue;
 			}
@@ -232,30 +123,64 @@ export class ClaudeImportAdapter implements SourceAdapter {
 			if (entry.type === "tool_result") {
 				const toolCallId = String(entry.tool_use_id ?? "");
 				const output = this.extractToolOutput(entry);
-				pushMessage(
-					"toolResult",
-					[{ type: "text", text: output }],
-					{
+				messages.push({
+					role: "toolResult",
+					content: [{ type: "text", text: output }],
+					extra: {
 						toolCallId,
 						toolName: "tool",
 						isError: Boolean(entry.is_error),
 					},
-					entry.timestamp as string,
-				);
+					timestampValue: this.timestampOf(entry.timestamp),
+				});
 			}
 		}
+		return messages;
+	}
+
+	/** 源条目时间戳归一化：字符串 ISO → ms；未知形状 → undefined（writer 回退）。 */
+	private timestampOf(value: unknown): number | undefined {
+		if (typeof value === "string" && value) {
+			const parsed = Date.parse(value);
+			return Number.isNaN(parsed) ? undefined : parsed;
+		}
+		return undefined;
+	}
+
+
+	convert(projectPath: string, session: ParsedSession): ConvertedSession {
+		const meta = session.meta as unknown as ParsedClaudeSession["meta"];
+		const sessionId = meta.sessionId;
+		const timestamp = new Date(meta.firstTimestamp).toISOString();
+		const messages = this.classifyEntries(session);
+		const summary = accumulateSummary(messages);
+
+		const writer = new PiJsonlWriter((sequence) => makeId(sessionId, sequence));
+		writer.pushHeader({
+			sessionId,
+			timestamp,
+			cwd: projectPath,
+			importType: "claude_import",
+			importMeta: {
+				claudeSessionId: sessionId,
+				sourcePath: session.sourcePath,
+				sourceMtime: session.sourceMtime,
+				sourceSize: session.sourceSize,
+			},
+			provider: "anthropic",
+			model: "anthropic/claude-sonnet-4",
+		});
+		for (const message of messages) writer.pushMessage(message);
 
 		const title =
-			titleState.title ||
-			cleanTitle(basename(session.sourcePath)) ||
-			"Claude 会话";
-		lines.splice(1, 0, JSON.stringify({ sessionName: title, cwd: projectPath }));
+			summary.title || cleanTitle(basename(session.sourcePath)) || "Claude 会话";
+		writer.insertAt(1, { sessionName: title, cwd: projectPath });
 
 		return {
-			raw: `${lines.join("\n")}\n`,
+			raw: writer.build(),
 			title,
-			preview: titleState.preview || "Claude imported session",
-			messageCount,
+			preview: summary.preview || "Claude imported session",
+			messageCount: summary.messageCount,
 		};
 	}
 

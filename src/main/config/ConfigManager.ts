@@ -8,10 +8,16 @@ import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
 import type { OmpModelRole, OmpRolesState } from "../../shared/types/ompRoles";
 import {
-	ensureOpenAiVersionPath,
-	needsSessionBaseUrlVersionHint,
-	suggestNormalizedBaseUrl,
-} from "./baseUrlPath";
+	buildModelsRequest,
+	buildTestRequest,
+	connectionErrorMessage,
+	extractHttpErrorDetail,
+	normalizeApiType,
+	parseModelsResponse,
+	parseTestResponse,
+	redactDiagnostics,
+	sessionBaseUrlHint,
+} from "./providerProbe";
 import { OmpRolesStore } from "./OmpRolesStore";
 import { TrustStore } from "./TrustStore";
 import type { WslEnvironment } from "../wsl/WslPaths";
@@ -270,7 +276,6 @@ export class ConfigManager {
 	async getProjectTrustDecision(cwd: string): Promise<boolean | null> {
 		return this.trustStore.getDecision(cwd);
 	}
-
 	/**
 	 * 写入某项目目录的信任决策（覆盖该路径既有值）。
 	 * 用户在信任弹窗选择“信任并记住”或“不信任”后调用，持久化决策避免重复打扰。
@@ -284,8 +289,8 @@ export class ConfigManager {
 		return this.trustStore;
 	}
 
-	// ── 保存（可视化表单） ────────────────────────────────
 
+	// ── 保存（可视化表单） ────────────────────────────────
 	async saveModelsConfig(data: PiModelsFile): Promise<ConfigValidationResult> {
 		const validation = this.validateModels(data);
 		if (!validation.valid) return validation;
@@ -328,6 +333,28 @@ export class ConfigManager {
 		if (/[:\[\]{}#"']|\s|^$/.test(value)) return JSON.stringify(value);
 		return value;
 	}
+
+	private normalizeModelsForPi(data: PiModelsFile): PiModelsFile {
+		return {
+			...data,
+			providers: Object.fromEntries(
+				Object.entries(data.providers).map(([name, provider]) => [
+					name,
+					{
+						...provider,
+						api: normalizeApiType(provider.api),
+						models: provider.models.map((model) => ({
+							...model,
+							api: typeof model.api === "string"
+								? normalizeApiType(model.api)
+								: model.api,
+						})),
+					},
+				]),
+			),
+		};
+	}
+
 
 	async saveAuthConfig(data: PiAuthFile): Promise<ConfigValidationResult> {
 		await this.writeJsonFile("auth.json", data);
@@ -578,12 +605,12 @@ export class ConfigManager {
 		/** 建议写入配置的 baseUrl（含 /v1 等）；UI 可自动改写 */
 		suggestedBaseUrl?: string;
 	}> {
-		const requests = this.buildModelsRequest(baseUrl, apiKey, apiType, requestHeaders);
+		const requests = buildModelsRequest(baseUrl, apiKey, apiType, requestHeaders);
 		let lastError: string | undefined;
 		let lastRequestUrl: string | undefined;
 
 		for (const request of requests) {
-			lastRequestUrl = this.redactSecret(request.url, apiKey);
+			lastRequestUrl = redactDiagnostics(request.url, apiKey);
 			try {
 				const controller = new AbortController();
 				// 10 秒超时，避免网络不通时长时间卡住
@@ -603,7 +630,7 @@ export class ConfigManager {
 					}
 
 					const body = (await res.json()) as Record<string, unknown>;
-					const models = this.parseModelsResponse(body, apiType);
+					const models = parseModelsResponse(body, apiType);
 
 					if (models.length === 0) {
 						lastError = "接口返回了空的模型列表";
@@ -612,12 +639,8 @@ export class ConfigManager {
 
 					// 成功路径若依赖检测侧自动补 /v1，而用户配置仍是根路径，
 					// 会话侧会原样用 baseUrl → 返回建议 baseUrl 供 UI 自动改写。
-					const sessionBaseUrlNeedsVersion = needsSessionBaseUrlVersionHint(
-						baseUrl,
-						request.url,
-					);
-					const suggestedBaseUrl =
-						suggestNormalizedBaseUrl(baseUrl, request.url, apiType) ?? undefined;
+					const { needsVersion: sessionBaseUrlNeedsVersion, suggestedBaseUrl } =
+						sessionBaseUrlHint(baseUrl, request.url, apiType ?? "");
 					return {
 						success: true,
 						models,
@@ -629,13 +652,14 @@ export class ConfigManager {
 					clearTimeout(timeout);
 				}
 			} catch (e) {
-				const msg =
+				lastError = redactDiagnostics(
 					e instanceof Error
 						? e.name === "AbortError"
 							? "请求超时，请检查网络或 baseUrl"
 							: e.message
-						: String(e);
-				lastError = this.redactSecret(msg, apiKey);
+						: String(e),
+					apiKey,
+				);
 			}
 		}
 
@@ -643,450 +667,14 @@ export class ConfigManager {
 			success: false,
 			error: lastError ?? "获取模型列表失败",
 			requestUrl: lastRequestUrl,
-			sessionBaseUrlNeedsVersion: needsSessionBaseUrlVersionHint(
-				baseUrl,
-				lastRequestUrl,
-			),
+			sessionBaseUrlNeedsVersion: sessionBaseUrlHint(baseUrl, lastRequestUrl ?? "", apiType ?? "")
+				.needsVersion,
 		};
 	}
 
 
 	// ── 快速测试连接 ─────────────────────────────────────
 
-	/**
-	 * 向 provider 发送一条最小聊天请求验证 baseUrl、apiKey 和模型是否正常。
-	 * 返回测试结果，包含模型名、响应摘要、token 用量和延迟。
-	 */
-	/**
-	 * 根据 API 类型构造获取模型列表的 URL 列表（含优先路径和回退路径）。
-	 * fetchProviderModels 会逐条尝试直到成功或全部失败。
-	 *
-	 * 各厂商获取模型列表的支持情况：
-	 *
-	 * | API 类型 | 优先路径 | 回退路径 |
-	 * |----------|---------|---------|
-	 * | OpenAI Chat Completions | /v1/models | /models |
-	 * | OpenAI Responses / Codex | /v1/models | /models |
-	 * | Anthropic Messages | /v1/models | /models |
-	 * | Google Gemini | /v1beta/models | - |
-	 * | Mistral Conversations | /v1/models | /models |
-	 *
-	 * OpenAI 生态（Chat Completions / Responses / Codex / Mistral）统一通过
-	 * GET /v1/models 获取模型列表。
-	 * 虽然 Anthropic 官方未公开 models 端点，但大部分兼容 Anthropic 协议的
-	 * 第三方网关同样支持 /v1/models。优先尝试 /v1/models，再回退到 /models。
-	 * Google Gemini 使用独立的 /v1beta/models。
-	 */
-	private buildModelsRequest(
-		baseUrl: string,
-		apiKey: string,
-		apiType?: string,
-		requestHeaders?: Record<string, string>,
-	): TestRequest[] {
-		const api = this.normalizeApiType(apiType);
-		const extraHeaders = this.normalizeRequestHeaders(requestHeaders);
-
-		if (api === "google-generative-ai") {
-			// Google Gemini：使用独立的 v1beta 路径
-			const u = baseUrl.replace(/\/+$/, "");
-			const needsPrefix = !/[\/]v\d+(alpha|beta)?$/.test(u);
-			const versioned = needsPrefix ? `${u}/v1beta` : u;
-			return [{
-				url: `${versioned}/models?key=${encodeURIComponent(apiKey)}`,
-				headers: { ...extraHeaders, "Content-Type": "application/json" },
-			}];
-		}
-
-		if (api === "anthropic-messages") {
-			// Anthropic：优先尝试 /v1/models（兼容大部分第三方网关），
-			// 再回退到 /models（原生 Anthropic API 或旧实现）
-			const u = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
-			const headers = this.withAnthropicSdkUserAgent({
-				"x-api-key": apiKey,
-				"anthropic-version": "2023-06-01",
-				"Content-Type": "application/json",
-				...extraHeaders,
-			});
-			const primaryUrl = `${u}/v1/models`;
-			const fallbackUrl = `${u}/models`;
-			return primaryUrl === fallbackUrl
-				? [{ url: primaryUrl, headers }]
-				: [
-					{ url: primaryUrl, headers },
-					{ url: fallbackUrl, headers },
-				];
-		}
-
-		// OpenAI 兼容 API（Chat Completions / Responses / Codex / Mistral）：
-		// 优先尝试 ensureVersionPath 补齐后的路径，再回退到原始 baseUrl + /models
-		const headers = this.withOpenAiSdkUserAgent({
-			Authorization: `Bearer ${apiKey}`,
-			"Content-Type": "application/json",
-			...extraHeaders,
-		});
-		const u = baseUrl.replace(/\/+$/, "");
-		const primaryUrl = `${this.ensureVersionPath(baseUrl)}/models`;
-		const fallbackUrl = `${u}/models`;
-
-		return primaryUrl === fallbackUrl
-			? [{ url: primaryUrl, headers }]
-			: [
-				{ url: primaryUrl, headers },
-				{ url: fallbackUrl, headers },
-			];
-	}
-
-
-	private parseModelsResponse(
-		body: Record<string, unknown>,
-		apiType?: string,
-	): Array<{ id: string; name?: string }> {
-		const api = this.normalizeApiType(apiType);
-		const rawData = Array.isArray(body.data) ? body.data : Array.isArray(body)
-			? body
-			: body.models && Array.isArray(body.models)
-				? body.models
-				: [];
-
-		return (rawData as Array<Record<string, unknown>>)
-			.map((model) => {
-				const rawId =
-					typeof model.id === "string"
-						? model.id
-						: typeof model.name === "string"
-							? model.name
-							: "";
-				const id =
-					api === "google-generative-ai"
-						? rawId.replace(/^models\//, "")
-						: rawId;
-				const name =
-					typeof model.displayName === "string"
-						? model.displayName
-						: typeof model.name === "string"
-							? model.name.replace(/^models\//, "")
-							: id;
-				return { id, name };
-			})
-			.filter((model) => model.id.length > 0);
-	}
-
-	private buildTestRequest(
-		baseUrl: string,
-		apiKey: string,
-		modelId: string,
-		apiType: string,
-		requestHeaders?: Record<string, string>,
-	): { url: string; headers: Record<string, string>; body: string } {
-		const api = this.normalizeApiType(apiType);
-		const extraHeaders = this.normalizeRequestHeaders(requestHeaders);
-
-		switch (api) {
-			case "openai-responses":
-			case "openai-codex-responses":
-				return {
-					url: `${this.ensureVersionPath(baseUrl)}/responses`,
-					headers: this.withOpenAiSdkUserAgent({
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
-						...extraHeaders,
-					}),
-					body: JSON.stringify({
-						model: modelId,
-						// 连接测试只验证接口是否可调用，不测试推理或工具能力；极短输入能减少
-						// reasoning 模型的思考时间，避免把慢响应误判为兼容模式不可用。
-						input: "Hi",
-						max_output_tokens: 1,
-					}),
-				};
-
-			case "anthropic-messages":
-				// Anthropic Messages API 的聊天端点在 /v1/messages
-				// 自动补齐 v1（Anthropic 文档示例：https://api.anthropic.com/v1/messages）
-				return {
-					url: `${this.ensureVersionPath(baseUrl)}/messages`,
-					headers: this.withAnthropicSdkUserAgent({
-						"x-api-key": apiKey,
-						"anthropic-version": "2023-06-01",
-						"Content-Type": "application/json",
-						...extraHeaders,
-					}),
-					body: JSON.stringify({
-						model: modelId,
-						messages: [{ role: "user", content: "Hi" }],
-						// 部分代理与 Claude 模型对 max_tokens 有最低要求，设为 10 避免 400/404。
-						max_tokens: 10,
-					}),
-				};
-
-			case "google-generative-ai":
-				// Gemini 的 API key 作为查询参数
-				// 自动补齐 v1beta（如果 baseUrl 不包含版本路径）
-				// Google 文档示例：https://generativelanguage.googleapis.com/v1beta
-				{
-					const u = baseUrl.replace(/\/+$/, "");
-					const needsPrefix = !/[\/]v\d+(alpha|beta)?$/.test(u);
-					const versioned = needsPrefix ? `${u}/v1beta` : u;
-					return {
-						url: `${versioned}/${this.googleModelPath(modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-						headers: {
-							"Content-Type": "application/json",
-							...extraHeaders,
-						},
-						body: JSON.stringify({
-							contents: [
-								{
-									role: "user",
-									parts: [{ text: "Hi" }],
-								},
-							],
-							generationConfig: { maxOutputTokens: 1 },
-						}),
-					};
-				}
-
-			case "mistral-conversations":
-				return {
-					url: `${baseUrl.replace(/\/+$/, "")}/conversations`,
-					headers: {
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
-						...extraHeaders,
-					},
-					body: JSON.stringify({
-						model: modelId,
-						inputs: "Hi",
-						store: false,
-					}),
-				};
-
-			default:
-				// openai-completions 是 pi 官方名称，对应 OpenAI Chat Completions 接口。
-				return {
-					url: `${this.ensureVersionPath(baseUrl)}/chat/completions`,
-					headers: {
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
-						...extraHeaders,
-					},
-					body: JSON.stringify({
-						model: modelId,
-						// Chat Completions 兼容网关常接入 reasoning 模型，测试时只要拿到
-						// 一个最小响应即可，不要求完整回答，降低超时和 token 消耗。
-						messages: [{ role: "user", content: "Hi" }],
-						max_tokens: 1,
-					}),
-				};
-		}
-	}
-
-	private normalizeModelsForPi(data: PiModelsFile): PiModelsFile {
-		return {
-			...data,
-			providers: Object.fromEntries(
-				Object.entries(data.providers).map(([name, provider]) => [
-					name,
-					{
-						...provider,
-						api: this.normalizeApiType(provider.api),
-						models: provider.models.map((model) => ({
-							...model,
-							api: typeof model.api === "string"
-								? this.normalizeApiType(model.api)
-								: model.api,
-						})),
-					},
-				]),
-			),
-		};
-	}
-
-	private normalizeApiType(apiType?: string) {
-		switch (apiType) {
-			case "anthropic":
-			case "anthropic-messages":
-				return "anthropic-messages";
-			case "openai-codex-responses":
-				return "openai-codex-responses";
-			case "openai-chat-completions":
-				// 兼容早期 pi-desktop 暴露过的别名；pi 官方 registry 名称是 openai-completions。
-				return "openai-completions";
-			case "openai-completions":
-			case "openai-responses":
-			case "google-generative-ai":
-			case "mistral-conversations":
-				return apiType;
-			default:
-				return "openai-completions";
-		}
-	}
-
-	/**
-	 * 确保 OpenAI 兼容 API 的基础 URL 包含 /v1 版本路径。
-	 * 仅用于「获取模型 / 测试连接」；pi 会话不会走此补齐。
-	 */
-	private ensureVersionPath(baseUrl: string): string {
-		return ensureOpenAiVersionPath(baseUrl);
-	}
-
-	private googleModelPath(modelId: string) {
-		return modelId.startsWith("models/") ? modelId : `models/${modelId}`;
-	}
-
-	private normalizeRequestHeaders(headers?: Record<string, string>) {
-		if (!headers) return {};
-		return Object.fromEntries(
-			Object.entries(headers).filter(
-				([key, value]) =>
-					key.trim().length > 0 && typeof value === "string",
-			),
-		);
-	}
-
-	private withOpenAiSdkUserAgent(headers: Record<string, string>) {
-		const hasUserAgent = Object.keys(headers).some(
-			(key) => key.toLowerCase() === "user-agent",
-		);
-		// pi 的 openai-responses provider 走 OpenAI JS SDK。部分代理会按 SDK
-		// 默认 User-Agent 拦截请求，所以配置检测需要模拟该默认值，避免“检测通过、会话 403”。
-		return hasUserAgent ? headers : { ...headers, "User-Agent": "OpenAI/JS 6.26.0" };
-	}
-
-	private withAnthropicSdkUserAgent(headers: Record<string, string>) {
-		const hasUserAgent = Object.keys(headers).some(
-			(key) => key.toLowerCase() === "user-agent",
-		);
-		// pi 的 anthropic-messages provider 走 Anthropic SDK。部分服务会验证
-		// User-Agent 避免非官方客户端，所以需要模拟 SDK 的默认值。
-		return hasUserAgent ? headers : { ...headers, "User-Agent": "anthropic-sdk-typescript/0.27.3" };
-	}
-
-	private redactSecret(value: string, apiKey: string) {
-		if (!apiKey) return value;
-		return value.split(apiKey).join("***");
-	}
-
-	/**
-	 * 根据 API 类型从响应中提取模型名、文本片段和 token 用量。
-	 */
-	private parseTestResponse(
-		body: Record<string, unknown>,
-		modelId: string,
-		apiType: string,
-	): { model: string; snippet: string; tokens?: { input?: number; output?: number } } {
-		const api = this.normalizeApiType(apiType);
-		switch (api) {
-			case "openai-completions": {
-				const choices = body.choices as Array<Record<string, unknown>> | undefined;
-				const text = (choices?.[0]?.text as string) ?? "(空响应)";
-				const usage = body.usage as Record<string, unknown> | undefined;
-				return {
-					model: (body.model as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.prompt_tokens as number | undefined,
-						output: usage?.completion_tokens as number | undefined,
-					},
-				};
-			}
-
-			case "openai-responses":
-			case "openai-codex-responses": {
-				const output = body.output as Array<Record<string, unknown>> | undefined;
-				const content = output?.[0]?.content as Array<Record<string, unknown>> | undefined;
-				const functionCall = output?.find(
-					(item) => item.type === "function_call",
-				);
-				const text =
-					(content?.[0]?.text as string | undefined) ??
-					(functionCall
-						? `工具调用兼容：${String(functionCall.name ?? "function_call")}`
-						: "(空响应)");
-				const usage = body.usage as Record<string, unknown> | undefined;
-				return {
-					model: (body.model as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.input_tokens as number | undefined,
-						output: usage?.output_tokens as number | undefined,
-					},
-				};
-			}
-
-			case "anthropic-messages": {
-				const content = body.content as Array<Record<string, unknown>> | undefined;
-				const text = (content?.[0]?.text as string) ?? "(空响应)";
-				const usage = body.usage as Record<string, unknown> | undefined;
-				return {
-					model: (body.model as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.input_tokens as number | undefined,
-						output: usage?.output_tokens as number | undefined,
-					},
-				};
-			}
-
-			case "google-generative-ai": {
-				const candidates = body.candidates as Array<Record<string, unknown>> | undefined;
-				const parts = candidates?.[0]?.content as Record<string, unknown> | undefined;
-				const text = (parts?.parts as Array<Record<string, unknown>>)?.[0]?.text as string ?? "(空响应)";
-				const usage = body.usageMetadata as Record<string, unknown> | undefined;
-				return {
-					model: (body.modelVersion as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.promptTokenCount as number | undefined,
-						output: usage?.candidatesTokenCount as number | undefined,
-					},
-				};
-			}
-
-			case "mistral-conversations": {
-				const outputs = body.outputs as Array<Record<string, unknown>> | undefined;
-				const firstOutput = outputs?.[0];
-				const content = firstOutput?.content;
-				const text = Array.isArray(content)
-					? content
-						.map((item) =>
-							item && typeof item === "object"
-								? String((item as Record<string, unknown>).text ?? "")
-								: String(item ?? ""),
-						)
-						.filter(Boolean)
-						.join(" ")
-					: typeof content === "string"
-						? content
-						: (body.response as string | undefined) ?? "(空响应)";
-				const usage = body.usage as Record<string, unknown> | undefined;
-				return {
-					model: (body.model as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.prompt_tokens as number | undefined,
-						output: usage?.completion_tokens as number | undefined,
-					},
-				};
-			}
-
-			default:
-				// openai-chat-completions
-			{
-				const choices = body.choices as Array<Record<string, unknown>> | undefined;
-				const message = choices?.[0]?.message as Record<string, unknown> | undefined;
-				const text = (message?.content as string) ?? "(空响应)";
-				const usage = body.usage as Record<string, unknown> | undefined;
-				return {
-					model: (body.model as string) ?? modelId,
-					snippet: text,
-					tokens: {
-						input: usage?.prompt_tokens as number | undefined,
-						output: usage?.completion_tokens as number | undefined,
-					},
-				};
-			}
-		}
-	}
 
 	async testProviderConnection(
 		baseUrl: string,
@@ -1109,18 +697,19 @@ export class ConfigManager {
 		suggestedBaseUrl?: string;
 	}> {
 		const startedAt = Date.now();
-		const api = this.normalizeApiType(apiType);
-		const { url: requestUrl, headers, body: requestBody } =
-			this.buildTestRequest(baseUrl, apiKey, modelId, api, requestHeaders);
-		const safeRequestUrl = this.redactSecret(requestUrl, apiKey);
-		const safeRequestBody = this.redactSecret(requestBody, apiKey);
-		// 与 fetch 一致：检测用了补齐路径、配置仍是根路径时给出建议 baseUrl。
-		const sessionBaseUrlNeedsVersion = needsSessionBaseUrlVersionHint(
+		const api = normalizeApiType(apiType);
+		const { url: requestUrl, headers, body: requestBody } = buildTestRequest(
 			baseUrl,
-			requestUrl,
+			apiKey,
+			modelId,
+			api,
+			requestHeaders,
 		);
-		const suggestedBaseUrl =
-			suggestNormalizedBaseUrl(baseUrl, requestUrl, api) ?? undefined;
+		const safeRequestUrl = redactDiagnostics(requestUrl, apiKey);
+		const safeRequestBody = redactDiagnostics(requestBody, apiKey);
+		// 与 fetch 一致：检测用了补齐路径、配置仍是根路径时给出建议 baseUrl。
+		const { needsVersion: sessionBaseUrlNeedsVersion, suggestedBaseUrl } =
+			sessionBaseUrlHint(baseUrl, requestUrl, api);
 
 		try {
 			const controller = new AbortController();
@@ -1144,18 +733,14 @@ export class ConfigManager {
 				let detail = `${res.status} ${res.statusText}`;
 				try {
 					const errBody = (await res.json()) as Record<string, unknown>;
-					const errMsg =
-						(errBody.error as Record<string, unknown>)?.message ??
-						errBody.message ??
-						"";
-					if (errMsg) detail += ` — ${String(errMsg)}`;
+					detail += extractHttpErrorDetail(errBody);
 				} catch {
 					/* 忽略解析错误 */
 				}
 				// 失败时不自动改写 baseUrl，只保留诊断字段。
 				return {
 					success: false,
-					error: this.redactSecret(detail, apiKey),
+					error: redactDiagnostics(detail, apiKey),
 					latencyMs,
 					requestUrl: safeRequestUrl,
 					requestBody: safeRequestBody,
@@ -1164,7 +749,7 @@ export class ConfigManager {
 			}
 
 			const body = (await res.json()) as Record<string, unknown>;
-			const parsed = this.parseTestResponse(body, modelId, api);
+			const parsed = parseTestResponse(body, modelId, api);
 
 			return {
 				success: true,
@@ -1177,15 +762,10 @@ export class ConfigManager {
 			};
 		} catch (e) {
 			const latencyMs = Date.now() - startedAt;
-			const msg =
-				e instanceof Error
-					? e.name === "AbortError"
-					? `请求超时（${PROVIDER_TEST_TIMEOUT_SECONDS} 秒）。这不一定代表兼容模式不支持或配置错误，可能是模型首包较慢、上游排队、代理/网络波动，或 reasoning 模型仍在内部思考。请稍后重试，或换用更轻量模型测试；如果模型列表可正常拉取，也可以保存配置后直接启动会话验证。`
-					: e.message
-					: String(e);
+			const msg = connectionErrorMessage(e, PROVIDER_TEST_TIMEOUT_SECONDS);
 			return {
 				success: false,
-				error: this.redactSecret(msg, apiKey),
+				error: redactDiagnostics(msg, apiKey),
 				latencyMs,
 				requestUrl: safeRequestUrl,
 				requestBody: safeRequestBody,
@@ -1196,13 +776,16 @@ export class ConfigManager {
 
 	// ── 导出 / 导入 ───────────────────────────────────────
 
-	/** 将三个配置文件打包为单个 JSON 对象，便于用户备份和迁移。 */
+	/** 将配置文件打包为单个 JSON 对象，便于用户备份和迁移（含信任决策与模型角色）。 */
 	async exportConfig(): Promise<string> {
 		const [models, auth, settings] = await Promise.all([
 			this.readJsonFile<PiModelsFile>("models.json", { providers: {} }),
 			this.readJsonFile<PiAuthFile>("auth.json", {}),
 			this.readJsonFile<PiSettings>("settings.json", {}),
 		]);
+		const trust = await this.getTrustConfig();
+		const roles = await this.readOmpModelRoles();
+		const defaultLevel = await this.getOmpDefaultThinkingLevel();
 		return JSON.stringify(
 			{
 				version: 1,
@@ -1211,14 +794,23 @@ export class ConfigManager {
 					"models.json": models.parsed,
 					"auth.json": auth.parsed,
 					"settings.json": settings.parsed,
+					// Q31：导出无声丢失的信任决策与 OMP 角色补上。config.yml 只取两个
+					// schema 槽位（modelRoles/defaultThinkingLevel），omp 自有键不动。
+					"trust.json": trust.parsed,
+					"config.yml": {
+						modelRoles: Object.fromEntries(
+							Object.entries(roles)
+								.filter(([, assignment]) => assignment.selector)
+								.map(([role, assignment]) => [role, assignment.selector]),
+						),
+						...(defaultLevel ? { defaultThinkingLevel: defaultLevel } : {}),
+					},
 				},
 			},
 			null,
 			2,
 		);
 	}
-
-	/** 从导出的 JSON 包恢复配置文件，返回导入结果。 */
 	async importConfig(
 		packageJson: string,
 	): Promise<ConfigValidationResult> {
@@ -1237,7 +829,7 @@ export class ConfigManager {
 			return { valid: false, error: "导入文件缺少 files 字段，请确认是 OmpDeck 导出的配置包" };
 		}
 
-		// 按需写入，只处理三个已知文件名，忽略其他 key
+		// 按需写入，只处理已知文件名，忽略其他 key（旧包无新键 = 原样恢复三 JSON）
 		const allowed: Array<[string, string]> = [
 			["models.json", "models.json"],
 			["auth.json", "auth.json"],
@@ -1247,6 +839,23 @@ export class ConfigManager {
 			if (files[key] != null) {
 				await this.writeJsonFile(fileName, files[key]);
 			}
+		}
+		const trustEntries = files["trust.json"];
+		if (trustEntries && typeof trustEntries === "object" && !Array.isArray(trustEntries)) {
+			const validEntries: Record<string, boolean> = {};
+			for (const [pathKey, decision] of Object.entries(trustEntries)) {
+				if (typeof pathKey === "string" && (decision === true || decision === false)) {
+					validEntries[pathKey] = decision;
+				}
+			}
+			if (Object.keys(validEntries).length > 0) {
+				await this.trustStore.importEntries(validEntries);
+			}
+		}
+		const ompConfig = files["config.yml"];
+		if (ompConfig && typeof ompConfig === "object" && !Array.isArray(ompConfig)) {
+			const result = await this.rolesStore.importPackage(ompConfig);
+			if (!result.valid) return result;
 		}
 		return { valid: true };
 	}

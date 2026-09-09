@@ -4,13 +4,11 @@ import { basename, join } from "node:path";
 import { getCodexSessionThreadInfo } from "../../../shared/codexSessionMeta";
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "../importPipeline";
 import {
-	cleanTitle,
-	extractPiText,
-	hash,
-	makeId,
-	normalizePath,
-	zeroUsage,
-} from "../importShared";
+	accumulateSummary,
+	PiJsonlWriter,
+	type WalkedMessage,
+} from "../importWalk";
+import { cleanTitle, extractPiText, hash, makeId, normalizePath, zeroUsage } from "../importShared";
 
 /**
  * Codex 适配器：从 ~/.codex/sessions/ 下的 JSONL 文件读取会话。
@@ -27,32 +25,36 @@ export class CodexImportAdapter implements SourceAdapter {
 	readonly source = "codex" as const;
 	readonly filePrefix = "codex_";
 
-	constructor(private readonly codexRoot: string) {}
+	private readonly codexRoot: string;
+
+	constructor(codexRoot: string) {
+		this.codexRoot = codexRoot;
+	}
 
 	/**
-	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
-	 * 逐条镜像 convert 的 pushMessage 过滤/提取规则（含 pendingThinking 累积、
-	 * toolCall 的 name 参与 extractPiText），一致性由 importPipeline.test.ts 对照兜底。
+	 * 轻量摘要：分类器 + 统一摘要派生，不构造 pi JSONL 行。
+	 * 与 convert 消费同一中间表示——无镜像。
 	 */
 	summarize(
 		projectPath: string,
 		session: ParsedSession,
 	): { title: string; preview: string; messageCount: number } {
-		const entries = session.entries as Array<Record<string, unknown>>;
-		const titleState = { title: "", preview: "" };
-		let messageCount = 0;
-		let pendingThinking = "";
-
-		const pushMessageLike = (role: "user" | "assistant" | "toolResult", content: unknown[]) => {
-			// 与 convert 的 pushMessage 一致：content 空数组不计数
-			if (content.length === 0) return;
-			messageCount += 1;
-			const text = extractPiText(content).trim();
-			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
-			if (role === "user" && text && !titleState.title) {
-				titleState.title = cleanTitle(text);
-			}
+		const summary = accumulateSummary(this.classifyEntries(session));
+		return {
+			title: summary.title || cleanTitle(basename(session.sourcePath)) || "Codex 会话",
+			preview: summary.preview || "Codex imported session",
+			messageCount: summary.messageCount,
 		};
+	}
+
+	/**
+	 * 源条目分类器：Codex JSONL 条目 -> WalkedMessage[]（纯）。
+	 * reasoning 累积（pendingThinking）与 toolCall 映射的唯一事实来源。
+	 */
+	private classifyEntries(session: ParsedSession): WalkedMessage[] {
+		const entries = session.entries as Array<Record<string, unknown>>;
+		const messages: WalkedMessage[] = [];
+		let pendingThinking = "";
 
 		for (const entry of entries) {
 			if (
@@ -61,7 +63,13 @@ export class CodexImportAdapter implements SourceAdapter {
 			) {
 				const payload = entry.payload as Record<string, unknown>;
 				const text = String(payload.message ?? "").trim();
-				if (text) pushMessageLike("user", [{ type: "text", text }]);
+				if (text) {
+					messages.push({
+						role: "user",
+						content: [{ type: "text", text }],
+						timestampValue: this.timestampOf(entry.timestamp),
+					});
+				}
 				continue;
 			}
 			if (entry.type !== "response_item") continue;
@@ -75,43 +83,89 @@ export class CodexImportAdapter implements SourceAdapter {
 
 			if (payload.type === "message" && payload.role === "assistant") {
 				const text = this.extractCodexText(payload).trim();
-				const content = [
-					...(pendingThinking
-						? [{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" }]
-						: []),
-					...(text ? [{ type: "text", text }] : []),
-				];
+				messages.push({
+					role: "assistant",
+					content: [
+						...(pendingThinking
+							? [{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" }]
+							: []),
+						...(text ? [{ type: "text", text }] : []),
+					],
+				});
 				pendingThinking = "";
-				pushMessageLike("assistant", content);
 				continue;
 			}
 
 			if (payload.type === "function_call") {
 				pendingThinking = "";
 				// convert 中 content 含 toolCall（name 参与 extractPiText），恒非空必计数
-				pushMessageLike("assistant", [
-					{ type: "toolCall", name: String(payload.name ?? "tool") },
-				]);
+				messages.push({
+					role: "assistant",
+					content: [{ type: "toolCall", name: String(payload.name ?? "tool") }],
+					extra: this.functionCallExtra(session, payload),
+				});
 				continue;
 			}
 
 			if (payload.type === "function_call_output") {
 				const output = this.extractToolOutput(payload);
-				pushMessageLike("toolResult", [{ type: "text", text: output }]);
+				messages.push({
+					role: "toolResult",
+					content: [{ type: "text", text: output }],
+					extra: this.functionCallOutputExtra(session, entry, payload),
+					timestampValue: this.timestampOf(entry.timestamp),
+				});
 			}
 		}
 
 		if (pendingThinking) {
-			pushMessageLike("assistant", [
-				{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" },
-			]);
+			messages.push({
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" },
+				],
+			});
 		}
+		return messages;
+	}
 
+	/** function_call 的附加字段（派生耗时/工具名）：writer 落盘用。 */
+	private functionCallExtra(
+		session: ParsedSession,
+		payload: Record<string, unknown>,
+	): Record<string, unknown> {
+		const sessionId = String(session.meta.id ?? hash(session.sourcePath));
+		const callId = String(payload.call_id ?? payload.id ?? makeId(sessionId, 0));
+		const meta = session.meta;
 		return {
-			title: titleState.title || cleanTitle(basename(session.sourcePath)) || "Codex 会话",
-			preview: titleState.preview || "Codex imported session",
-			messageCount,
+			id: callId,
+			api: "codex-import",
+			provider: String(meta.model_provider ?? "codex"),
+			model: String(meta.model ?? "codex"),
+			stopReason: "toolUse",
 		};
+	}
+
+	/** function_call_output 的附加字段（工具名回填 + 派生耗时）：writer 落盘用。 */
+	private functionCallOutputExtra(
+		session: ParsedSession,
+		entry: Record<string, unknown>,
+		payload: Record<string, unknown>,
+	): Record<string, unknown> {
+		const sessionId = String(session.meta.id ?? hash(session.sourcePath));
+		const callId = String(payload.call_id ?? payload.id ?? makeId(sessionId, 0));
+		const completedAt = this.parseTimestamp(entry.timestamp);
+		return {
+			toolCallId: callId,
+			toolName: String(payload.name ?? "tool"),
+			isError: Boolean(payload.is_error),
+			...(completedAt !== undefined ? { completedAt } : {}),
+		};
+	}
+
+	/** 源条目时间戳归一化：parseTimestamp 失败 → undefined（writer 回退）。 */
+	private timestampOf(value: unknown): number | undefined {
+		return this.parseTimestamp(value);
 	}
 
 	async discover(projectPath: string): Promise<ParsedSession[]> {
@@ -157,196 +211,59 @@ export class CodexImportAdapter implements SourceAdapter {
 
 	convert(projectPath: string, session: ParsedSession): ConvertedSession {
 		const meta = session.meta;
-		const entries = session.entries as Array<Record<string, unknown>>;
 		const sessionId = String(meta.id ?? hash(session.sourcePath));
 		const threadInfo = getCodexSessionThreadInfo(meta);
 		const timestamp = new Date(
 			Date.parse(String(meta.timestamp ?? "")) || session.sourceMtime,
 		).toISOString();
-		const titleState = { title: "", preview: "" };
-		const toolNames = new Map<string, string>();
-		const toolStartedAt = new Map<string, number>();
-		const lines: string[] = [];
-		let parentId: string | null = null;
-		let sequence = 0;
-		let messageCount = 0;
-		let pendingThinking = "";
+		const messages = this.classifyEntries(session);
+		const summary = accumulateSummary(messages);
 
-		const pushEntry = (entry: Record<string, unknown>) => {
-			lines.push(JSON.stringify(entry));
-		};
-		const pushMessage = (
-			role: "user" | "assistant" | "toolResult",
-			content: unknown[],
-			extra: Record<string, unknown> = {},
-			timestampValue?: unknown,
-		) => {
-			if (content.length === 0) return;
-			const id = makeId(sessionId, sequence++);
-			const messageTimestamp = this.parseTimestamp(timestampValue) ?? session.sourceMtime + sequence;
-			const ts = new Date(messageTimestamp).toISOString();
-			pushEntry({
-				type: "message",
-				id,
-				parentId,
-				timestamp: ts,
-				message: {
-					role,
-					content,
-					timestamp: messageTimestamp,
-					// pi 的上下文统计会读取 assistant.usage.totalTokens；Codex 原始历史没有该字段，导入时用 0 值占位保证可继续对话。
-					...(role === "assistant" ? { usage: zeroUsage() } : {}),
-					...extra,
-				},
-			});
-			parentId = id;
-			messageCount += 1;
-
-			const text = extractPiText(content).trim();
-			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
-			if (role === "user" && text && !titleState.title) {
-				titleState.title = cleanTitle(text);
-			}
-		};
-
-		pushEntry({
-			type: "session",
-			version: 3,
-			id: sessionId,
+		const writer = new PiJsonlWriter((sequence) => makeId(sessionId, sequence));
+		writer.pushHeader({
+			sessionId,
 			timestamp,
 			cwd: projectPath,
-		});
-		pushEntry({
-			type: "codex_import",
-			version: 1,
-			codexSessionId: sessionId,
-			sourcePath: session.sourcePath,
-			sourceMtime: session.sourceMtime,
-			sourceSize: session.sourceSize,
-			importedAt: new Date().toISOString(),
-			threadSource: threadInfo.threadSource,
-			parentThreadId: threadInfo.parentThreadId,
-			agentRole: threadInfo.agentRole,
-			agentNickname: threadInfo.agentNickname,
-		});
-		const modelChangeId = makeId(sessionId, sequence++);
-		pushEntry({
-			type: "model_change",
-			id: modelChangeId,
-			parentId,
-			timestamp,
+			importType: "codex_import",
+			importMeta: {
+				codexSessionId: sessionId,
+				sourcePath: session.sourcePath,
+				sourceMtime: session.sourceMtime,
+				sourceSize: session.sourceSize,
+				threadSource: threadInfo.threadSource,
+				parentThreadId: threadInfo.parentThreadId,
+				agentRole: threadInfo.agentRole,
+				agentNickname: threadInfo.agentNickname,
+			},
 			provider: String(meta.model_provider ?? "codex"),
 			model: `${String(meta.model_provider ?? "codex")}/${String(meta.model ?? "codex")}`,
 		});
-		parentId = modelChangeId;
-
-		for (const entry of entries) {
-			if (entry.type === "event_msg" && (entry.payload as Record<string, unknown> | undefined)?.type === "user_message") {
-				const payload = entry.payload as Record<string, unknown>;
-				const text = String(payload.message ?? "").trim();
-				if (text) pushMessage("user", [{ type: "text", text }], {}, entry.timestamp);
-				continue;
-			}
-
-			if (entry.type !== "response_item") continue;
-			const payload = (entry.payload ?? {}) as Record<string, unknown>;
-
-			if (payload.type === "reasoning") {
-				const reasoning = this.extractCodexText(payload).trim();
-				if (reasoning) pendingThinking = this.joinText(pendingThinking, reasoning);
-				continue;
-			}
-
-			if (payload.type === "message" && payload.role === "assistant") {
-				const text = this.extractCodexText(payload).trim();
-				const content = [
-					...(pendingThinking
-						? [{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" }]
-						: []),
-					...(text ? [{ type: "text", text }] : []),
-				];
-				pendingThinking = "";
-				pushMessage(
-					"assistant",
-					content,
-					{
-						api: "codex-import",
-						provider: String(meta.model_provider ?? "codex"),
-						model: String(meta.model ?? "codex"),
-						stopReason: "stop",
-					},
-					entry.timestamp,
-				);
-				continue;
-			}
-
-			if (payload.type === "function_call") {
-				const callId = String(payload.call_id ?? payload.id ?? makeId(sessionId, sequence));
-				const toolName = String(payload.name ?? "tool");
-				toolNames.set(callId, toolName);
-				const callStartedAt = this.parseTimestamp(entry.timestamp);
-				if (callStartedAt !== undefined) toolStartedAt.set(callId, callStartedAt);
-				const args = this.parseArguments(payload.arguments);
-				const content = [
-					...(pendingThinking
-						? [{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" }]
-						: []),
-					{ type: "toolCall", id: callId, name: toolName, arguments: args },
-				];
-				pendingThinking = "";
-				pushMessage(
-					"assistant",
-					content,
-					{
-						api: "codex-import",
-						provider: String(meta.model_provider ?? "codex"),
-						model: String(meta.model ?? "codex"),
-						stopReason: "toolUse",
-					},
-					entry.timestamp,
-				);
-				continue;
-			}
-
-			if (payload.type === "function_call_output") {
-				const callId = String(payload.call_id ?? payload.id ?? makeId(sessionId, sequence));
-				const output = this.extractToolOutput(payload);
-				const completedAt = this.parseTimestamp(entry.timestamp);
-				const startedAt = toolStartedAt.get(callId);
-				pushMessage(
-					"toolResult",
-					[{ type: "text", text: output }],
-					{
-						toolCallId: callId,
-						toolName: toolNames.get(callId) ?? "tool",
-						isError: Boolean(payload.is_error),
-						// Codex 历史只有 function_call / output 时间戳，导入时保存派生耗时，
-						// 让桌面端工具卡片与原生 pi 会话保持一致。
-						...(startedAt !== undefined ? { startedAt } : {}),
-						...(startedAt !== undefined && completedAt !== undefined
-							? { durationMs: Math.max(0, completedAt - startedAt) }
-							: {}),
-					},
-					entry.timestamp,
-				);
-			}
+		for (const message of messages) {
+			writer.pushMessage(this.withCodexUsage(message, session));
 		}
 
-		// 处理最后未flush的 reasoning
-		if (pendingThinking) {
-			pushMessage("assistant", [
-				{ type: "thinking", thinking: pendingThinking, thinkingSignature: "codex_reasoning" },
-			]);
-		}
-
-		const title = titleState.title || cleanTitle(basename(session.sourcePath)) || "Codex 会话";
-		lines.splice(1, 0, JSON.stringify({ sessionName: title, cwd: projectPath }));
+		const title =
+			summary.title || cleanTitle(basename(session.sourcePath)) || "Codex 会话";
+		writer.insertAt(1, { sessionName: title, cwd: projectPath });
 
 		return {
-			raw: `${lines.join("\n")}\n`,
+			raw: writer.build(),
 			title,
-			preview: titleState.preview || "Codex imported session",
-			messageCount,
+			preview: summary.preview || "Codex imported session",
+			messageCount: summary.messageCount,
+		};
+	}
+
+	/**
+	 * assistant 消息补 usage 零值占位（pi 上下文统计读 assistant.usage.totalTokens；
+	 * Codex 原始历史无该字段）。opencode 在 extra 里自带 tokens，claude 的 extra
+	 * 已含占位——只有 codex 需要在此统一补。
+	 */
+	private withCodexUsage(message: WalkedMessage, session: ParsedSession): WalkedMessage {
+		if (message.role !== "assistant") return message;
+		return {
+			...message,
+			extra: { usage: zeroUsage(), ...(message.extra ?? {}) },
 		};
 	}
 

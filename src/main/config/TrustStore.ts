@@ -111,6 +111,20 @@ export class TrustStore {
 		await this.writeTrust({ ...entries, [key]: decision });
 	}
 
+	/**
+	 * 批量导入信任条目（配置包恢复用）：包内路径逐条归一化后合并写入，
+	 * 无效值由调用方过滤；现有条目整体保留（只覆盖同键），包赢。
+	 */
+	async importEntries(validEntries: Record<string, boolean>): Promise<void> {
+		const { entries, ok } = await this.readTrust();
+		if (!ok) return;
+		const next = { ...entries };
+		for (const [pathKey, decision] of Object.entries(validEntries)) {
+			next[normalizeTrustPath(pathKey)] = decision;
+		}
+		await this.writeTrust(next);
+	}
+
 	/** 项目是否含需要信任才能加载的资源（.omp 配置/扩展/skills、逐级 .agents/skills）。 */
 	hasRequiringResources(hostCwd: string, userAgentsSkillsDir: string): boolean {
 		const configDir = join(hostCwd, ".omp");

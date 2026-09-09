@@ -61,6 +61,11 @@ function loadConfigManager() {
 	const trustStore = loadTranspiledModule("src/main/config/TrustStore.ts", (id) => {
 		return undefined;
 	}, { fsPromises: fsPromisesFake });
+	const probe = loadTranspiledModule("src/main/config/providerProbe.ts", (id) => {
+		if (id === "./baseUrlPath") return loadBaseUrlPath();
+		if (id === "../../shared/types/ompRoles") return sharedRoles;
+		return undefined;
+	});
 	const sandbox = {
 		AbortController,
 		clearTimeout,
@@ -71,7 +76,7 @@ function loadConfigManager() {
 			if (id === "./baseUrlPath") return loadBaseUrlPath();
 			if (id === "./OmpRolesStore") return rolesStore;
 			if (id === "./TrustStore") return trustStore;
-			if (id === "node:fs/promises") return fsPromisesFake;
+			if (id === "./providerProbe") return probe;
 			if (id === "node:path") return path.win32;
 			if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
 			if (id === "electron") return { net: {} };
@@ -107,6 +112,13 @@ function loadTranspiledModule(sourcePath, extraRequire = () => undefined, option
 	vm.runInNewContext(outputText, sandbox, { filename: sourcePath });
 	return sandbox.exports;
 }
+/** 复用与 loadConfigManager 相同的转译映射，拿到 providerProbe 的公开函数。 */
+function loadProbeExportsForTest() {
+	return loadTranspiledModule("src/main/config/providerProbe.ts", (id) => {
+		if (id === "./baseUrlPath") return loadBaseUrlPath();
+		return undefined;
+	});
+}
 
 test("preserves POSIX WSL trust keys under Windows path semantics", async () => {
 	const { ConfigManager, getContent, writes } = loadConfigManager();
@@ -133,12 +145,13 @@ test("retains case-insensitive matching for native Windows trust keys", async ()
 	assert.equal(await manager.getProjectTrustDecision("c:\\repo\\child"), true);
 });
 
-test("buildModelsRequest honors provider User-Agent override for OpenAI gateways", () => {
-	const { ConfigManager } = loadConfigManager();
-	const manager = new ConfigManager("C:\\OmpDeck\\config");
-
+test("buildModelsRequest honors provider User-Agent override for OpenAI gateways", async () => {
+	// Q32：探测构造层已抽为 providerProbe 纯模块——测试面即公开函数，
+	// ConfigManager 沙箱的 require("./providerProbe") 映射即转译后真模块，
+	// 这里复用同一映射拿到它调用公开函数。
+	const { buildModelsRequest } = loadProbeExportsForTest();
 	// 未配自定义 UA：应注入 SDK 默认 UA（模拟 pi 的 OpenAI JS SDK）
-	const defaultReq = manager.buildModelsRequest(
+	const defaultReq = buildModelsRequest(
 		"https://puppyrouter.com/v1",
 		"sk-test",
 		"openai-responses",
@@ -151,7 +164,7 @@ test("buildModelsRequest honors provider User-Agent override for OpenAI gateways
 
 	// 配置了自定义 User-Agent（如拦截 SDK UA 的中转网关）：必须保留覆盖值，
 	// 不能退回 SDK UA，否则 PuppyRouter 等网关注册 403 "Your request was blocked."。
-	const overrideReq = manager.buildModelsRequest(
+	const overrideReq = buildModelsRequest(
 		"https://puppyrouter.com/v1",
 		"sk-test",
 		"openai-responses",

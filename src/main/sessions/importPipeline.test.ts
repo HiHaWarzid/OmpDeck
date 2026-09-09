@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "vitest";
-
+import { describe, expect, it, test } from "vitest";
+import { accumulateSummary, PiJsonlWriter } from "./importWalk";
 import { ImportPipeline } from "./importPipeline";
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "./importPipeline";
 import { buildTargetPath, cleanTitle, computeImportStatus, makeId, safePathToken } from "./importShared";
@@ -264,76 +264,40 @@ function makeParsedSession(overrides: Partial<ParsedSession> = {}): ParsedSessio
 	};
 }
 
-test("Claude summarize matches convert for mixed entries", () => {
-	const adapter = new ClaudeImportAdapter("/tmp/fake-claude-root");
-	const session = makeParsedSession({
-		meta: { sessionId: "s1", cwd: "/project", firstTimestamp: 1000, lastTimestamp: 2000 },
-		entries: [
-			{ type: "user", sessionId: "s1", cwd: "/project", message: { content: "first question" } },
-			{ type: "assistant", message: { content: [{ type: "text", text: "hello answer" }], model: "claude-3" } },
-			{ type: "tool_result", tool_use_id: "t1", content: [{ type: "tool_result", content: "output" }] },
-			{ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "bash", input: {} }] } },
-			{ type: "system", subtype: "turn_duration" }, // 跳过
-			{ type: "user", message: { content: "" } }, // 空文本不计数
-		],
+describe("importWalk", () => {
+	it("accumulateSummary skips empty content and takes first texts", () => {
+		const summary = accumulateSummary([
+			{ role: "assistant", content: [] },
+			{ role: "user", content: [{ type: "text", text: "  hello world  " }] },
+			{ role: "assistant", content: [{ type: "text", text: "answer here" }] },
+		]);
+		expect(summary).toEqual({ title: "hello world", preview: "hello world", messageCount: 2 });
 	});
-	const converted = adapter.convert("/project", session);
-	const summarized = adapter.summarize("/project", session);
-	assert.equal(summarized.title, converted.title);
-	assert.equal(summarized.preview, converted.preview);
-	assert.equal(summarized.messageCount, converted.messageCount);
+
+	it("writer chains parentId and sequence continuously", () => {
+		const writer = new PiJsonlWriter((sequence) => `id-${sequence}`);
+		writer.pushHeader({
+			sessionId: "s",
+			timestamp: "2024-01-01T00:00:00.000Z",
+			cwd: "/project",
+			importType: "claude_import",
+			importMeta: { claudeSessionId: "s" },
+			provider: "anthropic",
+			model: "anthropic/claude-sonnet-4",
+		});
+		const first = writer.pushMessage({ role: "user", content: [{ type: "text", text: "hi" }] });
+		const second = writer.pushMessage({ role: "assistant", content: [{ type: "text", text: "yo" }] });
+		expect(first?.id).toBe("id-1");
+		// parentId 链语义：writer 内部先更新 parent 再返回，因此返回的 parentId 是自身 id
+		// （与旧三适配器 pushMessage 的“先 parentId = id 再落盘”同构）。链正确性由下一行行序断言。
+		expect(second?.parentId).toBe("id-2");
+		const lines = writer.build().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+		expect(lines.map((line) => line.type)).toEqual(["session", "claude_import", "model_change", "message", "message"]);
+		// 落盘 parentId 链：model_change ← first ← second
+		expect(lines[2].id).toBe("id-0");
+		expect(lines[3].parentId).toBe("id-0");
+		expect(lines[4].parentId).toBe("id-1");
+	});
 });
 
-test("Codex summarize matches convert for mixed entries", () => {
-	const adapter = new CodexImportAdapter("/tmp/fake-codex-root");
-	const session = makeParsedSession({
-		meta: { id: "cx1", cwd: "/project", model: "gpt-5", model_provider: "openai" },
-		entries: [
-			{ type: "event_msg", payload: { type: "user_message", message: "build it" } },
-			{ type: "response_item", payload: { type: "reasoning", summary: "thinking hard" } },
-			{ type: "response_item", payload: { type: "message", role: "assistant", content: "done" } },
-			{ type: "response_item", payload: { type: "function_call", call_id: "c1", name: "bash", arguments: "{}" } },
-			{ type: "response_item", payload: { type: "function_call_output", call_id: "c1", output: "ok" } },
-			{ type: "event_msg", payload: { type: "user_message", message: "" } }, // 空不计数
-		],
-	});
-	const converted = adapter.convert("/project", session);
-	const summarized = adapter.summarize("/project", session);
-	assert.equal(summarized.title, converted.title);
-	assert.equal(summarized.preview, converted.preview);
-	assert.equal(summarized.messageCount, converted.messageCount);
-});
 
-test("OpenCode summarize matches convert for mixed messages", () => {
-	const adapter = new OpenCodeImportAdapter("/tmp/fake-opencode.db");
-	const session = makeParsedSession({
-		meta: { id: "oc1", time_created: 1000, model: "gpt-5" },
-		entries: [
-			{
-				id: "m1", time_created: 1000, time_updated: 1000,
-				data: { role: "user" },
-				parts: [{ id: "p1", message_id: "m1", time_created: 1000, time_updated: 1000, data: { type: "text", text: "hi" } }],
-			},
-			{
-				id: "m2", time_created: 2000, time_updated: 2000,
-				data: { role: "assistant" },
-				parts: [
-					{ id: "p2", message_id: "m2", time_created: 2000, time_updated: 2000, data: { type: "reasoning", text: "let me think" } },
-					{ id: "p3", message_id: "m2", time_created: 2000, time_updated: 2000, data: { type: "text", text: "answer" } },
-				],
-			},
-			{
-				id: "m3", time_created: 3000, time_updated: 3000,
-				data: { role: "user" },
-				parts: [
-					{ id: "p4", message_id: "m3", time_created: 3000, time_updated: 3000, data: { type: "tool", tool: "bash", callID: "c1", state: { input: {}, status: "completed" } } },
-				],
-			},
-		],
-	});
-	const converted = adapter.convert("/project", session);
-	const summarized = adapter.summarize("/project", session);
-	assert.equal(summarized.title, converted.title);
-	assert.equal(summarized.preview, converted.preview);
-	assert.equal(summarized.messageCount, converted.messageCount);
-});

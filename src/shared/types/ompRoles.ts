@@ -64,3 +64,11 @@ export function formatRoleSelector(
 		? `${provider}/${modelId}:${trimmedLevel}`
 		: `${provider}/${modelId}`;
 }
+
+/**
+ * IPC/导入边界收窄：role 必须是 omp 内置角色之一。
+ * 与 configHandlers 的旧内联校验同语义，提到 shared 供双端复用。
+ */
+export function isOmpModelRole(value: string): value is OmpModelRole {
+	return (OMP_MODEL_ROLES as readonly string[]).includes(value);
+}

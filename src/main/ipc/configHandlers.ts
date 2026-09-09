@@ -4,14 +4,9 @@
  */
 import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRolePayload, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import { OMP_MODEL_ROLES, formatRoleSelector, type OmpModelRole } from "../../shared/types/ompRoles";
+import { formatRoleSelector, isOmpModelRole } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
 import type { AppLogger } from "../logging/AppLogger";
-
-/** 入参校验：role 必须是 omp 内置角色之一（IPC 边界收窄 unknown → OmpModelRole）。 */
-function isOmpModelRole(value: string): value is OmpModelRole {
-	return (OMP_MODEL_ROLES as readonly string[]).includes(value);
-}
 
 interface ConfigHandlerDeps {
 	configManager: ConfigManager;

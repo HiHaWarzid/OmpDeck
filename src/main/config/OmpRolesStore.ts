@@ -2,8 +2,13 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseDocument, type Document } from "yaml";
-import type { OmpModelRole, OmpRolesState } from "../../shared/types/ompRoles";
-import { OMP_MODEL_ROLES, parseRoleSelector } from "../../shared/types/ompRoles";
+import {
+	OMP_MODEL_ROLES,
+	isOmpModelRole,
+	parseRoleSelector,
+	type OmpModelRole,
+	type OmpRolesState,
+} from "../../shared/types/ompRoles";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
@@ -184,6 +189,14 @@ export class OmpRolesStore {
 			doc.setIn(["modelRoles", role], trimmed ? `${selector}:${trimmed}` : selector);
 		});
 	}
+	/** 只写顶层 defaultThinkingLevel（导入恢复用：保留已有档位的兜底项）。 */
+	async applyDefaultThinkingLevel(
+		level: string,
+	): Promise<ConfigValidationResult> {
+		return this.writeDoc((doc) => {
+			doc.set("defaultThinkingLevel", level.trim());
+		});
+	}
 
 	/** 清除某个角色；default 联动清顶层 defaultThinkingLevel。 */
 	async clearRole(role: OmpModelRole): Promise<ConfigValidationResult> {
@@ -216,6 +229,36 @@ export class OmpRolesStore {
 	/** 清除 OMP 默认（modelRoles.default + 顶层 defaultThinkingLevel 一次清）。 */
 	async clearDefault(): Promise<ConfigValidationResult> {
 		return this.clearRole("default");
+	}
+
+	/**
+	 * 恢复导出的 config.yml 包片段：逐角色校验后原子写入，顶层档位保留。
+	 * 无效角色/空 selector/缺 provider 跳过；包赢（同文档一次变更）。
+	 */
+	async importPackage(ompConfig: unknown): Promise<ConfigValidationResult> {
+		if (!ompConfig || typeof ompConfig !== "object" || Array.isArray(ompConfig)) {
+			return { valid: true };
+		}
+		const roles = (ompConfig as Record<string, unknown>).modelRoles;
+		const topLevel = (ompConfig as Record<string, unknown>).defaultThinkingLevel;
+		return this.writeDoc((doc) => {
+			if (roles && typeof roles === "object" && !Array.isArray(roles)) {
+				for (const [role, selector] of Object.entries(roles)) {
+					if (!isOmpModelRole(role) || typeof selector !== "string" || !selector) continue;
+					const parsed = parseRoleSelector(selector);
+					if (!parsed.provider || !parsed.modelId) continue;
+					// 先剥离、再统一拼后缀，避免 "a:b" + "b" → "a:b:b"。
+					const bare = `${parsed.provider}/${parsed.modelId}`;
+					doc.setIn(
+						["modelRoles", role],
+						parsed.thinkingLevel ? `${bare}:${parsed.thinkingLevel}` : bare,
+					);
+				}
+			}
+			if (typeof topLevel === "string" && topLevel) {
+				doc.set("defaultThinkingLevel", topLevel);
+			}
+		});
 	}
 
 	/**

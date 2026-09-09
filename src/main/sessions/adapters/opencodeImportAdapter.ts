@@ -4,12 +4,11 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { ConvertedSession, ParsedSession, SourceAdapter } from "../importPipeline";
 import {
-	cleanTitle,
-	extractPiText,
-	makeId,
-	normalizePath,
-	zeroUsage,
-} from "../importShared";
+	accumulateSummary,
+	PiJsonlWriter,
+	type WalkedMessage,
+} from "../importWalk";
+import { cleanTitle, extractPiText, makeId, normalizePath } from "../importShared";
 
 /**
  * OpenCode 适配器：从 SQLite 数据库读取会话历史。
@@ -37,29 +36,41 @@ export class OpenCodeImportAdapter implements SourceAdapter {
 	readonly source = "opencode" as const;
 	readonly filePrefix = "opencode_";
 
-	constructor(private readonly dbPath: string) {}
+	private readonly dbPath: string;
+
+	constructor(dbPath: string) {
+		this.dbPath = dbPath;
+	}
 
 	/**
-	 * 轻量摘要：只提取 title/preview/messageCount，不构造 pi JSONL 行。
-	 * 逐条镜像 convert 的 part 组装与 pushMessage 过滤规则（tool part 在非
-	 * assistant role 下即时计数、toolCall 的 name 参与 extractPiText）。
+	 * 轻量摘要：分类器 + 统一摘要派生，不构造 pi JSONL 行。
+	 * 与 convert 消费同一中间表示——无镜像。
 	 */
 	summarize(
 		projectPath: string,
 		session: ParsedSession,
 	): { title: string; preview: string; messageCount: number } {
-		const messages = session.entries as OpenCodeMessage[];
-		const titleState = { title: "", preview: "" };
-		let messageCount = 0;
-
-		const pushMessageLike = (role: "user" | "assistant" | "toolResult", content: unknown[]) => {
-			if (content.length === 0) return;
-			messageCount += 1;
-			const text = extractPiText(content).trim();
-			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
-			if (role === "user" && text && !titleState.title) titleState.title = cleanTitle(text);
+		const summary = accumulateSummary(this.classifyEntries(session));
+		const meta = session.meta as Record<string, unknown>;
+		return {
+			// convert 的 fallback 顺序：meta.title → 首条 user → sourcePath 尾部 → 默认
+			title:
+				cleanTitle(String(meta.title ?? "")) ||
+				summary.title ||
+				cleanTitle(session.sourcePath.split("#")[1] ?? session.sourcePath) ||
+				"OpenCode 会话",
+			preview: summary.preview || "OpenCode imported session",
+			messageCount: summary.messageCount,
 		};
+	}
 
+	/**
+	 * 源条目分类器：OpenCode message/parts -> WalkedMessage[]（纯）。
+	 * part 组装与 push 过滤规则的唯一事实来源。
+	 */
+	private classifyEntries(session: ParsedSession): WalkedMessage[] {
+		const messages = session.entries as OpenCodeMessage[];
+		const walked: WalkedMessage[] = [];
 		for (const message of messages) {
 			const messageData = message.data as Record<string, unknown>;
 			const role = messageData.role as string | undefined;
@@ -77,32 +88,40 @@ export class OpenCodeImportAdapter implements SourceAdapter {
 							name: String(partData.tool ?? "tool"),
 						});
 					} else {
-						// 与 convert 一致：非 assistant 的 tool part 立即计一条 toolResult
-						pushMessageLike("toolResult", [
-							{ type: "text", text: this.extractToolOutput(partData) },
-						]);
+						// 非 assistant 的 tool part 即时计一条 toolResult
+						walked.push({
+							role: "toolResult",
+							content: [{ type: "text", text: this.extractToolOutput(partData) }],
+							extra: {
+								toolCallId: String((partData as Record<string, unknown>).callID ?? part.id),
+								toolName: String(partData.tool ?? "tool"),
+								isError: (partData.state as Record<string, unknown>)?.status === "error",
+							},
+							timestampValue: part.time_created,
+						});
 					}
 				}
 			}
 
-			if (role === "user") {
-				pushMessageLike("user", content);
-			} else if (role === "assistant") {
-				pushMessageLike("assistant", content);
+			if (role === "user" || role === "assistant") {
+				walked.push({
+					role,
+					content,
+					extra:
+						role === "assistant"
+							? {
+								api: "opencode-import",
+								provider: (messageData.providerID as string) ?? "opencode",
+								model: (messageData.modelID as string) ?? "opencode",
+								stopReason: (messageData.finish as string) ?? "stop",
+								tokens: messageData.tokens,
+							}
+							: undefined,
+					timestampValue: message.time_created,
+				});
 			}
 		}
-
-		const meta = session.meta as Record<string, unknown>;
-		return {
-			// 与 convert 的 fallback 顺序完全一致：meta.title → 首条 user → sourcePath 尾部 → 默认
-			title:
-				cleanTitle(String(meta.title ?? "")) ||
-				titleState.title ||
-				cleanTitle(session.sourcePath.split("#")[1] ?? session.sourcePath) ||
-				"OpenCode 会话",
-			preview: titleState.preview || "OpenCode imported session",
-			messageCount,
-		};
+		return walked;
 	}
 
 	async discover(projectPath: string): Promise<ParsedSession[]> {
@@ -145,128 +164,53 @@ export class OpenCodeImportAdapter implements SourceAdapter {
 		const meta = session.meta as Record<string, unknown>;
 		const timestamp = new Date(Number(meta.time_created ?? session.sourceMtime)).toISOString();
 		const model = this.parseModel(meta.model);
-		const messages = session.entries as OpenCodeMessage[];
-		const titleState = { title: "", preview: "" };
-		const lines: string[] = [];
-		let parentId: string | null = null;
-		let sequence = 0;
-		let messageCount = 0;
+		const messages = this.classifyEntries(session);
+		const summary = accumulateSummary(messages);
 
-		const pushEntry = (entry: Record<string, unknown>) => lines.push(JSON.stringify(entry));
-		const pushMessage = (
-			role: "user" | "assistant" | "toolResult",
-			content: unknown[],
-			extra: Record<string, unknown> = {},
-			timestampValue?: number,
-		) => {
-			if (content.length === 0) return;
-			const id = makeId(sessionId, sequence++);
-			const messageTimestamp = Number(timestampValue ?? session.sourceMtime + sequence);
-			pushEntry({
-				type: "message",
-				id,
-				parentId,
-				timestamp: new Date(messageTimestamp).toISOString(),
-				message: {
-					role,
-					content,
-					timestamp: messageTimestamp,
-					...(role === "assistant" ? { usage: this.toUsage((extra as Record<string, unknown>).tokens) } : {}),
-					...extra,
-				},
-			});
-			parentId = id;
-			messageCount += 1;
-
-			const text = extractPiText(content).trim();
-			if (text && !titleState.preview) titleState.preview = text.slice(0, 160);
-			if (role === "user" && text && !titleState.title) titleState.title = cleanTitle(text);
-		};
-
-		pushEntry({ type: "session", version: 3, id: sessionId, timestamp, cwd: projectPath });
-		pushEntry({
-			type: "opencode_import",
-			version: 1,
-			openCodeSessionId: sessionId,
-			sourcePath: session.sourcePath,
-			sourceMtime: session.sourceMtime,
-			sourceSize: session.sourceSize,
-			importedAt: new Date().toISOString(),
-		});
-		const modelChangeId = makeId(sessionId, sequence++);
-		pushEntry({
-			type: "model_change",
-			id: modelChangeId,
-			parentId,
+		const writer = new PiJsonlWriter((sequence) => makeId(sessionId, sequence));
+		writer.pushHeader({
+			sessionId,
 			timestamp,
-			provider: model.providerID || "opencode",
-			model: `${model.providerID || "opencode"}/${model.id || model.modelID || "opencode"}`,
+			cwd: projectPath,
+			importType: "opencode_import",
+			importMeta: {
+				openCodeSessionId: sessionId,
+				sourcePath: session.sourcePath,
+				sourceMtime: session.sourceMtime,
+				sourceSize: session.sourceSize,
+			},
+			provider: String(model.providerID ?? "opencode"),
+			model: `${String(model.providerID ?? "opencode")}/${String(model.id ?? model.modelID ?? "opencode")}`,
 		});
-		parentId = modelChangeId;
-
 		for (const message of messages) {
-			const messageData = message.data as Record<string, unknown>;
-			const role = messageData.role as string | undefined;
-			const content: unknown[] = [];
-			for (const part of message.parts) {
-				const partData = part.data as Record<string, unknown>;
-				if (partData.type === "text" && partData.text) {
-					content.push({ type: "text", text: String(partData.text) });
-				} else if (partData.type === "reasoning" && partData.text) {
-					content.push({ type: "thinking", thinking: String(partData.text), thinkingSignature: "opencode_reasoning" });
-				} else if (partData.type === "tool") {
-					const toolCallId = String(partData.callID ?? part.id);
-					if (role === "assistant") {
-						content.push({
-							type: "toolCall",
-							id: toolCallId,
-							name: String(partData.tool ?? "tool"),
-							arguments: (partData.state as Record<string, unknown>)?.input ?? {},
-						});
-					} else {
-						pushMessage(
-							"toolResult",
-							[{ type: "text", text: this.extractToolOutput(partData) }],
-							{
-								toolCallId,
-								toolName: String(partData.tool ?? "tool"),
-								isError: (partData.state as Record<string, unknown>)?.status === "error",
-							},
-							part.time_created,
-						);
-					}
-				}
-			}
-
-			if (role === "user") {
-				pushMessage("user", content, {}, message.time_created);
-			} else if (role === "assistant") {
-				pushMessage(
-					"assistant",
-					content,
-					{
-						api: "opencode-import",
-						provider: (messageData.providerID as string) ?? model.providerID ?? "opencode",
-						model: (messageData.modelID as string) ?? model.id ?? model.modelID ?? "opencode",
-						stopReason: (messageData.finish as string) ?? "stop",
-						tokens: messageData.tokens,
-					},
-					message.time_created,
-				);
-			}
+			writer.pushMessage(this.withOpenCodeUsage(message));
 		}
 
 		const title =
 			cleanTitle(String(meta.title ?? "")) ||
-			titleState.title ||
+			summary.title ||
 			cleanTitle(session.sourcePath.split("#")[1] ?? session.sourcePath) ||
 			"OpenCode 会话";
-		lines.splice(1, 0, JSON.stringify({ sessionName: title, cwd: projectPath }));
+		writer.insertAt(1, { sessionName: title, cwd: projectPath });
 		return {
-			raw: `${lines.join("\n")}\n`,
+			raw: writer.build(),
 			title,
-			preview: titleState.preview || "OpenCode imported session",
-			messageCount,
+			preview: summary.preview || "OpenCode imported session",
+			messageCount: summary.messageCount,
+		};
+	}
+
+	/**
+	 * assistant 消息的 tokens 换算为 usage 占位（pi 上下文统计读
+	 * assistant.usage.totalTokens）。usage 拼装逻辑是 opencode 特有的 toUsage，
+	 * 保留在此；claude/codex 走各自 extra。
+	 */
+	private withOpenCodeUsage(message: WalkedMessage): WalkedMessage {
+		if (message.role !== "assistant") return message;
+		const tokens = (message.extra as Record<string, unknown> | undefined)?.tokens;
+		return {
+			...message,
+			extra: { usage: this.toUsage(tokens), ...(message.extra ?? {}) },
 		};
 	}
 
