@@ -374,6 +374,44 @@ function setupTray() {
 }
 
 /**
+ * 退出/重启共用的停机清理（shutdown）。
+ *
+ * 两条退出路径必须走同一套顺序：
+ * - before-quit（正常退出）：同步 handler，只能 fire-and-forget；
+ * - restartApp（重启）：async，可以 await 刷盘完成再 relaunch。
+ * 共用函数保证"重启丢刷盘"这类分叉 bug 不再出现：要改顺序只改一处。
+ *
+ * 顺序说明：
+ * 1. 刷盘优先（settings + 摘要缓存）：内存态落盘，后续 stop 不再产生新写入；
+ * 2. 停对外服务（webService）：不再接受新请求；
+ * 3. 关终端与 agent 进程：长耗时，fire-and-forget；
+ * 4. 停宠物/速记进程、倒性能水位：纯本地收尾。
+ */
+function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
+	const flush = Promise.all([
+		settingsStore.flushSave().catch((error) => {
+			void appLogger?.warn("settings", "Failed to flush settings on shutdown", error);
+		}),
+		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
+	]);
+	const stop = () => {
+		void webServiceManager?.stop();
+		terminalManager?.closeAll();
+		void agentManager?.stopAll();
+		petSystem?.stop();
+		petSystem = null;
+		quickGen?.stop();
+		perfDump();
+	};
+	if (!opts.awaitFlush) {
+		void flush;
+		stop();
+		return;
+	}
+	return flush.then(stop);
+}
+
+/**
  * 重启应用：统一清理后 relaunch + quit。
  * 必须先置 isQuitting，否则 closeToTray 会把退出流程吞成「隐藏到托盘」，relaunch 不生效；
  * 清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
@@ -381,18 +419,9 @@ function setupTray() {
  */
 async function restartApp() {
 	isQuitting = true;
-	// 重启同样走退出刷盘：设置 store 是 150ms 防抖写盘，摘要缓存是内存 + debounce，
-	// 不 flush 就 relaunch 会丢掉重启前最后一次 update（before-quit 的刷盘
-	// 在 app.quit() 后才跑，而新实例此时已在读旧文件）。
-	await Promise.all([
-		settingsStore.flushSave().catch((error) => {
-			void appLogger?.warn("settings", "Failed to flush settings on restart", error);
-		}),
-		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
-	]);
-	void webServiceManager?.stop();
-	terminalManager?.closeAll();
-	void agentManager?.stopAll();
+	// await 刷盘完成再 relaunch：before-quit 的刷盘在 app.quit() 后才跑，
+	// 不等就 relaunch 会丢掉重启前最后一次 update（新实例已在读旧文件）。
+	await shutdownServices({ awaitFlush: true });
 	// 先释放单实例锁再 relaunch：新实例启动时旧实例仍持有锁（锁内 PID 存活判定），
 	// 会被当成"同版本二次启动"而写 .focus 后立即退出，导致重启变成退出、应用不再回来。
 	// 旧实例随后 will-quit 的 dispose 是幂等的，读到新实例 PID 不会误删新锁。
@@ -1242,20 +1271,9 @@ app.on("child-process-gone", (_event, details) => {
 app.on("before-quit", () => {
 	isQuitting = true;
 	trayManager?.destroy();
-	void webServiceManager?.stop();
-	terminalManager?.closeAll();
-	agentManager?.stopAll();
-	// 退出前刷盘会话摘要缓存，保证下次冷启动可复用未变化文件的摘要。
-	void sessionScanner?.flushSummaryCache();
-	// 退出前刷盘防抖中的设置写入，保证最后一次 update 不丢失。
-	void settingsStore.flushSave().catch((error) => {
-		void appLogger.warn("settings", "Failed to flush settings on quit", error);
-	});
-	petSystem?.stop();
-	petSystem = null;
-	quickGen?.stop();
-	// PIDECK_PERF=1 时输出本次会话关键路径耗时汇总。
-	perfDump();
+	// 与 restartApp 同一套停机顺序（shutdownServices）：正常退出是同步 handler，
+	// 只能 fire-and-forget，刷盘完成靠进程退出前的时间窗口。
+	shutdownServices({ awaitFlush: false });
 });
 
 app.on("window-all-closed", () => {
