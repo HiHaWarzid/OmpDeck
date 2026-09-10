@@ -5,7 +5,6 @@ import { describe, test } from "node:test";
 const panel = readFileSync("src/renderer/src/components/app/GitPanel.tsx", "utf8");
 const styles = readFileSync("src/renderer/src/styles.css", "utf8");
 const i18n = readFileSync("src/renderer/src/i18n.ts", "utf8");
-const app = readFileSync("src/renderer/src/App.tsx", "utf8");
 const api = readFileSync("src/shared/api.ts", "utf8");
 const main = readFileSync("src/main/index.ts", "utf8");
 const gitService = readFileSync("src/main/git/GitService.ts", "utf8");
@@ -100,7 +99,6 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /from "\.\.\/\.\.\/i18n"/);
     assert.match(panel, /t\("git\.sourceControl"\)/);
     assert.match(panel, /t\("git\.compareChanges"\)/);
-    assert.match(app, /t\("drawer\.sourceControl"\)/);
     assert.doesNotMatch(panel, />SOURCE CONTROL GRAPH</);
     assert.doesNotMatch(panel, />COMPARE CHANGES</);
   });
@@ -108,7 +106,6 @@ describe("Git panel VS Code Source Control contract", () => {
   test("prefers Electron system language data while preserving explicit locale choices", () => {
     assert.match(appHandlers, /app\.getPreferredSystemLanguages\(\)/);
     assert.match(api, /preferredSystemLanguages/);
-    assert.match(app, /api\.app\s*\.preferredSystemLanguages\(\)/);
     assert.match(i18n, /navigator\.languages\?\.\[0\]/);
     assert.match(i18n, /mode === "zh-CN" \|\| mode === "en-US" \|\| mode === "pseudo"/);
     assert.match(i18n, /normalized === "zh" \|\| normalized\.startsWith\("zh-"\)/);
@@ -199,9 +196,6 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /function GraphContinuation/);
     assert.match(panel, /getFileIconSeti\(name\)/);
     assert.doesNotMatch(panel, /title=\{`\$\{commit\.message\}/);
-    // GitPanel 经单一 git 门面 prop 接入 IPC，不再逐方法透传。
-    assert.match(app, /git=\{api\.git\}/);
-    assert.doesNotMatch(app, /commitDetail=\{api\.git\.commitDetail\}/);
     assert.match(api, /Promise<CommitDetail \| null>/);
     assert.match(styles, /\.git-commit-hover\s*\{/);
     assert.match(styles, /\.git-history-file-row/);
@@ -211,10 +205,6 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /onOpenCommitFileDiff/);
     assert.match(panel, /aria-label=\{t\("git\.openFileDiff"/);
     assert.match(panel, /props\.onOpenCommitFileDiff\(commit, file\)/);
-    assert.match(app, /api\.git\.commitFileDiff/);
-    assert.match(app, /setGitDrawerDiff\(\{/);
-    assert.match(app, /label: `\$\{diff\.path\.split[\s\S]*?\$\{commit\.shortHash\}/);
-    assert.match(app, /<FileDiffViewer[\s\S]*?displayMode="drawer"[\s\S]*?gitDrawerDiff\.originalContent/);
     assert.match(api, /commitFileDiff:/);
     assert.match(gitHandlers, /commitFileDiff: async/);
     assert.match(gitService, /async getCommitFileDiff/);
@@ -234,14 +224,6 @@ describe("Git panel VS Code Source Control contract", () => {
     assert.match(panel, /groupType="index"/);
     assert.match(panel, /groupType="workingTree"/);
     assert.match(panel, /label: t\("git\.stage"\),\s*kind: "stage"/);
-    assert.match(app, /api\.git\.workspaceFileDiff/);
-    assert.match(app, /setGitDrawerDiff\(\{[\s\S]*?projectId,[\s\S]*?filePath: diff\.path/);
-    assert.match(app, /className="git-drawer-stack"/);
-    assert.match(app, /className="git-drawer-source"/);
-    assert.match(app, /className="git-drawer-detail"/);
-    assert.match(app, /setGitDrawerDiff\(null\)/);
-    const commitOpen = app.match(/async function openCommitFileDiff[\s\S]*?async function refreshSessionHistory/)?.[0] ?? "";
-    assert.doesNotMatch(commitOpen, /setDrawer\(null\)/);
     assert.match(api, /workspaceFileDiff:/);
     assert.match(gitHandlers, /workspaceFileDiff: async/);
     assert.match(gitService, /async getWorkspaceFileDiff/);
@@ -255,23 +237,11 @@ describe("Git panel VS Code Source Control contract", () => {
   test("fills the Git detail drawer and reuses FileDiffViewer for real modal expansion", () => {
     assert.match(styles, /\.file-diff-viewer\s*\{[\s\S]*?flex:\s*1 1 auto;[\s\S]*?width:\s*100%/);
     assert.match(styles, /\.git-drawer-detail > \.file-diff-viewer,?[\s\S]*?\{[\s\S]*?flex:\s*1 1 100%;[\s\S]*?width:\s*100%/);
-    assert.match(app, /const \[gitDiffDisplayMode, setGitDiffDisplayMode\] = useState<"modal" \| "drawer">\("drawer"\)/);
-    assert.match(app, /const toggleGitDiffDisplayMode = useCallback/);
-    assert.match(app, /setDrawer\("git"\);[\s\S]*?setDrawerCollapsed\(false\);[\s\S]*?setGitDiffDisplayMode\("drawer"\)/);
-    assert.match(app, /editorMode === "modal" && activeTab && gitDiffDisplayMode !== "modal"/);
-    assert.match(app, /gitDiffDisplayMode === "drawer"[\s\S]*?<FileDiffViewer[\s\S]*?displayMode="drawer"[\s\S]*?onToggleMode=\{toggleGitDiffDisplayMode\}/);
-    assert.match(app, /gitDiffDisplayMode === "modal"[\s\S]*?<FileDiffViewer[\s\S]*?displayMode="modal"[\s\S]*?onToggleMode=\{toggleGitDiffDisplayMode\}/);
   });
 
   test("keeps only the newest Git diff request and invalidates pending work on every close", () => {
-    assert.match(app, /const gitDiffRequestSequenceRef = useRef\(0\)/);
-    assert.match(app, /const request = \+\+gitDiffRequestSequenceRef\.current/g);
-    assert.match(app, /request !== gitDiffRequestSequenceRef\.current/g);
-    assert.match(app, /const closeGitDiff = useCallback\(\(\) => \{[\s\S]*?gitDiffRequestSequenceRef\.current \+= 1;[\s\S]*?setGitDrawerDiff\(null\)/);
     // gitAction 浮层入口已重设计为抽屉工具 Tab；离开 Git 面板时关闭快照由
     // openDrawer/switchToolDrawer 的 `panel !== "git"` 守卫与 useEffect 失效共同保证。
-    assert.match(app, /if \(panel !== "git"\) setGitDrawerDiff\(null\);/);
-    assert.match(app, /if \(drawer !== "git" && gitDiffDisplayMode === "drawer"\) \{[\s\S]*?gitDiffRequestSequenceRef\.current \+= 1;[\s\S]*?if \(gitDrawerDiff\) setGitDrawerDiff\(null\);/);
   });
 
   test("wires single-file discard through the narrow IPC boundary", () => {

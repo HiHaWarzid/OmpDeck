@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SessionSummary } from "../../shared/types";
 import {
+	getProjectAgentSessionDisplay,
 	getSessionTreeProjection,
 	sameSessionSummary,
 	sameSessionSummaryList,
@@ -75,5 +76,28 @@ describe("getSessionTreeProjection", () => {
 		const projection = getSessionTreeProjection([child, parent]);
 		expect(projection.topLevel.map((s) => s.id)).toEqual(["p"]);
 		expect(projection.childrenOf.get("cx-p")?.map((s) => s.id)).toEqual(["c"]);
+	});
+});
+
+describe("getProjectAgentSessionDisplay empty container", () => {
+	it("空项目产出零子项：App 不渲染 session-card 容器", () => {
+		const display = getProjectAgentSessionDisplay({ agents: [], sessions: [] });
+		expect(display.children).toEqual([]);
+		expect(display.visibleChildren).toEqual([]);
+		expect(display.hiddenChildCount).toBe(0);
+		// App 渲染条件：visibleChildren.length > 0 || hiddenChildCount > 0
+		expect(
+			display.visibleChildren.length > 0 || display.hiddenChildCount > 0,
+		).toBe(false);
+	});
+
+	it("有子项即满足容器渲染条件", () => {
+		const display = getProjectAgentSessionDisplay({
+			agents: [],
+			sessions: [makeSession()],
+		});
+		expect(
+			display.visibleChildren.length > 0 || display.hiddenChildCount > 0,
+		).toBe(true);
 	});
 });
