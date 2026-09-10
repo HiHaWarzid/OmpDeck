@@ -515,7 +515,6 @@ export function EnvironmentDialog(props: {
 
 export const SessionStatus = memo(function SessionStatus(props: {
 	state?: AgentRuntimeState;
-	duration?: number;
 }) {
 	const state = props.state;
 	if (!state) return null;

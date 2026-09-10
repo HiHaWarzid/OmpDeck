@@ -176,17 +176,21 @@ test("statusChanged 只在 status 实际变化时发（同一状态重复聚合�
 	inner.emitStateNow();
 	assert.equal(events.length, 1);
 
-	// 状态变化时只发变化的 agent；新出现的 agent 发首次状态，未变化的 agent 不发
+	// 状态变化时只发变化的 agent；新出现的 agent 发首次状态，未变化的 agent 不发。
+	// 注意：list() 按 createdAt 倒序，同毫秒创建的顺序不保证，因此按 agentId 取事件而不按下标。
 	runtime.tab.status = "running";
 	inner.agents.set("a2", makeRuntime(makeTab("a2", "idle")));
 	inner.emitStateNow();
 	assert.equal(events.length, 3);
-	assert(events[1].type === "statusChanged");
-	assert.equal(events[1].agentId, "a1");
-	assert.equal(events[1].status, "running");
-	assert(events[2].type === "statusChanged");
-	assert.equal(events[2].agentId, "a2");
-	assert.equal(events[2].status, "idle");
+	// events[0] 是首次聚合的 a1/idle；这里只看状态变化后新增的两个事件
+	const changed = events.slice(1);
+	const byAgent = new Map<string, Extract<AgentManagerEvent, { type: "statusChanged" }>>();
+	for (const event of changed) {
+		if (event.type === "statusChanged") byAgent.set(event.agentId, event);
+	}
+	assert.equal(changed.length, 2);
+	assert.equal(byAgent.get("a1")?.status, "running");
+	assert.equal(byAgent.get("a2")?.status, "idle");
 });
 
 // ── 异常隔离 ───────────────────────────────────────────

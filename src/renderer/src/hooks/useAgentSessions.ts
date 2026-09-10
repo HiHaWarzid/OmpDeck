@@ -93,7 +93,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const pendingAgentsRef = useRef<PendingAgentTab[]>([]);
 	const runtimeStateByAgentRef = useRef<Record<string, AgentRuntimeState>>({});
 	runtimeStateByAgentRef.current = runtimeStateByAgent;
-	const agentStatusByAgentRef = useRef<Record<string, AgentTab["status"]>>({});
 	/** 会话扫描可能由项目展开、运行态结束和周期同步同时触发；按项目丢弃旧响应，避免慢请求覆盖新子会话。 */
 	const sessionRequestByProjectRef = useRef<Record<string, number>>({});
 	const sessionRefreshRunningRef = useRef<Set<string>>(new Set());
@@ -389,7 +388,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		messagesByAgentRef,
 		pendingAgentsRef,
 		runtimeStateByAgentRef,
-		agentStatusByAgentRef,
 		displayAgentsRef,
 		// computed
 		displayAgents,

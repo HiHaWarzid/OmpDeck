@@ -1,4 +1,5 @@
 import { composerSlice, type ComposerState } from "./slices/composerSlice";
+import { rpcLogSlice, type RpcLogState } from "./slices/rpcLogSlice";
 import { thinkingSlice, type ThinkingState } from "./slices/thinkingSlice";
 
 /**
@@ -72,6 +73,7 @@ export interface WorkspaceSlice<S> {
 export const workspaceSlices = {
   composer: composerSlice,
   thinking: thinkingSlice,
+  rpcLog: rpcLogSlice,
 } as const;
 
 type Slices = typeof workspaceSlices;
@@ -83,6 +85,7 @@ type Slices = typeof workspaceSlices;
 export type SliceStateMap = {
   composer: ComposerState;
   thinking: ThinkingState;
+  rpcLog: RpcLogState;
 };
 
 /** 切片名（manifest 的键集合）：订阅与读取都按它定位。 */
@@ -173,6 +176,7 @@ function seedEntryData(kind: EntryKind): EntryData {
   return {
     composer: composerSlice.seed(kind),
     thinking: thinkingSlice.seed(kind),
+    rpcLog: rpcLogSlice.seed(kind),
   } as EntryData;
 }
 

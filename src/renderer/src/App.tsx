@@ -134,6 +134,7 @@ import { reconcileAgentState } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
 import { composerActions } from "./workspace/slices/composerSlice";
+import { rpcLogActions } from "./workspace/slices/rpcLogSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
 import type { WorkspaceAction } from "./workspace/sessionWorkspace";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
@@ -572,7 +573,7 @@ export function App() {
     setAgents, setActiveAgentId, setActiveAgentByProject,
     setSessions, setSessionsByProject, setSessionLoadingByProject,
     agentsRef, activeAgentIdRef, messagesByAgentRef, pendingAgentsRef, runtimeStateByAgentRef,
-    agentStatusByAgentRef, displayAgentsRef,
+    displayAgentsRef,
     displayAgents, activeAgent, activeMessages,
     applyAgentRuntimeState, refreshRuntimeState, cycleModel, cycleThinking,
     editMessage, refreshSessions, refreshProjectSessions,
@@ -768,12 +769,6 @@ export function App() {
     Record<string, { messages: Array<{ role: string; content: string }>; fullContext: boolean; selectedIndices: number[] }>
   >({});
 
-  /** 每个 agent 最后一次会话的开始时间(status 变为 running 时记录),用 ref 避免 effect 闭包陈旧 */
-  const sessionStartByAgentRef = useRef<Record<string, number>>({});
-  /** 每个 agent 最后一次会话的总时长(ms),仅在会话结束后更新 */
-  const [sessionDurationByAgent, setSessionDurationByAgent] = useState<
-    Record<string, number>
-  >({});
   // 会话区不再维护独立的“修改文件摘要”卡片；diff 入口贴在 edit/write 工具调用处，
   // 避免会话输入框上方摘要与 Git 工作区状态/历史会话恢复互相干扰。
   const [search, setSearch] = useState("");
@@ -813,6 +808,8 @@ export function App() {
     y: number;
     agent: AgentTab;
   } | null>(null);
+  /** 右键菜单里 RPC 日志开关的当前值（rpcLog 切片；开关菜单时才订阅该条目）。 */
+  const menuAgentRpcLogging = useWorkspaceSlice(agentMenu?.agent.id, "rpcLog")?.enabled ?? false;
   const [sessionMenu, setSessionMenu] = useState<{
     x: number;
     y: number;
@@ -1338,11 +1335,6 @@ export function App() {
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(false);
   const [_debugOpen, _setDebugOpen] = useState(false);
-  /** 每个 agent 是否开启 RPC 日志记录（右键菜单开关） */
-  const [agentRpcLogging, setAgentRpcLogging] = useState<Map<string, boolean>>(new Map());
-  /** 同步 ref，供 onRpcLog 订阅回调读取最新开关，避免闭包拿到旧 Map。 */
-  const agentRpcLoggingRef = useRef<Map<string, boolean>>(new Map());
-  agentRpcLoggingRef.current = agentRpcLogging;
   /** 是否自动滚动到最新消息 */
   const [autoScroll, setAutoScroll] = useState(true);
   /** 用 ref 同步 autoScroll，供 ResizeObserver 回调读取最新值，避免响应式时序间隙导致滚动抢跑。 */
@@ -2630,7 +2622,8 @@ export function App() {
     const RPC_CONSOLE_WINDOW_LIMIT = 40;
     const RPC_CONSOLE_PER_AGENT_LIMIT = 12;
     const offRpcLog = api.agents.onRpcLog((payload) => {
-      const loggingOn = agentRpcLoggingRef.current.get(payload.agentId) === true;
+      // 开关来自 rpcLog 切片：直接读 store 最新值，无需镜像 ref 跟随闭包
+      const loggingOn = sessionWorkspaceStore.getSlice(payload.agentId, "rpcLog")?.enabled === true;
       if (!loggingOn) return;
 
       const now = Date.now();
@@ -3279,31 +3272,6 @@ export function App() {
     return () => document.removeEventListener("mousedown", handler);
   }, [sessionActionsOpen]);
 
-
-  useEffect(() => {
-    for (const agent of displayAgents) {
-      if (agent.id !== activeAgentId) continue;
-      const previousStatus = agentStatusByAgentRef.current[agent.id];
-      if (isAgentExactlyRunning(agent)) {
-        if (previousStatus !== "running") {
-          sessionStartByAgentRef.current[agent.id] = Date.now();
-        }
-      } else if (isAgentIdle(agent)) {
-        const start = sessionStartByAgentRef.current[agent.id];
-        if (start) {
-          setSessionDurationByAgent((d) => ({
-            ...d,
-            [agent.id]: Date.now() - start,
-          }));
-        }
-      }
-      agentStatusByAgentRef.current[agent.id] = agent.status;
-    }
-    // 函数体只读 displayAgents + activeAgentId 的状态记账；messagesByAgent 每次
-    // 流式 delta 都是新引用，列入依赖会让该 effect 每条 delta 空跑 O(agents) 遍历。
-  }, [displayAgents, activeAgentId]);
-
-  /** 侧栏 π logo 业务反馈：新建/历史会话启动/关闭 agent 时重播拼装动画。 */
   const triggerBrandLogoReplay = useCallback(() => {
     setBrandLogoReplayToken((token) => token + 1);
   }, []);
@@ -6758,11 +6726,7 @@ export function App() {
                             event.preventDefault();
                             if (subagentAgent) {
                               const logging = await window.piDesktop.rpcLogs.getLogging(subagentAgent.id);
-                              setAgentRpcLogging((prev) => {
-                                const next = new Map(prev);
-                                next.set(subagentAgent.id, logging);
-                                return next;
-                              });
+                              dispatchWorkspaceToAgent(subagentAgent.id, rpcLogActions.set(logging));
                               setAgentMenu({
                                 x: event.clientX,
                                 y: event.clientY,
@@ -6906,11 +6870,7 @@ export function App() {
                             event.preventDefault();
                             // 菜单打开时查询 RPC 日志记录状态
                             const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
-                            setAgentRpcLogging((prev) => {
-                              const next = new Map(prev);
-                              next.set(agent.id, logging);
-                              return next;
-                            });
+                            dispatchWorkspaceToAgent(agent.id, rpcLogActions.set(logging));
                             setAgentMenu({
                               x: event.clientX,
                               y: event.clientY,
@@ -7229,7 +7189,7 @@ export function App() {
                                   onContextMenu={async (event) => {
                                     event.preventDefault();
                                     const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
-                                    setAgentRpcLogging((prev) => { const next = new Map(prev); next.set(agent.id, logging); return next; });
+                                    dispatchWorkspaceToAgent(agent.id, rpcLogActions.set(logging));
                                     setAgentMenu({ x: event.clientX, y: event.clientY, agent });
                                   }}
                                   onClick={() => { setActiveProjectId(agent.projectId); setActiveAgentId(agent.id); ensureAgentMessagesLoaded(agent.id); }}
@@ -7444,14 +7404,7 @@ export function App() {
                   {activeAgent.id.slice(0, 8)}
                 </span>
               )} */}
-              <SessionStatus
-                state={activeRuntimeState}
-                duration={
-                  activeAgentId
-                    ? sessionDurationByAgent[activeAgentId]
-                    : undefined
-                }
-              />
+              <SessionStatus state={activeRuntimeState} />
               <div className="header-actions-right">
                 <div className="header-action-group session-group">
                   <div className="session-combo" ref={sessionComboRef}>
@@ -9206,13 +9159,9 @@ export function App() {
           }}
           onToggleRpcLogging={() => {
             const id = agentMenu.agent.id;
-            const current = agentRpcLogging.get(id) ?? false;
+            const current = sessionWorkspaceStore.getSlice(id, "rpcLog")?.enabled ?? false;
             void window.piDesktop.rpcLogs.setLogging(id, !current).then((enabled) => {
-              setAgentRpcLogging((prev) => {
-                const next = new Map(prev);
-                next.set(id, enabled);
-                return next;
-              });
+              dispatchWorkspaceToAgent(id, rpcLogActions.set(enabled));
               // 开启后在 console 提示一次，方便用户知道 F12 可直接看摘要。
               if (enabled) {
                 console.info(
@@ -9224,7 +9173,7 @@ export function App() {
             });
             setAgentMenu(null);
           }}
-          isRpcLogging={agentRpcLogging.get(agentMenu.agent.id) ?? false}
+          isRpcLogging={menuAgentRpcLogging}
           onOpenLogFile={() => {
             void window.piDesktop.rpcLogs.openFile(agentMenu.agent.id);
             setAgentMenu(null);

@@ -283,4 +283,21 @@ describe("session workspace core", () => {
     expect(store.getSlice(sessionA, "composer")).toMatchObject({ mode: "normal", busyDraft: false });
     expect(store.getSlice(sessionA, "thinking")).toMatchObject({ text: "" });
   });
+
+  it("closing a tab disposes its slice state with the entry (no App-side prune needed)", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.dispatchTo(sessionA, composerActions.setBusyDraft(true));
+    store.dispatchTo(sessionA, thinkingActions.update("streaming", 1_000));
+    expect(store.getSlice(sessionA, "thinking")?.text).toBe("streaming");
+
+    store.leave(sessionA);
+    expect(store.getSlice(sessionA, "thinking")).toBeUndefined();
+    expect(store.getSlice(sessionA, "composer")).toBeUndefined();
+
+    // 重新打开同一会话：切片状态必须从零开始，不能继承上一轮的值
+    store.joinTab(sessionA);
+    expect(store.getSlice(sessionA, "thinking")).toMatchObject({ text: "" });
+    expect(store.getSlice(sessionA, "composer")).toMatchObject({ busyDraft: false });
+  });
 });
