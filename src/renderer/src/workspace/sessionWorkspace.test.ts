@@ -6,6 +6,7 @@ import {
   type WorkspaceFocus,
 } from "./sessionWorkspace";
 import { composerActions } from "./slices/composerSlice";
+import { thinkingActions } from "./slices/thinkingSlice";
 
 describe("session workspace core", () => {
   const sessionA = "C:\\work\\project-a";
@@ -19,7 +20,8 @@ describe("session workspace core", () => {
     expect(snapshot.entries.has(sessionA)).toBe(true);
     const entry = snapshot.entries.get(sessionA)!;
     expect(entry.kind).toBe("tab");
-    expect(entry.data.composer).toEqual({ mode: "normal", busyDraft: false });
+    // 快照只带结构；切片状态一律经 getSlice 读取
+    expect(store.getSlice(sessionA, "composer")).toEqual({ mode: "normal", busyDraft: false });
   });
 
   it("rejoining the same key is a no-op that never resets state", () => {
@@ -28,7 +30,7 @@ describe("session workspace core", () => {
     store.dispatchTo(sessionA, composerActions.setMode("plan"));
 
     expect(store.joinTab(sessionA)).toBe(false);
-    expect(store.getSnapshot().entries.get(sessionA)!.data.composer.mode).toBe("plan");
+    expect(store.getSlice(sessionA, "composer")?.mode).toBe("plan");
   });
 
   it("entries are isolated per key", () => {
@@ -38,9 +40,9 @@ describe("session workspace core", () => {
     store.dispatchTo(sessionA, composerActions.setMode("plan"));
     store.dispatchTo(sessionA, composerActions.setBusyDraft(true));
 
-    const b = store.getSnapshot().entries.get(sessionB)!.data.composer;
+    const b = store.getSlice(sessionB, "composer");
     expect(b).toEqual({ mode: "normal", busyDraft: false });
-    const a = store.getSnapshot().entries.get(sessionA)!.data.composer;
+    const a = store.getSlice(sessionA, "composer");
     expect(a).toEqual({ mode: "plan", busyDraft: true });
   });
 
@@ -54,7 +56,7 @@ describe("session workspace core", () => {
     expect(store.has(sessionA)).toBe(false);
 
     store.joinTab(sessionA);
-    expect(store.getSnapshot().entries.get(sessionA)!.data.composer.mode).toBe("normal");
+    expect(store.getSlice(sessionA, "composer")?.mode).toBe("normal");
   });
 
   it("dispatch to an unknown key returns false and never throws", () => {
@@ -98,7 +100,7 @@ describe("session workspace core", () => {
     // 聚焦 project 后 dispatchActive 作用于 project 条目
     expect(store.dispatchActive(composerActions.setMode("plan"))).toBe(true);
     expect(
-      store.getSnapshot().entries.get(projectKey(projectId))!.data.composer.mode,
+      store.getSlice(projectKey(projectId), "composer")?.mode,
     ).toBe("plan");
   });
 
@@ -116,18 +118,22 @@ describe("session workspace core", () => {
     expect(before.revision).toBe(store.getSnapshot().revision);
   });
 
-  it("real change notifies once, bumps revision, and swaps snapshot identity", () => {
+  it("real slice change wakes its slice subscriber without touching the structural snapshot", () => {
     const store = createSessionWorkspaceStore();
     store.joinTab(sessionA);
     store.activate(sessionA);
-    const listener = vi.fn();
-    store.subscribe(listener);
+    const structural = vi.fn();
+    const composer = vi.fn();
+    store.subscribe(structural);
+    store.subscribeSlice(sessionA, "composer", composer);
 
     const before = store.getSnapshot();
     expect(store.dispatchActive(composerActions.setBusyDraft(true))).toBe(true);
-    expect(listener).toHaveBeenCalledTimes(1);
-    expect(store.getSnapshot()).not.toBe(before);
-    expect(store.getSnapshot().revision).toBe(before.revision + 1);
+    expect(composer).toHaveBeenCalledTimes(1);
+    // 切片变化不动结构：快照引用与 revision 都不变，结构订阅者不醒
+    expect(structural).not.toHaveBeenCalled();
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.getSlice(sessionA, "composer")?.busyDraft).toBe(true);
   });
 
   it("unsubscribe stops notifications", () => {
@@ -135,11 +141,16 @@ describe("session workspace core", () => {
     store.joinTab(sessionA);
     store.activate(sessionA);
     const listener = vi.fn();
-    const unsubscribe = store.subscribe(listener);
+    const unsubscribe = store.subscribeSlice(sessionA, "composer", listener);
 
     unsubscribe();
     store.dispatchActive(composerActions.setBusyDraft(true));
     expect(listener).not.toHaveBeenCalled();
+
+    // 取消后再订阅仍然生效（空桶被清理，不残留脏状态）
+    store.subscribeSlice(sessionA, "composer", listener);
+    store.dispatchActive(composerActions.setBusyDraft(false));
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("dispatchTo updates a background entry without touching the focus", () => {
@@ -150,9 +161,9 @@ describe("session workspace core", () => {
 
     store.dispatchTo(sessionB, composerActions.setBusyDraft(true));
     expect(store.getSnapshot().focus).toEqual({ kind: "tab", sessionKey: sessionA });
-    expect(store.getSnapshot().entries.get(sessionB)!.data.composer.busyDraft).toBe(true);
+    expect(store.getSlice(sessionB, "composer")?.busyDraft).toBe(true);
     // 焦点条目不受影响
-    expect(store.getSnapshot().entries.get(sessionA)!.data.composer.busyDraft).toBe(false);
+    expect(store.getSlice(sessionA, "composer")?.busyDraft).toBe(false);
   });
 
   it("snapshot reference is stable between mutations", () => {
@@ -174,5 +185,102 @@ describe("session workspace core", () => {
   it("focusKey resolves both focus kinds to entry keys", () => {
     expect(focusKey({ kind: "tab", sessionKey: sessionA })).toBe(sessionA);
     expect(focusKey({ kind: "project", projectId: "p" })).toBe(projectKey("p"));
+  });
+
+  // ── 订阅粒度：结构 vs 切片 ─────────────────────────────
+
+  it("slice dispatch wakes only that slice's subscriber, never structural subscribers", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    const structural = vi.fn();
+    const composer = vi.fn();
+    const thinking = vi.fn();
+    store.subscribe(structural);
+    store.subscribeSlice(sessionA, "composer", composer);
+    store.subscribeSlice(sessionA, "thinking", thinking);
+
+    store.dispatchTo(sessionA, composerActions.setMode("plan"));
+
+    expect(composer).toHaveBeenCalledTimes(1);
+    expect(thinking).not.toHaveBeenCalled();
+    // 热路径不得唤醒根组件：结构订阅与快照引用都不动
+    expect(structural).not.toHaveBeenCalled();
+  });
+
+  it("a hot slice update keeps the snapshot reference stable (root does not re-render)", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.activate(sessionA);
+    const snapshotBefore = store.getSnapshot();
+
+    for (let i = 0; i < 50; i += 1) {
+      store.dispatchTo(sessionA, thinkingActions.update(`t${i}`, i));
+    }
+
+    expect(store.getSnapshot()).toBe(snapshotBefore);
+    expect(store.getSlice(sessionA, "thinking")?.text).toBe("t49");
+  });
+
+  it("slice subscribers are isolated per key", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.joinTab(sessionB);
+    const a = vi.fn();
+    const b = vi.fn();
+    store.subscribeSlice(sessionA, "thinking", a);
+    store.subscribeSlice(sessionB, "thinking", b);
+
+    store.dispatchTo(sessionA, thinkingActions.update("only-a", 1));
+
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).not.toHaveBeenCalled();
+    expect(store.getSlice(sessionB, "thinking")?.text).toBe("");
+  });
+
+  it("leaving an entry wakes its slice subscribers so they can fall back to defaults", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    const thinking = vi.fn();
+    store.subscribeSlice(sessionA, "thinking", thinking);
+
+    store.leave(sessionA);
+
+    expect(thinking).toHaveBeenCalledTimes(1);
+    expect(store.getSlice(sessionA, "thinking")).toBeUndefined();
+  });
+
+  it("structural changes (join / focus / leave) wake structural subscribers", () => {
+    const store = createSessionWorkspaceStore();
+    const structural = vi.fn();
+    store.subscribe(structural);
+
+    store.joinTab(sessionA);
+    store.activate(sessionA);
+    store.leave(sessionA);
+
+    expect(structural).toHaveBeenCalledTimes(3);
+  });
+
+  it("unsubscribing a slice listener stops notifications and drops the empty bucket", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    const thinking = vi.fn();
+    const unsubscribe = store.subscribeSlice(sessionA, "thinking", thinking);
+
+    unsubscribe();
+    store.dispatchTo(sessionA, thinkingActions.update("after", 1));
+
+    expect(thinking).not.toHaveBeenCalled();
+    // 取消订阅后再次订阅仍然生效（桶被清理过，不能残留脏状态）
+    store.subscribeSlice(sessionA, "thinking", thinking);
+    store.dispatchTo(sessionA, thinkingActions.update("again", 2));
+    expect(thinking).toHaveBeenCalledTimes(1);
+  });
+
+  it("getSlice returns the seeded defaults for a fresh entry", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    expect(store.getSlice(sessionA, "composer")).toMatchObject({ mode: "normal", busyDraft: false });
+    expect(store.getSlice(sessionA, "thinking")).toMatchObject({ text: "" });
   });
 });

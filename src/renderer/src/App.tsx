@@ -131,6 +131,7 @@ import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
 import { reconcileAgentState } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
+import { useWorkspaceSlice } from "./workspace/hooks";
 import { composerActions } from "./workspace/slices/composerSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
 import type { WorkspaceAction } from "./workspace/sessionWorkspace";
@@ -606,22 +607,17 @@ export function App() {
     promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
     migratePerAgentState, commitPendingToReal,
   } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
-  // ── 会话工作区（切片 1）：busyDraft / composer 模式迁入 workspace store ─────
+  // ── 会话工作区：结构订阅在根，切片订阅在真正渲染它的组件 ─────────────────
   // 条目成员关系 = 存活 agent tab（agents ∪ pendingAgents），键 = agentId。
-  // busyDraft 与模式随 tab 生灭重置，与迁移前按 agentId 键控的 map 语义逐点等价。
+  // store.subscribe 只报结构变化（焦点/成员），因此根组件不会被 20Hz 流式切片唤醒；
+  // busyDraft / composer 模式经按 (key, slice) 订阅读取，thinking 由消息列表自己订阅。
   const workspaceSnapshot = useSyncExternalStore(
     sessionWorkspaceStore.subscribe,
     sessionWorkspaceStore.getSnapshot,
   );
-  const activeWorkspaceEntry = activeAgentId
-    ? workspaceSnapshot.entries.get(activeAgentId)
-    : undefined;
-  const activeWorkspaceComposer = activeWorkspaceEntry?.data.composer;
+  const activeWorkspaceComposer = useWorkspaceSlice(activeAgentId, "composer");
   const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
   const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
-  /** 当前活跃 agent 的实时思考文本与起点（切片 2a：per-entry，镜像 ref 已删除）。 */
-  const activeThinking = activeWorkspaceEntry?.data.thinking.text ?? "";
-  const activeThinkingStartedAt = activeWorkspaceEntry?.data.thinking.startedAt;
   /** 对活体 tab 条目 dispatch；条目缺失时先 join 自愈，避免成员同步的时序窗口。 */
   const dispatchWorkspaceToAgent = (agentId: string, action: WorkspaceAction) => {
     if (!sessionWorkspaceStore.has(agentId)) sessionWorkspaceStore.joinTab(agentId);
@@ -5281,7 +5277,9 @@ export function App() {
    *  用 useMemo 保证只有任一输入真正变化时才重建引用——流式期间 App 每次重渲染
    *  （~50ms delta + 侧栏等无关状态变化）不能让对象每帧新建，否则 memo 失效整树重渲染。
    *  聚合与内容比较器同处 streamStateSelector 模块（buildStreamState /
-   *  areStreamStatesEqual），字段形状与比较逻辑不跨文件漂移。 */
+   *  areStreamStatesEqual），字段形状与比较逻辑不跨文件漂移。
+   *  注意：thinking 文本不在此处——它由 MessageListContent 自己订阅 thinking 切片，
+   *  否则 20Hz 思考更新会经这里把整个 App 根组件一起唤醒。 */
   const streamState = useMemo(
     () =>
       buildStreamState({
@@ -5290,8 +5288,6 @@ export function App() {
         statusRunning: isAgentExactlyRunning(activeAgent),
         isAwaitingAssistant,
         showThinking: settings.showThinking,
-        activeThinking,
-        thinkingStartedAt: activeThinkingStartedAt,
         isExecutingTool: activeRuntimeState?.isExecutingTool,
         isStreaming: activeRuntimeState?.isStreaming,
         cancellingUi,
@@ -5303,9 +5299,7 @@ export function App() {
       activeAgent?.status,
       isAwaitingAssistant,
       settings.showThinking,
-      activeThinking,
       activeAgentId,
-      activeThinkingStartedAt,
       activeRuntimeState?.isExecutingTool,
       activeRuntimeState?.isStreaming,
       cancellingUi,
