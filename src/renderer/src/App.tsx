@@ -5254,15 +5254,22 @@ export function App() {
   async function sendPromptAsFollowUp() {
     const targetAgentId = activeAgentId;
     const livePrompt = getLivePrompt(targetAgentId ?? "");
-    if (
-      agentStarting ||
-      !targetAgentId ||
-      (!livePrompt.trim() && attachedImages.length === 0)
-    )
-      return;
+    // 跟随发送同样走判定表：无 override 概念（isOverride=false），不做命令展开
+    //（commandRoutes=false，原样走 busy/直发）。
+    const followUpDecision = decideComposerSubmit({
+      isOverride: false,
+      agentStarting,
+      hasTarget: Boolean(targetAgentId),
+      message: livePrompt,
+      imageCount: attachedImages.length,
+      isBusy: isAgentBusy,
+      commandRoutes: false,
+    });
+    if (followUpDecision.action === "ignore") return;
+    const followUpAgentId = targetAgentId as string; // ignore 已排除无 target
     const message = livePrompt;
     // 在任何 await 之前清掉实时草稿，防止双击/Enter 连发读取同一份消息。
-    stageLivePrompt(targetAgentId);
+    stageLivePrompt(followUpAgentId);
     const images = attachedImages.length > 0 ? attachedImages : undefined;
     setAutoScroll(true);
     autoScrollRef.current = true;
@@ -5273,7 +5280,7 @@ export function App() {
     setAttachedImages([]);
     // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
     if (message.trim() && !message.startsWith("!")) {
-      const key = historyKeyForAgentId(targetAgentId);
+      const key = historyKeyForAgentId(followUpAgentId);
       setPromptHistory((current) => {
         const prev = current[key] ?? [];
         const filtered = prev.filter(cmd => cmd !== message.trim());
@@ -5287,7 +5294,7 @@ export function App() {
     setHistoryIndex(-1);
     setHistoryNavigating(false);
     setSavedPrompt("");
-    if (targetAgentId) clearBusyDraftForAgent(targetAgentId);
+    if (followUpAgentId) clearBusyDraftForAgent(followUpAgentId);
     setSuggestionsOpen(false);
     setSendBehaviorMenuOpen(false);
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
@@ -5302,13 +5309,14 @@ export function App() {
       agentMode: currentComposerAgentMode,
       timestamp: Date.now(),
     };
-    if (isAgentBusy) {
-      if (!enqueueQueuedPrompt(targetAgentId, queuedPromptSnapshot)) {
-        setLivePrompt(targetAgentId, (current) =>
+    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
+    if (followUpDecision.action === "enqueue") {
+      if (!enqueueQueuedPrompt(followUpAgentId, queuedPromptSnapshot)) {
+        setLivePrompt(followUpAgentId, (current) =>
           [message, current].filter((text) => text.trim()).join("\n\n"),
         );
         if (images) {
-          setAttachedImagesForAgent(targetAgentId, (current) => [...images, ...current]);
+          setAttachedImagesForAgent(followUpAgentId, (current) => [...images, ...current]);
         }
         showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
       }
@@ -5316,23 +5324,23 @@ export function App() {
     }
 
     const accepted = await submitPromptSnapshot(
-      targetAgentId,
+      followUpAgentId,
       message,
       images,
       "followUp",
       currentComposerAgentMode,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(targetAgentId, queuedPromptSnapshot);
+      appendUnknownQueuedPrompt(followUpAgentId, queuedPromptSnapshot);
       return;
     }
     if (!accepted) {
-      stageLivePrompt(targetAgentId, message);
-      setLivePrompt(targetAgentId, (current) =>
+      stageLivePrompt(followUpAgentId, message);
+      setLivePrompt(followUpAgentId, (current) =>
         [message, current].filter((text) => text.trim()).join("\n\n"),
       );
       if (images) {
-        setAttachedImagesForAgent(targetAgentId, (current) => [...images, ...current]);
+        setAttachedImagesForAgent(followUpAgentId, (current) => [...images, ...current]);
       }
       return;
     }
