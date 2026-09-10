@@ -300,4 +300,65 @@ describe("session workspace core", () => {
     expect(store.getSlice(sessionA, "thinking")).toMatchObject({ text: "" });
     expect(store.getSlice(sessionA, "composer")).toMatchObject({ busyDraft: false });
   });
+
+  it("dispatchActive with no focus returns false and wakes nothing", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    const structural = vi.fn();
+    const composer = vi.fn();
+    store.subscribe(structural);
+    store.subscribeSlice(sessionA, "composer", composer);
+
+    expect(store.dispatchActive(composerActions.setMode("plan"))).toBe(false);
+    expect(structural).not.toHaveBeenCalled();
+    expect(composer).not.toHaveBeenCalled();
+    expect(store.getSlice(sessionA, "composer")?.mode).toBe("normal");
+  });
+
+  it("dispatchTo a removed entry returns false; rejoin starts from seed", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.dispatchTo(sessionA, composerActions.setMode("plan"));
+    store.leave(sessionA);
+
+    expect(store.dispatchTo(sessionA, composerActions.setMode("plan"))).toBe(false);
+    expect(store.joinTab(sessionA)).toBe(true);
+    expect(store.getSlice(sessionA, "composer")?.mode).toBe("normal");
+  });
+
+  it("leave on an unknown key returns false and wakes nobody", () => {
+    const store = createSessionWorkspaceStore();
+    const structural = vi.fn();
+    store.subscribe(structural);
+    expect(store.leave("missing")).toBe(false);
+    expect(structural).not.toHaveBeenCalled();
+  });
+
+  it("focusProject on a joined-but-not-focused project still reports focus", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinProject("proj-1");
+    expect(store.focusProject("proj-1")).toBe(true);
+    // 同一 project 再次 focus：幂等，不重复唤醒结构订阅者
+    const structural = vi.fn();
+    store.subscribe(structural);
+    expect(store.focusProject("proj-1")).toBe(true);
+    expect(structural).not.toHaveBeenCalled();
+  });
+
+  it("clearFocus with no focus is a no-op", () => {
+    const store = createSessionWorkspaceStore();
+    const structural = vi.fn();
+    store.subscribe(structural);
+    store.clearFocus();
+    expect(structural).not.toHaveBeenCalled();
+  });
+
+  it("project entries seed slices like tab entries", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinProject("proj-1");
+    expect(store.getSlice(projectKey("proj-1"), "composer")).toMatchObject({
+      mode: "normal",
+    });
+    expect(store.getSlice(projectKey("proj-1"), "thinking")).toMatchObject({ text: "" });
+  });
 });
