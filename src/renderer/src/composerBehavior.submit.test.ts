@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	decideComposerSubmit,
+	expandPromptTemplates,
 	parseCompactCommand,
 } from "./composerBehavior";
 
@@ -91,5 +92,35 @@ describe("decideComposerSubmit", () => {
 				commandRoutes: false,
 			}),
 		).toEqual({ action: "enqueue" });
+	});
+});
+
+describe("expandPromptTemplates empty body", () => {
+	it("正文为空的模板保留原样并上报 emptyTemplateName", () => {
+		const templates = [
+			{ name: "emptyTpl", path: "/t/emptyTpl.md", description: "", content: "---\ndescription: x\n---\n" },
+			{ name: "full", path: "/t/full.md", description: "", content: "do things" },
+		];
+		const res = expandPromptTemplates("/emptyTpl", templates);
+		expect(res.emptyTemplateName).toBe("emptyTpl");
+		expect(res.message).toContain("/emptyTpl");
+	});
+
+	it("空模板 + busy 仍走 block-empty-template（不入队）", () => {
+		const templates = [
+			{ name: "emptyTpl", path: "/t/emptyTpl.md", description: "", content: "---\ndescription: x\n---\n" },
+		];
+		const res = expandPromptTemplates("/emptyTpl", templates);
+		expect(
+			decideComposerSubmit({
+				isOverride: false,
+				agentStarting: false,
+				hasTarget: true,
+				message: "/emptyTpl",
+				imageCount: 0,
+				emptyTemplateName: res.emptyTemplateName,
+				isBusy: true,
+			}),
+		).toEqual({ action: "block-empty-template", templateName: "emptyTpl" });
 	});
 });

@@ -77,6 +77,7 @@ import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/AppParts";
 import {
   buildComposerPromptSubmission,
+  decideComposerSubmit,
   expandPromptTemplates,
   getComposerEnterIntent,
   getComposerHistoryLineBounds,
@@ -5107,38 +5108,52 @@ export function App() {
     const livePrompt = override?.message ?? getLivePrompt(targetAgentId ?? "");
     const attachedImagesSnapshot = override?.images ?? attachedImages;
     const agentMode = override?.agentMode ?? currentComposerAgentMode;
-    if (
-      (!override && agentStarting) ||
-      !targetAgentId ||
-      (!livePrompt.trim() && attachedImagesSnapshot.length === 0)
-    )
-      return;
+    // 发送判定表（composerBehavior.decideComposerSubmit）：只定路线、不做副作用。
+    // expand 是纯函数，提前到副作用之前，以便一次判定覆盖 compact/空模板/busy 全部分支。
     const message = livePrompt;
-    if (!override) stageLivePrompt(targetAgentId);
+    const { message: expandedMessage, description: templateDescription, emptyTemplateName } =
+      expandPromptTemplates(message, promptTemplateList);
+    const decision = decideComposerSubmit({
+      isOverride: Boolean(override),
+      agentStarting,
+      hasTarget: Boolean(targetAgentId),
+      message: livePrompt,
+      imageCount: attachedImagesSnapshot.length,
+      emptyTemplateName,
+      isBusy: isAgentBusy,
+    });
+    if (decision.action === "ignore") return;
+    const agentId = targetAgentId as string; // ignore 已排除无 target，后续分支必有值
+    if (!override) stageLivePrompt(agentId);
     const images = attachedImagesSnapshot.length > 0 ? attachedImagesSnapshot : undefined;
-
-    const trimmedMessage = message.trim();
-
-    // 已删除内置 /goal 拦截，命令直接发给 agent。
 
     // ── /compact 命令处理 ──
     // 与底栏“压缩”按钮同一实现：走 agents.compact RPC，而不是把 /compact 当普通 prompt 发给模型。
-    if (/^\/compact(?:\s|$)/i.test(trimmedMessage)) {
-      const compactPrompt = trimmedMessage.replace(/^\/compact\s*/i, "").trim();
-      setLivePrompt(targetAgentId, "");
-      setAttachedImagesForAgent(targetAgentId, []);
+    // compact 绕过队列（判定表保证忙也走压缩），且不写历史记录。
+    if (decision.action === "compact") {
+      const compactPrompt = decision.compactPrompt;
+      setLivePrompt(agentId, "");
+      setAttachedImagesForAgent(agentId, []);
       setSuggestionsOpen(false);
       // 清空 contentEditable 显示（仅清 ref 时 DOM 可能残留 /compact 文本）
       if (composerTextareaRef.current) {
         composerTextareaRef.current.textContent = "";
       }
-      await compactAgent(compactPrompt || undefined, targetAgentId);
+      await compactAgent(compactPrompt || undefined, agentId);
+      return;
+    }
+    // 模板正文为空（UI 新建模板只写 frontmatter）时不发送：展开会产出空白消息，
+    // 被主进程拒为"消息不能为空"；这里拦截并明确提示补正文，便于定位编辑。
+    // 位置注意：拦在写历史/清输入之前——"/emptyTpl" 不是一条真实发送，
+    // 不应进历史、更不应吞掉用户输入（旧代码先清框才拦，输入被吞）。
+    if (decision.action === "block-empty-template") {
+      showToast(t("app.promptTemplateEmptyBody", { name: decision.templateName }), 4000);
       return;
     }
 
     // 保存到当前 Agent 的历史记录（按会话路径键持久化到 localStorage，重启后可恢复）
     if (message.trim() && !message.startsWith("!")) {
-      const key = historyKeyForAgentId(targetAgentId);
+      const key = historyKeyForAgentId(agentId);
       setPromptHistory((current) => {
         const prev = current[key] ?? [];
         const filtered = prev.filter(cmd => cmd !== message.trim());
@@ -5161,12 +5176,12 @@ export function App() {
     autoScrollRef.current = true;
     // Viewer 首条是独立快照，不消费恢复期间新写入真实 Agent 的第二条草稿。
     if (!override) {
-      setLivePrompt(targetAgentId, "");
-      setAttachedImagesForAgent(targetAgentId, []);
+      setLivePrompt(agentId, "");
+      setAttachedImagesForAgent(agentId, []);
       // 发送清空：上一轮的 dismissed 抑制随文本一起作废，新输入从头开始。
       suggestionsDismissedRef.current = false;
     }
-    if (targetAgentId) clearBusyDraftForAgent(targetAgentId);
+    if (agentId) clearBusyDraftForAgent(agentId);
     setSuggestionsOpen(false);
     setSendBehaviorMenuOpen(false);
     // 发送后强制重置自动高度：避免粘贴多行内容后 scrollHeight 残留导致 composer 无法恢复默认高度。
@@ -5174,19 +5189,6 @@ export function App() {
     // 发送后固定 composer 高度，不再自动适配内容高度
     // 让输入框保持固定大小，超出部分滚动显示
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
-
-
-    // 在发送前本地展开 prompt template 命令（/name → 完整内容），
-    // 避免依赖 pi 的展开导致用户附加文本丢失以及特殊符号干扰
-    // 同时提取模板的 description 作为元数据发给 pi agent，让其了解本次 prompt 意图
-    const { message: expandedMessage, description: templateDescription, emptyTemplateName } = expandPromptTemplates(message, promptTemplateList);
-
-    // 模板正文为空（UI 新建模板只写 frontmatter）时不发送：展开会产出空白消息，
-    // 被主进程拒为"消息不能为空"；这里拦截并明确提示补正文，便于定位编辑。
-    if (emptyTemplateName) {
-      showToast(t("app.promptTemplateEmptyBody", { name: emptyTemplateName }), 4000);
-      return;
-    }
 
     const queuedPromptSnapshot: QueuedPrompt = {
       id: crypto.randomUUID(),
@@ -5199,13 +5201,14 @@ export function App() {
       timestamp: Date.now(),
 
     };
-    if (isAgentBusy) {
-      if (!enqueueQueuedPrompt(targetAgentId, queuedPromptSnapshot)) {
-        setLivePrompt(targetAgentId, (current) =>
+    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
+    if (decision.action === "enqueue") {
+      if (!enqueueQueuedPrompt(agentId, queuedPromptSnapshot)) {
+        setLivePrompt(agentId, (current) =>
           [message, current].filter((text) => text.trim()).join("\n\n"),
         );
         if (images) {
-          setAttachedImagesForAgent(targetAgentId, (current) => [...images, ...current]);
+          setAttachedImagesForAgent(agentId, (current) => [...images, ...current]);
         }
         showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
       }
@@ -5213,7 +5216,7 @@ export function App() {
     }
 
     const accepted = await submitPromptSnapshot(
-      targetAgentId,
+      agentId,
       expandedMessage,
       images,
       undefined,
@@ -5221,7 +5224,7 @@ export function App() {
       templateDescription,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(targetAgentId, {
+      appendUnknownQueuedPrompt(agentId, {
         ...queuedPromptSnapshot,
         behavior: "direct",
       });
@@ -5229,11 +5232,11 @@ export function App() {
     }
     if (!accepted) {
       // 首条失败时恢复到第二条草稿之前；不要预写 live ref，否则会重复拼接。
-      setLivePrompt(targetAgentId, (current) =>
+      setLivePrompt(agentId, (current) =>
         [message, current].filter((text) => text.trim()).join("\n\n"),
       );
       if (images) {
-        setAttachedImagesForAgent(targetAgentId, (current) => [...images, ...current]);
+        setAttachedImagesForAgent(agentId, (current) => [...images, ...current]);
       }
       return;
     }
