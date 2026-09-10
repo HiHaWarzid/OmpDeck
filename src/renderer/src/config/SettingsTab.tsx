@@ -149,6 +149,9 @@ export function SettingsTab(props: {
 
 	/**
 	 * 配置键名 → 显示标签。
+	 * 退役字段（C3 Q17a）：defaultProvider/defaultModel/defaultThinkingLevel 不再
+	 * 在此编辑——omp 不再读取前两者，defaultThinkingLevel 桌面端已改读 config.yml。
+	 * 旧文件残留这些键时渲染为只读行（展示现值，不可编辑、不写回）。
 	 * 已登记 i18n 的键走多语言；未登记回退原始 key，避免未知字段空白。
 	 */
 	const configLabel = (key: string): string => {
@@ -194,6 +197,11 @@ export function SettingsTab(props: {
 			default: return key;
 		}
 	};
+	const RETIRED_SETTINGS_KEYS = new Set([
+		"defaultProvider",
+		"defaultModel",
+		"defaultThinkingLevel",
+	]);
 
 	/** 全局会话目录：空值表示使用 pi 默认 ~/.omp/agent/sessions/<encoded-cwd>/ */
 	const sessionDirValue = typeof data.sessionDir === "string" ? data.sessionDir : "";
@@ -339,26 +347,36 @@ export function SettingsTab(props: {
 							key !== "compaction",
 					)
 					.map(([key, value]) => (
-					<div key={key} className="config-settings-row">
-						<span className="config-settings-key">{configLabel(key)}</span>
-						<SettingsValueInput
-							value={value}
-							fieldKey={key}
-							modelsData={props.modelsData}
-							authData={props.authData}
-							discoveredModels={props.discoveredModels}
-							allSettings={data}
-							onChange={(v) => props.onChange({ ...data, [key]: v })}
-						/>
-					</div>
-				))}
+						<div key={key} className="config-settings-row">
+							<span className="config-settings-key">{configLabel(key)}</span>
+							{RETIRED_SETTINGS_KEYS.has(key) ? (
+								<span
+									className="config-settings-value config-settings-value--retired"
+									title={t("config.settings.retiredField")}
+								>
+									{typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value ?? null)}
+									{" · "}
+									{t("config.settings.retiredField")}
+								</span>
+							) : (
+								<SettingsValueInput
+									value={value}
+									fieldKey={key}
+									modelsData={props.modelsData}
+									authData={props.authData}
+									discoveredModels={props.discoveredModels}
+									allSettings={data}
+									onChange={(v) => props.onChange({ ...data, [key]: v })}
+								/>
+							)}
+						</div>
+					))}
 				{!hasEnabledModels && (
 					<div className="config-settings-row config-settings-row--add">
 						<button
 							className="config-btn"
 							onClick={() => props.onChange({ ...data, enabledModels: [] })}
 						>
-							<Plus size={14} />
 							{t("config.settings.addEnabledModels")}
 						</button>
 					</div>

@@ -12,6 +12,7 @@ import type {
 	OpenCodeImportReport,
 	Project,
 } from "../../../../shared/types";
+import { getImportThreadProjection } from "../../agentListDisplay";
 
 function displayPath(path?: string) {
 	if (!path) return "";
@@ -33,26 +34,6 @@ function formatCodexStatus(status: CodexSessionSummary["status"]) {
 	return t("codex.status.new");
 }
 
-function groupCodexSessions(sessions: CodexSessionSummary[]) {
-	const parentById = new Map(sessions.map((session) => [session.id, session]));
-	const childrenByParent = new Map<string, CodexSessionSummary[]>();
-	const orphanSubagents: CodexSessionSummary[] = [];
-	const parents = sessions.filter((session) => session.threadSource !== "subagent");
-
-	for (const session of sessions) {
-		if (session.threadSource !== "subagent") continue;
-		const parentId = session.parentThreadId;
-		if (parentId && parentById.has(parentId)) {
-			const children = childrenByParent.get(parentId) ?? [];
-			children.push(session);
-			childrenByParent.set(parentId, children);
-		} else {
-			orphanSubagents.push(session);
-		}
-	}
-
-	return { parents, childrenByParent, orphanSubagents };
-}
 
 function codexSubagentLabel(session: CodexSessionSummary) {
 	const parts = [session.agentNickname, session.agentRole].filter(Boolean);
@@ -87,7 +68,7 @@ export function CodexImportModal(props: {
 	const [expandedSubagents, setExpandedSubagents] = useState<Set<string>>(() => new Set());
 	const [showOrphanSubagents, setShowOrphanSubagents] = useState(false);
 	const selected = new Set(props.selectedPaths);
-	const grouped = groupCodexSessions(props.sessions);
+	const grouped = getImportThreadProjection(props.sessions);
 	const selectableParents = grouped.parents;
 	const allSelected =
 		selectableParents.length > 0 &&

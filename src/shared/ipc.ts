@@ -70,6 +70,12 @@ export interface IpcOpEntry<Args extends unknown[] = unknown[], Packed = unknown
 	 * kind 仍描述通道协议，主进程照常注册。
 	 */
 	readonly override?: boolean;
+	/**
+	 * LAN-web 能力列（候选 6）：标记 WebServiceManager 的 /api/* REST 实接覆盖的
+	 * 成员。browserApi 以此列为唯一事实源生成 REST 适配；未标记成员在 LAN-web
+	 * 下必须显式抛"桌面端独占"错误，禁止静默回退到 preview 罐头/undefined。
+	 */
+	readonly web?: true;
 }
 
 /** skillHub.search 打包 payload：由 (query, page, pageSize, sortBy, order) 折叠为单对象。 */
@@ -122,7 +128,7 @@ export const ipcTable = {
 		openProject: { channel: "editors:open-project", kind: "invoke" },
 	},
 	projects: {
-		list: { channel: "projects:list", kind: "invoke" },
+		list: { channel: "projects:list", kind: "invoke", web: true },
 		add: { channel: "projects:add", kind: "invoke" },
 		remove: { channel: "projects:remove", kind: "invoke" },
 		reorder: { channel: "projects:reorder", kind: "invoke" },
@@ -165,7 +171,7 @@ export const ipcTable = {
 		getClipboardPaths: { channel: "clipboard:read-file-paths", kind: "sendSync", override: true },
 	},
 	sessions: {
-		list: { channel: "sessions:list", kind: "invoke" },
+		list: { channel: "sessions:list", kind: "invoke", web: true },
 		rename: { channel: "sessions:rename", kind: "invoke" },
 		copy: { channel: "sessions:copy", kind: "invoke" },
 		exportHtml: { channel: "sessions:export-html", kind: "invoke" },
@@ -388,13 +394,13 @@ export const ipcTable = {
 		},
 	},
 	agents: {
-		list: { channel: "agents:list", kind: "invoke" },
+		list: { channel: "agents:list", kind: "invoke", web: true },
 		getMessages: { channel: "agents:get-messages", kind: "invoke" },
-		create: { channel: "agents:create", kind: "invoke" },
+		create: { channel: "agents:create", kind: "invoke", web: true },
 		rename: { channel: "agents:rename", kind: "invoke" },
-		stop: { channel: "agents:stop", kind: "invoke" },
-		prompt: { channel: "agents:prompt", kind: "invoke" },
-		abort: { channel: "agents:abort", kind: "invoke" },
+		stop: { channel: "agents:stop", kind: "invoke", web: true },
+		prompt: { channel: "agents:prompt", kind: "invoke", web: true },
+		abort: { channel: "agents:abort", kind: "invoke", web: true },
 		exportHtml: { channel: "agents:export-html", kind: "invoke" },
 		getForkMessages: { channel: "agents:fork-messages", kind: "invoke" },
 		forkSession: { channel: "agents:fork-session", kind: "invoke" },
@@ -408,19 +414,18 @@ export const ipcTable = {
 		restart: { channel: "agents:restart", kind: "invoke" },
 		compact: { channel: "agents:compact", kind: "invoke" },
 		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），配对见 onRuntimeState
-		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state" },
-		cycleModel: { channel: "agents:cycle-model", kind: "invoke" },
-		availableModels: { channel: "agents:available-models", kind: "invoke" },
-		setModel: { channel: "agents:set-model", kind: "invoke" },
-		/** 刷新模型配置：通知运行中的 agent 重新加载 models.json，无需重启 */
-		refreshModels: { channel: "agents:refresh-models", kind: "invoke" },
-		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke" },
-		setThinking: { channel: "agents:set-thinking", kind: "invoke" },
+		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state", web: true },
+		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true },
+		availableModels: { channel: "agents:available-models", kind: "invoke", web: true },
+		setModel: { channel: "agents:set-model", kind: "invoke", web: true },
+		refreshModels: { channel: "agents:refresh-models", kind: "invoke", web: true },
+		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
+		setThinking: { channel: "agents:set-thinking", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
-		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager" },
-		/** 桌面宠物点击跳转：主进程通知主窗切换到活跃 Agent tab */
+		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager", web: true },
+		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
 		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe", pushFrom: "pet-index" },
-		onMessages: { channel: "agents:message", kind: "subscribe", pushFrom: "agent-manager" },
+		onMessages: { channel: "agents:message", kind: "subscribe", pushFrom: "agent-manager", web: true },
 		onLog: { channel: "agents:log", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 流式思考内容更新，agent 忙碌时实时推送当前思考文本 */
 		onThinking: { channel: "agents:thinking", kind: "subscribe", pushFrom: "agent-manager" },
@@ -428,7 +433,6 @@ export const ipcTable = {
 		onNotice: { channel: "agents:notice", kind: "subscribe", pushFrom: "agent-manager" },
 		/** RPC 日志，用于调试 */
 		onRpcLog: { channel: "agents:rpc-log", kind: "subscribe", pushFrom: "agent-manager" },
-		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
 		/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
 		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-manager" },
 		/** 渲染进程 → 主进程，传递用户在 UI 请求中的响应（选中的选项、输入的文本等） */

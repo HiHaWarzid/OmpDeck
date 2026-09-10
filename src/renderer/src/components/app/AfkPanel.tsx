@@ -103,7 +103,6 @@ function formatDuration(ms: number): string {
 	if (m > 0) return `${m}m ${s}s`;
 	return `${s}s`;
 }
-
 /** 订阅事件推送的单任务更新：按 ticketRef 覆盖/插入（不整体替换，避免列表闪烁） */
 function upsertTask(state: AfkState, task: AfkTask): AfkState {
 	const exists = state.tasks.some((item) => item.ticketRef === task.ticketRef);
@@ -113,6 +112,20 @@ function upsertTask(state: AfkState, task: AfkTask): AfkState {
 			? state.tasks.map((item) => (item.ticketRef === task.ticketRef ? task : item))
 			: [task, ...state.tasks],
 	};
+}
+
+/**
+ * afk.status() 快照守卫：preview/mock 基座对未 override 的 afk 成员返回
+ * undefined（见 mockApiBase），LAN-web 抛桌面端独占错误由调用方 catch。
+ * 只有形状合法的快照才进 state，避免 undefined 污染渲染链。
+ */
+function isAfkState(value: unknown): value is AfkState {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		Array.isArray((value as AfkState).tasks) &&
+		typeof (value as AfkState).enabled === "boolean"
+	);
 }
 
 type TimelineStep = {
@@ -249,11 +262,16 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 	const refresh = useCallback(async () => {
 		setRefreshing(true);
 		try {
-			// 快照 = 运行态 + 历史归档，整体替换
+			// 快照 = 运行态 + 历史归档，整体替换。LAN-web 下 afk 抛桌面端独占错误
+			// （见 browserApi web 能力列），走降级分支而不把 undefined 写进 state；
+			// 主进程 AFK 未装配（抛错）时保持旧快照，不打断页面。
 			const snapshot = await window.piDesktop.afk.status();
-			setState(snapshot);
+			if (isAfkState(snapshot)) {
+				setState(snapshot);
+			} else {
+				showNotice(t("afk.unavailable"), 4000, "error");
+			}
 		} catch (error) {
-			// 主进程 AFK 未装配时保持旧快照，不打断页面
 			showNotice(
 				`${t("common.error")}: ${error instanceof Error ? error.message : String(error)}`,
 				4000,

@@ -1,4 +1,4 @@
-import type { AgentTab, SessionSummary } from "../../shared/types";
+import type { AgentTab, ImportSummary, SessionSummary } from "../../shared/types";
 
 const DEFAULT_VISIBLE_PROJECT_CHILD_LIMIT = 5;
 
@@ -369,4 +369,140 @@ export function getProjectAgentSessionDisplay({
 		hiddenChildCount: Math.max(0, children.length - visibleChildren.length),
 		piSubagentsByParent,
 	};
+}
+
+/**
+ * 会话目录扁平投影：侧栏树与会话管理弹窗共享同一分组语义。
+ *
+ * - pi 原生子会话按 parentSessionPath（归一化）挂到父会话下；
+ * - codex 子会话按 codexParentThreadId 挂到 codexSessionId 匹配的父会话下；
+ * - orphan 恢复：父键不在顶层出现时，子会话降级回顶层；
+ * - 顶层按 updatedAt 降序。
+ */
+export interface SessionTreeProjection {
+	/** 顶层会话：parents + orphan 恢复项，按 updatedAt 降序 */
+	topLevel: SessionSummary[];
+	/** 父 filePath（归一化键）→ pi 原生 + codex 子会话合并列表 */
+	childrenOf: ReadonlyMap<string, SessionSummary[]>;
+}
+
+export function getSessionTreeProjection(sessions: SessionSummary[]): SessionTreeProjection {
+	const piSubagentsByParent = new Map<string, SessionSummary[]>();
+	const codexSubagentsByParent = new Map<string, SessionSummary[]>();
+	const parentCodexIds = new Set(
+		sessions
+			.filter((session) => session.codexThreadSource !== "subagent")
+			.map(getCodexParentKey)
+			.filter(Boolean),
+	);
+	const topLevel: SessionSummary[] = [];
+	for (const session of sessions) {
+		if (
+			session.codexThreadSource === "subagent" &&
+			session.codexParentThreadId &&
+			parentCodexIds.has(session.codexParentThreadId)
+		) {
+			const children = codexSubagentsByParent.get(session.codexParentThreadId) ?? [];
+			children.push(session);
+			codexSubagentsByParent.set(session.codexParentThreadId, children);
+			continue;
+		}
+		if (session.parentSessionPath) {
+			const parentKey = normalizeSessionPathForCompare(session.parentSessionPath);
+			if (parentKey) {
+				const children = piSubagentsByParent.get(parentKey) ?? [];
+				children.push(session);
+				piSubagentsByParent.set(parentKey, children);
+				continue;
+			}
+		}
+		topLevel.push(session);
+	}
+	// orphan 恢复（与侧栏 getProjectAgentSessionDisplay 同语义）：父键不在顶层
+	// 出现时，子会话降级回顶层，避免入口消失。
+	const topLevelKeys = new Set<string>();
+	for (const session of topLevel) {
+		const key = normalizeSessionPathForCompare(session.filePath);
+		if (key) topLevelKeys.add(key);
+	}
+	for (const [parentKey, orphanSubagents] of piSubagentsByParent) {
+		if (!topLevelKeys.has(parentKey) && orphanSubagents.length > 0) {
+			topLevel.push(...orphanSubagents);
+		}
+	}
+	topLevel.sort((left, right) => right.updatedAt - left.updatedAt);
+	const childrenOf = new Map<string, SessionSummary[]>();
+	for (const [key, list] of piSubagentsByParent) {
+		childrenOf.set(key, [...list]);
+	}
+	for (const session of topLevel) {
+		const key = getCodexParentKey(session);
+		const codexChildren = codexSubagentsByParent.get(key);
+		if (codexChildren && codexChildren.length > 0) {
+			childrenOf.set(key, [...(childrenOf.get(key) ?? []), ...codexChildren]);
+		}
+	}
+	return { topLevel, childrenOf };
+}
+
+/**
+ * 会话列表新鲜度契约：同一 id 的两份快照何时视为等效。
+ * 行展示依赖以下全部字段——旧 5 字段版本漏比 preview/messageCount/
+ * parentSessionPath 会导致 stale 行（预览/计数/归属变化不刷新）。
+ */
+export function sameSessionSummary(a: SessionSummary, b: SessionSummary): boolean {
+	return (
+		a.id === b.id &&
+		a.updatedAt === b.updatedAt &&
+		a.name === b.name &&
+		a.projectPath === b.projectPath &&
+		a.degraded === b.degraded &&
+		a.filePath === b.filePath &&
+		a.parentSessionPath === b.parentSessionPath &&
+		a.preview === b.preview &&
+		a.messageCount === b.messageCount &&
+		a.codexSessionId === b.codexSessionId &&
+		a.codexParentThreadId === b.codexParentThreadId &&
+		a.codexThreadSource === b.codexThreadSource
+	);
+}
+
+export function sameSessionSummaryList(
+	previous: SessionSummary[],
+	next: SessionSummary[],
+): boolean {
+	if (previous.length !== next.length) return false;
+	return previous.every((a, i) => sameSessionSummary(a, next[i]));
+}
+
+/**
+ * 导入会话（ImportSummary）用的 codex 线程分组投影：与 SessionSummary 的
+ * codex 分组同语义（threadSource/parentThreadId 按 id 归属），供导入弹窗消费——
+ * 弹窗不再自建 groupCodexSessions 双实现。
+ */
+export interface ImportThreadProjection {
+	parents: ImportSummary[];
+	childrenByParent: ReadonlyMap<string, ImportSummary[]>;
+	orphanSubagents: ImportSummary[];
+}
+
+export function getImportThreadProjection(sessions: ImportSummary[]): ImportThreadProjection {
+	const parentById = new Map(sessions.map((session) => [session.id, session]));
+	const childrenByParent = new Map<string, ImportSummary[]>();
+	const orphanSubagents: ImportSummary[] = [];
+	const parents = sessions.filter((session) => session.threadSource !== "subagent");
+
+	for (const session of sessions) {
+		if (session.threadSource !== "subagent") continue;
+		const parentId = session.parentThreadId;
+		if (parentId && parentById.has(parentId)) {
+			const children = childrenByParent.get(parentId) ?? [];
+			children.push(session);
+			childrenByParent.set(parentId, children);
+		} else {
+			orphanSubagents.push(session);
+		}
+	}
+
+	return { parents, childrenByParent, orphanSubagents };
 }

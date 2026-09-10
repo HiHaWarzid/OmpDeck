@@ -156,6 +156,40 @@ describe("override 成员 × 实现层奇偶守卫（表驱动）", () => {
 		});
 	});
 });
+/** 推导 web 能力成员键（"命名空间.成员"），从表结构出发，不写死名单。 */
+function collectWebKeys(): string[] {
+	const keys: string[] = [];
+	for (const [namespace, members] of Object.entries(ipcTable)) {
+		for (const [member, entry] of Object.entries(members)) {
+			if ((entry as IpcOpEntry).web) keys.push(`${namespace}.${member}`);
+		}
+	}
+	return keys.sort();
+}
+
+const WEB_KEYS = collectWebKeys();
+
+describe("web 能力列 × browserApi 奇偶守卫（表驱动）", () => {
+	it(`web:true 成员全部在 browserApi 有 REST 实接（${WEB_KEYS.length} 个）`, () => {
+		// REST 实接必须是具名函数，且与 preview 罐头不是同一引用（真走 fetch）。
+		const missing: string[] = [];
+		for (const key of WEB_KEYS) {
+			const [namespace, member] = key.split(".");
+			const browserValue = getMember(createBrowserApi(), namespace, member);
+			const previewValue = getMember(createPreviewApi(), namespace, member);
+			expect(typeof browserValue, `browserApi.${key} 应为可调用 REST 实接`).toBe("function");
+			if (browserValue === undefined || browserValue === previewValue) {
+				missing.push(key);
+			}
+		}
+		expect(missing, `browserApi 缺 REST 实接：${missing.join(" | ")}`).toEqual([]);
+	});
+
+	it("web 能力列非空且是表成员的真子集", () => {
+		expect(WEB_KEYS.length).toBeGreaterThan(0);
+		expect(WEB_KEYS.length).toBeLessThan(ALL_KEYS.length);
+	});
+});
 
 describe("负向控制：非 override 成员不要求存在于覆盖对象", () => {
 	it("正向要求集严格是表成员的真子集（只要求 override 标记的成员）", () => {

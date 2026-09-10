@@ -27,7 +27,7 @@ import { translateAgentErrorMessage } from "../utils/agentErrors";
 import { showNotice } from "../utils/notice";
 import { t } from "../i18n";
 import { withTimeout } from "../utils/withTimeout";
-import { sameSessionSummaryList } from "../utils/sessionSummaryList";
+import { sameSessionSummaryList as sameCatalogSummaryList } from "../agentListDisplay";
 
 /** 会话扫描超时：避免 IPC 无响应时 UI 永久等待。 */
 const SESSION_REFRESH_TIMEOUT_MS = 20_000;
@@ -318,7 +318,7 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 			const sorted = [...next].sort((a, b) => b.updatedAt - a.updatedAt);
 			setSessionsByProject((current) => {
 				const previous = current[projectId] ?? [];
-				if (sameSessionSummaryList(previous, sorted)) return current;
+				if (sameCatalogSummaryList(previous, sorted)) return current;
 				return { ...current, [projectId]: sorted };
 			});
 			// 任意来源的成功都清除错误标记，让侧栏错误行/重试入口消失。

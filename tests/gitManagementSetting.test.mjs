@@ -7,7 +7,9 @@ const settingsModal = readFileSync("src/renderer/src/components/app/SettingsModa
 const settingsStore = readFileSync("src/main/settings/SettingsStore.ts", "utf8");
 // src/shared/types.ts 已拆为按领域 re-export 的 barrel；AppSettings 声明在 types/settings.ts。
 const sharedTypes = readFileSync("src/shared/types/settings.ts", "utf8");
-const previewApi = readFileSync("src/renderer/src/previewApi.ts", "utf8");
+// previewApi 的罐头 AppSettings 已收敛到 previewFixtures.makePreviewAppSettings，
+// 升级安全默认值断言改读工厂源。
+const previewApi = readFileSync("src/renderer/src/previewFixtures.ts", "utf8");
 const i18n = readFileSync("src/renderer/src/i18n.ts", "utf8");
 
 describe("optional Git management entry", () => {

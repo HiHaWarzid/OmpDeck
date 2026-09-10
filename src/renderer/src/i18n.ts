@@ -906,11 +906,12 @@ const zhCN = {
   "config.settings.enabledModelsSelected": "个模型已选",
   "config.settings.enabledModelsSearchPlaceholder": "搜索模型 ID… 输入含 * 或 ? 可添加 glob 模式",
   "config.settings.enabledModelsGlobHint": "glob 模式",
+  "config.settings.retiredField": "已退役：改由模型角色配置生效",
   "config.loadingExtensions": "正在加载扩展列表…",
   "config.extensionConflict": "内置扩展 {builtIn} 与 {thirdParty} 冲突，已自动关闭并移除内置版文件，避免工具同名冲突导致启动失败",
   "config.removeBuiltIn": "移除内置扩展（停止自动部署并删除用户目录文件，可随时恢复）",
   "config.restoreBuiltIn": "恢复内置扩展",
-"config.emptyExtensions": "暂无已安装扩展。",
+  "config.emptyExtensions": "暂无已安装扩展。",
   "config.emptyModels": "暂无模型，点击「+ 模型」添加",
   "config.emptyProviders": "暂无供应商配置",
   "config.fileDeletedOrEmpty": "文件可能已被删除或为空，请检查文件系统中该文件是否仍然存在。",
@@ -1836,6 +1837,7 @@ const zhCN = {
   "afk.prs.markMerged": "标记已合并",
   "afk.prs.gcHint": "标记后建议清理 afk 分支",
   "afk.sidebar.badge": "AFK",
+  "afk.unavailable": "AFK 仅桌面端可用",
 } as const;
 
 export type TranslationKey = keyof typeof zhCN;
@@ -2724,8 +2726,9 @@ const enUS: Record<TranslationKey, string> = {
   "config.settings.enabledModelsSelected": " models selected",
   "config.settings.enabledModelsSearchPlaceholder": "Search model ID… Enter glob pattern with * or ?",
   "config.settings.enabledModelsGlobHint": "glob pattern",
+  "config.settings.retiredField": "Retired: managed by model role config",
   "config.loadingExtensions": "Loading extensions…",
-"config.emptyExtensions": "No installed extensions.",
+  "config.emptyExtensions": "No installed extensions.",
   "config.extensionConflict": "Built-in {builtIn} conflicts with third-party {thirdParty}; built-in file was removed to prevent tool-name startup failures.",
   "config.removeBuiltIn": "Remove built-in extension (stop auto-deploy and delete user file; can restore later)",
   "config.restoreBuiltIn": "Restore built-in extension",
@@ -3657,6 +3660,7 @@ const enUS: Record<TranslationKey, string> = {
   "afk.prs.markMerged": "Mark merged",
   "afk.prs.gcHint": "Marking will suggest cleaning the afk branch",
   "afk.sidebar.badge": "AFK",
+  "afk.unavailable": "AFK is desktop-only",
 };
 
 type Params = Record<string, string | number | boolean | null | undefined>;

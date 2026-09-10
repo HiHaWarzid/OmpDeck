@@ -103,7 +103,7 @@ import {
 	FoldVertical,
 } from "lucide-react";
 import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../fileIcons";
-import { normalizeSessionPathForCompare } from "../../agentListDisplay";
+import { getSessionTreeProjection, normalizeSessionPathForCompare } from "../../agentListDisplay";
 import { t, type TranslationKey } from "../../i18n";
 import { showNotice } from "../../utils/notice";
 import { writeClipboard } from "../../utils/clipboard";
@@ -6051,24 +6051,10 @@ function SessionsPanel(props: {
 		}
 	}
 
-	// 计算子会话到父会话的分组映射；路径可能跨 Windows/WSL 或经过 IPC，统一分隔符和大小写。
-	const parentToChildren = useMemo(() => {
-		const map = new Map<string, SessionSummary[]>();
-		for (const s of props.sessions) {
-			const parentKey = normalizeSessionPathForCompare(s.parentSessionPath);
-			if (parentKey) {
-				const list = map.get(parentKey) ?? [];
-				list.push(s);
-				map.set(parentKey, list);
-			}
-		}
-		return map;
-	}, [props.sessions]);
-	// 仅显示顶层会话（非子会话）的计数
-	const parentSessions = useMemo(() =>
-		props.sessions.filter(s => !s.parentSessionPath),
-		[props.sessions],
-	);
+	// 分组走会话目录共享投影（agentListDisplay.getSessionTreeProjection）：与侧栏
+	// 同一语义（pi 按 parentSessionPath 归一化、codex 按 codexSessionId、orphan 恢复）。
+	const tree = useMemo(() => getSessionTreeProjection(props.sessions), [props.sessions]);
+	const parentSessions = tree.topLevel;
 	const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
 	const toggleParent = useCallback((filePath: string) => {
 		const key = normalizeSessionPathForCompare(filePath) ?? filePath;
@@ -6079,7 +6065,10 @@ function SessionsPanel(props: {
 			return next;
 		});
 	}, []);
-
+	const getChildren = useCallback(
+		(filePath?: string) => (filePath ? (tree.childrenOf.get(normalizeSessionPathForCompare(filePath) ?? "") ?? []) : []),
+		[tree],
+	);
 	return (
 		<div className="sessions-panel">
 			<div className="panel-action-row">
@@ -6093,7 +6082,7 @@ function SessionsPanel(props: {
 				</div>
 			)}
 			{parentSessions.map((session) => {
-				const children = parentToChildren.get(normalizeSessionPathForCompare(session.filePath) ?? "");
+				const children = getChildren(session.filePath);
 				const normalizedPath = normalizeSessionPathForCompare(session.filePath) ?? session.filePath;
 				const isExpanded = expandedParents.has(normalizedPath);
 				return (
@@ -6264,7 +6253,7 @@ function SessionsPanel(props: {
 				);
 			})}
 			{deleteConfirmSession && (() => {
-					const deleteChildren = parentToChildren.get(normalizeSessionPathForCompare(deleteConfirmSession.filePath) ?? "") ?? [];
+					const deleteChildren = getChildren(deleteConfirmSession.filePath);
 					return (
 				<div className="session-delete-confirm-backdrop" onClick={() => setDeleteConfirmSession(null)}>
 					<section

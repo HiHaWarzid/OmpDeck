@@ -15,6 +15,18 @@ import type {
 import { t } from "./i18n";
 import { createMockApiBase } from "./mockApiBase";
 import { mergeApiOverrides, type NamespaceOverrides } from "../../shared/apiMerge";
+import {
+	makeChatProject,
+	makePreviewAgent,
+	makePreviewAgentTitle,
+	makePreviewAppSettings,
+	makePreviewFileTree,
+	makePreviewMessages,
+	makePreviewProject,
+	makePreviewSession,
+	makePreviewSkillSummary,
+	makePreviewTerminalTab,
+} from "./previewFixtures";
 
 /**
  * 预览模式（非 Electron）假实现：mock 基座 + 罐头数据覆盖层。
@@ -22,200 +34,34 @@ import { mergeApiOverrides, type NamespaceOverrides } from "../../shared/apiMerg
  * 覆盖层只保留「返回具体值 / 有副作用」的成员；void 契约成员与纯 subscribe
  * 成员由基座兜底（async () => undefined / () => () => undefined）。
  * 成员签名以 PiDesktopApi 编译期校验，表变更漏成员时以 undefined 暴露（防漂移）。
+ *
+ * 罐头数据全部走 previewFixtures 工厂：新增成员给罐头 = 一次函数调用，
+ * 不再复制粘贴结构体字面量。
  */
 
-const now = Date.now();
-
-const projects: Project[] = [
-	{
-		id: "builtin-chat",
-		name: "Chat",
-		path: "C:/Users/14012/AppData/Roaming/pi-desktop/chat-workspace",
-		lastOpenedAt: now,
-		pinned: true,
-		sortOrder: -1,
-		kind: "chat",
-	},
-	{
-		id: "preview-project",
-		name: "preview-project",
-		path: "C:/Users/14012/preview-project",
-		lastOpenedAt: now,
-		sortOrder: 0,
-	},
-];
+const projects: Project[] = [makeChatProject(), makePreviewProject()];
 
 let previewAgentTitle: string | null = null;
 
 function getAgents(): AgentTab[] {
-	return [
-		{
-			id: "preview-agent",
-			projectId: "builtin-chat",
-			cwd: projects[0].path,
-			title: previewAgentTitle ?? t("preview.agentTitle"),
-			status: "idle",
-			sessionId: "preview",
-			createdAt: now,
-		},
-	];
+	return [makePreviewAgent({ title: previewAgentTitle ?? makePreviewAgentTitle() })];
 }
 
 function getMessages(): ChatMessage[] {
-	return [
-		{
-			id: "m1",
-			agentId: "preview-agent",
-			role: "user",
-			text: t("preview.userPrompt"),
-			timestamp: now - 120000,
-		},
-		{
-			id: "m2",
-			agentId: "preview-agent",
-			role: "assistant",
-			text: t("preview.assistantText"),
-			timestamp: now - 90000,
-		},
-		{
-			id: "m3",
-			agentId: "preview-agent",
-			role: "tool",
-			text: "✓ read done",
-			timestamp: now - 60000,
-			meta: { detailText: t("preview.toolDetail") },
-		},
-	];
+	return makePreviewMessages();
 }
 
-const files: FileTreeNode[] = [
-	{
-		name: "src",
-		path: "C:/Users/14012/preview-project/src",
-		relativePath: "src",
-		type: "directory",
-		children: [
-			{
-				name: "App.tsx",
-				path: "C:/Users/14012/preview-project/src/App.tsx",
-				relativePath: "src/App.tsx",
-				type: "file",
-			},
-		],
-	},
-	{
-		name: "README.md",
-		path: "C:/Users/14012/preview-project/README.md",
-		relativePath: "README.md",
-		type: "file",
-	},
-];
+const files: FileTreeNode[] = makePreviewFileTree();
 
 function getSessions(): SessionSummary[] {
-	return [
-		{
-			id: "s1",
-			filePath: "preview.jsonl",
-			projectPath: projects[0].path,
-			name: t("preview.sessionName"),
-			preview: t("preview.sessionPreview"),
-			updatedAt: now,
-			messageCount: 3,
-		},
-	];
+	return [makePreviewSession()];
 }
 
 const terminalTabs: TerminalTab[] = [];
 const terminalDataListeners = new Set<(payload: TerminalDataEvent) => void>();
 const terminalExitListeners = new Set<(payload: TerminalExitEvent) => void>();
 
-let previewSettings: AppSettings = {
-	useNativeTitleBar: true,
-	showNativeMenu: false,
-	sendShortcut: "enter-send",
-	theme: "system",
-	lightBackground: "white",
-	language: "system",
-	startupWindowMode: "maximized",
-	piEnvironmentChecked: true,
-	enableGitManagement: true,
-	gitCommitMessagePrompt: "",
-	closeToTray: false,
-	singleInstance: true,
-	enableNotifications: true,
-	// showThinking 由 pi agent 的 hideThinkingBlock 控制，运行时从主进程加载
-	showThinking: true,
-	showDevTools: false,
-	electronChromiumSandbox: false,
-	piProxyEnabled: false,
-	piProxyUrl: "http://127.0.0.1:7890",
-	piProxyBypass: "localhost,127.0.0.1,::1",
-	desktopProxyEnabled: false,
-	desktopProxyUrl: "http://127.0.0.1:7890",
-	desktopProxyBypass: "localhost,127.0.0.1,::1",
-	customPiPath: "",
-	wslEnabled: false,
-	wslDistro: "Ubuntu",
-	wslUser: "root",
-	telemetryEnabled: true,
-	webServiceEnabled: false,
-	webServiceHost: "0.0.0.0",
-	webServicePort: 8765,
-	rpcTimeout: 600_000,
-	linkOpenMode: "external",
-	contentMaxWidth: 1400,
-	maxEditorFileSizeMB: 5,
-	externalEditors: createDefaultExternalEditorSettings(),
-
-	// 桌面宠物默认关闭
-	petEnabled: false,
-	petId: "clawd",
-	petAlwaysOnTop: true,
-	petScale: 0.8,
-	petPatrolEnabled: true,
-	petPatrolPauseMin: 5,
-	favoriteModels: [],
-
-	fontSize: "default",
-	uiFontSize: null,
-	chatFontSize: null,
-	inputFontSize: null,
-	zoomFactor: 1,
-	fontFamilyBase: "system",
-	fontFamilyBaseCustom: "",
-	fontFamilyMono: "commit-mono",
-	fontFamilyMonoCustom: "",
-	removedBuiltInExtensions: [],
-	disableUpdateCheck: false,
-	piRpcOffline: true,
-	piRpcNoExtensions: false,
-	piRpcNoSkills: false,
-	afk: { enabled: false, targetProjectIds: [], pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
-};
-
-/** 预览终端：创建 tab 后异步推送欢迎输出，模拟主进程 pty 数据流。 */
-function createPreviewTerminalTab(agentId: string, shell?: string, cwd?: string): Promise<TerminalTab> {
-	const shellName = shell ?? "powershell";
-	const displayName = shellName === "git-bash" ? "Git Bash" : shellName === "bash" ? "bash" : shellName === "cmd" ? "cmd" : "PowerShell";
-	const tab: TerminalTab = {
-		id: `preview-terminal-${terminalTabs.length + 1}`,
-		agentId,
-		title: `${displayName} ${terminalTabs.length + 1}`,
-		cwd: "C:/Users/14012/preview-project",
-		shell: "powershell",
-		createdAt: Date.now(),
-	};
-	terminalTabs.push(tab);
-	setTimeout(() => {
-		for (const listener of terminalDataListeners) {
-			listener({
-				tabId: tab.id,
-				data: "Windows PowerShell\r\nPS C:\\\\Users\\\\14012\\\\preview-project> ",
-			});
-		}
-	}, 0);
-	return Promise.resolve(tab);
-}
+let previewSettings: AppSettings = makePreviewAppSettings();
 
 const previewOverrides: NamespaceOverrides = {
 	editors: {
@@ -254,45 +100,12 @@ const previewOverrides: NamespaceOverrides = {
 	},
 	projectResources: {
 		list: async () => ({ skills: [], extensions: [] }),
-		createSkill: async (input) => ({
-			id: `project-pi:${input.name}`,
-			name: input.name,
-			description: input.description,
-			path: `C:/Users/preview/project/.omp/skills/${input.name}/SKILL.md`,
-			dir: `C:/Users/preview/project/.omp/skills/${input.name}`,
-			sourceId: "project-pi" as const,
-			sourceLabel: ".omp/skills",
-			type: "directory" as const,
-			enabled: true,
-			valid: true,
-			warnings: [],
-		}),
-		renameSkill: async (_projectId, _skillPath, newName) => ({
-			id: `project-pi:${newName}`,
-			name: newName,
-			description: "",
-			path: `C:/Users/preview/project/.omp/skills/${newName}/SKILL.md`,
-			dir: `C:/Users/preview/project/.omp/skills/${newName}`,
-			sourceId: "project-pi" as const,
-			sourceLabel: ".omp/skills",
-			type: "directory" as const,
-			enabled: true,
-			valid: true,
-			warnings: [],
-		}),
-		toggleSkill: async (_projectId, _skillPath, enabled) => ({
-			id: "project-pi:preview-toggle",
-			name: "preview-skill",
-			description: "",
-			path: "C:/Users/preview/project/.omp/skills/preview-skill/SKILL.md",
-			dir: "C:/Users/preview/project/.omp/skills/preview-skill",
-			sourceId: "project-pi" as const,
-			sourceLabel: ".omp/skills",
-			type: "directory" as const,
-			enabled,
-			valid: true,
-			warnings: [],
-		}),
+		createSkill: async (input) =>
+			makePreviewSkillSummary({ name: input.name, description: input.description }),
+		renameSkill: async (_projectId, _skillPath, newName) =>
+			makePreviewSkillSummary({ name: newName }),
+		toggleSkill: async (_projectId, _skillPath, enabled) =>
+			makePreviewSkillSummary({ enabled }),
 	},
 	files: {
 		list: async () => files,
@@ -473,45 +286,34 @@ const previewOverrides: NamespaceOverrides = {
 			],
 			skills: [],
 		}),
-		create: async (input) => ({
-			id: `pi-global:${input.name}`,
-			name: input.name,
-			description: input.description,
-			path: `C:/Users/preview/.omp/agent/skills/${input.name}/SKILL.md`,
-			dir: `C:/Users/preview/.omp/agent/skills/${input.name}`,
-			sourceId: input.locationId,
-			sourceLabel: "~/.omp/agent/skills",
-			type: "directory" as const,
-			enabled: true,
-			valid: true,
-			warnings: [],
-		}),
-		toggle: async (path, enabled) => ({
-			id: `pi-global:${path}`,
-			name: "preview-skill",
-			description: "Preview skill",
-			path,
-			dir: path.replace(/[/\\]SKILL\.md$/, ""),
-			sourceId: "pi-global" as const,
-			sourceLabel: "~/.omp/agent/skills",
-			type: "directory" as const,
-			enabled,
-			valid: true,
-			warnings: [],
-		}),
-		rename: async (_skillPath, newName) => ({
-			id: `pi-global:preview/${newName}/SKILL.md`,
-			name: newName,
-			description: "Preview skill",
-			path: `C:/Users/preview/.omp/agent/skills/${newName}/SKILL.md`,
-			dir: `C:/Users/preview/.omp/agent/skills/${newName}`,
-			sourceId: "pi-global" as const,
-			sourceLabel: "~/.omp/agent/skills",
-			type: "directory" as const,
-			enabled: true,
-			valid: true,
-			warnings: [],
-		}),
+		create: async (input) =>
+			makePreviewSkillSummary({
+				id: `pi-global:${input.name}`,
+				name: input.name,
+				description: input.description,
+				path: `C:/Users/preview/.omp/agent/skills/${input.name}/SKILL.md`,
+				dir: `C:/Users/preview/.omp/agent/skills/${input.name}`,
+				sourceId: "pi-global",
+				sourceLabel: "~/.omp/agent/skills",
+			}),
+		toggle: async (path, enabled) =>
+			makePreviewSkillSummary({
+				id: `pi-global:${path}`,
+				path,
+				dir: path.replace(/[/\\]SKILL\.md$/, ""),
+				sourceId: "pi-global",
+				sourceLabel: "~/.omp/agent/skills",
+				enabled,
+			}),
+		rename: async (_skillPath, newName) =>
+			makePreviewSkillSummary({
+				id: `pi-global:preview/${newName}/SKILL.md`,
+				name: newName,
+				path: `C:/Users/preview/.omp/agent/skills/${newName}/SKILL.md`,
+				dir: `C:/Users/preview/.omp/agent/skills/${newName}`,
+				sourceId: "pi-global",
+				sourceLabel: "~/.omp/agent/skills",
+			}),
 	},
 	extensions: {
 		list: async (_forceRefresh = false) => ({
@@ -789,9 +591,24 @@ const previewOverrides: NamespaceOverrides = {
 		ensure: async (agentId, cwd) => {
 			const existing = terminalTabs.filter((tab) => tab.agentId === agentId);
 			if (existing.length > 0) return existing;
-			return [await createPreviewTerminalTab(agentId, undefined, cwd)];
+			const tab = makePreviewTerminalTab(agentId, terminalTabs.length + 1);
+			terminalTabs.push(tab);
+			// 异步推送欢迎输出，模拟主进程 pty 数据流
+			setTimeout(() => {
+				for (const listener of terminalDataListeners) {
+					listener({
+						tabId: tab.id,
+						data: "Windows PowerShell\r\nPS C:\\\\Users\\\\14012\\\\preview-project> ",
+					});
+				}
+			}, 0);
+			return [tab];
 		},
-		create: createPreviewTerminalTab,
+		create: async (agentId: string) => {
+			const tab = makePreviewTerminalTab(agentId, terminalTabs.length + 1);
+			terminalTabs.push(tab);
+			return tab;
+		},
 		input: async (tabId, data) => {
 			for (const listener of terminalDataListeners) {
 				listener({ tabId, data });
