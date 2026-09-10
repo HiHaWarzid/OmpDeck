@@ -129,6 +129,7 @@ import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
+import { useSessionImport } from "./hooks/useSessionImport";
 import { reconcileAgentState } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
@@ -176,6 +177,7 @@ import {
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
 import { MessageListContent } from "./components/app/MessageListContent";
+import { createImportSources } from "./components/app/sessionImportSources";
 import { buildStreamState } from "./components/app/streamStateSelector";
 import {
   groupToolMessages,
@@ -211,9 +213,7 @@ const SettingsModal = lazy(() => import("./components/app/SettingsModal").then((
 // AFK 中心：按需懒加载（与 SettingsModal 同策略，减少首屏 JS）
 const AfkPanel = lazy(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
 
-const CodexImportModal = lazy(() => import("./components/app/ImportModals").then((m) => ({ default: m.CodexImportModal })));
-const ClaudeImportModal = lazy(() => import("./components/app/ImportModals").then((m) => ({ default: m.ClaudeImportModal })));
-const OpenCodeImportModal = lazy(() => import("./components/app/ImportModals").then((m) => ({ default: m.OpenCodeImportModal })));
+const SessionImportModal = lazy(() => import("./components/app/SessionImportModal").then((m) => ({ default: m.SessionImportModal })));
 const ProjectResourcesModal = lazy(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
 const UpdateErrorModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
 const UpToDateModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
@@ -230,12 +230,6 @@ import type {
   ExternalEditor,
   FeedbackEnvironment,
   ChatMessage,
-  CodexImportReport,
-  CodexSessionSummary,
-  ClaudeImportReport,
-  ClaudeSessionSummary,
-  OpenCodeImportReport,
-  OpenCodeSessionSummary,
   FileTreeNode,
   GitBranchInfo,
   CommitEntry,
@@ -341,12 +335,6 @@ function displayProjectDirectoryName(project: Project) {
 
 function isChatProject(project?: Project) {
   return project?.kind === "chat";
-}
-
-function getSelectableCodexImportPaths(sessions: CodexSessionSummary[]) {
-  return sessions
-    .filter((session) => session.threadSource !== "subagent")
-    .map((session) => session.sourcePath);
 }
 
 function formatCodexSubagentName(session: SessionSummary) {
@@ -1138,40 +1126,35 @@ export function App() {
     (path: string, content: string) => api.files.writeContent(path, content),
     [],
   );
-  const [codexImportProject, setCodexImportProject] = useState<Project | null>(
-    null,
-  );
-  const [codexImportSessions, setCodexImportSessions] = useState<
-    CodexSessionSummary[]
-  >([]);
-  const [codexImportSelected, setCodexImportSelected] = useState<string[]>([]);
-  const [codexImportLoading, setCodexImportLoading] = useState(false);
-  const [codexImportRunning, setCodexImportRunning] = useState(false);
-  const [codexImportReport, setCodexImportReport] =
-    useState<CodexImportReport | null>(null);
-  const [claudeImportProject, setClaudeImportProject] = useState<Project | null>(
-    null,
-  );
-  const [claudeImportSessions, setClaudeImportSessions] = useState<
-    ClaudeSessionSummary[]
-  >([]);
-  const [claudeImportSelected, setClaudeImportSelected] = useState<string[]>([]);
-  const [claudeImportLoading, setClaudeImportLoading] = useState(false);
-  const [claudeImportRunning, setClaudeImportRunning] = useState(false);
-  const [claudeImportReport, setClaudeImportReport] =
-    useState<ClaudeImportReport | null>(null);
-  const [openCodeImportProject, setOpenCodeImportProject] = useState<Project | null>(
-    null,
-  );
+  // ── 会话导入（Codex / Claude / OpenCode）：一个状态机 + 一张源描述表 ──────────
+  // 三源共用同一套类型与交互，差异（api 命名空间/默认勾选/文案前缀/子代理分组）
+  // 全在 createImportSources 返回的描述表里。
+  const importSources = useMemo(() => createImportSources(api), []);
+  const importFlow = useSessionImport({
+    resolveSource: (id) => importSources[id],
+    onError: (id, stage, message) =>
+      showToast(
+        t(
+          stage === "scan"
+            ? importSources[id].labels.scanFailed
+            : importSources[id].labels.importFailed,
+          { error: message },
+        ),
+        5000,
+      ),
+    onImported: async (id, report, project) => {
+      await refreshProjectSessions(project.id);
+      if (sessionsProjectId === project.id) await refreshSessions(project.id, true);
+      showToast(
+        t(importSources[id].labels.importDone, {
+          imported: report.imported,
+          failed: report.failed,
+        }),
+        5000,
+      );
+    },
+  });
   const [projectResourcesProject, setProjectResourcesProject] = useState<Project | null>(null);
-  const [openCodeImportSessions, setOpenCodeImportSessions] = useState<
-    OpenCodeSessionSummary[]
-  >([]);
-  const [openCodeImportSelected, setOpenCodeImportSelected] = useState<string[]>([]);
-  const [openCodeImportLoading, setOpenCodeImportLoading] = useState(false);
-  const [openCodeImportRunning, setOpenCodeImportRunning] = useState(false);
-  const [openCodeImportReport, setOpenCodeImportReport] =
-    useState<OpenCodeImportReport | null>(null);
   // 历史命令：按会话隔离，通过 localStorage 持久化，重启后可恢复上下方向键导航的历史。
   // 键优先用 sessionPath（跨重启/重开稳定，agentId 是每次打开随机生成的 UUID，跨重启无意义），
   // 匿名会话没有 sessionPath 时退回 agentId。存储由 useAgentLifecycle 内的
@@ -4113,249 +4096,6 @@ export function App() {
     }
   }
 
-  async function openCodexImport(project: Project) {
-    setProjectMenu(null);
-    setCodexImportProject(project);
-    setCodexImportReport(null);
-    setCodexImportSessions([]);
-    setCodexImportSelected([]);
-    await scanCodexSessions(project);
-  }
-
-  async function scanCodexSessions(
-    project = codexImportProject,
-    clearReport = true,
-  ) {
-    if (!project) return;
-    setCodexImportLoading(true);
-    if (clearReport) setCodexImportReport(null);
-    try {
-      const next = await api.codexSessions.scan(project.id);
-      setCodexImportSessions(next);
-      setCodexImportSelected(getSelectableCodexImportPaths(next));
-    } catch (error) {
-      showToast(
-        t("codex.scanFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setCodexImportLoading(false);
-    }
-  }
-
-  function toggleCodexSession(sourcePath: string) {
-    setCodexImportSelected((current) =>
-      current.includes(sourcePath)
-        ? current.filter((item) => item !== sourcePath)
-        : [...current, sourcePath],
-    );
-  }
-
-  function toggleAllCodexSessions() {
-    const allPaths = getSelectableCodexImportPaths(codexImportSessions);
-    setCodexImportSelected((current) =>
-      allPaths.length > 0 && allPaths.every((path) => current.includes(path))
-        ? []
-        : allPaths,
-    );
-  }
-
-  async function importCodexSessions() {
-    if (!codexImportProject || codexImportSelected.length === 0) return;
-    setCodexImportRunning(true);
-    setCodexImportReport(null);
-    try {
-      const report = await api.codexSessions.import(
-        codexImportProject.id,
-        codexImportSelected,
-      );
-      setCodexImportReport(report);
-      await scanCodexSessions(codexImportProject, false);
-      await refreshProjectSessions(codexImportProject.id);
-      if (sessionsProjectId === codexImportProject.id)
-        await refreshSessions(codexImportProject.id, true);
-      showToast(
-        t("codex.importDone", {
-          imported: report.imported,
-          failed: report.failed,
-        }),
-      );
-    } catch (error) {
-      showToast(
-        t("codex.importFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setCodexImportRunning(false);
-    }
-  }
-
-  async function openClaudeImport(project: Project) {
-    setProjectMenu(null);
-    setClaudeImportProject(project);
-    setClaudeImportReport(null);
-    setClaudeImportSessions([]);
-    setClaudeImportSelected([]);
-    await scanClaudeSessions(project);
-  }
-
-  async function scanClaudeSessions(
-    project = claudeImportProject,
-    clearReport = true,
-  ) {
-    if (!project) return;
-    setClaudeImportLoading(true);
-    if (clearReport) setClaudeImportReport(null);
-    try {
-      const next = await api.claudeSessions.scan(project.id);
-      setClaudeImportSessions(next);
-      setClaudeImportSelected([]);
-    } catch (error) {
-      showToast(
-        t("claude.scanFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setClaudeImportLoading(false);
-    }
-  }
-
-  function toggleClaudeSession(sourcePath: string) {
-    setClaudeImportSelected((current) =>
-      current.includes(sourcePath)
-        ? current.filter((item) => item !== sourcePath)
-        : [...current, sourcePath],
-    );
-  }
-
-  function toggleAllClaudeSessions() {
-    const allPaths = claudeImportSessions.map((session) => session.sourcePath);
-    setClaudeImportSelected((current) =>
-      allPaths.length > 0 && allPaths.every((path) => current.includes(path))
-        ? []
-        : allPaths,
-    );
-  }
-
-  async function importClaudeSessions() {
-    if (!claudeImportProject || claudeImportSelected.length === 0) return;
-    setClaudeImportRunning(true);
-    setClaudeImportReport(null);
-    try {
-      const report = await api.claudeSessions.import(
-        claudeImportProject.id,
-        claudeImportSelected,
-      );
-      setClaudeImportReport(report);
-      await scanClaudeSessions(claudeImportProject, false);
-      await refreshProjectSessions(claudeImportProject.id);
-      if (sessionsProjectId === claudeImportProject.id)
-        await refreshSessions(claudeImportProject.id, true);
-      showToast(
-        t("claude.importDone", {
-          imported: report.imported,
-          failed: report.failed,
-        }),
-      );
-    } catch (error) {
-      showToast(
-        t("claude.importFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setClaudeImportRunning(false);
-    }
-  }
-
-  async function openOpenCodeImport(project: Project) {
-    setProjectMenu(null);
-    setOpenCodeImportProject(project);
-    setOpenCodeImportReport(null);
-    setOpenCodeImportSessions([]);
-    setOpenCodeImportSelected([]);
-    await scanOpenCodeSessions(project);
-  }
-
-  async function scanOpenCodeSessions(
-    project = openCodeImportProject,
-    clearReport = true,
-  ) {
-    if (!project) return;
-    setOpenCodeImportLoading(true);
-    if (clearReport) setOpenCodeImportReport(null);
-    try {
-      const next = await api.openCodeSessions.scan(project.id);
-      setOpenCodeImportSessions(next);
-      // OpenCode 导入会覆盖同名目标副本，默认不勾选，避免误覆盖用户已经导入过的历史。
-      setOpenCodeImportSelected([]);
-    } catch (error) {
-      showToast(
-        t("opencode.scanFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setOpenCodeImportLoading(false);
-    }
-  }
-
-  function toggleOpenCodeSession(sourcePath: string) {
-    setOpenCodeImportSelected((current) =>
-      current.includes(sourcePath)
-        ? current.filter((item) => item !== sourcePath)
-        : [...current, sourcePath],
-    );
-  }
-
-  function toggleAllOpenCodeSessions() {
-    const allPaths = openCodeImportSessions.map((session) => session.sourcePath);
-    setOpenCodeImportSelected((current) =>
-      allPaths.length > 0 && allPaths.every((path) => current.includes(path))
-        ? []
-        : allPaths,
-    );
-  }
-
-  async function importOpenCodeSessions() {
-    if (!openCodeImportProject || openCodeImportSelected.length === 0) return;
-    setOpenCodeImportRunning(true);
-    setOpenCodeImportReport(null);
-    try {
-      const report = await api.openCodeSessions.import(
-        openCodeImportProject.id,
-        openCodeImportSelected,
-      );
-      setOpenCodeImportReport(report);
-      await scanOpenCodeSessions(openCodeImportProject, false);
-      await refreshProjectSessions(openCodeImportProject.id);
-      if (sessionsProjectId === openCodeImportProject.id)
-        await refreshSessions(openCodeImportProject.id, true);
-      showToast(
-        t("opencode.importDone", {
-          imported: report.imported,
-          failed: report.failed,
-        }),
-      );
-    } catch (error) {
-      showToast(
-        t("opencode.importFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    } finally {
-      setOpenCodeImportRunning(false);
-    }
-  }
 
   async function reorderProjects(
     sourceProjectId: string,
@@ -9366,9 +9106,18 @@ export function App() {
             setEditorsOpen(true);
             setProjectMenu(null);
           }}
-          onImportCodexSessions={() => openCodexImport(projectMenu.project)}
-          onImportClaudeSessions={() => openClaudeImport(projectMenu.project)}
-          onImportOpenCodeSessions={() => openOpenCodeImport(projectMenu.project)}
+          onImportCodexSessions={() => {
+            setProjectMenu(null);
+            void importFlow.open("codex", projectMenu.project);
+          }}
+          onImportClaudeSessions={() => {
+            setProjectMenu(null);
+            void importFlow.open("claude", projectMenu.project);
+          }}
+          onImportOpenCodeSessions={() => {
+            setProjectMenu(null);
+            void importFlow.open("opencode", projectMenu.project);
+          }}
           onManageProjectResources={() => {
             setProjectResourcesProject(projectMenu.project);
             setProjectMenu(null);
@@ -9987,65 +9736,23 @@ filePath={gitDrawerDiff.filePath}
           onClose={() => setPreviewImage(null)}
         />
       )}
-      {codexImportProject && (
+      {importFlow.sourceId && importFlow.project && (
         <Suspense fallback={null}>
-        <CodexImportModal
-          project={codexImportProject}
-          sessions={codexImportSessions}
-          selectedPaths={codexImportSelected}
-          loading={codexImportLoading}
-          importing={codexImportRunning}
-          report={codexImportReport}
-          onClose={() => {
-            setCodexImportProject(null);
-            setCodexImportReport(null);
-          }}
-          onRefresh={() => scanCodexSessions()}
-          onToggle={toggleCodexSession}
-          onToggleAll={toggleAllCodexSessions}
-          onImport={importCodexSessions}
-        />
-      </Suspense>
-      )}
-      {claudeImportProject && (
-        <Suspense fallback={null}>
-        <ClaudeImportModal
-          project={claudeImportProject}
-          sessions={claudeImportSessions}
-          selectedPaths={claudeImportSelected}
-          loading={claudeImportLoading}
-          importing={claudeImportRunning}
-          report={claudeImportReport}
-          onClose={() => {
-            setClaudeImportProject(null);
-            setClaudeImportReport(null);
-          }}
-          onRefresh={() => scanClaudeSessions()}
-          onToggle={toggleClaudeSession}
-          onToggleAll={toggleAllClaudeSessions}
-          onImport={importClaudeSessions}
-        />
-      </Suspense>
-      )}
-      {openCodeImportProject && (
-        <Suspense fallback={null}>
-        <OpenCodeImportModal
-          project={openCodeImportProject}
-          sessions={openCodeImportSessions}
-          selectedPaths={openCodeImportSelected}
-          loading={openCodeImportLoading}
-          importing={openCodeImportRunning}
-          report={openCodeImportReport}
-          onClose={() => {
-            setOpenCodeImportProject(null);
-            setOpenCodeImportReport(null);
-          }}
-          onRefresh={() => scanOpenCodeSessions()}
-          onToggle={toggleOpenCodeSession}
-          onToggleAll={toggleAllOpenCodeSessions}
-          onImport={importOpenCodeSessions}
-        />
-      </Suspense>
+          <SessionImportModal
+            source={importSources[importFlow.sourceId]}
+            project={importFlow.project}
+            sessions={importFlow.sessions}
+            selectedPaths={importFlow.selectedPaths}
+            loading={importFlow.phase === "scanning"}
+            importing={importFlow.phase === "importing"}
+            report={importFlow.report}
+            onClose={importFlow.close}
+            onRefresh={() => void importFlow.refresh()}
+            onToggle={importFlow.toggle}
+            onToggleAll={importFlow.toggleAll}
+            onImport={() => void importFlow.runImport()}
+          />
+        </Suspense>
       )}
       <Suspense fallback={null}>
       <ConfigModal
