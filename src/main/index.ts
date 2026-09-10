@@ -379,8 +379,17 @@ function setupTray() {
  * 清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
  * 托盘菜单与设置页「重启」IPC（registerAppHandlers → appRestart）共用此流程。
  */
-function restartApp() {
+async function restartApp() {
 	isQuitting = true;
+	// 重启同样走退出刷盘：设置 store 是 150ms 防抖写盘，摘要缓存是内存 + debounce，
+	// 不 flush 就 relaunch 会丢掉重启前最后一次 update（before-quit 的刷盘
+	// 在 app.quit() 后才跑，而新实例此时已在读旧文件）。
+	await Promise.all([
+		settingsStore.flushSave().catch((error) => {
+			void appLogger?.warn("settings", "Failed to flush settings on restart", error);
+		}),
+		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
+	]);
 	void webServiceManager?.stop();
 	terminalManager?.closeAll();
 	void agentManager?.stopAll();
