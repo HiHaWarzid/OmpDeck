@@ -217,6 +217,70 @@ export function buildComposerPromptSubmission(
 		].join("\n"),
 	};
 }
+/**
+ * /compact 命令的纯判定部分（对应 App sendPrompt 内的内联正则）。
+ *
+ * 从 App 抽出的第一步：正则本身是纯的，先让它可单测；副作用
+ * （清输入框、调 compactAgent）仍留在 App，后续接线时再搬。
+ * 入参应为 trim 后的消息；非命令返回 undefined。
+ */
+export function parseCompactCommand(trimmedMessage: string): { compactPrompt: string } | undefined {
+	if (!/^\/compact(?:\s|$)/i.test(trimmedMessage)) return undefined;
+	return { compactPrompt: trimmedMessage.replace(/^\/compact\s*/i, "").trim() };
+}
+
+export type ComposerSendBlockReason = "starting" | "no-target" | "empty";
+
+export type ComposerSubmitDecision =
+	| { action: "ignore"; reason: ComposerSendBlockReason }
+	| { action: "compact"; compactPrompt: string | undefined }
+	| { action: "block-empty-template"; templateName: string }
+	| { action: "enqueue" }
+	| { action: "submit" };
+
+/**
+ * composer 发送判定表（对应 App sendPrompt 的 if 链，只定路线、不做副作用）。
+ *
+ * 行顺序即 App 现有顺序，改顺序会改行为：
+ * 1. ignore：starting（仅非 override）/ 无 target / 空文本且无图；
+ * 2. compact：/compact 绕过队列，即使忙也直接走压缩（App 先判 compact 后判 busy）；
+ * 3. 空模板拦截：expand 报 emptyTemplateName 即拦，即使忙也不入队；
+ * 4. busy → 入队；5. 否则直发。
+ *
+ * commandRoutes=false 时跳过 2、3 行，对应 sendPromptAsFollowUp
+ * （跟随发送不做命令展开，原样走 busy/直发）。
+ */
+export function decideComposerSubmit(params: {
+	isOverride: boolean;
+	agentStarting: boolean;
+	hasTarget: boolean;
+	message: string;
+	imageCount: number;
+	emptyTemplateName?: string;
+	isBusy: boolean;
+	commandRoutes?: boolean;
+}): ComposerSubmitDecision {
+	const {
+		isOverride,
+		agentStarting,
+		hasTarget,
+		message,
+		imageCount,
+		emptyTemplateName,
+		isBusy,
+		commandRoutes = true,
+	} = params;
+	if (!isOverride && agentStarting) return { action: "ignore", reason: "starting" };
+	if (!hasTarget) return { action: "ignore", reason: "no-target" };
+	if (!message.trim() && imageCount === 0) return { action: "ignore", reason: "empty" };
+	if (commandRoutes) {
+		const compact = parseCompactCommand(message.trim());
+		if (compact) return { action: "compact", compactPrompt: compact.compactPrompt || undefined };
+		if (emptyTemplateName) return { action: "block-empty-template", templateName: emptyTemplateName };
+	}
+	if (isBusy) return { action: "enqueue" };
+	return { action: "submit" };
+}
 
 type ComposerKeyboardState = {
 	key: string;
