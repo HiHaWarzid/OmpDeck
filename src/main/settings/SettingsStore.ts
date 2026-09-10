@@ -329,12 +329,8 @@ export class SettingsStore {
   }
 
   applyMenu() {
-    // 菜单属于 Electron 外壳设置，不影响 pi agent；默认隐藏以获得更接近独立工具的观感。
-    if (this.settings.showNativeMenu) {
-      Menu.setApplicationMenu(null);
-    } else {
-      Menu.setApplicationMenu(null);
-    }
+    // 菜单属于 Electron 外壳设置，不影响 pi agent；应用为自定义标题栏，始终隐藏原生菜单。
+    Menu.setApplicationMenu(null);
   }
 
   createWindowOptions() {

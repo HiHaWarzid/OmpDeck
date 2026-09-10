@@ -1,26 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { app, shell } from "electron";
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join } from "node:path";
+import { shell } from "electron";
+import { mkdir, rename, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 import type { FileAdapter } from "../fs/adapters/fileAdapter";
-import type { SessionSummary } from "../../shared/types";
 
 /**
- * 会话文件操作模块 —— 从 SessionScanner 中抽出的纯文件操作（rename/copy/delete/
- * exportHtml/readMessages/readSessionMeta/readSessionRawText），与扫描管线解耦。
+ * 会话文件操作模块 —— 从 SessionScanner 中抽出的纯文件操作（rename/delete/
+ * readMessages/readSessionMeta/readSessionRawText），与扫描管线解耦。
  *
  * 设计动机（deep module）：
- *   - SessionScanner 原本把扫描管线（collect→fingerprint→cache）、摘要打分与六个
- *     文件操作混在一个 1191 行的类里。文件操作不关心扫描/缓存/项目过滤，
- *     只依赖「文件适配器 + 会话根路径 + 摘要读取」，收拢为本模块后职责单一。
- *   - WSL/本地适配器随环境切换（SessionScanner.configureWsl 会替换实例），
- *     因此通过 getAdapter 访问器每次操作时读取当前适配器，避免持有过期实例。
- *   - copy/exportHtml 需要会话名称/消息数，通过 readSummary 回调注入，
- *     由扫描方（SessionScanner）提供，保持本模块不依赖扫描实现。
+ *   - SessionScanner 原本把扫描管线（collect→fingerprint→cache）、摘要打分与文件
+ *     操作混在一个类里。文件操作不关心扫描/缓存/项目过滤，只依赖文件适配器与
+ *     会话根路径，收拢为本模块后职责单一。
+ *   - WSL/本地适配器随环境切换（configureWsl 会替换实例），因此通过 getAdapter
+ *     访问器每次操作时读取当前适配器，避免持有过期实例。
  *
- * 依赖方向：SessionFileOps 不依赖 SessionScanner（readSummary 注入），
- * 不依赖 AgentManager/RPC；可在无 Electron/无 WSL 环境下用 stub 测试。
+ * 依赖方向：不依赖 SessionScanner、不依赖 AgentManager/RPC；
+ * 可在无 WSL 环境下用 stub 适配器测试。
  */
 
 /** SessionFileOps 的注入依赖。 */
@@ -31,8 +28,6 @@ export interface SessionFileOpsDeps {
   localSessionsRoot: string;
   /** 当前环境默认会话根目录（WSL 时为 Linux 路径），删除安全防护用。 */
   getDefaultSessionsRoot: () => string;
-  /** 读取会话摘要（copy/exportHtml 需要名称/消息数）。 */
-  readSummary: (filePath: string) => Promise<SessionSummary | null>;
 }
 
 /** 从 JSONL 消息 content 中提取纯文本（string | 块数组）。 */
@@ -92,7 +87,7 @@ export class SessionFileOps {
    * 同时剔除旧版应用的 {"sessionName":...} 私有行（无 type 字段）：pi 无法识别，
    * 位于文件头时会破坏首行校验导致整个会话无法加载（#114 的存量受损文件）。
    */
-  private appendSessionInfoLine(raw: string, name: string, extra?: Record<string, unknown>): string {
+  private appendSessionInfoLine(raw: string, name: string): string {
     // 与 pi appendSessionInfo 相同的清洗规则：换行折叠为空格，避免破坏 JSONL 行结构。
     const sanitized = name.replace(/[\r\n]+/g, " ").trim();
     const ids = new Set<string>();
@@ -125,7 +120,6 @@ export class SessionFileOps {
       parentId: lastId,
       timestamp: new Date().toISOString(),
       name: sanitized,
-      ...extra,
     };
     keptLines.push(JSON.stringify(entry));
     return `${keptLines.join("\n")}\n`;
@@ -188,53 +182,6 @@ export class SessionFileOps {
     }
   }
 
-  /**
-   * 复制会话文件并追加新的 session_info 名称记录（pi 原生格式，见 rename/#114）。
-   * 这不是 CLI 的 fork：不裁剪会话树，只生成一个可独立打开/继续的新历史会话文件。
-   * 支持 WSL 路径。
-   */
-  async copy(filePath: string): Promise<SessionSummary> {
-    const raw = await this.deps.getAdapter().read(filePath);
-    const current = await this.deps.readSummary(filePath).catch(() => null);
-    const copyName = `${current?.name || "Untitled"} copy`;
-    const targetPath = await this.nextCopyPath(filePath);
-    // copiedFrom 作为附加字段保留来源信息；pi 会忽略未知字段，不影响加载。
-    const content = this.appendSessionInfoLine(raw, copyName, { copiedFrom: filePath });
-    await this.deps.getAdapter().write(targetPath, content);
-    const summary = await this.deps.readSummary(targetPath);
-    if (!summary) throw new Error("复制后的会话文件无法读取");
-    return summary;
-  }
-
-  /** 将历史 JSONL 会话直接导出为基础 HTML，支持 WSL 路径 */
-  async exportHtml(filePath: string): Promise<{ path: string }> {
-    const summary = await this.deps.readSummary(filePath);
-    if (!summary) throw new Error("会话文件无法读取");
-    const raw = await this.deps.getAdapter().read(filePath);
-    const rows = raw.split(/\r?\n/).filter(Boolean).map((line) => {
-      try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        const data = typeof entry.data === "object" && entry.data !== null
-          ? (entry.data as Record<string, unknown>)
-          : undefined;
-        const message = (entry.message ?? data?.message ?? entry) as Record<string, unknown> | undefined;
-        const role = message && typeof message.role === "string" ? message.role : "";
-        if (!message || !role) return "";
-        const text = extractText(message.content).trim();
-        if (!text) return "";
-        return `<section class=\"msg ${this.escapeHtml(role)}\"><h2>${this.escapeHtml(role)}</h2><pre>${this.escapeHtml(text)}</pre></section>`;
-      } catch {
-        return "";
-      }
-    }).filter(Boolean).join("\n");
-    const title = summary.name || "Untitled";
-    const html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>${this.escapeHtml(title)}</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:920px;margin:32px auto;padding:0 20px;color:#1f2937}.msg{border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin:12px 0;background:#fff}.msg h2{margin:0 0 8px;font-size:13px;color:#64748b}.msg pre{white-space:pre-wrap;margin:0;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}</style></head><body><h1>${this.escapeHtml(title)}</h1><p>${new Date(summary.updatedAt).toLocaleString()} · ${summary.messageCount} messages</p>${rows}</body></html>`;
-    const safeName = title.replace(/[\\/:*?\"<>|]/g, "_").slice(0, 80) || "session";
-    const targetPath = join(app.getPath("downloads"), `${safeName}-${Date.now()}.html`);
-    await writeFile(targetPath, html, "utf8");
-    return { path: targetPath };
-  }
-
   /** 读取会话消息列表，支持 WSL 路径 */
   async readMessages(filePath: string): Promise<Array<{ role: string; content: string; timestamp: number }>> {
     const raw = await this.deps.getAdapter().read(filePath);
@@ -289,20 +236,4 @@ export class SessionFileOps {
     return { provider, modelId, thinkingLevel };
   }
 
-  private async nextCopyPath(filePath: string): Promise<string> {
-    const dir = dirname(filePath);
-    const ext = extname(filePath) || ".jsonl";
-    const base = basename(filePath, ext);
-    for (let index = 1; index < 1000; index += 1) {
-      const suffix = index === 1 ? "copy" : `copy-${index}`;
-      const candidate = join(dir, `${base}-${suffix}${ext}`);
-      // 两个实现都支持存在性检查；WSL 走 wsl.exe test，本地走 existsSync。
-      if (!(await this.deps.getAdapter().exists(candidate))) return candidate;
-    }
-    throw new Error("无法生成唯一的复制会话文件名");
-  }
-
-  private escapeHtml(value: string) {
-    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
-  }
 }

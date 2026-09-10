@@ -46,7 +46,7 @@ import { chooseMessageMode, buildPostMessages, buildMarkdownCards } from "./rich
 import { CardStream } from "./CardStream";
 import { buildFeishuTextChildren, sanitizeFeishuUserVisibleText, stripFeishuActionMarkers, wantsFeishuDoc, wrapHostInstruction } from "./docActions";
 import { hasExplicitFeishuFileSendIntent } from "./fileIntent";
-import { createInitialState, reduceFromPiEvent, markInterrupted, markError, markDone, type RunState } from "./CardRunState";
+import { createInitialState, reduceFromPiEvent, markInterrupted, markError, type RunState } from "./CardRunState";
 import { renderRunCard } from "./CardRenderer";
 import { buildModelPickerCard, parseModelActionValue } from "./ModelPickerCard";
 import type { AgentManager } from "../pi/AgentManager";
@@ -91,9 +91,6 @@ export class FeishuBridge {
 	private groupInfoCache = new Map<string, FeishuGroupInfo>();
 	private userNameCache = new Map<string, string>();
 
-	// ===== 图片/文件即时处理（参考 Proma 思路：不做 pending 等待，收到即处理） =====
-	private imageConfirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
 	// 流式卡片：sessionId → CardStream
 	private streamingCards = new Map<string, CardStream>();
 	// 流式状态：sessionId → RunState
@@ -110,8 +107,6 @@ export class FeishuBridge {
 	private feishuSessions = new Set<string>();
 	/** 飞书消息触发中的运行，agent_end 期间不要再走 OmpDeck 本地同步，避免文件/文本重复发送。 */
 	private feishuDrivenRuns = new Set<string>();
-
-	private lastUserMessageId = new Map<string, string>();
 
 	/** 用户消息中检测到要做飞书文档，agent 结束后自动创建 */
 	private pendingDocRequests = new Map<string, string>();
@@ -185,10 +180,6 @@ export class FeishuBridge {
 		this.streamingRunStates.delete(binding.sessionId);
 		this.pendingCardEvents.delete(binding.sessionId);
 		this.cardUpdateFailed.delete(binding.sessionId);
-		// 清理图片确认定时器（如果有）
-		const timer = this.imageConfirmTimers.get(chatId);
-		if (timer) { clearTimeout(timer); this.imageConfirmTimers.delete(chatId); }
-		this.lastUserMessageId.delete(chatId);
 		this.updateStatus({ activeBindings: this.chatBindings.size });
 		this.persistBindings();
 		this.pushBindings();
@@ -289,12 +280,10 @@ export class FeishuBridge {
 		this.wsClient = null; this.client = null;
 		this.chatBindings.clear(); this.sessionToChat.clear(); this.feishuSessions.clear();
 		this.recentMessageIds.clear(); this.recentEventIds.clear(); this.recentContent.clear();
-		this.processingChats.clear(); this.lastUserMessageId.clear();
+		this.processingChats.clear();
 		this.groupInfoCache.clear(); this.userNameCache.clear(); this.botOpenId = null;
 		this.cardUpdateFailed.clear();
 		this.pendingDocRequests.clear();
-		for (const [, timer] of this.imageConfirmTimers) { clearTimeout(timer); }
-		this.imageConfirmTimers.clear();
 		this.pendingAttachments.clear();
 		this.updateStatus({ status: "disconnected", activeBindings: 0, botId: undefined, botName: undefined, botOpenId: undefined });
 		log("[Feishu Bridge] stopped");
@@ -407,8 +396,6 @@ export class FeishuBridge {
 			const binding = this.chatBindings.get(chatId);
 			if (!binding || binding.source !== "session-mirror") return;
 		}
-			if (chatType === "group" && messageId) this.lastUserMessageId.set(chatId, messageId);
-
 			const supportedTypes = new Set(["text", "image", "post", "file"]);
 			if (!supportedTypes.has(messageType)) { log(`[飞书 Bridge] 不支持的消息类型: ${messageType}`); return; }
 

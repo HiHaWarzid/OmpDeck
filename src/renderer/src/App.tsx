@@ -126,7 +126,6 @@ import {
   type TerminalDockStateByOwner,
 } from "./terminalDockState";
 import { useMessagePagination } from "./hooks/useMessagePagination";
-import { useSessionLoader } from "./hooks/useSessionLoader";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";

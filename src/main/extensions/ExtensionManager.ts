@@ -1,36 +1,13 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { app } from "electron";
-import { is } from "@electron-toolkit/utils";
 import type { AppSettings, PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary, PiUpdateCheckResult } from "../../shared/types";
 import type { PiLocator } from "../pi/PiLocator";
 import type { AppLogger } from "../logging/AppLogger";
 import { toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 type SettingsProvider = () => AppSettings;
-
-/** OmpDeck 内置扩展列表（已全部移除，omp 提供原生能力替代） */
-export const BUILT_IN_EXTENSIONS = [] as const;
-
-/** ensureOmpDeckExtension 的校准结果，供启动任务汇总日志。 */
-export type OmpDeckExtensionSyncResult =
-	| "installed"
-	| "updated"
-	| "unchanged"
-	| "missing-source";
-
-/** 启动时内置扩展部署汇总，供日志输出。 */
-export interface ExtensionDeploySummary {
-	homeDir: string;
-	installed: string[];
-	updated: string[];
-	unchanged: string[];
-	skippedRemoved: string[];
-	missingSource: string[];
-	failed: Array<{ name: string; error: string }>;
-}
 
 /**
  * 通过 omp CLI 管理已安装插件，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
@@ -84,130 +61,6 @@ export class ExtensionManager {
 		// 允许下一次 list() 立刻发起新请求，而不是复用失效前的 inflight。
 		this.listInflight = null;
 		this.listInflightForce = false;
-	}
-
-	/**
-	 * 启动时异步校准内置扩展：对比 resources 源文件与用户扩展目录，
-	 * 不一致则覆盖。用户在设置里「移除」的内置扩展按 removedBuiltInExtensions 跳过，
-	 * 同时清理残留文件避免 pi 加载旧版导致 RPC 启动失败。
-	 *
-	 * @param homeDir 目标 HOME 目录；不传则使用当前 homeDir（Windows 本地或 WSL）。
-	 */
-	async deploy(homeDir?: string): Promise<ExtensionDeploySummary> {
-		const target = homeDir ?? this.homeDir;
-		const summary: ExtensionDeploySummary = {
-			homeDir: target,
-			installed: [],
-			updated: [],
-			unchanged: [],
-			skippedRemoved: [],
-			missingSource: [],
-			failed: [],
-		};
-
-		const removedBuiltIn = new Set(this.getOmpDeckSettings().removedBuiltInExtensions ?? []);
-
-		// 并行校准：磁盘 IO 为主，互不依赖
-		await Promise.all(
-			BUILT_IN_EXTENSIONS.map(async (extensionName) => {
-				if (removedBuiltIn.has(extensionName)) {
-					summary.skippedRemoved.push(extensionName);
-					// 历史「仅标记移除、文件仍保留」会让 pi 继续加载残留扩展，
-					// 与三方同名工具（如 rpiv-todo 的 todo）冲突导致 RPC 启动失败。启动时清残留。
-					try {
-						await rm(join(target, ".omp", "agent", "extensions", extensionName), { force: true });
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						summary.failed.push({ name: extensionName, error: `purge residual: ${message}` });
-					}
-					return;
-				}
-				try {
-					const result = await this.ensureExtension(extensionName, target);
-					if (result === "installed") summary.installed.push(extensionName);
-					else if (result === "updated") summary.updated.push(extensionName);
-					else if (result === "unchanged") summary.unchanged.push(extensionName);
-					else if (result === "missing-source") summary.missingSource.push(extensionName);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					summary.failed.push({ name: extensionName, error: message });
-				}
-			}),
-		);
-
-		const changedCount = summary.installed.length + summary.updated.length;
-		if (changedCount > 0) {
-			// 文件有变时清扩展列表缓存，配置页/下次 list 能看到最新状态
-			this.invalidateListCache();
-		}
-
-		void this.appLogger?.info("extension", "Built-in extensions sync finished", {
-			homeDir: summary.homeDir,
-			installed: summary.installed,
-			updated: summary.updated,
-			unchanged: summary.unchanged,
-			skippedRemoved: summary.skippedRemoved,
-			missingSource: summary.missingSource,
-			failed: summary.failed,
-			changedCount,
-		});
-		if (summary.failed.length > 0) {
-			void this.appLogger?.warn("extension", "Some built-in extensions failed to sync", {
-				homeDir: summary.homeDir,
-				failed: summary.failed,
-			});
-		}
-
-		return summary;
-	}
-
-	/**
-	 * 确保单个内置扩展文件存在于目标目录。
-	 * - 目标不存在 → 安装
-	 * - 内容不一致（老版本/用户手改）→ 覆盖为 OmpDeck 当前版本
-	 * - 内容一致 → 跳过写盘
-	 *
-	 * 供 restoreBuiltIn IPC handler 在用户「恢复」内置扩展时调用，
-	 * 也供 deploy() 内部并行校准使用。
-	 */
-	async ensureExtension(
-		extensionName: string,
-		homeDir: string,
-	): Promise<OmpDeckExtensionSyncResult> {
-		const extensionsDir = join(homeDir, ".omp", "agent", "extensions");
-		const targetPath = join(extensionsDir, extensionName);
-
-		// 获取源文件路径：开发模式下在 resources/ 目录，打包后通过 process.resourcesPath 访问
-		const sourcePath = is.dev
-			? join(app.getAppPath(), "resources", "extensions", extensionName)
-			: join(process.resourcesPath, "extensions", extensionName);
-
-		const sourceContent = await readFile(sourcePath, "utf-8").catch(() => null);
-		if (!sourceContent) {
-			void this.appLogger?.warn("extension", "Built-in extension source missing", {
-				extensionName,
-				sourcePath,
-			});
-			return "missing-source";
-		}
-
-		const existingContent = await readFile(targetPath, "utf-8").catch(() => null);
-		// 全文比对：任意与 resources 不一致都覆盖，避免用户仍跑旧版 ask/plan/todo 扩展。
-		if (existingContent === sourceContent) {
-			return "unchanged";
-		}
-
-		const action: OmpDeckExtensionSyncResult = existingContent == null ? "installed" : "updated";
-		await mkdir(extensionsDir, { recursive: true });
-		await writeFile(targetPath, sourceContent, "utf-8");
-		void this.appLogger?.info("extension", `Built-in extension ${action}`, {
-			extensionName,
-			targetPath,
-			sourcePath,
-			previousBytes: existingContent?.length ?? 0,
-			nextBytes: sourceContent.length,
-		});
-		return action;
 	}
 
 	/**
@@ -270,36 +123,10 @@ export class ExtensionManager {
 			}
 		}
 
-		// 补充：将已禁用/文件缺失的内置扩展也纳入列表，确保用户可在 UI 中重新启用。
-		const existingSources = new Set(merged.map((ext) => ext.source));
-		for (const builtIn of BUILT_IN_EXTENSIONS) {
-			if (!existingSources.has(builtIn)) {
-				merged.push({
-					id: `local:${builtIn}`,
-					source: builtIn,
-					path: undefined,
-					scope: "user",
-					builtIn: true,
-				});
-			}
-		}
-
 		// 通过 OmpDeck 桌面设置标记内置扩展移除状态
 		const removedBuiltIn = new Set(this.getOmpDeckSettings().removedBuiltInExtensions ?? []);
 		for (const ext of merged) {
 			ext.enabled = !(ext.builtIn && removedBuiltIn.has(ext.source));
-		}
-
-		// 仅检测 todo / plan / ask 固定冲突：三方包名含对应关键词时自动禁用内置版。
-		// nul-redirect-fix 等其它内置扩展暂不参与冲突检测，避免 mode 等通用词误伤。
-		// 注意：此处不走 disableBuiltIn（会 invalidateListCache），避免 list 请求中途 generation
-		// 变化导致结果被丢弃后反复重入。
-		const conflicts: { builtIn: string; thirdParty: string }[] = [];
-		let removedChanged = false;
-		// BUILT_IN_CONFLICT_KEYWORDS 已清空（omp 内置能力替代）
-
-		if (removedChanged) {
-			await this.saveRemovedBuiltIn([...removedBuiltIn]);
 		}
 
 		// 已标记移除但磁盘仍有残留时主动清掉，修复「UI 已禁用但仍冲突」的历史状态。
@@ -308,7 +135,7 @@ export class ExtensionManager {
 			await this.removeBuiltInFile(builtInName).catch(() => undefined);
 		}
 
-		return { extensions: merged, raw, conflicts: conflicts.length > 0 ? conflicts : undefined };
+		return { extensions: merged, raw };
 	}
 
 	/**
@@ -698,21 +525,3 @@ export class ExtensionManager {
 	}
 }
 
-/**
- * 当前参与冲突检测的内置扩展与关键词。
- * todo / plan / ask：三方包名含关键词即视为功能冲突；其它内置扩展暂不自动互斥。
- */
-export const BUILT_IN_CONFLICT_KEYWORDS = [] as const;
-
-/**
- * 固定关键词冲突匹配：清理协议/作用域后，包名是否包含指定关键词。
- * 例：rpiv-todo、my-plan-helper 命中；context-mode 不含 plan/todo 不命中。
- */
-export function extensionNameMatches(source: string, keyword: string): boolean {
-	const clean = source
-		.replace(/^(?:npm|file|github|git|https?):/i, "")
-		.replace(/\.ts$/, "")
-		.replace(/@[^/]+\//, "")
-		.toLowerCase();
-	return clean.includes(keyword.toLowerCase());
-}

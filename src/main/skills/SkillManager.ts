@@ -218,7 +218,9 @@ export class SkillManager {
 
 		const displayName = newName.trim();
 		const oldDir = skill.dir;
-		const parentDir = skill.dir.split(/[\\/]/).slice(0, -1).join("\\");
+		// dirname/join 取 node:path 的平台语义：Windows 走 win32，macOS/Linux 走 posix。
+		// 旧实现用 "\\" 手工拼父目录，非 Windows 平台上会得到不存在的路径。
+		const parentDir = dirname(oldDir);
 		const newDir = join(parentDir, normalizedNew);
 
 		if (oldDir === newDir) throw new Error("新旧名称相同");
@@ -233,8 +235,6 @@ export class SkillManager {
 
 		// 重命名后路径变为新路径
 		const newSkillPath = join(newDir, skill.path.split(/[\\/]/).pop()!);
-		// 找对应的 location（搜索所有 locations）
-		const { skills } = await this.list();
 		const reloaded = await this.readSkill(
 			newSkillPath,
 			this.locations.find((l) => newSkillPath.startsWith(l.path)) ?? this.locations[0],

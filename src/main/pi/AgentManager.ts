@@ -21,9 +21,6 @@ import type {
 	ThinkingUpdate,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
-import {
-	extractResultDetails,
-} from "../../shared/todo";
 import { PiProcess } from "./PiProcess";
 import type { RpcResponse } from "./PiRpcClient";
 import { formatBashToolMessage } from "./bashResult";
@@ -32,24 +29,16 @@ import { mergeHistoryWithPreservedMessages } from "./historyMessages";
 import {
 	buildActiveBranchEntryIds,
 	convertAgentMessages,
-	formatToolDetail,
 	getToolPathFromArgs,
 	trimHistoryMessages,
 } from "./messageTimeline";
 import { perfEnd, perfStart } from "../perf";
 import {
-	buildAskCard,
-	extractAskQuestionDetails,
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
 import {
-	MAX_TOOL_RESULT_CHARS,
 	extractImages,
-	extractThinking,
-	extractToolResultText,
-	safeJson,
 	stripAnsi,
-	truncateForDetail,
 } from "./messageTextUtils";
 import {
 	assertResendRootEntry,
@@ -85,6 +74,38 @@ import {
 	sealStreamGate,
 	type StreamGateState,
 } from "./streamGate";
+import {
+	appendMessage as appendTranscriptMessage,
+	beginAssistantMessage,
+	appendThinkingDelta,
+	cacheFullText,
+	clearThinkingBuffer,
+	createTranscriptState,
+	endThinking,
+	fullTextOf,
+	markAllMessagesDirty,
+	markDirtyFrom,
+	markMessageDirty,
+	replaceMessages,
+	resetTranscriptRun,
+	takeDirtySlice,
+	upsertAssistantMessage,
+	upsertToolMessage,
+	type AgentTranscriptState,
+} from "./agentTranscript";
+import {
+	closeRun as closeAgentRun,
+	createRunState,
+	decideSettle,
+	hasLocalWork,
+	isRunSealed,
+	noteRunAbortSettled,
+	sealRun,
+	SETTLE_POLL_TIMEOUT_MS,
+	type AgentRunState,
+	type LocalWorkSignals,
+	type PiStateFields,
+} from "./agentRunState";
 import {
   updateActiveToolCalls,
   type ActiveToolCallState,
@@ -170,13 +191,6 @@ export class AgentManager {
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
 	private readonly pendingTrustRequests = new Map<string, { resolve: (choice: ProjectTrustChoice) => void }>();
 	/**
-	 * 工具结果全文缓存（仅存被截断下发的完整文本），供「查看完整输出」按需读取。
-	 * LRU 上限 200 条防止长会话无界增长；agent 退出时由 stopAll/删除路径清空关联条目
-	 * （messageId 全局唯一，直接按 id 删除即可）。
-	 */
-	private readonly toolFullTextByMessageId = new Map<string, string>();
-	private static readonly TOOL_FULL_TEXT_LRU_MAX = 200;
-	/**
 	 * emitRuntimeState 并发合并：工具密集循环（tool_start/end 交替）每个边沿都会
 	 * 触发一次 get_state + get_session_stats RPC 与文件尾部读取；同一时刻只允许
 	 * 一个在途请求，期间到达的新请求只标记 pending，在途请求完成后补发一次最新状态
@@ -256,103 +270,20 @@ export class AgentManager {
 	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
 	 */
 	getMessages(agentId: string): ChatMessage[] {
-		return this.agents.get(agentId)?.messages ?? [];
+		return this.agents.get(agentId)?.transcript.messages ?? [];
 	}
 
 	/**
 	 * 不启动 pi 进程，直接从 JSONL 构造与运行态相同的时间线数据。
-	 * Viewer 必须复用 AgentManager 的压缩归档与消息转换规则，避免维护第二套显示模型。
+	 * 转换规则（活动分支回溯 + 压缩归档参与）在 SessionJsonl.readDisplayMessages；
+	 * 本方法只负责把协议路径交给 sessionJsonl 的宿主路径解析。
 	 */
 	async readSessionDisplayMessages(
 		sessionPath: string,
 		agentId = "_viewer",
 		sessionContent?: string,
 	): Promise<ChatMessage[]> {
-		const content = sessionContent ?? await readFile(this.toSessionHostPath(sessionPath), "utf8");
-		const entries: Array<{
-			id: string;
-			parentId: string | null;
-			type: string;
-			message?: unknown;
-			summary?: string;
-			firstKeptEntryId?: string;
-			tokensBefore?: number;
-			timestamp?: string;
-		}> = [];
-
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line);
-				if (!entry || typeof entry !== "object" || typeof entry.id !== "string") continue;
-				entries.push({
-					id: entry.id,
-					parentId: typeof entry.parentId === "string" ? entry.parentId : null,
-					type: typeof entry.type === "string" ? entry.type : "",
-					message: entry.message,
-					summary: typeof entry.summary === "string" ? entry.summary : undefined,
-					firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
-					tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
-					timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
-				});
-			} catch {
-				// 单行损坏不应阻断整个 Viewer。
-			}
-		}
-		if (entries.length === 0) return [];
-
-		// JSONL 最后一个 entry 是 pi 当前叶节点；沿 parentId 回溯得到与 get_messages 一致的活动分支。
-		const byId = new Map(entries.map((entry) => [entry.id, entry]));
-		const activeBranch: typeof entries = [];
-		const seen = new Set<string>();
-		let current: (typeof entries)[number] | undefined = entries[entries.length - 1];
-		while (current && !seen.has(current.id)) {
-			seen.add(current.id);
-			activeBranch.push(current);
-			current = current.parentId ? byId.get(current.parentId) : undefined;
-		}
-		activeBranch.reverse();
-
-		const lastCompactionIndex = activeBranch.findLastIndex((entry) => entry.type === "compaction");
-		const lastCompaction = lastCompactionIndex >= 0 ? activeBranch[lastCompactionIndex] : undefined;
-		const firstKeptIndex = lastCompaction?.firstKeptEntryId
-			? activeBranch.findIndex((entry) => entry.id === lastCompaction.firstKeptEntryId)
-			: -1;
-		// pi 压缩后上下文由 summary + firstKeptEntryId 起的保留消息 + 后续消息组成；
-		// 不能只取 compaction entry 之后，否则会漏掉压缩时明确保留的尾部消息。
-		const currentStartIndex = firstKeptIndex >= 0
-			? firstKeptIndex
-			: lastCompactionIndex >= 0
-				? lastCompactionIndex + 1
-				: 0;
-		const currentEntries = activeBranch
-			.slice(currentStartIndex)
-			.filter((entry) => entry.type === "message" && entry.message);
-		const rawMessages = currentEntries.map((entry) => entry.message);
-		const trimmed = trimHistoryMessages(rawMessages);
-		const trimStart = trimmed.length > 0 ? rawMessages.indexOf(trimmed[0]) : 0;
-		const activeEntryIds = currentEntries.slice(Math.max(0, trimStart)).map((entry) => entry.id);
-
-		let finalRaw: unknown[] = trimmed;
-		if (lastCompaction) {
-			const compactionEntry = lastCompaction;
-			const archiveData = await this.sessionJsonl.parseArchives(sessionPath, agentId, content);
-			const archivedMessages = archiveData.archivedMessagesByCompactionId.get(compactionEntry.id) ?? [];
-			finalRaw = [{
-				role: "compactionSummary",
-				summary: compactionEntry.summary || "[摘要]",
-				timestamp: compactionEntry.timestamp ? Date.parse(compactionEntry.timestamp) : Date.now(),
-				meta: {
-					compactionId: compactionEntry.id,
-					compactionCount: archiveData.compactions.length,
-					firstKeptEntryId: compactionEntry.firstKeptEntryId,
-					tokensBefore: compactionEntry.tokensBefore,
-					archivedMessages,
-				},
-			}, ...trimmed];
-		}
-
-		return convertAgentMessages(agentId, finalRaw, activeEntryIds, false);
+		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, sessionContent);
 	}
 
 	recordHostExchange(agentId: string, userText: string, assistantText: string) {
@@ -524,7 +455,7 @@ export class AgentManager {
 		// 将压缩摘要插到消息最前面（在 trim 之后，避免被按 user 轮次切掉）。
 		const finalRaw = compactionSummaryRaw ? [compactionSummaryRaw, ...trimmed] : trimmed;
 
-		const messages = convertAgentMessages(agentId, finalRaw, activeEntryIds, runtime.abortedDuringAsk);
+		const messages = convertAgentMessages(agentId, finalRaw, activeEntryIds, runtime.run.abortedDuringAsk);
 		const t2 = Date.now();
 		void this.appLogger?.info("agent", "Agent messages loaded", {
 			agentId,
@@ -536,13 +467,13 @@ export class AgentManager {
 			totalMs: t2 - t0,
 		});
 		// abort 时 ask_question 的 answer 已被覆写为 null，不再需要跟踪
-		runtime.abortedDuringAsk = false;
+		runtime.run.abortedDuringAsk = false;
 		const nextMessages = mergeHistoryWithPreservedMessages(
 			messages,
-			runtime.messages,
+			runtime.transcript.messages,
 			options?.preserveMessagesAfter,
 		);
-		runtime.messages = nextMessages;
+		runtime.transcript.messages = nextMessages;
 		// 整组重建：下一次 flush 必须是全量基线（渲染层整体替换），不能用增量合并。
 		this.markAllMessagesDirty(runtime);
 		this.refreshAutoTitle(runtime);
@@ -876,7 +807,7 @@ export class AgentManager {
 					})
 					.catch((error) => {
 						const rt = this.agents.get(id);
-						const list = rt?.messages ?? [];
+						const list = rt?.transcript.messages ?? [];
 						const loadingMessage = list.find((message) => message.meta?.historyLoading === true);
 						if (loadingMessage) {
 							loadingMessage.role = "error";
@@ -915,7 +846,7 @@ export class AgentManager {
 					})
 					.catch((error) => {
 						const rt = this.agents.get(id);
-						const list = rt?.messages ?? [];
+						const list = rt?.transcript.messages ?? [];
 						const loadingMessage = list.find((message) => message.meta?.historyLoading === true);
 						if (loadingMessage) {
 							loadingMessage.role = "error";
@@ -1222,7 +1153,7 @@ export class AgentManager {
 		// 工具 result 的 answer = null，answered 为 false → 卡片显示"已取消"。
 		const pending = runtime.pendingUIRequests;
 		if (pending.size > 0) {
-			runtime.abortedDuringAsk = true;
+			runtime.run.abortedDuringAsk = true;
 			for (const [requestId] of pending) {
 				runtime.process.client.sendRaw({
 					type: "extension_ui_response",
@@ -1232,13 +1163,11 @@ export class AgentManager {
 			}
 		}
 
-		// 标记最近中止的 agent，用于抑制 auto-retry/compaction 把状态重新标为 running。
-		// 必须在发送 abort RPC 之前加入集合，避免事件处理函数在 RPC 发出后、
-		// handlePiEvent 返回前收到管道中的旧事件并重建 assistant 消息。
-		runtime.recentlyAborted = true;
-		// 封印当前 stream generation：比 recentlyAborted 更硬，不依赖 activeAssistantMessageIds 例外条件，
-		// 残留 thinking/text/tool 事件在 abort settled 前一律丢弃。
-		this.sealAgentStream(runtime);
+		// 标记最近中止的 agent，用于抑制 auto-retry/compaction 把状态重新标为 running；
+		// 同时封印当前 stream generation（比 recentlyAborted 更硬）：残留 thinking/text/tool
+		// 事件在 abort settled 前一律丢弃。必须在发送 abort RPC 之前完成，避免事件处理函数
+		// 在 RPC 发出后、handlePiEvent 返回前收到管道中的旧事件并重建 assistant 消息。
+		sealRun(runtime.run, Date.now());
 		this.scheduleAbortSettledFallback(runtime);
 
 		runtime.process.client
@@ -1249,7 +1178,7 @@ export class AgentManager {
 
 		// 立即清理 pending UI 记录并移除 ask_question 卡片，不等待 abort 返回
 		if (pending.size > 0) {
-			const messages = runtime.messages;
+			const messages = runtime.transcript.messages;
 			for (const [requestId] of pending) {
 				const idx = messages.findIndex(
 					(msg) =>
@@ -1267,11 +1196,7 @@ export class AgentManager {
 		}
 		// abort 时必须清除所有流式状态，防止后续 pi 的延迟事件（text_delta、thinking_delta、tool_execution_* 等）
 		// 修改上次会话的旧消息，导致新会话消息混入被中止的旧输出。
-		runtime.activeAssistantMessageId = undefined;
-		runtime.streamingThinking = "";
-		runtime.thinkingStartedAt = undefined;
-		runtime.thinkingEndedAt = undefined;
-		runtime.toolMessageIds.clear();
+		resetTranscriptRun(runtime.transcript);
 		runtime.activeToolCalls.clear();
 		runtime.toolExecuting = null;
 		// 取消节流中的 thinking/message 推送，避免 abort 后还有 pending flush 把旧内容刷回 UI。
@@ -1466,7 +1391,7 @@ export class AgentManager {
 			runtime.autoRestartAttempted = false;
 
 			// 如果有旧的 pending abort 标记，清理掉
-			runtime.abortedDuringAsk = false;
+			runtime.run.abortedDuringAsk = false;
 
 			await this.loadMessages(agentId).catch(() => undefined);
 
@@ -1898,17 +1823,20 @@ export class AgentManager {
 			// 先查一次 runtime state 确认 stream 状态
 			try {
 				const state = await this.getRuntimeState(agentId);
-				// 复用 settleReducer 的 poll 语义做即时复核：isStreaming/isCompacting
-				// 的严格归一化与忙碌裁定与 settle 决策收敛到同一判定器。
-				// timeoutMs=0：即时检查（无 settle 窗口概念），reducer 仅区分
-				// undefined（未安排轮询）与有值（有权给结论），0 允许立即判定。
-				const decision = resolveSettle({
-					isStreaming: state.isStreaming,
-					hasPendingGetState: state.isCompacting,
+				// 复用 agentRunState.decideSettle 的 poll 语义做即时复核：isStreaming/isCompacting
+				// 的严格归一化、闸门封印与本地忙碌裁定与 settle 决策收敛到同一判定器。
+				// timeoutMs=0：即时检查（无 settle 窗口概念），reducer 仅区分 undefined（未安排轮询）
+				// 与有值（有权给结论），0 允许立即判定。
+				const remote: PiStateFields = { isStreaming: state.isStreaming, isCompacting: state.isCompacting };
+				const decision = decideSettle({
+					run: runtime.run,
+					local: this.localWorkSignals(runtime),
+					remote,
 					now: Date.now(),
 					timeoutMs: 0,
 				});
-				if (decision.decision === "stay-running") {
+				// 非 idle 一律视为 busy（含 abort 封印中的 wait）：编辑/删除要在确定无事时才放行。
+				if (decision.decision !== "idle") {
 					throw new Error("BUSY_STREAMING: Agent is streaming, please wait");
 				}
 				// isExecutingTool 时也视为 busy（保留独立错误信息，便于 UI 区分展示）
@@ -1965,7 +1893,7 @@ export class AgentManager {
 			if (!sessionPath) throw new Error("Session not persisted");
 
 			await this.sessionJsonl.modifyLines(sessionPath, (lines) => {
-				const messages = runtime.messages;
+				const messages = runtime.transcript.messages;
 				const msg = messages.find((m) => m.id === messageId);
 				if (!msg) throw new Error("Message not found");
 
@@ -2054,7 +1982,7 @@ export class AgentManager {
 			if (!sessionPath) throw new Error("Session not persisted");
 
 			await this.sessionJsonl.modifyLines(sessionPath, (lines) => {
-				const messages = runtime.messages;
+				const messages = runtime.transcript.messages;
 				const msg = messages.find((m) => m.id === messageId);
 				if (!msg) throw new Error("Message not found");
 
@@ -2130,7 +2058,7 @@ export class AgentManager {
 
 	/**
 	 * 按需读取消息完整文本（工具结果截断后的「查看完整输出」）。
-	 * 优先运行时内存缓存（toolFullTextByMessageId，仅截断下发的完整文本），
+	 * 优先本 agent 的运行时全文缓存（仅截断下发时才写入），
 	 * 回退按 entryId 在会话文件里定位读取；找不到或读取失败抛错，由 IPC 层转结构化错误。
 	 */
 	async readMessageFullText(
@@ -2138,9 +2066,9 @@ export class AgentManager {
 		messageId: string,
 		entryId?: string,
 	): Promise<{ text: string }> {
-		const cached = this.toolFullTextByMessageId.get(messageId);
-		if (cached !== undefined) return { text: cached };
 		const runtime = this.agents.get(agentId);
+		const cached = runtime ? fullTextOf(runtime.transcript, messageId) : undefined;
+		if (cached !== undefined) return { text: cached };
 		const sessionPath = runtime?.tab.sessionPath;
 		if (sessionPath && entryId) {
 			const text = await this.sessionJsonl.readEntryTextById(sessionPath, entryId);
@@ -2170,7 +2098,7 @@ export class AgentManager {
 			const sessionPath = runtime.tab.sessionPath;
 			if (!sessionPath) throw new Error("Session not persisted");
 
-			const messages = runtime.messages;
+			const messages = runtime.transcript.messages;
 			const msg = messages.find((m) => m.id === messageId);
 			if (!msg) throw new Error("Message not found");
 			if (msg.role !== "user") throw new Error("Only user messages can be resent");
@@ -2955,7 +2883,7 @@ export class AgentManager {
 			// agent_start 表示一轮新的 agent run 开始：
 			// 1) 清理 recentlyAborted，允许状态机恢复 running
 			// 2) 推进 stream generation，解封流式闸门（唯一合法解封点）
-			runtime.recentlyAborted = false;
+			runtime.run.recentlyAborted = false;
 			this.openAgentStream(runtime);
 			if (runtime.settleCheckTimer) {
 				clearTimeout(runtime.settleCheckTimer);
@@ -2964,8 +2892,8 @@ export class AgentManager {
 			runtime.tab.status = "running";
 			// 新一轮回答开始即恢复：清掉上次 error 的 lastError（如 auto_retry_end 失败后重新触发）。
 			delete runtime.tab.lastError;
-			runtime.activeAssistantMessageId = undefined;
-			runtime.toolMessageIds.clear();
+			runtime.transcript.activeAssistantMessageId = undefined;
+			runtime.transcript.toolMessageIds.clear();
 			runtime.activeToolCalls.clear();
 			runtime.toolExecuting = null;
 			this.emitState();
@@ -2988,7 +2916,7 @@ export class AgentManager {
 		if (typed.type === "auto_retry_start") {
 			this.upsertRetryStatusMessage(runtime, typed, "running");
 			// 用户已主动中止时不重新激活 running 状态，避免 abort 后 auto-retry 事件误覆盖 state
-			if (!runtime.recentlyAborted) {
+			if (!runtime.run.recentlyAborted) {
 				// pi 在等待指数退避期间可能短暂结束一轮 agent run；桌面端保持 running，
 				// 让用户明确知道当前不是最终失败，而是在等待下一次自动重试。
 				runtime.tab.status = "running";
@@ -3006,7 +2934,7 @@ export class AgentManager {
 			);
 			// 自动重试最终失败：如果用户没有主动中止，则保持 agent 的 error 状态
 			// 不被后续 agent_settled 覆盖，确保侧边栏状态显示失败标记。
-			if (!typed.success && !runtime.recentlyAborted) {
+			if (!typed.success && !runtime.run.recentlyAborted) {
 				runtime.tab.status = "error";
 				const reason = typed.finalError ?? typed.errorMessage ?? "API 请求失败";
 				const failureText = `请求失败：${String(reason)}`;
@@ -3021,7 +2949,7 @@ export class AgentManager {
 		if (typed.type === "compaction_start" || typed.type === "auto_compaction_start") {
 			runtime.rpcCompacting = true;
 			// 用户已主动中止或出错时不重新激活 running 状态
-			if (!runtime.recentlyAborted && runtime.tab.status !== "error") {
+			if (!runtime.run.recentlyAborted && runtime.tab.status !== "error") {
 				// 自动压缩在 agent_end 之后触发：Pi 仍在改写上下文，但不会再发 agent_start。
 				// 因此桌面端必须主动保持 running，阻止用户误以为空闲并继续发送消息。
 				runtime.tab.status = "running";
@@ -3039,7 +2967,7 @@ export class AgentManager {
 			// 避免前端仍展示压缩前分支，下一轮继续对话时看起来像“断在旧会话”。
 			void this.loadMessages(agentId).catch(() => undefined);
 			// 用户已主动中止或出错时不重新激活 running 状态
-			if (!runtime.recentlyAborted && runtime.tab.status !== "error") {
+			if (!runtime.run.recentlyAborted && runtime.tab.status !== "error") {
 				// compaction_end 之后 Pi 仍可能因 overflow retry 或 queued follow-up 自动继续。
 				// omp 没有 agent_settled 事件，压缩完成后再调度一次最终空闲检查（get_state 校验）。
 				runtime.tab.status = "running";
@@ -3061,8 +2989,8 @@ export class AgentManager {
 		if (typed.type === "agent_end") {
 			// agent_end 只表示一次底层 run 结束；Pi 之后仍可能执行自动重试、自动压缩，
 			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
-			runtime.activeAssistantMessageId = undefined;
-			runtime.toolMessageIds.clear();
+			runtime.transcript.activeAssistantMessageId = undefined;
+			runtime.transcript.toolMessageIds.clear();
 			// run 结束意味着本轮工具必然已结束。长任务中最后一个工具的 end 事件可能
 			// 丢失（并行工具批次、错误/中断路径），残留 toolExecuting 会让空闲检查
 			// （markIdleIfPiReportsNoWork）永远判 busy，UI 卡在 running、三点指示器
@@ -3101,7 +3029,7 @@ export class AgentManager {
 			if (typed.willRetry === true) {
 				// agent_end.willRetry 表示 pi 已判定本次错误会进入自动重试；
 				// 此时不写入最终错误，避免用户误以为会话已经失败。
-				if (errorMsg && runtime.retryStatusMessageId === undefined) {
+				if (errorMsg && runtime.transcript.retryStatusMessageId === undefined) {
 					this.upsertRetryStatusMessage(
 						runtime,
 						{
@@ -3115,7 +3043,7 @@ export class AgentManager {
 				}
 				// 重试中保持 running，不能误置为 idle/error，否则宠物聚合状态会提前转 done/failed
 				// 用户已主动中止时不覆盖 state，避免 abort 后收到此事件又重新激活 running
-				if (!runtime.recentlyAborted) {
+				if (!runtime.run.recentlyAborted) {
 					runtime.tab.status = "running";
 					// 进入自动重试即恢复：清掉上次 error 的 lastError。
 					delete runtime.tab.lastError;
@@ -3153,21 +3081,16 @@ export class AgentManager {
 			// 先捕获「该 settled 是否由 abort 触发」再清标记：abortAgent 在发送 abort RPC 前
 			// 置 recentlyAborted=true，此处若为 true 说明是用户手动停止后的收尾，
 			// 不再发「已完成」系统通知（用户主动中止，无需提醒）。
-			const settledAfterAbort = runtime.recentlyAborted;
+			const settledAfterAbort = runtime.run.recentlyAborted;
 			this.noteAgentAbortSettled(runtime);
-			runtime.recentlyAborted = false;
+			runtime.run.recentlyAborted = false;
 			if (runtime.settleCheckTimer) {
 				clearTimeout(runtime.settleCheckTimer);
 				runtime.settleCheckTimer = undefined;
 			}
-			// 事件路径：settledAt 已到 → settleReducer 无条件收口 idle（reason 'event'）。
-			// 保持原有的 error/closed 守卫与无条件收口语义，转移判定收敛到同一决策器；
-			// 事件分支不依赖 isStreaming/gate/polling，故只传 settledAt/now。
-			const settleDecision = resolveSettle({
-				isStreaming: undefined,
-				now: Date.now(),
-				settledAt: Date.now(),
-			});
+			// 事件路径：agent_settled 到达即无条件收口 idle（reason 'event'）。
+			// 转移判定仍走同一决策器（settledAt 分支），便于单点维护事件路径语义。
+			const settleDecision = resolveSettle({ isStreaming: undefined, now: Date.now(), settledAt: Date.now() });
 			if (
 				settleDecision.decision === "idle" &&
 				runtime.tab.status !== "error" &&
@@ -3180,11 +3103,10 @@ export class AgentManager {
 				const settledFromBusy =
 					runtime.tab.status === "running" || runtime.tab.status === "starting";
 				runtime.tab.status = "idle";
-				runtime.streamingThinking = "";
-				runtime.thinkingStartedAt = undefined;
-				runtime.thinkingEndedAt = undefined;
-				runtime.activeAssistantMessageId = undefined;
-				runtime.toolMessageIds.clear();
+				// 清转录运行态，但**不动闸门**：gate 由上面的 noteAgentAbortSettled 管理，
+				// 按设计要一直封印到下一轮 agent_start，否则 settled 与 start 之间的残留
+				// delta 会被放行，重新长出已被中止的气泡（abortStreamRegression 的原始问题）。
+				resetTranscriptRun(runtime.transcript);
 				runtime.activeToolCalls.clear();
 				runtime.toolExecuting = null;
 				runtime.rpcCompacting = false;
@@ -3196,7 +3118,7 @@ export class AgentManager {
 					this.notifyEventListeners({ type: "settled", agentId });
 				}
 
-				const messages = runtime.messages;
+				const messages = runtime.transcript.messages;
 				const lastMessage = messages[messages.length - 1];
 				if (lastMessage?.role === "assistant" && !settledAfterAbort) {
 					this.notifySessionEnd(runtime.tab.title);
@@ -3222,9 +3144,9 @@ export class AgentManager {
 			if (this.isAgentStreamSealed(runtime)) {
 				return;
 			}
-			if (runtime.activeAssistantMessageId !== undefined) {
+			if (runtime.transcript.activeAssistantMessageId !== undefined) {
 				this.upsertAssistantMessage(runtime, typed.message);
-				runtime.activeAssistantMessageId = undefined;
+				runtime.transcript.activeAssistantMessageId = undefined;
 				// message_end 是本轮回答的最终状态，立即 flush 确保完整消息及时可见
 				this.flushMessageEmit(runtime);
 			}
@@ -3422,7 +3344,7 @@ export class AgentManager {
 		pending.delete(requestId);
 
 		// 更新卡片消息状态为 answered 或 cancelled；cancelled 时从消息流移除，不留痕迹
-		const messages = runtime.messages;
+		const messages = runtime.transcript.messages;
 		if (response.cancelled) {
 			// 取消交互：从消息流中移除对应的 askQuestion 卡片，不在时间线上留下痕迹
 			const idx = messages.findIndex(
@@ -3555,38 +3477,25 @@ export class AgentManager {
 			return;
 		}
 		if (eventType === "thinking_delta") {
-			const prev = runtime.streamingThinking;
 			const delta = String(assistantEvent.delta ?? "");
-			// 同一轮 agent 内可能有多段思考（思考→工具→再思考）。
-			// 上一段已结束（thinkingEndedAt 有值）时视为新一轮思考，刷新起点，
-			// 否则时长会从第一段起点累计，把工具调用等无关时间算进本轮思考。
-			if (runtime.thinkingStartedAt === undefined || runtime.thinkingEndedAt !== undefined) {
-				runtime.thinkingStartedAt = Date.now();
-			}
-			runtime.thinkingEndedAt = undefined;
 			// 只拼接一次、strip 一次；upsertAssistantMessage 的增量模式不会再全量
 			// 提取 content，避免同一段思考文本被反复整段扫描。
-			const nextThinking = prev + delta;
-			runtime.streamingThinking = nextThinking;
+			const nextThinking = appendThinkingDelta(runtime.transcript, delta, Date.now());
 			this.thinkingEmitter.push(runtime.tab.id, stripAnsi(nextThinking));
 			this.upsertAssistantMessage(runtime, partialMessage, "", true);
 			return;
 		}
 
 		if (eventType === "thinking_end") {
-			const finalThinking = String(
-				assistantEvent.content ?? runtime.streamingThinking ?? "",
-			);
+			const finalThinking = endThinking(runtime.transcript, assistantEvent.content, Date.now());
 			if (finalThinking) {
-				runtime.streamingThinking = finalThinking;
 				this.thinkingEmitter.push(runtime.tab.id, stripAnsi(finalThinking));
 				this.thinkingEmitter.flush(runtime.tab.id);
 			}
-			runtime.thinkingEndedAt = Date.now();
 			this.upsertAssistantMessage(runtime, partialMessage);
 			// 一段思考结束：清空累积缓冲。否则工具调用后第二段思考的
 			// thinking_delta 会追加到本段完整文本之后，造成内容重复。
-			runtime.streamingThinking = "";
+			clearThinkingBuffer(runtime.transcript);
 			// thinking_end 是阶段性终态，立即 flush 让思考块完整落盘显示。
 			this.flushMessageEmit(runtime);
 			return;
@@ -3596,14 +3505,12 @@ export class AgentManager {
 			this.upsertAssistantMessage(runtime, partialMessage);
 			// message_end/done/error 是本轮回答的最终状态，立即 flush 确保完整消息及时可见。
 			this.flushMessageEmit(runtime);
-			runtime.activeAssistantMessageId = undefined;
+			runtime.transcript.activeAssistantMessageId = undefined;
 		}
 	}
 
 	private beginAssistantMessage(runtime: AgentRuntime) {
-		if (runtime.activeAssistantMessageId === undefined) {
-			runtime.activeAssistantMessageId = randomUUID();
-		}
+		beginAssistantMessage(runtime.transcript);
 	}
 
 	private upsertAssistantMessage(
@@ -3612,74 +3519,16 @@ export class AgentManager {
 		fallbackDelta = "",
 		incremental = false,
 	) {
-		const agentId = runtime.tab.id;
-		const list = runtime.messages;
-		let messageId = runtime.activeAssistantMessageId;
-		if (!messageId) {
-			messageId = randomUUID();
-			runtime.activeAssistantMessageId = messageId;
-		}
-
-		// 增量模式（text_delta / thinking_delta 高频路径）：跳过对 partialMessage.content
-		// 的全量提取。每条 delta 都携带完整累积 content，全量 extractMessageText +
-		// extractThinking + stripAnsi 是 O(累积文本)，长回答整体退化为 O(N²)。
-		// delta 追加语义由 pi 协议保证（QuickGenProcess 同样按 delta 累积）；
-		// message_end/text_end/thinking_end 等终态走全量提取，用完整 content 校准。
-		const partialContent =
-			partialMessage && typeof partialMessage === "object" && "content" in partialMessage
-				? partialMessage.content
-				: undefined;
-		const extractedText =
-			!incremental && partialContent !== undefined
-				? extractMessageText(partialContent)
-				: "";
-		const extractedThinking =
-			!incremental && partialContent !== undefined
-				? extractThinking(partialContent)
-				: "";
-		const pendingThinking = runtime.streamingThinking;
-		const nextThinking = stripAnsi(extractedThinking || pendingThinking || "");
-		const thinkingStartedAt = runtime.thinkingStartedAt;
-		const thinkingEndedAt = runtime.thinkingEndedAt;
-
-		// 单次线性扫描定位（findIndex），避免原先 find + indexOf 的双重扫描；
-		// 流式消息总是数组尾部，findIndex 命中即退出。
-		const existingIndex = list.findIndex((message) => message.id === messageId);
-		if (existingIndex !== -1) {
-			const existing = list[existingIndex];
-			existing.text = extractedText || `${existing.text}${fallbackDelta}`;
-			if (nextThinking) existing.thinking = nextThinking;
-			existing.timestamp = Date.now();
-			if (thinkingStartedAt) {
-				if (existing.thinkingStartedAt !== thinkingStartedAt) {
-					// 新一轮思考开始（起点已刷新）：旧的 thinkingEndedAt 不再适用，
-					// 必须清除，否则 UI 会误判思考已结束、停止实时计时。
-					existing.thinkingEndedAt = undefined;
-				}
-				existing.thinkingStartedAt = thinkingStartedAt;
-			}
-			if (thinkingEndedAt) existing.thinkingEndedAt = thinkingEndedAt;
-			// 就地更新：标记该消息自上次 flush 起已变更，增量推送需覆盖它。
-			this.markMessagesDirty(runtime, existingIndex);
-		} else {
-			const text = extractedText || fallbackDelta;
-			if (!text) return;
-			list.push({
-				id: messageId,
-				agentId,
-				role: "assistant",
-				text,
-				timestamp: Date.now(),
-				...(nextThinking ? { thinking: nextThinking } : {}),
-				...(thinkingStartedAt ? { thinkingStartedAt } : {}),
-				...(thinkingEndedAt ? { thinkingEndedAt } : {}),
-			});
-			this.markMessagesDirty(runtime, list.length - 1);
-		}
-
-		if (nextThinking && (extractedText || fallbackDelta)) {
-			runtime.streamingThinking = "";
-			this.emitThinking(agentId, "");
+		const { clearedThinking } = upsertAssistantMessage(runtime.transcript, {
+			agentId: runtime.tab.id,
+			partialMessage,
+			fallbackDelta,
+			incremental,
+			now: Date.now(),
+		});
+		if (clearedThinking) {
+			runtime.transcript.streamingThinking = "";
+			this.emitThinking(runtime.tab.id, "");
 		}
 
 		// upsertAssistantMessage 被 text_delta/thinking_delta 高频调用，走节流合并；
@@ -3688,110 +3537,20 @@ export class AgentManager {
 	}
 
 	/**
-	 * 识别 todo 写入类工具（大小写不敏感）。
-	 * omp 原生工具名为 "todo"；TodoWrite / todo_write 为其它 harness 命名变体。
-	 * 只匹配写入工具，不匹配 todo_list / todo_get 等只读查询——它们不更新 todo 列表。
+	 * upsert 一条工具消息（按 toolCallId 合并 start/end）。详细规则见 agentTranscript.upsertToolMessage。
 	 */
 	private upsertToolMessage(
 		runtime: AgentRuntime,
 		event: Record<string, any>,
 		status: "running" | "done" | "error",
 	) {
-		const agentId = runtime.tab.id;
-		const toolName = event.toolName || "tool";
-		const toolCallId = String(event.toolCallId ?? `${toolName}-${Date.now()}`);
-		const agentTools = runtime.toolMessageIds;
-
-		let messageId = agentTools.get(toolCallId);
-		if (!messageId) {
-			messageId = randomUUID();
-			agentTools.set(toolCallId, messageId);
-		}
-
-		const list = runtime.messages;
-		const existingIndex = list.findIndex((message) => message.id === messageId);
-		const existing = existingIndex !== -1 ? list[existingIndex] : undefined;
-		const isError = status === "error" || event.isError === true;
-		const args = event.args ?? existing?.meta?.args;
-		const startedAt =
-			typeof existing?.meta?.startedAt === "number"
-				? existing.meta.startedAt
-				: Date.now();
-		// 工具耗时只能由 start/end 两个事件推导；start 时先保存 startedAt，end 时再写入 durationMs，
-		// 避免使用消息 timestamp（会在 update/end 时刷新）导致历史恢复后耗时不可还原。
-		const durationMs =
-			status === "running" ? undefined : Math.max(0, Date.now() - startedAt);
-		const result =
-			event.result ??
-			event.partialResult ??
-			event.output ??
-			existing?.meta?.result;
-		// 完整结果文本只算一次：detailText（截断版）、meta.result（截断版）、
-		// truncated 判定与全文缓存（未截断）共用同一份，避免大工具结果在同一事件内
-		// 被 extractToolResultText / safeJson 重复处理（历史实现计算了 2~3 次）。
-		const fullResultText =
-			extractToolResultText(result) || safeJson(result) || "";
-		// tool_execution_start 事件（omp 协议）不带 result/partialResult/output，
-		// result 为 undefined；safeJson 归一为 "" 后此处恒为字符串，下游 .length 安全。
-		const detailText = formatToolDetail(toolName, args, result, isError, fullResultText);
-		const icon = status === "running" ? "▶" : isError ? "✗" : "✓";
-		const text =
-			status === "running" ? `${icon} ${toolName}` : `${icon} ${toolName}`;
-		// args 可能来自 event.args（对象）或 existing.meta.args（已序列化的 JSON 字符串）。
-		// 如果是后者（如 tool_execution_end 不带 args），直接复用已有字符串避免 double encoding。
-		const argsMeta = typeof args === "string" ? args : truncateForDetail(safeJson(args));
-		// omp 等工具的结构化结果快照（todo 的 details.phases）以对象形式保存，
-		// 供工具卡渲染与历史恢复解析；extractToolResultText 只保留文本会丢失该信息。
-		const resultDetails = extractResultDetails(result);
-		// 提取 ask_question 详情用于渲染提问卡片；支持批量（questions 数组）和单问题两种格式。
-		// pi RPC 返回格式可能为 result.details 嵌套 或 result 顶层（无 details 包装）
-		const askDetails = extractAskQuestionDetails(toolName, result, args);
-		const askCard = buildAskCard(askDetails, runtime.abortedDuringAsk);
-		if (fullResultText.length > MAX_TOOL_RESULT_CHARS) {
-			this.toolFullTextByMessageId.set(messageId, fullResultText);
-			// LRU：超限时删除最早插入的一条（Map 迭代序即插入序）
-			if (this.toolFullTextByMessageId.size > AgentManager.TOOL_FULL_TEXT_LRU_MAX) {
-				const oldest = this.toolFullTextByMessageId.keys().next().value;
-				if (oldest !== undefined) this.toolFullTextByMessageId.delete(oldest);
-			}
-		}
-		const meta = {
+		upsertToolMessage(runtime.transcript, {
+			agentId: runtime.tab.id,
+			event,
 			status,
-			toolName,
-			toolCallId,
-			startedAt,
-			...(durationMs !== undefined ? { durationMs } : {}),
-			args: argsMeta,
-			result: truncateForDetail(fullResultText),
-			...(fullResultText.length > MAX_TOOL_RESULT_CHARS
-				? { truncated: true, fullLength: fullResultText.length }
-				: {}),
-			...(resultDetails !== undefined ? { details: resultDetails } : {}),
-			isError,
-			detailText,
-			// originalContent 不再存储到消息中（full file 会使会话元数据体积过大）。
-			// diff 使用工具参数（oldText/newText 等）展示变动区域，无需完整文件快照。
-
-			...(askCard ? { _askCard: askCard } : {}),
-		};
-
-		if (existing) {
-			existing.text = text;
-			existing.timestamp = Date.now();
-			existing.meta = meta;
-			this.markMessagesDirty(runtime, existingIndex);
-		} else {
-			list.push({
-				id: messageId,
-				agentId,
-				role: "tool",
-				text,
-				timestamp: Date.now(),
-				meta,
-			});
-			this.markMessagesDirty(runtime, list.length - 1);
-		}
-
+			abortedDuringAsk: runtime.run.abortedDuringAsk,
+			now: Date.now(),
+		});
 		this.scheduleMessageEmit(runtime);
 	}
 
@@ -3802,30 +3561,26 @@ export class AgentManager {
 		meta?: Record<string, unknown>,
 		images?: ImageContent[],
 	) {
-		const agentId = runtime.tab.id;
-		const message: ChatMessage = {
-			id: randomUUID(),
-			agentId,
+		const message = appendTranscriptMessage(runtime.transcript, {
+			agentId: runtime.tab.id,
 			role,
 			text,
-			timestamp: Date.now(),
 			meta,
-			...(images && images.length > 0 ? { images } : {}),
-		};
-		runtime.messages.push(message);
-		this.markMessagesDirty(runtime, runtime.messages.length - 1);
+			images,
+			now: Date.now(),
+		});
 		if (role === "user" || role === "assistant") this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
 		// 语义事件：消息追加在统一写入点汇聚发出（而非散落在各调用处），
-		// 保证订阅者拿到的 message 与 runtime.messages 中实际落库的对象完全同构。
-		this.notifyEventListeners({ type: "messageAppended", agentId, message });
+		// 保证订阅者拿到的 message 与 runtime.transcript.messages 中实际落库的对象完全同构。
+		this.notifyEventListeners({ type: "messageAppended", agentId: runtime.tab.id, message });
 	}
 
 	private refreshAutoTitle(runtime: AgentRuntime) {
 		const project = this.getProject(runtime.tab.projectId);
 		if (!project) return false;
 		if (!this.isDefaultAgentTitle(runtime.tab.title, project)) return false;
-		const nextTitle = this.inferTitleFromMessages(runtime.messages);
+		const nextTitle = this.inferTitleFromMessages(runtime.transcript.messages);
 		if (!nextTitle || nextTitle === runtime.tab.title) return false;
 		// Agent 列表标题应和历史会话列表的“摘要名”一致；
 		// 只覆盖默认标题，避免打开/重命名过的历史会话名称被第一条消息反向改掉。
@@ -3857,9 +3612,9 @@ export class AgentManager {
 	}
 
 	private addDetailedErrorMessage(runtime: AgentRuntime, errorMessage: string) {
-		const retryMessageId = runtime.retryStatusMessageId;
+		const retryMessageId = runtime.transcript.retryStatusMessageId;
 		const retryMessage = retryMessageId
-			? runtime.messages.find((message) => message.id === retryMessageId)
+			? runtime.transcript.messages.find((message) => message.id === retryMessageId)
 			: undefined;
 		const attempt = Number(retryMessage?.meta?.attempt ?? 0);
 		const maxAttempts = Number(retryMessage?.meta?.maxAttempts ?? 0);
@@ -3874,8 +3629,8 @@ export class AgentManager {
 		status: "running" | "success" | "error",
 	) {
 		const agentId = runtime.tab.id;
-		const list = runtime.messages;
-		let messageId = runtime.retryStatusMessageId;
+		const list = runtime.transcript.messages;
+		let messageId = runtime.transcript.retryStatusMessageId;
 		let message = messageId ? list.find((item) => item.id === messageId) : undefined;
 		if (!message) {
 			messageId = randomUUID();
@@ -3888,7 +3643,7 @@ export class AgentManager {
 			};
 			list.push(message);
 			this.markMessagesDirty(runtime, list.length - 1);
-			runtime.retryStatusMessageId = messageId;
+			runtime.transcript.retryStatusMessageId = messageId;
 		}
 
 		const attempt = Number(event.attempt ?? message.meta?.attempt ?? 0);
@@ -3925,7 +3680,7 @@ export class AgentManager {
 
 			pending.delete(requestId);
 
-			const messages = runtime.messages;
+			const messages = runtime.transcript.messages;
 			const idx = messages.findIndex(
 				(msg) =>
 					msg.role === "system" &&
@@ -3971,35 +3726,27 @@ export class AgentManager {
 		const runtime = this.agents.get(agentId);
 		if (!runtime || runtime.tab.status !== "running") return;
 		// 本地忙碌信号：命中任一即无需 RPC 查询（保持原提前返回，省一次 get_state）。
-		if (runtime.pendingUIRequests.size > 0) return;
-		if (runtime.rpcCompacting || runtime.compacting) return;
-		if (runtime.activeAssistantMessageId !== undefined) return;
-		if (runtime.toolExecuting) return;
+		const local = this.localWorkSignals(runtime);
+		if (hasLocalWork(local)) return;
 
 		const response = await runtime.process.client
 			.request({ type: "get_state" }, 10_000)
 			.catch(() => undefined);
 		if (!response?.success || !response.data) return;
 
-		const state = response.data as {
-			isStreaming?: boolean;
-			isCompacting?: boolean;
-			pendingMessageCount?: number;
-			queuedMessageCount?: number;
-		};
-		// omp 返回 queuedMessageCount，旧 pi 用 pendingMessageCount：两者都读，任一非零都视为仍有排队消息
-		const queued = (state.pendingMessageCount ?? 0) + (state.queuedMessageCount ?? 0);
-		// 统一收口到 settleReducer：isStreaming 严格归一化、gate 封印（wait）、
-		// 远端忙碌信号与 abort 兜底截止的裁定全部在单一决策器里完成。
-		const decision = resolveSettle({
-			isStreaming: state.isStreaming,
-			hasPendingGetState: normalizePiBoolean(state.isCompacting) || queued > 0,
-			gateWaitingAbort: runtime.streamGate.waitingForAbortSettled,
+		// 统一收口到 agentRunState.decideSettle：isStreaming 严格归一化、gate 封印（wait）、
+		// 本地/远端忙碌信号与 abort 兜底截止的裁定全部在单一决策器里完成。
+		// 轮询已触发（无论 100ms 扩展命令窗口还是 1200ms settle 窗口）：timeoutMs 有值即有权
+		// 给出 no-work 结论。
+		// get_state 的 data 走本应用自有协议：只读 4 个可选字段，逐个在决策器内归一化，
+		// 因此这里按已知形态收口一次，避免在读取点散布断言。
+		const remoteState = response.data as PiStateFields;
+		const decision = decideSettle({
+			run: runtime.run,
+			local,
+			remote: remoteState,
 			now: Date.now(),
-			abortFallbackDeadline: this.abortFallbackDeadline(runtime),
-			// 轮询已触发（无论 100ms 扩展命令窗口还是 1200ms settle 窗口）：
-			// timeoutMs 有值即有权给出 no-work 结论。
-			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
 		});
 		// stay-running / wait 一律不产生转移。wait 是本次语义修正点：abort 封印中
 		// poll 不得越过 gate 抢先置 idle 发 settled（原实现不查 gate 会误发）。
@@ -4016,9 +3763,10 @@ export class AgentManager {
 		}
 
 		runtime.tab.status = "idle";
-		runtime.streamingThinking = "";
-		runtime.thinkingStartedAt = undefined;
-		runtime.thinkingEndedAt = undefined;
+		// 运行结束：思考缓冲与时间戳一并清空（与 abort/agent_end 共用同一清态语义）。
+		clearThinkingBuffer(runtime.transcript);
+		runtime.transcript.thinkingStartedAt = undefined;
+		runtime.transcript.thinkingEndedAt = undefined;
 		this.emitThinking(agentId, "");
 		this.emitState();
 		void this.emitRuntimeState(agentId);
@@ -4058,28 +3806,25 @@ export class AgentManager {
 		}
 	}
 
-	/** abort 时封印当前 generation。 */
-	private sealAgentStream(runtime: AgentRuntime) {
-		runtime.streamGate = sealStreamGate(runtime.streamGate);
-	}
-
 	/** agent_start 时尝试推进 generation；若仍在等 abort settled，则只记 pending。 */
 	private openAgentStream(runtime: AgentRuntime) {
-		runtime.streamGate = openStreamGateForNewRun(runtime.streamGate);
+		runtime.run.streamGate = openStreamGateForNewRun(runtime.run.streamGate);
 	}
 
 	/** abort 后的 agent_settled：结束 waiting，必要时解封 pending start。 */
 	private noteAgentAbortSettled(runtime: AgentRuntime) {
 		this.clearAbortSettledFallback(runtime);
-		runtime.abortSettledAt = undefined;
-		runtime.streamGate = noteAbortSettled(runtime.streamGate);
+		noteRunAbortSettled(runtime.run);
 	}
 
-	/** abort 兜底定时器的截止时刻（abort 时刻 + ABORT_SETTLED_FALLBACK_MS）；无 abort 记录时 undefined。 */
-	private abortFallbackDeadline(runtime: AgentRuntime): number | undefined {
-		return runtime.abortSettledAt !== undefined
-			? runtime.abortSettledAt + ABORT_SETTLED_FALLBACK_MS
-			: undefined;
+	/** 本地忙碌信号（不需要 RPC 就能判定的部分），供 settle 决策器统一组装。 */
+	private localWorkSignals(runtime: AgentRuntime): LocalWorkSignals {
+		return {
+			hasPendingUiRequest: runtime.pendingUIRequests.size > 0,
+			compacting: runtime.rpcCompacting || runtime.compacting,
+			hasActiveAssistant: runtime.transcript.activeAssistantMessageId !== undefined,
+			toolExecuting: runtime.toolExecuting,
+		};
 	}
 
 	/**
@@ -4088,9 +3833,6 @@ export class AgentManager {
 	 */
 	private scheduleAbortSettledFallback(runtime: AgentRuntime) {
 		this.clearAbortSettledFallback(runtime);
-		// 记录 abort 时刻，作为 reducer 的 abortFallbackDeadline 输入（settle-check
-		// 轮询与兜底定时器共用同一截止；每次 abort 刷新）。
-		runtime.abortSettledAt = Date.now();
 		const agentId = runtime.tab.id;
 		const timer = setTimeout(() => {
 			// 定时器触发时 agent 可能已被 stop 删除；重新查询，避免操作已脱离 map 的 runtime。
@@ -4098,17 +3840,16 @@ export class AgentManager {
 			if (!current) return;
 			current.abortSettledFallbackTimer = undefined;
 			// 仅在仍 waiting 时生效；正常 settled 路径会先 clear 定时器。
-			if (current.streamGate.waitingForAbortSettled) {
-				// 定时器触发即兜底截止已到：经 reducer 判定为 idle/abort-fallback 才解封，
-				// 与 markIdleIfPiReportsNoWork 共用同一 gate 判定。
-				const decision = resolveSettle({
-					isStreaming: undefined,
-					gateWaitingAbort: true,
+			if (current.run.streamGate.waitingForAbortSettled) {
+				// 定时器触发即兜底截止已到：经决策器判定为 abort 兜底解封才生效，
+				// 与 markIdleIfPiReportsNoWork 共用同一判定。
+				const decision = decideSettle({
+					run: current.run,
+					local: this.localWorkSignals(current),
 					now: Date.now(),
-					abortFallbackDeadline: this.abortFallbackDeadline(current) ?? Date.now(),
 				});
 				if (decision.decision === "idle" && decision.reason === "abort-fallback") {
-					this.noteAgentAbortSettled(current);
+					noteRunAbortSettled(current.run);
 				}
 			}
 		}, ABORT_SETTLED_FALLBACK_MS);
@@ -4126,14 +3867,13 @@ export class AgentManager {
 
 	/** 当前 generation 是否已封印，封印期间所有流式事件应丢弃。 */
 	private isAgentStreamSealed(runtime: AgentRuntime): boolean {
-		return isStreamGateSealed(runtime.streamGate);
+		return isRunSealed(runtime.run);
 	}
 
 	/** agent 关闭/重建时清理 gate，避免泄漏到新生命周期。 */
 	private clearStreamGate(runtime: AgentRuntime) {
 		this.clearAbortSettledFallback(runtime);
-		runtime.streamGate = createStreamGateState();
-		runtime.recentlyAborted = false;
+		closeAgentRun(runtime.run, runtime.transcript);
 		this.thinkingEmitter.cancel(runtime.tab.id);
 		this.cancelMessageEmit(runtime);
 		// 清理运行态节流定时器与在途合并状态，避免 agent 删除后残留 timer / pending
@@ -4152,65 +3892,60 @@ export class AgentManager {
 			this.flushMessageEmit(runtime);
 			return;
 		}
-		if (runtime.pendingMessage) return;
-		runtime.pendingMessage = true;
+		if (runtime.transcript.pendingMessage) return;
+		runtime.transcript.pendingMessage = true;
 		const timer = setTimeout(() => this.flushMessageEmit(runtime), AgentManager.MESSAGE_FLUSH_INTERVAL_MS);
 		// 节流定时器不应阻止进程退出
 		timer.unref?.();
-		runtime.messageFlushTimer = timer;
+		runtime.transcript.messageFlushTimer = timer;
 	}
 
 	/** 记录消息数组自上次 flush 以来的最早变更下标，增量推送据此计算 replaceFrom。 */
 	private markMessagesDirty(runtime: AgentRuntime, fromIndex: number): void {
-		if (fromIndex < runtime.messageDirtyFrom) runtime.messageDirtyFrom = fromIndex;
+		markDirtyFrom(runtime.transcript, fromIndex);
 	}
 
 	/** 记录某条消息被就地变更（按引用定位下标，避免各调用方自己维护 index）。 */
 	private markMessageDirty(runtime: AgentRuntime, message: ChatMessage | undefined): void {
-		if (!message) return;
-		const index = runtime.messages.indexOf(message);
-		if (index !== -1) this.markMessagesDirty(runtime, index);
+		markMessageDirty(runtime.transcript, message);
 	}
 
 	/** 整组消息被重建（历史加载/重启替换），下一次 flush 必须全量推送基线。 */
 	private markAllMessagesDirty(runtime: AgentRuntime): void {
-		runtime.messageDirtyFrom = 0;
+		markAllMessagesDirty(runtime.transcript);
 	}
 
 	/** 取消尚未 flush 的消息推送，abort 时避免旧数组晚到覆盖 UI。 */
 	private cancelMessageEmit(runtime: AgentRuntime) {
-		const timer = runtime.messageFlushTimer;
+		const timer = runtime.transcript.messageFlushTimer;
 		if (timer) {
 			clearTimeout(timer);
-			runtime.messageFlushTimer = undefined;
+			runtime.transcript.messageFlushTimer = undefined;
 		}
-		runtime.pendingMessage = false;
+		runtime.transcript.pendingMessage = false;
 	}
 
 	private flushMessageEmit(runtime: AgentRuntime) {
-		const timer = runtime.messageFlushTimer;
+		const timer = runtime.transcript.messageFlushTimer;
 		if (timer) {
 			clearTimeout(timer);
-			runtime.messageFlushTimer = undefined;
+			runtime.transcript.messageFlushTimer = undefined;
 		}
-		runtime.pendingMessage = false;
-		const messages = runtime.messages;
-		// 增量推送：只传输 messageDirtyFrom 之后的变更。replaceFrom === 0 时是
+		runtime.transcript.pendingMessage = false;
+		// 增量推送：只传输自上次 flush 起变更的部分。replaceFrom === 0 时是
 		// 全量基线（渲染层 slice(0,0) 合并即整体替换），其余情况为尾部增量。
-		const replaceFrom = Math.min(runtime.messageDirtyFrom, messages.length);
-		// 本轮变更已随 slice 发出，重置为数组尾部；下一次变更再向前收缩。
-		runtime.messageDirtyFrom = messages.length;
+		const { replaceFrom, messages } = takeDirtySlice(runtime.transcript);
 		const t0 = perfStart("agents:message-flush");
 		this.emit(ipcChannels.agentsMessage, {
 			agentId: runtime.tab.id,
 			replaceFrom,
-			messages: messages.slice(replaceFrom),
+			messages,
 		});
 		perfEnd("agents:message-flush", t0, {
 			agentId: runtime.tab.id,
 			replaceFrom,
-			sent: messages.length - replaceFrom,
-			total: messages.length,
+			sent: messages.length,
+			total: runtime.transcript.messages.length,
 		});
 	}
 
@@ -4290,19 +4025,10 @@ type AgentRuntime = {
 	tab: AgentTab;
 	process: PiProcess;
 
-	// 消息时间线状态
-	messages: ChatMessage[];
-	/** 当前正在流式更新的 assistant 消息 id；tool 事件插入时继续更新同一回答块 */
-	activeAssistantMessageId?: string;
-	/** toolCallId -> messageId，把同一次工具调用合并成一条 UI 记录 */
-	toolMessageIds: Map<string, string>;
-	/** 每个 agent 只保留一条自动重试状态消息，避免短暂 5xx 刷屏 */
-	retryStatusMessageId?: string;
-
-	// 流式思考状态
-	streamingThinking: string;
-	thinkingStartedAt?: number;
-	thinkingEndedAt?: number;
+	/** 会话转录：消息时间线 + 流式思考 + 增量推送统计（见 agentTranscript.ts）。 */
+	transcript: AgentTranscriptState;
+	/** 运行态：abort 闸门 + settle 判定输入（见 agentRunState.ts）。 */
+	run: AgentRunState;
 
 	// 工具运行态
 	toolStateSequence: number;
@@ -4312,23 +4038,10 @@ type AgentRuntime = {
 	/** 完整运行态推送的单调序号：渲染层据此丢弃乱序到达的旧快照（长任务后 RPC 慢更容易乱序）。 */
 	runtimeStateSeq: number;
 
-	// abort 流式闸门（按 generation 封印残留 delta）
-	streamGate: StreamGateState;
-	abortSettledFallbackTimer?: NodeJS.Timeout;
-	/** 最近一次 abort 的时刻（ms）：+ ABORT_SETTLED_FALLBACK_MS 即 settleReducer 的 abortFallbackDeadline。 */
-	abortSettledAt?: number;
-	/** omp 无 agent_settled 事件时的最终空闲检查定时器（agent_end/压缩结束后调度） */
+	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
 	settleCheckTimer?: NodeJS.Timeout;
-
-	// 消息 emit 节流
-	messageFlushTimer?: NodeJS.Timeout;
-	pendingMessage: boolean;
-	/**
-	 * 自上次 flush 以来最早被变更的消息下标，作为增量推送的 replaceFrom。
-	 * flush 后重置为 messages.length；任何消息增/删/就地更新都向前收缩该值。
-	 * 历史加载/重启重建时置 0，强制下一次 flush 全量推送基线。
-	 */
-	messageDirtyFrom: number;
+	/** abort 后等 pi 确认的兜底定时器（见 scheduleAbortSettledFallback） */
+	abortSettledFallbackTimer?: NodeJS.Timeout;
 
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;
@@ -4350,10 +4063,6 @@ type AgentRuntime = {
 	userInitiatedStop: boolean;
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
-	/** 用户主动 abort 后等待 pi 确认，抑制 auto-retry/compaction 状态回写 */
-	recentlyAborted: boolean;
-	/** abort 时正等待 ask_question 响应，工具结果中覆写 answer 为 null */
-	abortedDuringAsk: boolean;
 };
 
 /** 创建一个带有全部 per-agent 状态默认值的 AgentRuntime。 */
@@ -4361,15 +4070,11 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 	return {
 		tab,
 		process,
-		messages: [],
-		toolMessageIds: new Map(),
-		streamingThinking: "",
+		transcript: createTranscriptState(),
+		run: createRunState(),
 		toolStateSequence: 0,
 		activeToolCalls: new Map(),
 		toolExecuting: null,
-		streamGate: createStreamGateState(),
-		pendingMessage: false,
-		messageDirtyFrom: 0,
 		pendingUIRequests: new Map(),
 		rpcLogging: false,
 		compacting: false,
@@ -4378,7 +4083,5 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 		modelRefreshing: false,
 		userInitiatedStop: false,
 		autoRestartAttempted: false,
-		recentlyAborted: false,
-		abortedDuringAsk: false,
 	};
 }

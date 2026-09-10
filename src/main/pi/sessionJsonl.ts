@@ -197,6 +197,107 @@ export class SessionJsonl {
 	}
 
 	/**
+	 * 不启动 pi 进程，直接从 JSONL 构造与运行态相同的时间线数据（Viewer 用）。
+	 *
+	 * 与 readRecentMessages 的尾窗策略不同：这里读全文并沿 parentId 回溯出**活动分支**，
+	 * 因此压缩归档必须参与进来——pi 压缩后上下文 = summary + firstKeptEntryId 起的保留消息
+	 * + 后续消息，只取 compaction 之后会漏掉明确保留的尾部消息。
+	 *
+	 * @param sessionContent 已读到的原文（渲染层已经读过一次时复用，避免重复整读）。
+	 */
+	async readDisplayMessages(
+		sessionPath: string,
+		agentId: string,
+		sessionContent?: string,
+	): Promise<ChatMessage[]> {
+		const content = sessionContent ?? await readFile(this.resolve(sessionPath), "utf8");
+		const entries: Array<{
+			id: string;
+			parentId: string | null;
+			type: string;
+			message?: unknown;
+			summary?: string;
+			firstKeptEntryId?: string;
+			tokensBefore?: number;
+			timestamp?: string;
+		}> = [];
+
+		for (const line of content.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line);
+				if (!entry || typeof entry !== "object" || typeof entry.id !== "string") continue;
+				entries.push({
+					id: entry.id,
+					parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+					type: typeof entry.type === "string" ? entry.type : "",
+					message: entry.message,
+					summary: typeof entry.summary === "string" ? entry.summary : undefined,
+					firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
+					tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
+					timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+				});
+			} catch {
+				// 单行损坏不应阻断整个 Viewer。
+			}
+		}
+		if (entries.length === 0) return [];
+
+		// JSONL 最后一个 entry 是 pi 当前叶节点；沿 parentId 回溯得到与 get_messages 一致的活动分支。
+		const byId = new Map(entries.map((entry) => [entry.id, entry]));
+		const activeBranch: typeof entries = [];
+		const seen = new Set<string>();
+		let current: (typeof entries)[number] | undefined = entries[entries.length - 1];
+		while (current && !seen.has(current.id)) {
+			seen.add(current.id);
+			activeBranch.push(current);
+			current = current.parentId ? byId.get(current.parentId) : undefined;
+		}
+		activeBranch.reverse();
+
+		const lastCompactionIndex = activeBranch.findLastIndex((entry) => entry.type === "compaction");
+		const lastCompaction = lastCompactionIndex >= 0 ? activeBranch[lastCompactionIndex] : undefined;
+		const firstKeptIndex = lastCompaction?.firstKeptEntryId
+			? activeBranch.findIndex((entry) => entry.id === lastCompaction.firstKeptEntryId)
+			: -1;
+		// pi 压缩后上下文由 summary + firstKeptEntryId 起的保留消息 + 后续消息组成；
+		// 不能只取 compaction entry 之后，否则会漏掉压缩时明确保留的尾部消息。
+		const currentStartIndex = firstKeptIndex >= 0
+			? firstKeptIndex
+			: lastCompactionIndex >= 0
+				? lastCompactionIndex + 1
+				: 0;
+		const currentEntries = activeBranch
+			.slice(currentStartIndex)
+			.filter((entry) => entry.type === "message" && entry.message);
+		const rawMessages = currentEntries.map((entry) => entry.message);
+		const trimmed = trimHistoryMessages(rawMessages);
+		const trimStart = trimmed.length > 0 ? rawMessages.indexOf(trimmed[0]) : 0;
+		const activeEntryIds = currentEntries.slice(Math.max(0, trimStart)).map((entry) => entry.id);
+
+		let finalRaw: unknown[] = trimmed;
+		if (lastCompaction) {
+			const compactionEntry = lastCompaction;
+			const archiveData = await this.parseArchives(sessionPath, agentId, content);
+			const archivedMessages = archiveData.archivedMessagesByCompactionId.get(compactionEntry.id) ?? [];
+			finalRaw = [{
+				role: "compactionSummary",
+				summary: compactionEntry.summary || "[摘要]",
+				timestamp: compactionEntry.timestamp ? Date.parse(compactionEntry.timestamp) : Date.now(),
+				meta: {
+					compactionId: compactionEntry.id,
+					compactionCount: archiveData.compactions.length,
+					firstKeptEntryId: compactionEntry.firstKeptEntryId,
+					tokensBefore: compactionEntry.tokensBefore,
+					archivedMessages,
+				},
+			}, ...trimmed];
+		}
+
+		return convertAgentMessages(agentId, finalRaw, activeEntryIds, false);
+	}
+
+	/**
 	 * 从会话文件尾部读取最近的用户消息文本（最新在前，最多 maxCount 条）。
 	 * 渲染层用它补全上下键导航的 prompt history：大会话只向渲染层推送最近窗口
 	 * （readRecentMessages 的 30 轮），仅靠消息基线重建会缺失更早的发送记录。

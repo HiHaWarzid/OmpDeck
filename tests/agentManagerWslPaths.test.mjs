@@ -129,12 +129,21 @@ function loadAgentManager() {
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
 	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
 	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");
+	// 转录与运行态已抽为纯状态模块（agentTranscript / agentRunState），
+	// AgentManager 只做编排；测试用它们的工厂构造 runtime，不再手写字段清单。
+	registry["../feishu/docActions"] = loadModule("src/main/feishu/docActions.ts", "docActions.ts");
+	const messageContent = loadModule("src/main/pi/messageContent.ts", "messageContent.ts");
+	registry["./messageContent"] = messageContent;
+	const agentTranscript = loadModule("src/main/pi/agentTranscript.ts", "agentTranscript.ts");
+	registry["./agentTranscript"] = agentTranscript;
+	const agentRunState = loadModule("src/main/pi/agentRunState.ts", "agentRunState.ts");
+	registry["./agentRunState"] = agentRunState;
 	// AgentManager 引入 ../perf（src/main/perf.ts，纯诊断模块，无内部依赖）；
 	// 测试文件自身的 require 会把 "../perf" 解析到仓库根目录，必须显式注入。
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
-	return { ...agentManagerExports, calls, wslPaths };
+	return { ...agentManagerExports, calls, wslPaths, agentTranscript, agentRunState };
 }
 
 function createManager(AgentManager, configManager = {}) {
@@ -147,7 +156,7 @@ function createManager(AgentManager, configManager = {}) {
 }
 
 test("maps WSL session file operations to host paths while deduping by Linux identity", async () => {
-	const { AgentManager, calls, wslPaths } = loadAgentManager();
+	const { AgentManager, calls, wslPaths, agentTranscript, agentRunState } = loadAgentManager();
 	const manager = createManager(AgentManager);
 	manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
 	const sessionPath = "/root/.pi/agent/sessions/session.jsonl";
@@ -182,16 +191,16 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 			createdAt: 1,
 			sessionPath,
 		},
-		messages: [
-			{ id: "message", agentId: "agent", role: "user", text: "hello", meta: { entryId: "entry-user" } },
-		],
-		toolMessageIds: new Map(),
-		streamingThinking: "",
+		transcript: {
+			...agentTranscript.createTranscriptState(),
+			messages: [
+				{ id: "message", agentId: "agent", role: "user", text: "hello", meta: { entryId: "entry-user" } },
+			],
+		},
+		run: agentRunState.createRunState(),
 		toolStateSequence: 0,
 		activeToolCalls: new Map(),
 		toolExecuting: null,
-		streamGate: { sealed: false, waitingForAbortSettled: false },
-		pendingMessage: false,
 		pendingUIRequests: new Map(),
 		rpcLogging: false,
 		compacting: false,
@@ -199,8 +208,6 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 		modelRefreshing: false,
 		userInitiatedStop: false,
 		autoRestartAttempted: false,
-		recentlyAborted: false,
-		abortedDuringAsk: false,
 	});
 	manager.reloadSession = async () => {};
 	await manager.prepareResendFromMessage("agent", "message");

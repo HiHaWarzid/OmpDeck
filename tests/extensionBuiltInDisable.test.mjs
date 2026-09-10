@@ -55,8 +55,7 @@ function loadExtensionManager({ homeDir, runPiOutput = "", fsOverrides = {} } = 
 			}
 			if (id === "../wsl/WslPaths") return wslPaths;
 			if (id === "../pi/PiLocator") return {};
-			// ExtensionManager.ensureExtension 通过 is.dev 判断资源路径，且模块加载期
-			// @electron-toolkit/utils 会访问 electron.app.isPackaged；纯 Node 测试需 mock。
+			// ExtensionManager 模块加载期会访问 electron / @electron-toolkit/utils，纯 Node 测试需 mock。
 			if (id === "electron") {
 				return { app: { getAppPath: () => process.cwd(), isPackaged: false } };
 			}

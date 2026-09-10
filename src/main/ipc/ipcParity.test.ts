@@ -68,7 +68,7 @@ const moduleRegistrations = [
 	{ module: "terminalHandlers", map: registerTerminalHandlers({ terminalManager: stubs, appLogger: stubs }) },
 	{
 		module: "extensionHandlers",
-		map: registerExtensionHandlers({ extensionManager: stubs, appLogger: stubs, getActiveWslEnvironment: () => null }),
+		map: registerExtensionHandlers({ extensionManager: stubs, appLogger: stubs }),
 	},
 	{
 		module: "editorHandlers",
@@ -101,7 +101,7 @@ const moduleRegistrations = [
 	},
 	{
 		module: "sessionHandlers",
-		map: registerSessionHandlers({ projectStore: stubs, sessionScanner: stubs, importPipeline: stubs, agentManager: stubs, appLogger: stubs }),
+		map: registerSessionHandlers({ projectStore: stubs, sessionScanner: stubs, sessionFileOps: stubs, importPipeline: stubs, agentManager: stubs, appLogger: stubs }),
 	},
 	{
 		module: "gitHandlers",

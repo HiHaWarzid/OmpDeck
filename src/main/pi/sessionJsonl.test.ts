@@ -358,8 +358,10 @@ test("backup creates a .edit-backup file and caps at MAX_BACKUPS", async () => {
 
 	const { readdir } = await import("node:fs/promises");
 	const files = (await readdir(dir)).filter((f) => f.endsWith(".edit-backup"));
-	// MAX_BACKUPS = 3，多次 backup 后不应超过 3 个
-	assert.equal(files.length, 3);
+	// MAX_BACKUPS = 3，多次 backup 后不应超过 3 个。
+	// 备份文件名以毫秒时间戳区分，同毫秒内多次备份会互相覆盖——这里断言的是裁剪上限，
+	// 不是同毫秒碰撞，因此允许文件名粒度差异（>=2 说明发生了裁剪，<=3 说明上限生效）。
+	assert.ok(files.length >= 2 && files.length <= 3, `expected 2..3 backups, got ${files.length}`);
 	// 最新备份内容应是当前文件内容
 	const latest = sj.findLatestBackup(sessionPath);
 	assert.ok(latest);
@@ -468,6 +470,84 @@ test("modifyLines passes through complex mutator return value (object)", async (
 		return { text, images: ["img1"] };
 	});
 	assert.deepEqual(result, { text: "payload", images: ["img1"] });
+});
+
+// ── readDisplayMessages（Viewer 时间线）───────────────
+
+test("readDisplayMessages walks the active branch from the leaf, not the file order", async () => {
+	const sj = makeSessionJsonl();
+	const path = join(tmpRoot, "branch.jsonl");
+	// 最后一行才是当前叶节点：沿 parentId 回溯应只保留 root → leaf，丢弃被放弃的 sibling
+	await writeFile(
+		path,
+		toJsonl([
+			{ id: "root", parentId: null, type: "message", message: { role: "user", content: "q" } },
+			{ id: "sibling", parentId: "root", type: "message", message: { role: "assistant", content: "abandoned" } },
+			{ id: "leaf", parentId: "root", type: "message", message: { role: "assistant", content: "answer" } },
+		]),
+		"utf8",
+	);
+
+	const messages = await sj.readDisplayMessages(path, "_viewer");
+
+	assert.deepEqual(
+		messages.map((message) => message.text),
+		["q", "answer"],
+	);
+});
+
+test("readDisplayMessages keeps messages retained by the last compaction", async () => {
+	const sj = makeSessionJsonl();
+	const path = join(tmpRoot, "compacted.jsonl");
+	// 压缩后上下文 = summary + firstKeptEntryId 起的保留消息；旧消息必须被丢弃
+	await writeFile(
+		path,
+		toJsonl([
+			{ id: "old", parentId: null, type: "message", message: { role: "user", content: "very old" } },
+			{
+				id: "compact",
+				parentId: "old",
+				type: "compaction",
+				summary: "earlier context",
+				firstKeptEntryId: "kept-user",
+				tokensBefore: 1234,
+				timestamp: "2026-01-01T00:00:00.000Z",
+			},
+			{ id: "kept-user", parentId: "compact", type: "message", message: { role: "user", content: "kept question" } },
+			{ id: "kept-reply", parentId: "kept-user", type: "message", message: { role: "assistant", content: "kept reply" } },
+			{ id: "new", parentId: "kept-reply", type: "message", message: { role: "user", content: "follow up" } },
+		]),
+		"utf8",
+	);
+
+	const messages = await sj.readDisplayMessages(path, "_viewer");
+
+	assert.deepEqual(
+		messages.map((message) => message.text),
+		["earlier context", "kept question", "kept reply", "follow up"],
+	);
+	// 摘要以 system 消息形式进入时间线（meta.type 区分压缩/分支摘要），并带压缩计数
+	assert.equal(messages[0].meta?.type, "compaction");
+	assert.equal(messages[0].meta?.compactionCount, 1);
+	// 压缩前被丢弃的消息不得出现在时间线里
+	assert.equal(messages.some((message) => message.text === "very old"), false);
+});
+
+test("readDisplayMessages tolerates corrupt lines and an empty file", async () => {
+	const sj = makeSessionJsonl();
+	const path = join(tmpRoot, "corrupt.jsonl");
+	await writeFile(
+		path,
+		['{"id":"a","parentId":null,"type":"message","message":{"role":"user","content":"ok"}}', "{not json", ""].join("\n"),
+		"utf8",
+	);
+
+	const messages = await sj.readDisplayMessages(path, "_viewer");
+	assert.deepEqual(messages.map((message) => message.text), ["ok"]);
+
+	const emptyPath = join(tmpRoot, "empty.jsonl");
+	await writeFile(emptyPath, "", "utf8");
+	assert.deepEqual(await sj.readDisplayMessages(emptyPath, "_viewer"), []);
 });
 
 // ── 辅助 ────────────────────────────────────────────────

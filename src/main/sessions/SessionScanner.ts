@@ -76,15 +76,14 @@ export class SessionScanner {
   private activeScanRoots: string[] = [];
 
   /**
-   * 会话文件操作（rename/delete/copy/exportHtml/readMessages 等）。
-   * 适配器随 configureWsl 替换，经 getAdapter 访问器每次读取最新实例；
-   * readSummary 由本类注入，保证 copy/exportHtml 复用扫描摘要。
+   * 会话文件操作（rename/delete/readMessages/readSessionMeta/readSessionRawText）。
+   * 适配器随 configureWsl 替换，经 getAdapter 访问器每次读取最新实例。
+   * 对外直接暴露该模块：handler 调用的就是真正实现，不再经本类转发。
    */
-  private readonly fileOps = new SessionFileOps({
+  readonly fileOps = new SessionFileOps({
     getAdapter: () => this.fileAdapter,
     localSessionsRoot: this.root,
     getDefaultSessionsRoot: () => this.defaultSessionsRoot,
-    readSummary: (filePath) => this.readSummary(filePath),
   });
 
   /**
@@ -393,47 +392,6 @@ export class SessionScanner {
       }
     }
     return all;
-  }
-
-  // ── 会话文件操作：委托 SessionFileOps（保持 handler 调用面不变） ─
-
-  /** 重命名会话（pi 原生 session_info 追加，支持 WSL 路径） */
-  rename(filePath: string, newName: string): Promise<void> {
-    return this.fileOps.rename(filePath, newName);
-  }
-
-  /** 删除会话文件并清理同级子会话目录（支持 WSL 路径） */
-  delete(filePath: string): Promise<void> {
-    return this.fileOps.delete(filePath);
-  }
-
-  /** 复制会话文件并追加新的 session_info 名称记录（支持 WSL 路径） */
-  copy(filePath: string): Promise<SessionSummary> {
-    return this.fileOps.copy(filePath);
-  }
-
-  /** 将历史 JSONL 会话直接导出为基础 HTML（支持 WSL 路径） */
-  exportHtml(filePath: string): Promise<{ path: string }> {
-    return this.fileOps.exportHtml(filePath);
-  }
-
-  /** 读取会话消息列表（支持 WSL 路径） */
-  readMessages(filePath: string): Promise<Array<{ role: string; content: string; timestamp: number }>> {
-    return this.fileOps.readMessages(filePath);
-  }
-
-  /** 统一读取本地/WSL 会话原文，供 Viewer 与 AgentManager 共享转换管线。 */
-  readSessionRawText(filePath: string): Promise<string> {
-    return this.fileOps.readSessionRawText(filePath);
-  }
-
-  /** 从会话 JSONL 文件头部读取模型和思考级别信息。 */
-  readSessionMeta(filePath: string): Promise<{
-    provider?: string;
-    modelId?: string;
-    thinkingLevel?: string;
-  }> {
-    return this.fileOps.readSessionMeta(filePath);
   }
 
   /**

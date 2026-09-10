@@ -9,6 +9,8 @@ import type {
 } from "../../shared/types";
 import { AgentManager, isRpcLogWorthy } from "./AgentManager";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
+import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
+import { createRunState, type AgentRunState } from "./agentRunState";
 import type { ConfigManager } from "../config/ConfigManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 
@@ -30,21 +32,13 @@ type TestRuntime = {
 			request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
 		};
 	};
-	messages: ChatMessage[];
-	activeAssistantMessageId?: string;
-	toolMessageIds: Map<string, string>;
-	streamingThinking: string;
-	thinkingStartedAt?: number;
-	thinkingEndedAt?: number;
+	transcript: AgentTranscriptState;
+	run: AgentRunState;
 	toolStateSequence: number;
 	activeToolCalls: Map<string, string>;
 	toolExecuting: string | null;
 	runtimeStateSeq: number;
-	streamGate: StreamGateState;
 	settleCheckTimer?: NodeJS.Timeout;
-	messageFlushTimer?: NodeJS.Timeout;
-	pendingMessage: boolean;
-	messageDirtyFrom: number;
 	pendingUIRequests: Map<string, { method: string; title: string }>;
 	rpcLogging: boolean;
 	compacting: boolean;
@@ -52,8 +46,6 @@ type TestRuntime = {
 	modelRefreshing: boolean;
 	userInitiatedStop: boolean;
 	autoRestartAttempted: boolean;
-	recentlyAborted: boolean;
-	abortedDuringAsk: boolean;
 };
 
 /** 构造带全部默认字段的最小 runtime；client.request 默认抛错（RPC 路径由各测试按需覆盖）。 */
@@ -70,16 +62,13 @@ function makeRuntime(
 				},
 			},
 		},
-		messages: [],
-		toolMessageIds: new Map(),
-		streamingThinking: "",
+		// 状态由模块工厂创建：测试不再手写字段清单，字段漂移在编译期暴露
+		transcript: createTranscriptState(),
+		run: createRunState(),
 		toolStateSequence: 0,
 		activeToolCalls: new Map(),
 		toolExecuting: null,
 		runtimeStateSeq: 0,
-		streamGate: createStreamGateState(),
-		pendingMessage: false,
-		messageDirtyFrom: 0,
 		pendingUIRequests: new Map(),
 		rpcLogging: false,
 		compacting: false,
@@ -87,8 +76,6 @@ function makeRuntime(
 		modelRefreshing: false,
 		userInitiatedStop: false,
 		autoRestartAttempted: false,
-		recentlyAborted: false,
-		abortedDuringAsk: false,
 	};
 }
 
@@ -148,8 +135,8 @@ test("onAgentEvent 收到 messageAppended，退订后不再收到", () => {
 	assert.equal(event.message.text, "你好");
 	assert.equal(event.message.role, "user");
 	assert.equal(event.message.agentId, "a1");
-	assert.equal(event.message.id, runtime.messages[0]?.id);
-	assert.equal(event.message, runtime.messages[0]); // 与落库对象同构
+	assert.equal(event.message.id, runtime.transcript.messages[0]?.id);
+	assert.equal(event.message, runtime.transcript.messages[0]); // 与落库对象同构
 	assert.equal(typeof event.message.timestamp, "number");
 
 	unsubscribe();

@@ -9,12 +9,15 @@ import type { ProjectStore } from "../projects/ProjectStore";
 import type { SessionScanner } from "../sessions/SessionScanner";
 import type { ImportPipeline } from "../sessions/importPipeline";
 import type { AgentManager } from "../pi/AgentManager";
+import type { SessionFileOps } from "../sessions/SessionFileOps";
 import type { AppLogger } from "../logging/AppLogger";
 import { perfEnd, perfStart } from "../perf";
 
 interface SessionHandlerDeps {
 	projectStore: ProjectStore;
 	sessionScanner: SessionScanner;
+	/** 会话文件操作（rename/delete/read*）；由组合根从 SessionScanner 取出后注入。 */
+	sessionFileOps: SessionFileOps;
 	importPipeline: ImportPipeline;
 	agentManager: AgentManager;
 	appLogger: AppLogger;
@@ -28,7 +31,7 @@ type SessionHandlerMaps = {
 };
 
 export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandlerMaps {
-	const { projectStore, sessionScanner, importPipeline, agentManager, appLogger } = deps;
+	const { projectStore, sessionScanner, sessionFileOps, importPipeline, agentManager, appLogger } = deps;
 
 	return {
 		sessions: {
@@ -47,7 +50,7 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				}
 			},
 			rename: async (_event, filePath: string, newName: string) => {
-				await sessionScanner.rename(filePath, newName);
+				await sessionFileOps.rename(filePath, newName);
 				void appLogger.info("session", "Session renamed", { filePath, newName });
 			},
 			copy: (_event, projectId: string, filePath: string) =>
@@ -67,11 +70,11 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 					throw new Error(`会话"${usingAgent.title}"正在使用中，请先关闭 Agent 后再删除`);
 				}
 
-				await sessionScanner.delete(filePath);
+				await sessionFileOps.delete(filePath);
 				void appLogger.info("session", "Session deleted", { filePath });
 			},
 			readMessages: async (_event, filePath: string) => {
-				return sessionScanner.readMessages(filePath);
+				return sessionFileOps.readMessages(filePath);
 			},
 			// 提取会话文件里最近的用户消息文本（最新在前），供渲染层补全上下键 prompt history。
 			// 与 readMessages 不同：只读文件尾部窗口 + 纯文本提取，大会话也不会整文件解析。
@@ -79,12 +82,12 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				// 内部按 maxCount|0 收敛（undefined→1 条）；传 0 与 undefined 行为等价
 				agentManager.readSessionUserPrompts(filePath, maxCount ?? 0),
 			readSessionMeta: async (_event, filePath: string) => {
-				return sessionScanner.readSessionMeta(filePath);
+				return sessionFileOps.readSessionMeta(filePath);
 			},
 			readChatMessages: async (_event, filePath: string) => {
-				// 统一文件读取（SessionScanner→SessionFileOps 处理本地/WSL 路径）；
+				// 统一文件读取（SessionFileOps 处理本地/WSL 路径）；
 				// 消息转换与压缩归档走 AgentManager 的单条 JSONL→ChatMessage 管线。
-				const content = await sessionScanner.readSessionRawText(filePath);
+				const content = await sessionFileOps.readSessionRawText(filePath);
 				return agentManager.readSessionDisplayMessages(filePath, "_viewer", content);
 			},
 			readMessageFullText: async (_event, agentId, messageId, entryId?) => {

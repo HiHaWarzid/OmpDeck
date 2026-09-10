@@ -893,7 +893,6 @@ function registerIpc() {
 		registerExtensionHandlers({
 			extensionManager,
 			appLogger,
-			getActiveWslEnvironment: () => activeWslEnvironment,
 		}),
 		registerEditorHandlers({ settingsStore, appLogger, getMainWindow: () => mainWindow }),
 		registerPromptHandlers({ promptManager, appLogger }),
@@ -912,7 +911,7 @@ function registerIpc() {
 			syncWslEnvironment,
 		}),
 		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
-		registerSessionHandlers({ projectStore, sessionScanner, importPipeline, agentManager, appLogger }),
+		registerSessionHandlers({ projectStore, sessionScanner, sessionFileOps: sessionScanner.fileOps, importPipeline, agentManager, appLogger }),
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
 		registerConfigHandlers({ configManager, appLogger }),
 		registerClipboardHandlers(),
@@ -1124,9 +1123,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		syncWslEnvironment(settingsStore.get()).catch((error) => {
 			console.error("Failed to sync WSL config:", error);
 		}),
-		extensionManager.deploy(app.getPath("home")).catch((error) => {
-			console.error("Failed to deploy extensions:", error);
-		}),
 		applyDesktopProxy(settingsStore.get()).catch((error) => {
 			console.error("Failed to apply desktop proxy:", error);
 		}),
@@ -1141,13 +1137,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 			installationType: settingsStore.get().installationType,
 		}),
 	]);
-
-	// WSL 启用时额外部署到动态解析出的 HOME。
-	if (activeWslEnvironment) {
-		void extensionManager.deploy(activeWslEnvironment.windowsHome).catch(() => {
-			console.warn("[OmpDeck] Failed to deploy extensions to WSL, skipping");
-		});
-	}
 
 	// 补齐 pi settings.json 缺失的默认配置项，新安装或精简配置的用户无需手动添加。
 	void ensureAllPiSettingsDefaults(settingsStore.get(), piLocator, activeWslEnvironment).catch((error) => {

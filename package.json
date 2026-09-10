@@ -106,13 +106,6 @@
     ],
     "extraResources": [
       {
-        "from": "resources/extensions",
-        "to": "extensions",
-        "filter": [
-          "*.ts"
-        ]
-      },
-      {
         "from": "resources/yao-prompts",
         "to": "yao-prompts"
       },
