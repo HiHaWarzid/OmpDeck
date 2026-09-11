@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./AgentManager";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, type AgentRunState } from "./agentRunState";
-import type { ConfigManager } from "../config/ConfigManager";
+import type { AgentConfigDeps } from "./AgentManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AgentStatus, AgentTab } from "../../shared/types";
 
@@ -67,7 +67,7 @@ function makeHarness(): Harness {
 				webContents: { send: (channel: string, payload: unknown) => ipc.push({ channel, payload }) },
 			}) as unknown as Electron.BrowserWindow,
 		{} as unknown as SettingsStore,
-		{} as unknown as ConfigManager,
+		{} as unknown as AgentConfigDeps,
 	);
 	return {
 		manager,

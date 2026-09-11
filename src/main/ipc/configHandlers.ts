@@ -6,10 +6,13 @@ import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRoleP
 import type { PiDesktopApi } from "../../shared/api";
 import { formatRoleSelector, isOmpModelRole } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
+import type { OmpRolesStore } from "../config/OmpRolesStore";
 import type { AppLogger } from "../logging/AppLogger";
 
 interface ConfigHandlerDeps {
 	configManager: ConfigManager;
+	/** config.yml 的模型角色读写（ConfigManager 不再逐方法转发）。 */
+	rolesStore: OmpRolesStore;
 	appLogger: AppLogger;
 }
 
@@ -18,14 +21,14 @@ type ConfigHandlerMaps = {
 };
 
 export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMaps {
-	const { configManager, appLogger } = deps;
+	const { configManager, rolesStore, appLogger } = deps;
 
 	return {
 		config: {
 			getModels: async () => configManager.getModelsConfig(),
 			getAuth: async () => configManager.getAuthConfig(),
 			getSettings: async () => configManager.getSettingsConfig(),
-			getOmpDefault: async () => configManager.readOmpDefaultModel(),
+			getOmpDefault: async () => rolesStore.readDefaultModel(),
 			getTrust: async () => configManager.getTrustConfig(),
 			saveModels: async (_event, data) => {
 				// configManager 负责形状校验（返回 valid/error），边界只透传
@@ -68,7 +71,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				// 原子设置 OMP 默认：单次文档变更写 modelRoles.default 与顶层
 				// defaultThinkingLevel 两个槽位（原两次串行全文件 RMW 的撕裂窗口
 				// 已收敛为 OmpRolesStore.applyDefault 的一次写）。
-				const roleResult = await configManager.applyOmpDefault(
+				const roleResult = await rolesStore.applyDefault(
 					selector,
 					level || undefined,
 				);
@@ -83,14 +86,14 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 			},
 			// 清除 omp 默认模型角色与默认思考档（config.yml）。
 			clearOmpDefault: async () => {
-				const result = await configManager.clearOmpDefault();
+				const result = await rolesStore.clearDefault();
 				if (result.valid) {
 					void appLogger.info("config", "Default model cleared", { valid: true });
 				}
 				return result;
 			},
 			// 读取 config.yml 全部模型角色（modelRoles.<role>）。
-			getOmpRoles: async () => configManager.readOmpModelRoles(),
+			getOmpRoles: async () => rolesStore.readRolesState(),
 			// 原子设置某个模型角色：写 config.yml 的 modelRoles.<role>，
 			// selector 形如 "provider/modelId"，可选 ":thinkingLevel" 后缀。
 			setOmpRole: async (_event, payload: SetOmpRolePayload) => {
@@ -102,7 +105,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				if (!selector) {
 					return { valid: false, error: "selector 不能为空" };
 				}
-				const result = await configManager.updateOmpModelRole(
+				const result = await rolesStore.applyRole(
 					role,
 					selector,
 					payload.thinkingLevel?.trim() || undefined,
@@ -122,7 +125,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				if (!isOmpModelRole(trimmedRole)) {
 					return { valid: false, error: "role 不能为空或不是有效角色" };
 				}
-				const result = await configManager.clearOmpModelRole(trimmedRole);
+				const result = await rolesStore.clearRole(trimmedRole);
 				if (result.valid) {
 					void appLogger.info("config", "Model role cleared", { role: trimmedRole });
 				}

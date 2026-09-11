@@ -117,7 +117,7 @@ import {
 	resolveSettle,
 } from "./settleReducer";
 import type { SettingsStore } from "../settings/SettingsStore";
-import type { ConfigManager } from "../config/ConfigManager";
+import type { TrustStore } from "../config/TrustStore";
 import type { RpcLogger } from "../logging/RpcLogger";
 import type { AppLogger } from "../logging/AppLogger";
 import {
@@ -125,6 +125,22 @@ import {
 	toWslLinuxPath,
 	type WslEnvironment,
 } from "../wsl/WslPaths";
+
+/**
+ * AgentManager 用到的配置能力（窄接口）。
+ *
+ * 原先整类依赖 862 行的 ConfigManager（实际只用到 3 个能力，且其中多数是
+ * ConfigManager 对 rolesStore/trustStore 的纯转发）。收窄后依赖面就是这个对象：
+ * 角色读取只留一个函数，信任决策拿到 store 本体，模型收敛只留一个函数。
+ */
+export type AgentConfigDeps = {
+	/** 顶层 defaultThinkingLevel（config.yml，缺省 undefined）。 */
+	readOmpDefaultThinkingLevel: () => Promise<string | undefined>;
+	/** 按 models.json 收敛可用模型（pi 内置目录里未配置的供应商/模型剔除）。 */
+	filterConfiguredModels: (models: AvailableModel[]) => Promise<AvailableModel[]>;
+	/** 项目信任决策存储（探测/decide 注入 ask）。 */
+	trustStore: TrustStore;
+};
 
 /** 项目信任确认弹窗的用户选择 */
 export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
@@ -218,7 +234,7 @@ export class AgentManager {
 		private readonly getProject: (id: string) => Project | undefined,
 		private readonly getWindow: () => BrowserWindow | null,
 		private readonly settingsStore: SettingsStore,
-		private readonly configManager: ConfigManager,
+		private readonly config: AgentConfigDeps,
 		private readonly rpcLogger?: RpcLogger,
 		private readonly appLogger?: AppLogger,
 	) {
@@ -544,7 +560,7 @@ export class AgentManager {
 	 */
 	private async readConfiguredDefaultThinkingLevel(): Promise<string | undefined> {
 		try {
-			const level = await this.configManager.getOmpDefaultThinkingLevel();
+			const level = await this.config.readOmpDefaultThinkingLevel();
 			return level !== undefined && AgentManager.OMP_THINKING_LEVELS[level] === true
 				? level
 				: undefined;
@@ -1626,7 +1642,7 @@ export class AgentManager {
 		);
 		const models = ((response.data as any)?.models ?? []) as AvailableModel[];
 		// pi 会把有 Key（含环境变量）的供应商内置目录也返回，这里只保留 models.json 显式配置的模型
-		return this.configManager.filterConfiguredModels(models);
+		return this.config.filterConfiguredModels(models);
 	}
 
 	async setModel(agentId: string, provider: string, modelId: string) {
@@ -3393,7 +3409,7 @@ export class AgentManager {
 		const hostCwd = this.wslEnvironment
 			? toWindowsHostPath(project.path, this.wslEnvironment)
 			: project.path;
-		const trustStore = this.configManager.getTrustStore();
+		const trustStore = this.config.trustStore;
 		void this.appLogger?.info("agent", "Agent trust decision start", { cwd });
 		const result = await trustStore.decide({
 			cwd,

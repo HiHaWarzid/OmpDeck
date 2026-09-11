@@ -951,7 +951,7 @@ function registerIpc() {
 		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
 		registerSessionHandlers({ projectStore, sessionScanner, sessionFileOps: sessionScanner.fileOps, importPipeline, agentManager, appLogger }),
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
-		registerConfigHandlers({ configManager, appLogger }),
+		registerConfigHandlers({ configManager, rolesStore: configManager.rolesStore, appLogger }),
 		registerClipboardHandlers(),
 		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
@@ -1052,7 +1052,7 @@ app.whenReady().then(async () => {
 	configManager = new ConfigManager();
 	// 一次性 legacy 迁移：旧 settings.json 的 defaultThinkingLevel 只填空搬进
 	// config.yml（config.yml 是 omp 权威源）；失败不阻塞启动。
-	void configManager.migrateOmpLegacyDefaultThinkingLevel();
+	void configManager.rolesStore.migrateLegacyDefaultThinkingLevel();
 	promptManager = new PromptManager();
 	xuePromptManager = new XuePromptManager();
 	skillManager = new SkillManager();
@@ -1073,7 +1073,11 @@ app.whenReady().then(async () => {
 		(id) => projectStore.get(id),
 		() => mainWindow,
 		settingsStore,
-		configManager,
+		{
+			readOmpDefaultThinkingLevel: () => configManager.rolesStore.readDefaultThinkingLevel(),
+			filterConfiguredModels: (models) => configManager.filterConfiguredModels(models),
+			trustStore: configManager.trustStore,
+		},
 		rpcLogger,
 		appLogger,
 	);

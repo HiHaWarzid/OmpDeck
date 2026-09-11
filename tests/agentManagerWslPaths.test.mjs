@@ -253,7 +253,7 @@ test("uses host paths for trust resource checks and Linux paths for trust keys",
 	const trustDir = mkdtempSync(join(tmpdir(), "agentmgr-trust-"));
 	try {
 		const store = new TrustStore({ resolveConfigDir: () => trustDir });
-		const manager = createManager(AgentManager, { getTrustStore: () => store });
+		const manager = createManager(AgentManager, { trustStore: store });
 		manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
 
 		await manager.ensureProjectTrust({

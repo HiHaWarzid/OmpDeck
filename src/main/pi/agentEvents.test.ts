@@ -11,7 +11,7 @@ import { AgentManager, isRpcLogWorthy } from "./AgentManager";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, type AgentRunState } from "./agentRunState";
-import type { ConfigManager } from "../config/ConfigManager";
+import type { AgentConfigDeps } from "./AgentManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 
 // electron 在 vitest（node 环境）下不可用；AgentManager 及其依赖只在构造/方法调用时
@@ -96,7 +96,7 @@ function makeManager(): AgentManager {
 		() => undefined, // getProject：不涉及项目解析
 		() => null, // getWindow：不推送 IPC
 		{} as unknown as SettingsStore, // 测试桩：不读写设置
-		{} as unknown as ConfigManager, // 测试桩：不读写配置
+		{} as unknown as AgentConfigDeps, // 测试桩：不读写配置
 	);
 }
 

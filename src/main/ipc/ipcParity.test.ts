@@ -107,7 +107,7 @@ const moduleRegistrations = [
 		module: "gitHandlers",
 		map: registerGitHandlers({ projectStore: stubs, gitService: stubs, settingsStore: stubs, worktreeService: stubs, appLogger: stubs, quickGen: stubs }),
 	},
-	{ module: "configHandlers", map: registerConfigHandlers({ configManager: stubs, appLogger: stubs }) },
+	{ module: "configHandlers", map: registerConfigHandlers({ configManager: stubs, rolesStore: stubs, appLogger: stubs }) },
 	{ module: "clipboardHandlers", map: registerClipboardHandlers() },
 	{
 		module: "piHandlers",

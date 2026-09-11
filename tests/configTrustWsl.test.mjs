@@ -124,16 +124,16 @@ test("preserves POSIX WSL trust keys under Windows path semantics", async () => 
 	const { ConfigManager, getContent, writes } = loadConfigManager();
 	const manager = new ConfigManager("C:\\OmpDeck\\config");
 
-	await manager.ensureTrustedDirectory("/root/ba_cli/");
+	await manager.trustStore.ensureTrustedDirectory("/root/ba_cli/");
 	assert.deepEqual(JSON.parse(getContent()), { "/root/ba_cli": true });
-	assert.equal(await manager.getProjectTrustDecision("/root/ba_cli/subdir"), true);
+	assert.equal(await manager.trustStore.getDecision("/root/ba_cli/subdir"), true);
 
-	await manager.setProjectTrustDecision("/root/ba_cli/subdir/../private", false);
+	await manager.trustStore.setDecision("/root/ba_cli/subdir/../private", false);
 	assert.deepEqual(JSON.parse(getContent()), {
 		"/root/ba_cli": true,
 		"/root/ba_cli/private": false,
 	});
-	assert.equal(await manager.getProjectTrustDecision("/root/ba_cli/private/nested"), false);
+	assert.equal(await manager.trustStore.getDecision("/root/ba_cli/private/nested"), false);
 	assert.equal(writes.every((write) => write.filePath === "C:\\OmpDeck\\config\\trust.json"), true);
 });
 
@@ -141,8 +141,8 @@ test("retains case-insensitive matching for native Windows trust keys", async ()
 	const { ConfigManager } = loadConfigManager();
 	const manager = new ConfigManager("C:\\OmpDeck\\config");
 
-	await manager.setProjectTrustDecision("C:\\Repo", true);
-	assert.equal(await manager.getProjectTrustDecision("c:\\repo\\child"), true);
+	await manager.trustStore.setDecision("C:\\Repo", true);
+	assert.equal(await manager.trustStore.getDecision("c:\\repo\\child"), true);
 });
 
 test("buildModelsRequest honors provider User-Agent override for OpenAI gateways", async () => {

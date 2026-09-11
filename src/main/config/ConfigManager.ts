@@ -6,7 +6,6 @@ import { homedir } from "node:os";
 import { net } from "electron";
 import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
-import type { OmpModelRole, OmpRolesState } from "../../shared/types/ompRoles";
 import {
 	buildModelsRequest,
 	buildTestRequest,
@@ -94,10 +93,14 @@ type TestRequest = {
  */
 export class ConfigManager {
 	private configDir: string;
-	/** config.yml 专属存取（roles + defaultThinkingLevel），configDir 经 accessor 注入。 */
-	private readonly rolesStore: OmpRolesStore;
+	/**
+	 * config.yml 专属存取（roles + defaultThinkingLevel），configDir 经 accessor 注入。
+	 * 公开只读：角色读写是 store 自身的能力，消费方（IPC/AgentManager）直取，
+	 * 本类不再逐方法转发（接口与实现等宽 = 浅模块）。
+	 */
+	readonly rolesStore: OmpRolesStore;
 	/** trust.json 专属存取（信任决策存储/探测/编排），configDir 经 accessor 注入。 */
-	private readonly trustStore: TrustStore;
+	readonly trustStore: TrustStore;
 
 	constructor(configDir?: string) {
 		this.configDir = configDir ?? PI_AGENT_DIR;
@@ -264,30 +267,10 @@ export class ConfigManager {
 				};
 	}
 
-	async ensureTrustedDirectory(directoryPath: string): Promise<void> {
-		await this.trustStore.ensureTrustedDirectory(directoryPath);
-	}
-
-	/**
-	 * 查询某项目目录的信任决策，沿父目录链查找最近记录（复刻 pi 的 findNearestTrustEntry 语义）。
-	 * pi 的信任语义是父目录决策继承到子目录，例如 trust.json 记录 "C:\\Users": true，
-	 * 则 C:\\Users\\14012\\project 同样视为已信任。返回 true/false；未记录返回 null。
-	 */
-	async getProjectTrustDecision(cwd: string): Promise<boolean | null> {
-		return this.trustStore.getDecision(cwd);
-	}
-	/**
-	 * 写入某项目目录的信任决策（覆盖该路径既有值）。
-	 * 用户在信任弹窗选择“信任并记住”或“不信任”后调用，持久化决策避免重复打扰。
-	 */
-	async setProjectTrustDecision(cwd: string, decision: boolean): Promise<void> {
-		await this.trustStore.setDecision(cwd, decision);
-	}
-
-	/** TrustStore 实例（AgentManager 决策编排经此使用：探测/decide 注入 ask）。 */
-	getTrustStore(): TrustStore {
-		return this.trustStore;
-	}
+	// ── 信任决策 / OMP 角色：直取 store ──────────────────
+	// 原先在此逐个转发 trustStore/rolesStore 的方法（getTrustStore/getProjectTrustDecision/
+	// readOmpModelRoles/...）：接口与实现等宽。现由消费方直取 this.trustStore / this.rolesStore；
+	// 本类只保留有加工的逻辑（getTrustConfig 的读结果整形、export/import 打包）。
 
 
 	// ── 保存（可视化表单） ────────────────────────────────
@@ -390,63 +373,9 @@ export class ConfigManager {
 	// 当前 omp 以 ~/.omp/agent/config.yml（YAML）为全局 settings 权威源，
 	// settings.json 只是历史迁移遗留、不再被读取；模型角色（modelRoles）与
 	// 默认思考等级必须写 config.yml 才会生效。config.yml 的读写与原子单文档写
-	// 收敛于 OmpRolesStore（原两次串行全文件 RMW 的撕裂窗口在此关闭），本类只
-	// 做委托；configureWsl 切换 home 时经 accessor 现取 configDir，指针跟随。
-
-	/** 读取 config.yml 的 modelRoles 全部角色当前值（委托 OmpRolesStore）。 */
-	async readOmpModelRoles(): Promise<OmpRolesState> {
-		return this.rolesStore.readRolesState();
-	}
-
-	/** 默认模型角色（modelRoles.default，顶层 defaultThinkingLevel 作无后缀回退）。 */
-	async readOmpDefaultModel(): Promise<{
-		selector?: string;
-		provider?: string;
-		model?: string;
-		thinkingLevel?: string;
-	}> {
-		return this.rolesStore.readDefaultModel();
-	}
-
-	/** 顶层 defaultThinkingLevel（桌面端 post-ready 强推与设置展示的数据源）。 */
-	async getOmpDefaultThinkingLevel(): Promise<string | undefined> {
-		return this.rolesStore.readDefaultThinkingLevel();
-	}
-
-	/** 设置某个模型角色（config.yml modelRoles.<role>；default 走 applyOmpDefault）。 */
-	async updateOmpModelRole(
-		role: OmpModelRole,
-		selector: string,
-		thinkingLevel?: string,
-	): Promise<ConfigValidationResult> {
-		return this.rolesStore.applyRole(role, selector, thinkingLevel);
-	}
-
-	/** 清除某个模型角色（default 联动清顶层 defaultThinkingLevel）。 */
-	async clearOmpModelRole(role: OmpModelRole): Promise<ConfigValidationResult> {
-		return this.rolesStore.clearRole(role);
-	}
-
-	/**
-	 * 原子设置 OMP 默认（模型 + 可选思考档）：单次文档变更写 modelRoles.default
-	 * 与顶层 defaultThinkingLevel（含后缀与顶层键两个 schema 槽位，见 OmpRolesStore）。
-	 */
-	async applyOmpDefault(
-		selector: string,
-		thinkingLevel?: string,
-	): Promise<ConfigValidationResult> {
-		return this.rolesStore.applyDefault(selector, thinkingLevel);
-	}
-
-	/** 清除 OMP 默认（modelRoles.default + 顶层 defaultThinkingLevel 一次清）。 */
-	async clearOmpDefault(): Promise<ConfigValidationResult> {
-		return this.rolesStore.clearDefault();
-	}
-
-	/** 一次性 legacy 迁移：settings.json 的 defaultThinkingLevel 只填空写进 config.yml。 */
-	async migrateOmpLegacyDefaultThinkingLevel(): Promise<void> {
-		await this.rolesStore.migrateLegacyDefaultThinkingLevel();
-	}
+	// 收敛于 OmpRolesStore（原两次串行全文件 RMW 的撕裂窗口在此关闭）；消费方
+	// 直取 this.rolesStore（configureWsl 切换 home 时经 accessor 现取 configDir，指针跟随）。
+	// 本类保留的唯一角色相关逻辑是 export/import 的打包（见下方）。
 
 	// ── 保存（源文件编辑） ────────────────────────────────
 
@@ -784,8 +713,8 @@ export class ConfigManager {
 			this.readJsonFile<PiSettings>("settings.json", {}),
 		]);
 		const trust = await this.getTrustConfig();
-		const roles = await this.readOmpModelRoles();
-		const defaultLevel = await this.getOmpDefaultThinkingLevel();
+		const roles = await this.rolesStore.readRolesState();
+		const defaultLevel = await this.rolesStore.readDefaultThinkingLevel();
 		return JSON.stringify(
 			{
 				version: 1,
