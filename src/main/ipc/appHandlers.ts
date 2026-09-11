@@ -28,6 +28,7 @@ import type { PiLocator } from "../pi/PiLocator";
 import type { PetSystem } from "../pet";
 import type { AfkOrchestrator } from "../afk/AfkOrchestrator";
 import type { WslEnvironment } from "../wsl/WslPaths";
+import { resolveNativeThemeSource } from "../nativeThemeSource";
 import { applyDesktopProxy } from "../settings/DesktopProxy";
 import { testPiProxy } from "../pi/PiProxyTester";
 import { UpdateManager, RELEASES_URL } from "../update/UpdateManager";

@@ -22,6 +22,7 @@ import {
 	readSingleInstancePreference,
 } from "./settings/SettingsStore";
 import { acquireVersionSingleInstance } from "./singleInstance";
+import { resolveNativeThemeSource } from "./nativeThemeSource";
 import { readLastWindowBounds, saveLastWindowBounds } from "./windowState";
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
@@ -304,8 +305,9 @@ async function syncWslEnvironment(settings: AppSettings): Promise<WslEnvironment
 }
 
 function applyNativeThemeSource(settings: AppSettings) {
+	const src = resolveNativeThemeSource(settings.theme);
 	// 原生标题栏不受 renderer CSS 影响；跟随应用主题，避免暗色界面顶部仍是系统浅色栏。
-	nativeTheme.themeSource = settings.theme === "system" ? "system" : settings.theme;
+	nativeTheme.themeSource = src;
 }
 
 const POSTHOG_PROJECT_KEY =
