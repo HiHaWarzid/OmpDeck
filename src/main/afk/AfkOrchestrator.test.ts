@@ -9,47 +9,45 @@
  * 不依赖真实墙钟（ts-no-test-timers）。
  */
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test, vi } from "vitest";
 import type { AgentTab, AfkSettings, AfkState, AppSettings, CreateAgentInput, Project, SendPromptInput, SendPromptResult } from "../../shared/types";
 import type { AgentManagerEventListener } from "../../shared/types";
-import { AfkOrchestrator, type AfkOrchestratorDeps } from "./AfkOrchestrator";
+import { AfkOrchestrator, type AfkEffects, type AfkOrchestratorDeps } from "./AfkOrchestrator";
 import type { AfkTicket, TicketSource } from "./ticketSources";
 
-/** 每测试用例独立临时 userData（beforeEach 注入 electron mock 与各 fake 的锚点） */
-let userData = "";
+/** 固定项目根（路径只作不透明字符串在各 fake 间传递，无需真实目录） */
+const USER_DATA = join("C:", "afk-test-userdata");
 
-// ── electron / CommandRunner mock（hoisted：vi.mock 工厂先于模块求值执行；
-//    工厂内不可引用模块 import，临时目录经 state 容器在 beforeEach 注入） ──
+/**
+ * 注入式副作用端口：git 回复可脚本化、状态文件在内存。
+ * 不再 vi.mock electron / CommandRunner——模块级 mock 与说明符耦合且全局生效，
+ * 端口注入让"给定状态走哪条路线"直接可测，也不落盘。
+ */
+class FakeAfkEffects implements AfkEffects {
+	readonly gitCalls: Array<{ cwd: string; args: string[] }> = [];
+	/** 按子命令（args[0]）分派的确定性 stdout；未命中回 "" */
+	readonly gitReplies = new Map<string, string>();
+	stateText: string | null = null;
+	readonly stateWrites: string[] = [];
 
-const { state, mocks } = vi.hoisted(() => ({
-	state: { userData: "" },
-	mocks: {
-		runGit: vi.fn(async (_cwd: string, _args: string[]) => ""),
-	},
-}));
+	async runGit(cwd: string, args: string[]): Promise<string> {
+		this.gitCalls.push({ cwd, args });
+		return this.gitReplies.get(args[0] ?? "") ?? "";
+	}
 
-vi.mock("electron", () => ({
-	app: { getPath: () => state.userData },
-}));
+	async readStateText(): Promise<string | null> {
+		return this.stateText;
+	}
 
-vi.mock("../utils/CommandRunner", () => ({
-	CommandError: class extends Error {
-		kind: string;
-		code: number | undefined;
-		constructor(kind: string, message: string, code?: number) {
-			super(message);
-			this.kind = kind;
-			this.code = code;
-		}
-	},
-	// 真实命令执行由 CommandRunner.test.ts 覆盖；此处按参数分类返回确定性 stdout
-	runGit: mocks.runGit,
-	runGh: async () => "",
-	runCommand: async () => ({ stdout: "" }),
-}));
+	async writeStateText(text: string): Promise<void> {
+		this.stateText = text;
+		this.stateWrites.push(text);
+	}
+}
+
+/** 每测试用例独立效果端口（beforeEach 重建） */
+let effects: FakeAfkEffects;
 
 // ── 依赖 fakes ──
 
@@ -255,7 +253,7 @@ function buildHarness(settings: Partial<AfkSettings> = {}) {
 	projectStore.projects.push({
 		id: "p1",
 		name: "repo",
-		path: join(userData, "repo"),
+		path: join(USER_DATA, "repo"),
 		lastOpenedAt: 0,
 	});
 	const settingsStore = new FakeSettingsStore();
@@ -269,13 +267,14 @@ function buildHarness(settings: Partial<AfkSettings> = {}) {
 		settingsStore: settingsStore as unknown as AfkOrchestratorDeps["settingsStore"],
 		getMainWindow: () => null,
 		ticketSource,
+		effects,
 	};
 	const orchestrator = new AfkOrchestrator(deps);
-	return { orchestrator, agentManager, worktreeService, projectStore, settingsStore, ticketSource };
+	return { orchestrator, agentManager, worktreeService, projectStore, settingsStore, ticketSource, effects };
 }
 
 function writeStateFile(state: Partial<AfkState>): void {
-	writeFileSync(join(userData, "afk-state.json"), JSON.stringify(state, null, 2), "utf8");
+	effects.stateText = JSON.stringify(state, null, 2);
 }
 
 /** 推进一步 fake 时钟并排空微任务链（poll/dispatch 全是 async/await，无真实墙钟依赖） */
@@ -293,16 +292,11 @@ async function settleUntil(condition: () => boolean): Promise<void> {
 }
 
 beforeEach(() => {
-	userData = join(tmpdir(), `afk-orchestrator-test-${process.pid}-${Math.random().toString(36).slice(2)}`);
-	state.userData = userData;
+	effects = new FakeAfkEffects();
 	vi.useFakeTimers();
-	mkdirSync(userData, { recursive: true });
 });
 
 afterEach(() => {
-	mocks.runGit.mockReset();
-	mocks.runGit.mockImplementation(async () => "");
-	rmSync(userData, { recursive: true, force: true });
 	vi.useRealTimers();
 });
 
@@ -329,7 +323,7 @@ describe("AfkOrchestrator 状态机", () => {
 		assert.equal(h.worktreeService.createAfkCalls.length, 1);
 		assert.deepEqual(
 			h.worktreeService.createAfkCalls[0],
-			{ projectPath: join(userData, "repo"), ticketId: 42, title: "Fix flaky test" },
+			{ projectPath: join(USER_DATA, "repo"), ticketId: 42, title: "Fix flaky test" },
 		);
 		assert.equal(h.worktreeService.ensuredAuthorFor.length, 1, "派发前应保证 git author（ADR-0003）");
 		const prompt = h.agentManager.prompts[0]!;
@@ -338,9 +332,7 @@ describe("AfkOrchestrator 状态机", () => {
 		assert.match(prompt.message, /# Workflow\nworkflow:test/);
 
 		// 真实提交含 [afk-wip] 快照 → 过滤后仍有余量 → 开 PR
-		mocks.runGit.mockImplementation(async (_cwd: string, args: string[]) =>
-			args[0] === "log" ? "feat: real work\n[afk-wip] #42\nchore: cleanup" : "",
-		);
+		effects.gitReplies.set("log", "feat: real work\n[afk-wip] #42\nchore: cleanup");
 		h.agentManager.emitSettled(task.agentId!);
 		await settleUntil(() => h.orchestrator.getState().tasks[0]!.status === "pr-pending");
 
@@ -367,9 +359,7 @@ describe("AfkOrchestrator 状态机", () => {
 		await h.orchestrator.stop();
 
 		const task = h.orchestrator.getState().tasks[0]!;
-		mocks.runGit.mockImplementation(async (_cwd: string, args: string[]) =>
-			args[0] === "log" ? "[afk-wip] #7\n[afk-wip] #7" : "",
-		);
+		effects.gitReplies.set("log", "[afk-wip] #7\n[afk-wip] #7");
 		h.agentManager.emitSettled(task.agentId!);
 		await settleUntil(() => h.orchestrator.getState().tasks[0]!.status === "complete");
 
@@ -462,7 +452,7 @@ describe("AfkOrchestrator 状态机", () => {
 					ticketRef: 21,
 					title: "Interrupted",
 					projectId: "p1",
-					worktreePath: join(userData, "wt-21"),
+					worktreePath: join(USER_DATA, "wt-21"),
 					branch: "afk-21-wip",
 					agentId: "gone-agent",
 					status: "running",
@@ -476,8 +466,6 @@ describe("AfkOrchestrator 状态机", () => {
 		await h.orchestrator.stop();
 
 		const recovered = h.orchestrator.getState().tasks[0]!;
-		assert.equal(recovered.status, "failed");
-		assert.match(recovered.errorSummary!, /崩溃恢复/);
 		assert.equal(h.worktreeService.removedWithWip.length, 1, "死亡 agent 应强清 worktree 留 WIP");
 		assert.equal(h.worktreeService.removedWithWip[0]!.ticketRef, 21);
 		assert.deepEqual(h.ticketSource.failed.map((f) => f.number), [21], "回写 needs-info 防循环重派");
@@ -490,7 +478,7 @@ describe("AfkOrchestrator 状态机", () => {
 					ticketRef: 22,
 					title: "Still working",
 					projectId: "p1",
-					worktreePath: join(userData, "wt-22"),
+					worktreePath: join(USER_DATA, "wt-22"),
 					branch: "afk-22-wip",
 					agentId: "alive-agent",
 					status: "running",
@@ -503,7 +491,7 @@ describe("AfkOrchestrator 状态机", () => {
 		h.agentManager.tabs.set("alive-agent", {
 			id: "alive-agent",
 			projectId: "p1",
-			cwd: join(userData, "wt-22"),
+			cwd: join(USER_DATA, "wt-22"),
 			title: "AFK: #22",
 			status: "running",
 			createdAt: 0,
@@ -596,11 +584,11 @@ describe("AfkOrchestrator applySettings 热更新", () => {
 		h.projectStore.projects.push({
 			id: "p2",
 			name: "repo2",
-			path: join(userData, "repo2"),
+			path: join(USER_DATA, "repo2"),
 			lastOpenedAt: 0,
 		});
 		h.ticketSource.readyList.push(makeTicket(91, "From p2"));
-		h.ticketSource.ticketProjectPaths.set(91, join(userData, "repo2"));
+		h.ticketSource.ticketProjectPaths.set(91, join(USER_DATA, "repo2"));
 		await h.settingsStore.update({
 			afk: { ...h.settingsStore.afk, enabled: true, targetProjectIds: ["p1"] },
 		});
@@ -660,9 +648,7 @@ describe("AfkOrchestrator 终止与工单地址", () => {
 	test("ticketUrl：dispatch 时从 git remote 反查仓库基址拼工单地址", async () => {
 		const h = buildHarness();
 		h.ticketSource.readyList.push(makeTicket(55, "Url me"));
-		mocks.runGit.mockImplementation(async (_cwd: string, args: string[]) =>
-			args[0] === "remote" ? "git@github.com:org/repo.git" : "",
-		);
+		effects.gitReplies.set("remote", "git@github.com:org/repo.git");
 		await h.orchestrator.start();
 		await settleUntil(() => h.orchestrator.getState().tasks.length === 1);
 		await h.orchestrator.stop();

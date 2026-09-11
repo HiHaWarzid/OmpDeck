@@ -28,6 +28,53 @@ import { GhTicketSource, type AfkTicket, type TicketSource } from "./ticketSourc
 /** 历史归档保留 30 天（handoff：afk-state.json 滚动清理） */
 const ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * AFK 编排器的副作用端口：git 执行 + 状态文件读写。
+ *
+ * 默认实现直调 CommandRunner.runGit / node:fs / electron app.getPath（行为与之前逐行一致）；
+ * 测试注入 fake 即可驱动状态机，不必再 vi.mock 整个模块（模块级 mock 与模块说明符耦合，
+ * 且对所有用例全局生效）。
+ */
+export type AfkEffects = {
+	runGit: (cwd: string, args: string[], options?: { timeoutMs?: number }) => Promise<string>;
+	/** 读状态文件；不存在/不可读返回 null（调用方按全新状态处理，损坏不阻断启动）。 */
+	readStateText: () => Promise<string | null>;
+	/** 写状态文件（含父目录创建）。 */
+	writeStateText: (text: string) => Promise<void>;
+};
+
+/**
+ * 合成端口：缺省键用真实实现（惰性——userData 路径只在真正读写时求值，
+ * 注入全部端口时不触碰 electron）。
+ */
+function resolveAfkEffects(overrides?: Partial<AfkEffects>): AfkEffects {
+	const stateFilePath = () => join(app.getPath("userData"), "afk-state.json");
+	return {
+		// 经箭头转发而非直接取方法引用：注入的端口多为类实例方法，
+		// 解绑后 this 会指向合成对象，实例字段全部读不到。
+		runGit: overrides?.runGit
+			? (cwd, args, options) => overrides.runGit!(cwd, args, options)
+			: (cwd, args, options) => runGit(cwd, args, options),
+		readStateText: overrides?.readStateText
+			? () => overrides.readStateText!()
+			: async () => {
+					try {
+						return await readFile(stateFilePath(), "utf8");
+					} catch {
+						// 文件缺失/损坏：调用方按全新状态处理（不阻断启动）
+						return null;
+					}
+				},
+		writeStateText: overrides?.writeStateText
+			? (text) => overrides.writeStateText!(text)
+			: async (text) => {
+					const filePath = stateFilePath();
+					await mkdir(dirname(filePath), { recursive: true });
+					await writeFile(filePath, text, "utf8");
+				},
+	};
+}
+
 export type AfkOrchestratorDeps = {
 	agentManager: AgentManager;
 	worktreeService: WorktreeService;
@@ -36,6 +83,8 @@ export type AfkOrchestratorDeps = {
 	getMainWindow: () => BrowserWindow | null;
 	/** 工单源（gh CLI 实现）；测试注入 FakeTicketSource 驱动状态机（ADR-0001 可测试性） */
 	ticketSource?: TicketSource;
+	/** 副作用端口（git / 状态文件）；缺省用真实实现，语义与之前一致 */
+	effects?: Partial<AfkEffects>;
 };
 
 /** 状态为活跃（不可再派发同 ticket）的任务状态集合 */
@@ -52,8 +101,7 @@ export class AfkOrchestrator {
 	private readonly settingsStore: SettingsStore;
 	private readonly getMainWindow: () => BrowserWindow | null;
 	private readonly ticketSource: TicketSource;
-	/** 持久化文件 userData/afk-state.json（同 SettingsStore 的 userData 获取方式） */
-	private readonly stateFilePath = join(app.getPath("userData"), "afk-state.json");
+	private readonly fx: AfkEffects;
 
 	/** 内存运行态：tasks + enabled + lastPollAt（与 AfkState 持久化形状一致） */
 	private state: AfkState = { tasks: [], enabled: false };
@@ -71,6 +119,7 @@ export class AfkOrchestrator {
 		this.getMainWindow = deps.getMainWindow;
 		// 缺省 gh 实现：main/index.ts 的构造入参不变（新增字段可选）
 		this.ticketSource = deps.ticketSource ?? GhTicketSource;
+		this.fx = resolveAfkEffects(deps.effects);
 
 		// 语义事件订阅（#2 杠杆点）：settled = agent 停止工作的权威完成信号；
 		// statusChanged === "error" = 失败信号。不轮询 addStateListener 快照。
@@ -183,7 +232,11 @@ export class AfkOrchestrator {
 
 	private async loadState(): Promise<void> {
 		try {
-			const raw = await readFile(this.stateFilePath, "utf8");
+			const raw = await this.fx.readStateText();
+			if (raw === null) {
+				this.state = { tasks: [], enabled: false };
+				return;
+			}
 			const parsed = JSON.parse(raw) as Partial<AfkState>;
 			this.state = {
 				tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
@@ -198,8 +251,7 @@ export class AfkOrchestrator {
 
 	private async saveState(): Promise<void> {
 		try {
-			await mkdir(dirname(this.stateFilePath), { recursive: true });
-			await writeFile(this.stateFilePath, JSON.stringify(this.state, null, 2), "utf8");
+			await this.fx.writeStateText(JSON.stringify(this.state, null, 2));
 		} catch (error) {
 			// 持久化失败不阻断主流程（内存态仍有效），仅留痕
 			console.error("[AFK] 状态持久化失败:", errorMessage(error));
@@ -509,7 +561,7 @@ export class AfkOrchestrator {
 
 	/** 推分支并设上游：git push -u origin {branch}（cwd 为项目主工作区）；网络大调用覆盖 120s 超时。 */
 	private async pushBranch(projectPath: string, branch: string): Promise<void> {
-		await runGit(projectPath, ["push", "-u", "origin", branch], { timeoutMs: 120_000 });
+		await this.fx.runGit(projectPath, ["push", "-u", "origin", branch], { timeoutMs: 120_000 });
 	}
 
 	/**
@@ -517,7 +569,7 @@ export class AfkOrchestrator {
 	 * 返回真实提交的 subject 列表（供 PR body 引用）；空数组 = 无真实提交 → 不开 PR。
 	 */
 	private async listRealCommits(projectPath: string, branch: string): Promise<string[]> {
-		const stdout = await runGit(projectPath, ["log", "main..branch", "--format=%s"]);
+		const stdout = await this.fx.runGit(projectPath, ["log", "main..branch", "--format=%s"]);
 		return stdout
 			.split("\n")
 			.map((line) => line.trim())
@@ -628,7 +680,7 @@ export class AfkOrchestrator {
 			return task.ticketUrl;
 		}
 		if (!project) return undefined;
-		const remote = await runGit(project.path, ["remote", "get-url", "origin"], {
+		const remote = await this.fx.runGit(project.path, ["remote", "get-url", "origin"], {
 			timeoutMs: 10_000,
 		}).catch(() => "");
 		const webBase = remoteToWebBase(remote);
