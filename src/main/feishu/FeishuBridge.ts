@@ -46,7 +46,8 @@ import { chooseMessageMode, buildPostMessages, buildMarkdownCards } from "./rich
 import { CardStream } from "./CardStream";
 import { buildFeishuTextChildren, sanitizeFeishuUserVisibleText, stripFeishuActionMarkers, wantsFeishuDoc, wrapHostInstruction } from "./docActions";
 import { hasExplicitFeishuFileSendIntent } from "./fileIntent";
-import { createInitialState, reduceFromPiEvent, markInterrupted, markError, type RunState } from "./CardRunState";
+import { createInitialState, type RunState } from "./CardRunState";
+import { SessionRunCards } from "./SessionRunCards";
 import { renderRunCard } from "./CardRenderer";
 import { buildModelPickerCard, parseModelActionValue } from "./ModelPickerCard";
 import type { AgentManager } from "../pi/AgentManager";
@@ -91,16 +92,8 @@ export class FeishuBridge {
 	private groupInfoCache = new Map<string, FeishuGroupInfo>();
 	private userNameCache = new Map<string, string>();
 
-	// 流式卡片：sessionId → CardStream
-	private streamingCards = new Map<string, CardStream>();
-	// 流式状态：sessionId → RunState
-	private streamingRunStates = new Map<string, RunState>();
-	// 卡片未创建时的缓存事件（并行模式下 Agent 先启动，事件暂存于此）
-	private pendingCardEvents = new Map<string, unknown[]>();
-	// 记录卡片更新失败的 session（用于 runAgent 降级兜底）
-	private cardUpdateFailed = new Set<string>();
-	/** 本轮已成功完成流式卡片终态的 session；agent_end 时跳过二次纯文本同步，避免双消息。 */
-	private cardTerminalSucceeded = new Set<string>();
+	// 流式卡片运行生命周期（状态/缓冲/终态交付）统一收进 SessionRunCards
+	private readonly runCards: SessionRunCards;
 
 	private unsubscribeLocalEvents: (() => void) | null = null;
 	// 哪些 session 是飞书发起的（不需要 session mirror）
@@ -124,6 +117,20 @@ export class FeishuBridge {
 		this.agentManager = agentManager;
 		this.getWindow = getWindow;
 		this.getProjects = getProjects;
+		this.runCards = new SessionRunCards({
+			// 卡片创建/更新都走注入端口，模块本身不依赖 lark SDK。
+			openStream: (chatId, initialCard, opts) => {
+				if (!this.client) return Promise.reject(new Error("飞书 Client 未初始化"));
+				return CardStream.open(this.client, chatId, initialCard, opts);
+			},
+			// 卡片只展示用户可见正文，去掉 thinking 标签与内部动作标记。
+			render: (state: RunState) => {
+				const clean = sanitizeFeishuUserVisibleText(state.outputText);
+				return renderRunCard(clean === state.outputText ? state : { ...state, outputText: clean }, {
+					stopHint: state.terminal === "running" ? "发送 /stop 可终止当前任务" : undefined,
+				});
+			},
+		});
 	}
 
 	getStatus(): FeishuBridgeStatus { return { ...this.status }; }
@@ -176,10 +183,7 @@ export class FeishuBridge {
 		this.sessionToChat.delete(binding.sessionId);
 		this.feishuSessions.delete(binding.sessionId);
 		this.chatBindings.delete(chatId);
-		this.streamingCards.delete(binding.sessionId);
-		this.streamingRunStates.delete(binding.sessionId);
-		this.pendingCardEvents.delete(binding.sessionId);
-		this.cardUpdateFailed.delete(binding.sessionId);
+		this.runCards.drop(binding.sessionId);
 		this.updateStatus({ activeBindings: this.chatBindings.size });
 		this.persistBindings();
 		this.pushBindings();
@@ -270,10 +274,7 @@ export class FeishuBridge {
 
 	stop(): void {
 		if (this.unsubscribeLocalEvents) { this.unsubscribeLocalEvents(); this.unsubscribeLocalEvents = null; }
-		for (const [, card] of this.streamingCards) { card.close().catch(() => {}); }
-		this.streamingCards.clear();
-		this.streamingRunStates.clear();
-		this.pendingCardEvents.clear();
+		this.runCards.closeAll();
 
 		const ws = this.wsClient as { stop?: () => void } | null;
 		if (ws?.stop) try { ws.stop(); } catch {}
@@ -282,7 +283,6 @@ export class FeishuBridge {
 		this.recentMessageIds.clear(); this.recentEventIds.clear(); this.recentContent.clear();
 		this.processingChats.clear();
 		this.groupInfoCache.clear(); this.userNameCache.clear(); this.botOpenId = null;
-		this.cardUpdateFailed.clear();
 		this.pendingDocRequests.clear();
 		this.pendingAttachments.clear();
 		this.updateStatus({ status: "disconnected", activeBindings: 0, botId: undefined, botName: undefined, botOpenId: undefined });
@@ -549,10 +549,8 @@ export class FeishuBridge {
 			if (!binding) return;
 		}
 
-		// 关闭已有流式卡片
-		const existingCard = this.streamingCards.get(binding.sessionId);
-		if (existingCard) { await existingCard.flush(markInterrupted(createInitialState())).catch(() => {}); await existingCard.close().catch(() => {}); this.streamingCards.delete(binding.sessionId); this.streamingRunStates.delete(binding.sessionId); }
-		this.pendingCardEvents.delete(binding.sessionId);
+		// 关闭已有流式卡片（上一轮未正常收尾）
+		await this.runCards.abort(binding.sessionId);
 
 		// 图片 → ImageContent (base64) + 临时文件（方便 Agent 用 bash 操作）
 		const { writeFileSync, mkdirSync } = await import("node:fs");
@@ -575,16 +573,19 @@ export class FeishuBridge {
 		}
 		if (fileAttachments.length > 0) { const names = fileAttachments.map((f) => f.fileName).join(", "); finalText = finalText ? `${finalText}\n\n[附件: ${names}]` : `处理以下文件: ${names}`; }
 
-		const initialState = createInitialState();
-		this.streamingRunStates.set(binding.sessionId, initialState);
-		this.pendingCardEvents.set(binding.sessionId, []);
-
-		// 流式卡片：创建后实时更新活动轨迹和输出
-		const cardPromise = CardStream.open(
-			this.client!, chatId,
-			renderRunCard(initialState),
-			{ replyToMessageId: ctx.chatType === "group" ? ctx.messageId : undefined },
-		).catch((e) => { logErr("[飞书 Bridge] 流式卡片创建失败:", e); return null as CardStream | null; });
+		// 卡片创建耗时不记入 Agent 用时：计时基线在 opened 之后重置（与旧实现一致）。
+		let startTime = Date.now();
+		// 流式卡片：创建后实时更新活动轨迹和输出；终态 patch 失败时由模块回调补发纯文本。
+		const handle = this.runCards.begin(binding.sessionId, {
+			chatId,
+			state: createInitialState(),
+			initialCard: renderRunCard(createInitialState()),
+			replyToMessageId: ctx.chatType === "group" ? ctx.messageId : undefined,
+			onDeliveryFailed: () => {
+				log(`[飞书 Bridge] 卡片交付失败，降级为文本消息: ${binding!.sessionId.slice(0, 8)}`);
+				void this.sendResultFallback(chatId, binding!.sessionId, startTime);
+			},
+		});
 
 		this.feishuDrivenRuns.add(binding.sessionId);
 		try {
@@ -600,41 +601,20 @@ export class FeishuBridge {
 			await this.agentManager.sendPrompt({ agentId: binding.sessionId, message: finalText || "处理附件", agentMessage: feishuCtx, ...(images.length > 0 ? { images } : {}) });
 		} catch (e) {
 			this.feishuDrivenRuns.delete(binding.sessionId);
-			this.streamingRunStates.delete(binding.sessionId);
-			this.pendingCardEvents.delete(binding.sessionId);
-			this.streamingCards.delete(binding.sessionId);
+			this.runCards.drop(binding.sessionId);
 			throw e;
 		}
 
-		const cardStream = await cardPromise;
-		const hasCard = cardStream !== null;
-		if (cardStream) {
-			this.streamingCards.set(binding.sessionId, cardStream);
-			this.replayBufferedEvents(binding.sessionId, cardStream);
-		} else {
-			this.pendingCardEvents.delete(binding.sessionId);
-		}
-
-		const startTime = Date.now();
+		// 卡片创建失败（opened=false）时该轮无卡片，结果只能走纯文本兜底。
+		const hasCard = await handle.opened;
+		startTime = Date.now();
 
 		try {
 			await this.waitForAgentEnd(binding.sessionId, 300_000);
 			await new Promise((r) => setTimeout(r, 800));
 
-			if (hasCard) {
-				if (this.cardUpdateFailed.has(binding.sessionId)) {
-					this.cardUpdateFailed.delete(binding.sessionId);
-					log(`[飞书 Bridge] 卡片更新失败，降级为文本消息`);
-					await this.sendResultFallback(chatId, binding.sessionId, startTime);
-				}
-				this.streamingCards.delete(binding.sessionId);
-				this.streamingRunStates.delete(binding.sessionId);
-				this.pendingCardEvents.delete(binding.sessionId);
-			} else {
-				await this.sendResultFallback(chatId, binding.sessionId, startTime);
-				this.streamingRunStates.delete(binding.sessionId);
-				this.pendingCardEvents.delete(binding.sessionId);
-			}
+			if (!hasCard) await this.sendResultFallback(chatId, binding.sessionId, startTime);
+
 			// 统一扫描 Agent 回复中的飞书标记并执行
 			await this.processFeishuActions(chatId, binding.sessionId).catch((e) =>
 				logErr("[飞书 Bridge] 处理飞书动作异常:", e));
@@ -654,40 +634,11 @@ export class FeishuBridge {
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			const errState = markError(createInitialState(), msg.slice(0, 96));
-			const finalCardStream = this.streamingCards.get(binding.sessionId);
-			if (finalCardStream) {
-				await finalCardStream.flush(renderRunCard(errState)).catch(() => {});
-				await finalCardStream.close().catch(() => {});
-				this.streamingCards.delete(binding.sessionId);
-			}
-			this.streamingRunStates.delete(binding.sessionId);
-			this.pendingCardEvents.delete(binding.sessionId);
-			this.cardUpdateFailed.delete(binding.sessionId);
+			this.runCards.fail(binding.sessionId, msg.slice(0, 96));
 			await this.sendSmartMessage(chatId, `❌ Agent 错误: ${msg}`);
 		} finally {
 			this.feishuDrivenRuns.delete(binding.sessionId);
 		}
-	}
-
-	/** 回放卡片创建期间缓存的 Agent 事件 */
-	private replayBufferedEvents(sessionId: string, cardStream: CardStream): void {
-		const pending = this.pendingCardEvents.get(sessionId);
-		if (!pending || pending.length === 0) { this.pendingCardEvents.delete(sessionId); return; }
-
-		log(`[飞书 Bridge] 回放 ${pending.length} 个缓存事件到卡片`);
-		let currentState = this.streamingRunStates.get(sessionId) ?? createInitialState();
-		for (const ev of pending) {
-			const nextState = reduceFromPiEvent(currentState, ev as Record<string, unknown>);
-			if (nextState !== currentState) {
-				currentState = nextState;
-				this.streamingRunStates.set(sessionId, nextState);
-				cardStream.update(renderRunCard(nextState, {
-					stopHint: nextState.terminal === "running" ? "发送 /stop 可终止当前任务" : undefined,
-				}));
-			}
-		}
-		this.pendingCardEvents.delete(sessionId);
 	}
 
 	private waitForAgentEnd(sessionId: string, timeoutMs: number): Promise<void> {
@@ -711,90 +662,20 @@ export class FeishuBridge {
 		if (this.status.status !== "connected") return;
 		const typed = event as Record<string, unknown>;
 
-		const cardStream = this.streamingCards.get(agentId);
-
-		// 卡片未就绪时：只缓存事件，不处理（replayBufferedEvents 会统一回放）
-		// 避免事件被 reduceFromPiEvent 处理两次导致重复轨迹
-		const pending = this.pendingCardEvents.get(agentId);
-		if (pending) {
-			pending.push(typed);
-			return;
-		}
-
-		// 卡片已就绪：直接更新状态和卡片
-		const runState = this.streamingRunStates.get(agentId);
-		if (runState) {
-			const nextState = reduceFromPiEvent(runState, typed);
-			if (nextState !== runState) {
-				this.streamingRunStates.set(agentId, nextState);
-			}
-			if (cardStream) {
-				// 卡片只展示用户可见正文，去掉 thinking 标签与内部动作标记。
-				const cleanText = sanitizeFeishuUserVisibleText(nextState.outputText);
-				const displayState = cleanText !== nextState.outputText
-					? { ...nextState, outputText: cleanText } : nextState;
-				const chatId = this.sessionToChat.get(agentId) ?? "";
-				const prefix = this.chatBindings.get(chatId)?.groupName ?? "";
-				const card = renderRunCard(displayState, { stopHint: nextState.terminal === "running" ? "发送 /stop 可终止当前任务" : undefined });
-				if (nextState.terminal === "running") {
-					cardStream.update(card);
-				} else {
-					// 先标记“本轮由卡片交付”，避免 agent_end 抢先再发一条纯文本（竞态）。
-					this.cardTerminalSucceeded.add(agentId);
-					// 终态：强制 flush + close，记录失败以便降级补发纯文本
-					void cardStream.flush(card).then(() => {
-						if (cardStream.lastPatchFailed) {
-							this.cardUpdateFailed.add(agentId);
-							this.cardTerminalSucceeded.delete(agentId);
-							log(`[飞书 Bridge] 终态卡片 patch 失败: ${cardStream.lastPatchError}`);
-							// 卡片交付失败时再补一条纯文本，保证用户仍能看到结果。
-							const chatIdForFallback = this.getBestChatId(agentId);
-							if (chatIdForFallback && this.client) {
-								void this.syncPiMessageToFeishu(agentId, chatIdForFallback).catch((e) =>
-									logErr("[Feishu Bridge] card-fallback sync failed:", e),
-								);
-							}
-						}
-					}).then(() => cardStream.close()).catch((e) => {
-						this.cardUpdateFailed.add(agentId);
-						this.cardTerminalSucceeded.delete(agentId);
-						logErr("[飞书 Bridge] 终态卡片 flush/close 异常:", e);
-						const chatIdForFallback = this.getBestChatId(agentId);
-						if (chatIdForFallback && this.client) {
-							void this.syncPiMessageToFeishu(agentId, chatIdForFallback).catch((err) =>
-								logErr("[Feishu Bridge] card-fallback sync failed:", err),
-							);
-						}
-					});
-					this.streamingRunStates.delete(agentId);
-					this.streamingCards.delete(agentId);
-					this.pendingCardEvents.delete(agentId);
-				}
-			} else {
-				// 卡片尚未创建 → 缓存事件（并行模式）
-				const pending = this.pendingCardEvents.get(agentId);
-				if (pending) {
-					pending.push(typed);
-				}
-			}
-		}
+		// 是否有卡片运行接管本轮（终态会在 feed 内同步移除运行，故须先取）。
+		const hadRun = this.runCards.has(agentId);
+		this.runCards.feed(agentId, typed);
 
 		// 只有用户显式手动连接过的 OmpDeck 会话，才把 Agent 结果同步到飞书。
-		// 本轮若已由流式卡片交付（含交付中/刚成功），跳过纯文本，避免双消息。
+		// 本轮若由流式卡片交付，跳过纯文本，避免双消息；卡片 patch 失败时由
+		// SessionRunCards 的 onDeliveryFailed 补发文本。
 		if (
 			!this.feishuSessions.has(agentId) &&
 			!this.feishuDrivenRuns.has(agentId) &&
 			typed.type === "agent_end"
 		) {
-			if (
-				this.cardTerminalSucceeded.has(agentId) ||
-				this.streamingCards.has(agentId) ||
-				this.streamingRunStates.has(agentId)
-			) {
-				// 卡片路径自己负责终态；flush 失败时会主动 fallback 补发。
-				return;
-			}
-			log(`[Feishu Bridge] agent_end 触发 syncPiMessageToFeishu, agentId=${agentId.slice(0,8)}`);
+			if (hadRun) return;
+			log(`[飞书 Bridge] agent_end 触发 syncPiMessageToFeishu, agentId=${agentId.slice(0,8)}`);
 			const chatId = this.getBestChatId(agentId);
 			if (chatId && this.client) {
 				this.syncPiMessageToFeishu(agentId, chatId).catch((e) =>
@@ -1170,45 +1051,41 @@ export class FeishuBridge {
 			? this.chatBindings.get(this.sessionToChat.get(sessionId)!)
 			: undefined;
 		if (!binding || binding.source !== "session-mirror") return;
-		if (this.streamingCards.has(sessionId)) return;
+		if (this.runCards.has(sessionId)) return;
 
 		const initialState = createInitialState();
-		this.streamingRunStates.set(sessionId, initialState);
-
 		try {
-			const cardStream = await CardStream.open(this.client!, binding.chatId, renderRunCard(initialState, { stopHint: "发送 /stop 可终止当前任务" }));
-			this.streamingCards.set(sessionId, cardStream);
+			const handle = this.runCards.begin(sessionId, {
+				chatId: binding.chatId,
+				state: initialState,
+				initialCard: renderRunCard(initialState, { stopHint: "发送 /stop 可终止当前任务" }),
+				// mirror 会话不在 feishuSessions/feishuDrivenRuns 里，卡片交付失败时必须自己补
+				// 一条纯文本，否则用户既看不到卡片也看不到结果。
+				onDeliveryFailed: () => {
+					const fallbackChatId = this.getBestChatId(sessionId);
+					if (fallbackChatId && this.client) {
+						void this.syncPiMessageToFeishu(sessionId, fallbackChatId).catch((e) =>
+							logErr("[飞书 Session Mirror] card fallback sync failed:", e));
+					}
+				},
+			});
+			await handle.opened;
 		} catch (e) {
 			logErr("[飞书 Session Mirror] 流式卡片创建失败:", e);
-			this.streamingRunStates.delete(sessionId);
 		}
 	}
 
 	stopSessionMirrorRun(sessionId: string): void {
-		const state = this.streamingRunStates.get(sessionId);
-		const card = this.streamingCards.get(sessionId);
-		if (state && card) {
-			const finalState = markInterrupted(state);
-			void card.flush(renderRunCard(finalState)).then(() => card.close()).catch(() => {});
-		}
-		this.streamingCards.delete(sessionId);
-		this.streamingRunStates.delete(sessionId);
-		this.pendingCardEvents.delete(sessionId);
+		// 以 interrupted 终态收尾并清空运行（flush/close 在模块内完成）。
+		void this.runCards.abort(sessionId);
 	}
 
 	private async handleStopCommand(ctx: FeishuMessageContext): Promise<void> {
 		const binding = this.chatBindings.get(ctx.chatId);
 		if (!binding) { await this.sendSmartMessage(ctx.chatId, "当前没有绑定的会话。"); return; }
 
-		// 关闭流式卡片
-		const state = this.streamingRunStates.get(binding.sessionId);
-		const card = this.streamingCards.get(binding.sessionId);
-		if (state && card) {
-			void card.flush(renderRunCard(markInterrupted(state))).then(() => card.close()).catch(() => {});
-			this.streamingCards.delete(binding.sessionId);
-			this.streamingRunStates.delete(binding.sessionId);
-			this.pendingCardEvents.delete(binding.sessionId);
-		}
+		// 关闭流式卡片（以 interrupted 终态收尾）
+		void this.runCards.abort(binding.sessionId);
 
 		await this.agentManager.abort(binding.sessionId);
 		await this.sendSmartMessage(ctx.chatId, "⏹ 已停止 Agent");
