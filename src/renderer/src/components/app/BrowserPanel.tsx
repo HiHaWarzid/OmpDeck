@@ -51,37 +51,16 @@ function genTabId(): string {
 }
 
 // ── 订阅机制：替代轮询 ──────────────────────────────────
-// navigateTo 设置 pendingUrl 并通知所有已注册的订阅者。
-// BrowserPanel 挂载时注册回调，卸载时取消。
-// 未挂载时 URL 留在 pendingUrl，挂载时消费。
+// navigateTo / subscribeNavigate / consumePendingUrl 抽到 browserNavigation.ts：
+// 纯模块无 React/DOM 依赖，可被单测覆盖（本文件导入 react/i18n，测试环境为 node）。
+import {
+	consumePendingUrl,
+	navigateTo,
+	subscribeNavigate,
+} from "./browserNavigation";
 
-type NavigateListener = (url: string) => void;
-
-const navigateListeners = new Set<NavigateListener>();
-let pendingUrl: string | null = null;
-
-/**
- * 供外部（App.tsx）调用：在浏览器侧栏/弹框中导航到指定 URL。
- * 如果没有订阅者（BrowserPanel 未挂载），URL 存入 pendingUrl，待挂载时消费。
- * 有订阅者时立即通知，订阅者负责创建 tab + loadURL。
- */
-export function navigateTo(url: string) {
-	pendingUrl = url;
-	for (const listener of navigateListeners) {
-		listener(url);
-	}
-}
-
-function subscribeNavigate(listener: NavigateListener): () => void {
-	navigateListeners.add(listener);
-	return () => navigateListeners.delete(listener);
-}
-
-function consumePendingUrl(): string | null {
-	const url = pendingUrl;
-	pendingUrl = null;
-	return url;
-}
+// 外部（App.tsx）继续从本模块导入 navigateTo，保持既有调用点不变。
+export { navigateTo };
 
 // ── 跨挂载持久化状态 ────────────────────────────────────
 // useRef 在组件卸载/重挂时保留对象引用，实现抽屉折叠/展开不丢状态。

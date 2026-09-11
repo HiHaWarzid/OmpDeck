@@ -4,7 +4,7 @@
  */
 
 import type { ReactNode } from "react";
-import type { ChatMessage, FileTreeNode, PiCommand } from "../../../../shared/types";
+import type { ChatMessage, FileTreeNode, ImageContent, PiCommand } from "../../../../shared/types";
 import { computeThinkingTiming } from "../../utils/thinkingTiming";
 import { formatFilePathRef } from "./RichInput";
 
@@ -109,6 +109,8 @@ export type AgentRunItem = {
 export type RenderMessage = MessageItem | ToolGroupItem | ThinkingGroupItem | AgentRunItem;
 
 export function sameChatMessageForRender(previous: ChatMessage, next: ChatMessage): boolean {
+	// 引用相等直接短路：流式期间未变更的消息按引用复用，避免逐字段深比较。
+	if (previous === next) return true;
 	if (
 		previous.id !== next.id ||
 		previous.role !== next.role ||
@@ -118,19 +120,33 @@ export function sameChatMessageForRender(previous: ChatMessage, next: ChatMessag
 	) {
 		return false;
 	}
-	const previousImages = previous.images ?? [];
-	const nextImages = next.images ?? [];
+	return sameImageListForRender(previous.images, next.images);
+}
+
+/**
+ * 图片列表按内容相等比较。
+ *
+ * 图片数组常由调用方每次渲染重新拼装（如 TurnRow 汇总整轮图片），引用比较会让
+ * memo 永远失效；图片 data 是不变的内容，按内容比较才能让未变化的子树跳过重渲染。
+ */
+export function sameImageListForRender(
+	previous: ImageContent[] | undefined,
+	next: ImageContent[] | undefined,
+): boolean {
+	if (previous === next) return true;
+	const a = previous ?? [];
+	const b = next ?? [];
 	return (
-		previousImages.length === nextImages.length &&
-		previousImages.every(
+		a.length === b.length &&
+		a.every(
 			(image, index) =>
-				image.mimeType === nextImages[index]?.mimeType &&
-				image.data === nextImages[index]?.data,
+				image.mimeType === b[index]?.mimeType && image.data === b[index]?.data,
 		)
 	);
 }
 
 export function sameAgentRunForRender(previous: AgentRunItem, next: AgentRunItem): boolean {
+	if (previous === next) return true;
 	if (
 		previous.id !== next.id ||
 		previous.startedAt !== next.startedAt ||
@@ -203,6 +219,8 @@ export function sameRenderMessageListForRender(
 	previous: RenderMessage[],
 	next: RenderMessage[],
 ): boolean {
+	// 未变更的列表（同一数组引用）在父组件每次渲染时都会被比较一次，先短路。
+	if (previous === next) return true;
 	if (previous.length !== next.length) return false;
 	return previous.every((item, index) => sameRenderMessageForRender(item, next[index]));
 }

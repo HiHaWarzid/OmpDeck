@@ -45,6 +45,7 @@ import {
 	getToolEditDiff,
 	sameAgentRunForRender,
 	sameChatMessageForRender,
+	sameImageListForRender,
 } from "./AppUtils";
 import { getComposerEnterIntent } from "../../composerBehavior";
 import { computeThinkingTiming } from "../../utils/thinkingTiming";
@@ -1975,7 +1976,9 @@ async function copyElementAsPng(element: HTMLElement) {
 }
 
 function CopyMenu(props: {
-	text: string;
+	/** 纯文本内容按需派生（打开菜单/点击复制时才展开 markdown 语法），
+	 *  避免流式期间每个 delta 都对增长中的正文跑一遍 remove-markdown。 */
+	deriveText: () => string;
 	markdown: string;
 	targetRef: React.RefObject<HTMLElement | null>;
 	className?: string;
@@ -2002,7 +2005,7 @@ function CopyMenu(props: {
 	useEffect(() => clearCloseTimer, []);
 	const copy = async (kind: "text" | "markdown" | "image") => {
 		try {
-			if (kind === "text") await writeClipboard(props.text);
+			if (kind === "text") await writeClipboard(props.deriveText());
 			if (kind === "markdown") await writeClipboard(props.markdown);
 			if (kind === "image" && props.targetRef.current) await copyElementAsPng(props.targetRef.current);
 			setCopied(kind);
@@ -3560,11 +3563,29 @@ export const AssistantText = memo(
 	// 自定义比较：文本、流式标记、图片一致时跳过重渲染。回调函数（onPreviewImage/onOpenExternal/
 	// onOpenFile）行为稳定（读 ref 或 setState），不参与比较，避免 App 每次渲染新建内联箭头
 	// 函数导致 memo 失效——历史消息在流式期间因此不再重复解析 Markdown，从根上消除卡顿。
+	// images 按内容比较：TurnRow 每轮渲染重拼图片数组，引用比较会使 memo 恒定失效。
 	(prev, next) =>
 		prev.text === next.text &&
 		prev.isStreaming === next.isStreaming &&
-		prev.images === next.images,
+		sameImageListForRender(prev.images, next.images),
 );
+
+/**
+ * 消息净化结果按对象身份缓存。
+ *
+ * 流式期间已定稿消息按引用复用（增量只替换尾部消息对象），若每次渲染都对整轮消息
+ * 重跑 stripAnsi/stripThinkingTags，代价会随回答长度逐 delta 叠加成 O(n²)。
+ * 用 WeakMap 以消息对象为键：对象被替换即自然失效，无需手动清理，也不阻止 GC。
+ */
+const sanitizedMessageTextCache = new WeakMap<ChatMessage, string>();
+
+function sanitizedMessageText(message: ChatMessage): string {
+	const cached = sanitizedMessageTextCache.get(message);
+	if (cached !== undefined) return cached;
+	const next = stripThinkingTags(stripAnsi(message.text)).trim();
+	sanitizedMessageTextCache.set(message, next);
+	return next;
+}
 
 /** 一轮 AI 回答的扁平容器：左侧竖线聚合，内含思考/工具/正文/文件摘要。
  *  替代旧的 AgentRun + ChatBubble 助手分支 + RunActivity 三层结构。 */
@@ -3601,17 +3622,24 @@ export const TurnRow = memo(function TurnRow(props: {
 	const showDuration = isComplete && duration > 0;
 
 	// 收集本轮所有 assistant 消息（按 run.items 的时序保持原始顺序）
-	const assistantMessages = run.items.filter(
-		(item): item is MessageItem =>
-			item.kind === "message" && item.message.role === "assistant",
+	const assistantMessages = useMemo(
+		() =>
+			run.items.filter(
+				(item): item is MessageItem =>
+					item.kind === "message" && item.message.role === "assistant",
+			),
+		[run.items],
 	);
-	const allImages: ImageContent[] = [];
-	for (const item of assistantMessages) {
-		if (item.message.images) allImages.push(...item.message.images);
-	}
+	const allImages = useMemo(() => {
+		const images: ImageContent[] = [];
+		for (const item of assistantMessages) {
+			if (item.message.images) images.push(...item.message.images);
+		}
+		return images;
+	}, [assistantMessages]);
 	// 合并后的完整文本仅用于编辑/复制/删除等操作栏，不用于展示
 	const mergedText = assistantMessages
-		.map((item) => stripThinkingTags(stripAnsi(item.message.text)).trim())
+		.map((item) => sanitizedMessageText(item.message))
 		.filter(Boolean)
 		.join("\n\n");
 
@@ -3646,7 +3674,7 @@ export const TurnRow = memo(function TurnRow(props: {
 	// 最终回答文本，用于判断自然完成 vs 手动中断。
 	// 提前定义以在 useEffect 中使用（auto-collapse 逻辑需要判断是否有最终文本回答）。
 	const finalTxt = finalMessageItem
-		? stripThinkingTags(stripAnsi(finalMessageItem.message.text)).trim()
+		? sanitizedMessageText(finalMessageItem.message)
 		: "";
 
 	// 执行过程默认展开（agent 处理中），输出完毕后自动折叠。
@@ -3740,7 +3768,7 @@ export const TurnRow = memo(function TurnRow(props: {
 			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
 		}
 		if (item.kind === "message" && item.message.role === "assistant") {
-			const txt = stripThinkingTags(stripAnsi(item.message.text)).trim();
+			const txt = sanitizedMessageText(item.message);
 			if (!txt) return null;
 			return (
 				<AssistantText
@@ -3950,7 +3978,7 @@ export const TurnRow = memo(function TurnRow(props: {
 				{/* 操作栏 */}
 				{mergedText && !editing && (
 					<div className="turn-row-actions">
-						<CopyMenu text={stripMarkdown(mergedText)} markdown={mergedText} targetRef={rowRef} />
+						<CopyMenu deriveText={() => stripMarkdown(mergedText)} markdown={mergedText} targetRef={rowRef} />
 						<button
 							className="turn-row-action-btn"
 							onClick={props.onEnterMultiSelect}
@@ -4151,7 +4179,7 @@ export const UserBubble = memo(function UserBubble(props: {
 				<time>{formatTime(message.timestamp)}</time>
 			</div>
 			<div className="user-turn-actions">
-				<CopyMenu text={stripMarkdown(cleanText)} markdown={message.text} targetRef={rowRef} />
+				<CopyMenu deriveText={() => stripMarkdown(cleanText)} markdown={message.text} targetRef={rowRef} />
 				<button
 					className="user-turn-action-btn"
 					onClick={props.onEnterMultiSelect}

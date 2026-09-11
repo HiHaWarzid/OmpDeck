@@ -130,19 +130,30 @@ export function migrateTerminalDockAgentState(
 	replacementById: Map<string, string>,
 	liveAgentIds: Set<string>,
 ): TerminalDockStateByOwner {
+	// 与 pruneTerminalDockState 同约定：无键改名/裁剪时返回原引用，
+	// 避免 onState 推送把未变化的 Dock 状态变成新对象触发重渲染。
+	let changed = false;
 	const next: TerminalDockStateByOwner = {};
 	for (const [key, value] of Object.entries(current)) {
 		const owner = parseTerminalOwnerKey(key);
-		if (!owner) continue;
+		if (!owner) {
+			changed = true;
+			continue;
+		}
 		if (owner.kind === "project") {
 			next[key] = value;
 			continue;
 		}
 		const nextAgentId = replacementById.get(owner.id) ?? owner.id;
-		if (!liveAgentIds.has(nextAgentId)) continue;
-		next[terminalOwnerKey({ kind: "agent", id: nextAgentId })] = value;
+		if (!liveAgentIds.has(nextAgentId)) {
+			changed = true;
+			continue;
+		}
+		const nextKey = terminalOwnerKey({ kind: "agent", id: nextAgentId });
+		if (nextKey !== key) changed = true;
+		next[nextKey] = value;
 	}
-	return next;
+	return changed ? next : current;
 }
 
 /**

@@ -126,6 +126,33 @@ test("migrates pending agent dock state to replacement id", () => {
 	assert.deepEqual(next[projectP], { open: true, collapsed: false });
 });
 
+test("migrate returns the same reference when nothing changes", () => {
+	const { migrateTerminalDockAgentState, terminalOwnerKey } =
+		loadTerminalDockStateModule();
+	const agentKey = terminalOwnerKey({ kind: "agent", id: "a1" });
+	const projectKey = terminalOwnerKey({ kind: "project", id: "p1" });
+	const current = {
+		[agentKey]: { open: true, collapsed: false },
+		[projectKey]: { open: false, collapsed: false },
+	};
+
+	// onState 每 50ms 推送一次；无键改名/裁剪时必须复用原引用，
+	// 否则每次推送都会让 Dock 状态变成新对象并触发重渲染。
+	const same = migrateTerminalDockAgentState(
+		current,
+		new Map(),
+		new Set(["a1"]),
+	);
+	assert.equal(same, current, "unchanged input must return the original reference");
+
+	// 对照：真的有键被裁剪时返回新引用。project 键不受 agent 存活集合影响
+	// （由 projects+displayAgents effect 单独 prune），因此只应裁掉 agent 键。
+	const pruned = migrateTerminalDockAgentState(current, new Map(), new Set());
+	assert.notEqual(pruned, current);
+	assert.equal(pruned[agentKey], undefined);
+	assert.deepEqual(pruned[projectKey], current[projectKey]);
+});
+
 test("project terminal session key normalizes cwd", () => {
 	const { projectTerminalSessionKey } = loadTerminalDockStateModule();
 	assert.equal(

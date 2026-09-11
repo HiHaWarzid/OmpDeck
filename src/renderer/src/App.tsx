@@ -117,6 +117,7 @@ import {
   type QueuedPromptSnapshot,
 } from "./utils/queuedPromptQueue";
 import { resolveIncomingMessagesDelta, resolveFullPullResult } from "./utils/messageDeltaResolver";
+import { createSingleFlight } from "./utils/singleFlight";
 import { usePersistedState } from "./hooks/usePersistedState";
 import {
   TERMINAL_HEIGHT_STORAGE_KEY,
@@ -2396,6 +2397,29 @@ export function App() {
     // 合并/失同步自愈标记/全量基线 prompt 历史重建已收敛为 messageDeltaResolver
     // 纯函数（resolveIncomingMessagesDelta / resolveFullPullResult），此处只负责
     // 闭包状态映射、代数序号落库与异步全量拉取流程。
+
+    /**
+     * 失同步自愈对每个 agent 单飞：在途时后续失同步 delta 只置 pending，
+     * settle 后再补拉一次。否则持续失同步（本地列表短于 replaceFrom）会让每个
+     * 50ms delta 都发起一次全量 transcript IPC，把一次自愈放大成 IPC 风暴。
+     */
+    const requestFullPull = createSingleFlight();
+    const pullFullBaseline = (id: string) => {
+      requestFullPull(id, async () => {
+        // 捕获发起时的代数：期间有更新 delta 到达则本次结果作废（resolveFullPullResult）。
+        const capturedSeq = messageDeltaSeqRef.current[id] ?? 0;
+        const pullKey = historyKeyForAgentId(id);
+        const full = await api.agents.getMessages(id);
+        const pull = resolveFullPullResult(capturedSeq, messageDeltaSeqRef.current[id] ?? 0, full, {
+          inited: promptHistoryInitedRef.current.has(pullKey),
+          existingHistory: promptHistoryRef.current[pullKey],
+        });
+        if (!pull) return;
+        setAgentMessages(id, pull.messages);
+        applyPromptHistoryRebuild(id, pull.promptHistory);
+      });
+    };
+
     const offMessages = api.agents.onMessages((payload) => {
       const agentId = payload.agentId;
       const key = historyKeyForAgentId(agentId);
@@ -2417,22 +2441,7 @@ export function App() {
       setAgentMessages(agentId, resolved.messages);
       // 增量失同步（如渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）：
       // 异步拉取全量基线补平。拉取期间的更新 delta 使代数前进，旧基线被丢弃。
-      if (resolved.needsFullPull) {
-        void api.agents.getMessages(agentId).then((full) => {
-          const pull = resolveFullPullResult(
-            resolved.seq,
-            messageDeltaSeqRef.current[agentId] ?? 0,
-            full,
-            {
-              inited: promptHistoryInitedRef.current.has(key),
-              existingHistory: promptHistoryRef.current[key],
-            },
-          );
-          if (!pull) return;
-          setAgentMessages(agentId, pull.messages);
-          applyPromptHistoryRebuild(agentId, pull.promptHistory);
-        });
-      }
+      if (resolved.needsFullPull) pullFullBaseline(agentId);
     });
     const offLog = api.agents.onLog((payload) =>
       // 写入式调试日志：无 UI 消费。用模块级环形缓冲替代 React state，

@@ -80,6 +80,11 @@ const TAIL_READ_INITIAL_BYTES = 1024 * 1024;
 /** 尾部读取总窗口上限：单行 JSON（巨型工具结果）超过此值时不再扩展。 */
 const TAIL_READ_MAX_BYTES = 16 * 1024 * 1024;
 
+/** JSONL 行解析结果的最小形状守卫（保留 unknown 收窄，便于逐字段检查）。 */
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
 export class SessionJsonl {
 	private readonly deps: SessionJsonlDeps;
 	constructor(deps: SessionJsonlDeps) {
@@ -670,25 +675,13 @@ export class SessionJsonl {
 	): LocatedEntry {
 		const entryId = msg.meta?.entryId as string | undefined;
 
-		// ── 调试日志（输出到控制台） ──
-		console.log(`[locateJsonlEntry] msg.id=${msg.id}, meta.entryId=${entryId?.slice(0, 12) ?? "(none)"}, role=${msg.role}, text=[${msg.text.slice(0, 60)}]`);
-
 		// 方案一：按 entryId 精确定位（首选）
 		if (entryId) {
 			const lineIndex = this.findLineByEntryId(lines, entryId);
 			if (lineIndex !== -1) {
-				console.log(`[locateJsonlEntry] scheme1(entryId) found at line=${lineIndex}`);
 				return { lineIndex, entry: JSON.parse(lines[lineIndex]) };
 			}
-			console.warn(`[locateJsonlEntry] EntryId ${entryId} not found in JSONL, trying msg.id extraction`);
 		}
-
-		// 调试：记录 JSONL 前 10 行的 id，辅助排查 entryId 为何找不到
-		const lineIds = lines.slice(0, 10).map((l, idx) => {
-			try { const p = JSON.parse(l); return `${idx}:id=${p.id?.slice(0, 12) ?? "(no id)"}${p.entryId ? `,entryId=${String(p.entryId).slice(0, 12)}` : ""}`; }
-			catch { return `${idx}:(parse error)`; }
-		}).join("; ");
-		console.log(`[locateJsonlEntry] first 10 JSONL ids: [${lineIds}]`);
 
 		// 方案二：从 msg.id 提取 entryId（id 格式: `${agentId}-history-${entryId}`）
 		// 当 get_entries 返回的 entryId 在 JSONL 中找不到时尝试此方案；
@@ -696,51 +689,48 @@ export class SessionJsonl {
 		const idPrefix = `${msg.agentId}-history-`;
 		if (msg.id.startsWith(idPrefix)) {
 			const extracted = msg.id.slice(idPrefix.length);
-			console.log(`[locateJsonlEntry] scheme2 extracting from msg.id, extracted=[${extracted}]`);
 			const lineIndex = this.findLineByEntryId(lines, extracted);
 			if (lineIndex !== -1) {
-				console.log(`[locateJsonlEntry] scheme2 found at line=${lineIndex}`);
 				return { lineIndex, entry: JSON.parse(lines[lineIndex]) };
 			}
-			console.warn(`[locateJsonlEntry] scheme2 extracted [${extracted}] not found in JSONL`);
-		} else {
-			console.warn(`[locateJsonlEntry] msg.id does NOT start with prefix [${idPrefix}], cannot try scheme2`);
 		}
 
 		// 方案三：按角色 + 文本内容匹配（兜底方案）
 		// 当 JSONL 中存在多个分支时，计数方案会错误统计非活跃分支的条目。
 		// 用户消息优先取「最后一次」匹配：重复文案时第一个命中往往是更早的历史，
 		// 重发若绑到更早 root 会把中间整段对话当后代删掉。
-		console.log(`[locateJsonlEntry] scheme3 scanning by role=${msg.role} + text match`);
 		if (msg.role === "user") {
 			const last = findLastUserMessageLine(lines, msg.text, (content) => extractMessageText(content));
-			if (last) {
-				console.log(`[locateJsonlEntry] scheme3 last-user found at line=${last.lineIndex}`);
-				return last;
-			}
+			if (last) return last;
 		} else {
 			for (let i = 0; i < lines.length; i++) {
 				const line = lines[i].trim();
 				if (!line) continue;
 				try {
-					const entry = JSON.parse(line);
-					if ((entry as any)?.type === "deleted") continue;
-					const entryRole = (entry as any)?.message?.role;
+					// JSONL 行是外部持久化数据：解析结果先按 unknown 收窄，再读字段。
+					const parsed: unknown = JSON.parse(line);
+					if (!isJsonRecord(parsed)) continue;
+					if (parsed.type === "deleted") continue;
+					const message = parsed.message;
+					const entryRole = isJsonRecord(message) ? message.role : undefined;
 					if (
 						entryRole === msg.role ||
 						(entryRole === "toolResult" && msg.role === "tool")
 					) {
-						const text = extractMessageText((entry as any)?.message?.content);
+						const text = extractMessageText(isJsonRecord(message) ? message.content : undefined);
 						if (text === msg.text) {
-							console.log(`[locateJsonlEntry] scheme3 found at line=${i}, role=${entryRole}`);
-							return { lineIndex: i, entry };
+							return { lineIndex: i, entry: parsed };
 						}
 					}
 				} catch { /* 跳过不可解析的行 */ }
 			}
 		}
 
-		console.error(`[locateJsonlEntry] ALL SCHEMES FAILED. msg.id=${msg.id}, role=${msg.role}, text=[${msg.text.slice(0, 100)}], jsonlLines=${lines.length}`);
+		// 三种方案都失败才记一次错误（不在每条分支打日志：编辑/删除每次都会调用，
+		// 逐分支 console 输出会在流式期间淹没主进程 stdout，且把消息正文写进日志）。
+		console.error(
+			`[locateJsonlEntry] all schemes failed: msg.id=${msg.id}, role=${msg.role}, jsonlLines=${lines.length}`,
+		);
 		throw new Error("Message not found in session file");
 	}
 

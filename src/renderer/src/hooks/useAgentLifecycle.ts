@@ -40,12 +40,20 @@ export function migrateAgentRecord<T>(
 	replacementById: Map<string, string>,
 	liveIds: Set<string>,
 ): Record<string, T> {
+	// 无键被改名、无键被裁剪时返回原引用：onState 每 50ms 推送一次，
+	// 无条件新建对象会让所有依赖该 record 的组件/记忆化全部失效。
+	let changed = false;
 	const next: Record<string, T> = {};
 	for (const [agentId, value] of Object.entries(current)) {
 		const nextAgentId = replacementById.get(agentId) ?? agentId;
-		if (liveIds.has(nextAgentId)) next[nextAgentId] = value;
+		if (nextAgentId !== agentId) changed = true;
+		if (liveIds.has(nextAgentId)) {
+			next[nextAgentId] = value;
+		} else {
+			changed = true;
+		}
 	}
-	return next;
+	return changed ? next : current;
 }
 
 export interface UseAgentLifecycleOptions {
@@ -255,13 +263,18 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 			setTerminalDockStateByOwner((current) =>
 				migrateTerminalDockAgentState(current, replacementById, draftIds),
 			);
-			setDrawerPinnedByProject((current) =>
-				Object.fromEntries(
+			setDrawerPinnedByProject((current) => {
+				const projectIds = Object.keys(current);
+				// 没有键被裁剪时保持原引用，避免 50ms 的 onState 推送造成无谓重渲染。
+				if (projectIds.every((projectId) => activeProjectIds.has(projectId))) {
+					return current;
+				}
+				return Object.fromEntries(
 					Object.entries(current).filter(([projectId]) =>
 						activeProjectIds.has(projectId),
 					),
-				),
-			);
+				);
+			});
 			setPromptByAgent((current) => {
 				const next = migrateAgentRecord(current, replacementById, draftIds);
 				livePromptByAgentRef.current = migrateAgentRecord(
