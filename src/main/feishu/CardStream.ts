@@ -11,7 +11,7 @@
  * 每次 patch 飞书都会立即重新渲染卡片，视觉上是真正的"流式"效果。
  */
 
-import type { LarkClient } from "./types";
+import type { FeishuTransport } from "./FeishuTransport";
 
 const THROTTLE_MS = 200;
 const MAX_UPDATE_RETRIES = 2;
@@ -26,17 +26,14 @@ export class CardStream {
 	public lastPatchError = "";
 
 	private constructor(
-		private readonly client: LarkClient,
+		private readonly transport: FeishuTransport,
 		public readonly messageId: string,
 		public readonly chatId: string,
 	) {}
 
-	/**
-	 * 发送初始卡片并返回 CardStream。
-	 * 只调用一次 im.message.create/reply，后续更新用 im.v1.message.patch。
-	 */
+	/** 发送初始卡片并返回 CardStream。 */
 	static async open(
-		client: LarkClient,
+		transport: FeishuTransport,
 		chatId: string,
 		initialCard: object,
 		opts: { replyToMessageId?: string } = {},
@@ -44,24 +41,16 @@ export class CardStream {
 		let messageId: string | undefined;
 
 		if (opts.replyToMessageId) {
-			const sent = await client.im.message.reply({
-				path: { message_id: opts.replyToMessageId },
-				data: { msg_type: "interactive", content: JSON.stringify(initialCard) },
-			});
-			messageId = (sent as { data?: { message_id?: string } })?.data?.message_id;
+			messageId = await transport.replyInteractiveMessage(opts.replyToMessageId, initialCard);
 		} else {
-			const sent = await client.im.message.create({
-				params: { receive_id_type: "chat_id" },
-				data: { receive_id: chatId, msg_type: "interactive", content: JSON.stringify(initialCard) },
-			});
-			messageId = (sent as { data?: { message_id?: string } })?.data?.message_id;
+			messageId = await transport.createInteractiveMessage(chatId, initialCard);
 		}
 
 		if (!messageId) {
 			throw new Error("发送卡片消息未返回 message_id");
 		}
 
-		return new CardStream(client, messageId, chatId);
+		return new CardStream(transport, messageId, chatId);
 	}
 
 	/** 排队一次更新，实际请求会在 THROTTLE_MS 后合并发送 */
@@ -129,10 +118,7 @@ export class CardStream {
 		let lastErr: unknown;
 		while (true) {
 			try {
-				await this.client.im.v1.message.patch({
-					path: { message_id: this.messageId },
-					data: { content: JSON.stringify(card) },
-				});
+				await this.transport.patchMessage(this.messageId, card);
 				this.lastPatchFailed = false;
 				this.lastPatchError = "";
 				return;

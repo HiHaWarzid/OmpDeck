@@ -51,6 +51,8 @@ import { SessionRunCards } from "./SessionRunCards";
 import { renderRunCard } from "./CardRenderer";
 import { buildModelPickerCard, parseModelActionValue } from "./ModelPickerCard";
 import type { AgentManager } from "../pi/AgentManager";
+import { FeishuTransportImpl } from "./FeishuTransport";
+import type { FeishuTransport } from "./FeishuTransport";
 
 // ===== 常量 =====
 const DEDUP_MAX = 200;
@@ -92,8 +94,10 @@ export class FeishuBridge {
 	private groupInfoCache = new Map<string, FeishuGroupInfo>();
 	private userNameCache = new Map<string, string>();
 
-	// 流式卡片运行生命周期（状态/缓冲/终态交付）统一收进 SessionRunCards
+	/** 流式卡片运行生命周期（状态/缓冲/终态交付）统一收进 SessionRunCards */
 	private readonly runCards: SessionRunCards;
+	/** SDK 传输层端口，CardStream 依赖它而不直接持有 LarkClient。 */
+	private transport: FeishuTransport | null = null;
 
 	private unsubscribeLocalEvents: (() => void) | null = null;
 	// 哪些 session 是飞书发起的（不需要 session mirror）
@@ -120,8 +124,8 @@ export class FeishuBridge {
 		this.runCards = new SessionRunCards({
 			// 卡片创建/更新都走注入端口，模块本身不依赖 lark SDK。
 			openStream: (chatId, initialCard, opts) => {
-				if (!this.client) return Promise.reject(new Error("飞书 Client 未初始化"));
-				return CardStream.open(this.client, chatId, initialCard, opts);
+				if (!this.transport) return Promise.reject(new Error("飞书 Transport 未初始化"));
+				return CardStream.open(this.transport, chatId, initialCard, opts);
 			},
 			// 卡片只展示用户可见正文，去掉 thinking 标签与内部动作标记。
 			render: (state: RunState) => {
@@ -215,6 +219,7 @@ export class FeishuBridge {
 				appType: lark.AppType.SelfBuild, domain: lark.Domain.Feishu,
 				loggerLevel: lark.LoggerLevel.error,
 			} as Record<string, unknown>) as LarkClient;
+			this.transport = new FeishuTransportImpl(appId, plainSecret);
 
 			try {
 				const botInfoResp = await this.client.request<{
@@ -278,7 +283,7 @@ export class FeishuBridge {
 
 		const ws = this.wsClient as { stop?: () => void } | null;
 		if (ws?.stop) try { ws.stop(); } catch {}
-		this.wsClient = null; this.client = null;
+		this.wsClient = null; this.client = null; this.transport = null;
 		this.chatBindings.clear(); this.sessionToChat.clear(); this.feishuSessions.clear();
 		this.recentMessageIds.clear(); this.recentEventIds.clear(); this.recentContent.clear();
 		this.processingChats.clear();
