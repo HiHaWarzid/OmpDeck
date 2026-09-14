@@ -1,5 +1,5 @@
 import { access } from "node:fs/promises";
-import { basename, delimiter, dirname, extname, join } from "node:path";
+import { delimiter, dirname, extname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { shell } from "electron";
 import {
@@ -7,19 +7,16 @@ import {
 	createDefaultExternalEditorSettings,
 	type AppSettings,
 	type ExternalEditor,
-	type ExternalEditorId,
 	type ExternalEditorSettings,
 } from "../../shared/types";
-
-type EditorCandidate = {
-	id: ExternalEditorId;
-	name: string;
-	commands: string[];
-	commonPaths: string[];
-	windowsExecutableNames?: string[];
-	windowsRegistryNames?: string[];
-	args?: string[];
-};
+import {
+	DETECT_BUDGET_MS,
+	createWindowsRegistryLookup,
+	probe,
+	spawnProbeChild,
+	type EditorCandidate,
+	type EditorProbePorts,
+} from "./EditorProbe";
 
 const WINDOWS_PROGRAM_FILES = [
 	process.env.LOCALAPPDATA,
@@ -174,108 +171,16 @@ async function findOnPath(command: string) {
 	return null;
 }
 
-function runRegQuery(key: string) {
-	return new Promise<string>((resolve) => {
-		const child = spawn("reg", ["query", key, "/s"], {
-			windowsHide: true,
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		let output = "";
-		child.stdout.setEncoding("utf8");
-		child.stdout.on("data", (chunk) => {
-			output += chunk;
-		});
-		child.once("error", () => resolve(""));
-		child.once("close", () => resolve(output));
-	});
-}
+/** 探测端口走真实实现：PATH/文件系统保持原语义，注册表探测改为有界（超时 kill）。 */
+const systemProbePorts: EditorProbePorts = {
+	exists,
+	findOnPath,
+	lookupRegistryInstall: createWindowsRegistryLookup({ spawnChild: spawnProbeChild, exists }),
+};
 
-function parseRegValue(block: string, name: string) {
-	const match = block.match(new RegExp(`^\\s*${name}\\s+REG_\\w+\\s+(.+)$`, "im"));
-	return match?.[1]?.trim() ?? "";
-}
-
-function normalizeDisplayIcon(value: string) {
-	const trimmed = value.trim().replace(/^"|"$/g, "");
-	return trimmed.replace(/,-?\d+$/, "");
-}
-
-function isLaunchableRegistryPath(path: string, executableNames: string[]) {
-	const extension = extname(path).toLowerCase();
-	if (![".exe", ".cmd", ".bat"].includes(extension)) return false;
-	const fileName = basename(path).toLowerCase();
-	return executableNames.some((name) => name.toLowerCase() === fileName);
-}
-
-async function findInWindowsRegistry(candidate: EditorCandidate) {
-	if (process.platform !== "win32") return null;
-	const names = candidate.windowsRegistryNames ?? [];
-	const executableNames = candidate.windowsExecutableNames ?? [];
-	if (names.length === 0 || executableNames.length === 0) return null;
-
-	const roots = [
-		"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-		"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-		"HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-	];
-	for (const root of roots) {
-		const output = await runRegQuery(root);
-		for (const block of output.split(/\r?\n(?=HKEY_)/)) {
-			const displayName = parseRegValue(block, "DisplayName").toLowerCase();
-			if (!displayName || !names.some((name) => displayName.includes(name))) continue;
-			const displayIcon = normalizeDisplayIcon(parseRegValue(block, "DisplayIcon"));
-			if (displayIcon && isLaunchableRegistryPath(displayIcon, executableNames) && await exists(displayIcon)) return displayIcon;
-			const installLocation = parseRegValue(block, "InstallLocation");
-			if (!installLocation) continue;
-			for (const executableName of executableNames) {
-				const executablePath = join(installLocation, executableName);
-				if (await exists(executablePath)) return executablePath;
-				const binPath = join(installLocation, "bin", executableName);
-				if (await exists(binPath)) return binPath;
-			}
-		}
-	}
-	return null;
-}
-
-/** 检测本机常见编辑器，优先 PATH，其次常见安装目录。 */
+/** 检测本机常见编辑器，优先 PATH，其次常见安装目录，最后注册表兜底；整批有预算上限。 */
 export async function detectExternalEditors(): Promise<ExternalEditor[]> {
-	const editors: ExternalEditor[] = [];
-	const seen = new Set<string>();
-	for (const candidate of CANDIDATES) {
-		let command: string | null = null;
-		let detectedFrom: ExternalEditor["detectedFrom"] = "path";
-		for (const cli of candidate.commands) {
-			command = await findOnPath(cli);
-			if (command) break;
-		}
-		if (!command) {
-			for (const commonPath of candidate.commonPaths) {
-				if (await exists(commonPath)) {
-					command = commonPath;
-					detectedFrom = "common-path";
-					break;
-				}
-			}
-		}
-		if (!command) {
-			command = await findInWindowsRegistry(candidate);
-			if (command) detectedFrom = "common-path";
-		}
-		if (!command) {
-			continue;
-		}
-		if (seen.has(candidate.id)) continue;
-		seen.add(candidate.id);
-		editors.push({
-			id: candidate.id,
-			name: candidate.name,
-			command,
-			args: candidate.args,
-			detectedFrom,
-		});
-	}
-	return editors;
+	return probe(CANDIDATES, DETECT_BUDGET_MS, systemProbePorts);
 }
 
 export function mergeDetectedExternalEditors(
@@ -390,11 +295,69 @@ function toWindowsCompatiblePath(path: string): string {
 	return path;
 }
 
-export async function openProjectInEditor(editor: ExternalEditor, projectPath: string) {
+/** 启动探测上限：进程创建被卡住时也要让调用方以明确失败收敛，而不是永久挂起。 */
+const EDITOR_LAUNCH_TIMEOUT_MS = 10_000;
+
+/** 启动句柄：超时收敛时用于 kill，避免遗留孤儿进程。 */
+export type EditorLaunchHandle = {
+	kill(): boolean;
+};
+
+/** 启动端口：实现负责在进程创建/失败/退出时回调，node ChildProcess 细节不外泄。 */
+export type EditorLaunchPort = (
+	command: string,
+	args: string[],
+	callbacks: {
+		onSpawn(pid: number | undefined): void;
+		onExit(code: number | null, signal: NodeJS.Signals | null): void;
+		onError(error: Error): void;
+	},
+) => EditorLaunchHandle;
+
+/** 启动编辑器的依赖端口；测试注入假 launch 即可覆盖超时 kill 与回退语义。 */
+export type EditorLaunchDeps = {
+	launch: EditorLaunchPort;
+	resolveCommand(command: string): Promise<string | null>;
+	openPath(path: string): Promise<string>;
+	timeoutMs: number;
+};
+
+const defaultLaunchDeps: EditorLaunchDeps = {
+	launch: (command, args, callbacks) => {
+		const child = spawn(command, args, {
+			detached: true,
+			stdio: "ignore",
+			shell: false,
+		});
+		child.once("error", (error) => {
+			callbacks.onError(error);
+		});
+		child.once("spawn", () => {
+			// 编辑器是长驻 GUI：提前 unref，不拖住主进程退出。
+			child.unref();
+			callbacks.onSpawn(child.pid);
+		});
+		child.once("exit", (code, signal) => {
+			callbacks.onExit(code, signal);
+		});
+		return {
+			kill: () => child.kill(),
+		};
+	},
+	resolveCommand: resolveLaunchableCommand,
+	openPath: (path) => shell.openPath(path),
+	timeoutMs: EDITOR_LAUNCH_TIMEOUT_MS,
+};
+
+export async function openProjectInEditor(
+	editor: ExternalEditor,
+	projectPath: string,
+	deps: EditorLaunchDeps = defaultLaunchDeps,
+): Promise<void> {
 	// 防御性解析:即便 listConfiguredExternalEditors 把 stored command 修好了,
 	// 也兜底处理从历史 settings.json 直接传过来的 legacy editor 对象,避免
 	// spawn 走 ENOENT 再回退打开资源管理器。
-	const launchCommand = (await resolveLaunchableCommand(editor.command)) ?? editor.command;
+	const launchCommand = (await deps.resolveCommand(editor.command)) ?? editor.command;
 	// WSL 项目路径转换：/mnt/d/tmp → D:\tmp，/home/user/... → \\wsl$\...\home\user\...
 	const resolvedPath = toWindowsCompatiblePath(projectPath);
 	return new Promise<void>((resolve, reject) => {
@@ -417,38 +380,59 @@ export async function openProjectInEditor(editor: ExternalEditor, projectPath: s
 			needsCmd,
 		});
 
-		const child = spawn(command, args, {
-			detached: true,
-			stdio: "ignore",
-			shell: false,
+		let settled = false;
+		let timer: NodeJS.Timeout | undefined;
+		function settle(finish: () => void) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			finish();
+		}
+
+		const handle = deps.launch(command, args, {
+			onSpawn: (pid) => {
+				console.log("[EditorDetector] editor process spawned", {
+					editorId: editor.id,
+					pid,
+					command,
+				});
+				settle(() => resolve());
+			},
+			onExit: (code, signal) => {
+				console.log("[EditorDetector] editor launcher exited", {
+					editorId: editor.id,
+					code,
+					signal,
+				});
+			},
+			onError: (error) => {
+				console.error("[EditorDetector] failed to launch editor", {
+					editorId: editor.id,
+					command,
+					args,
+					error,
+				});
+				// 部分 GUI 应用不适合 spawn 时,回退到系统打开路径,避免用户点击后无反馈。
+				void deps.openPath(projectPath).then(
+					(fallbackError) => settle(() => {
+						if (fallbackError) reject(error);
+						else resolve();
+					}),
+					() => settle(() => reject(error)),
+				);
+			},
 		});
-		child.once("error", async (error) => {
-			console.error("[EditorDetector] failed to launch editor", {
-				editorId: editor.id,
-				command,
-				args,
-				error,
-			});
-			// 部分 GUI 应用不适合 spawn 时,回退到系统打开路径,避免用户点击后无反馈。
-			const fallbackError = await shell.openPath(projectPath);
-			if (fallbackError) reject(error);
-			else resolve();
-		});
-		child.once("spawn", () => {
-			console.log("[EditorDetector] editor process spawned", {
-				editorId: editor.id,
-				pid: child.pid,
-				command,
-			});
-			child.unref();
-			resolve();
-		});
-		child.once("exit", (code, signal) => {
-			console.log("[EditorDetector] editor launcher exited", {
-				editorId: editor.id,
-				code,
-				signal,
-			});
-		});
+
+		// launch 可能同步回调（假实现或立即失败），此时无需再挂超时。
+		if (settled) return;
+		timer = setTimeout(() => {
+			// 先收敛 promise 再 kill：kill 触发的回调不应覆盖「超时」这一明确失败。
+			settle(() => reject(new Error(`Editor launch timed out after ${deps.timeoutMs}ms: ${editor.id}`)));
+			try {
+				handle.kill();
+			} catch {
+				// 进程可能已退出；kill 失败不影响已明确的超时失败。
+			}
+		}, deps.timeoutMs);
 	});
 }

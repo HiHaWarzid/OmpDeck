@@ -32,6 +32,29 @@ function loadWslEnvironment(paths) {
 	return sandbox.exports;
 }
 
+/** 把源码 TS 转译为 CommonJS 后在 vm 沙箱执行；extraRequire 返回 undefined 时走真实 require。 */
+function loadTranspiledModule(sourcePath, extraRequire = () => undefined) {
+	const sandbox = {
+		exports: {},
+		process,
+		require: (id) => {
+			const mapped = extraRequire(id);
+			return mapped ?? require(id);
+		},
+	};
+	vm.runInNewContext(transpile(sourcePath), sandbox, { filename: sourcePath });
+	return sandbox.exports;
+}
+
+// ProjectStore 现在值导入 ../storage/JsonFileStore（其再导入 ../utils/fsRetry），
+// 测试文件自身的 require 会把这两个相对路径解析到 tests/ 目录，必须按依赖顺序
+// 转译注入真模块。本测试只构造 ProjectStore（构造期无任何磁盘 IO，load/add 被
+// 替换或未调用），故真实默认 fs 端口即可，无需注入假实现。
+const fsRetry = loadTranspiledModule("src/main/utils/fsRetry.ts");
+const jsonFileStore = loadTranspiledModule("src/main/storage/JsonFileStore.ts", (id) =>
+	id === "../utils/fsRetry" ? fsRetry : undefined,
+);
+
 function loadProjectStore(paths, dialog) {
 	const sandbox = {
 		exports: {},
@@ -40,6 +63,7 @@ function loadProjectStore(paths, dialog) {
 				return { app: { getPath: () => "/tmp/pideck-test" }, dialog };
 			}
 			if (id === "../wsl/WslPaths") return paths;
+			if (id === "../storage/JsonFileStore") return jsonFileStore;
 			return require(id);
 		},
 	};

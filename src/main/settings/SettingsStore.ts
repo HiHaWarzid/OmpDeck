@@ -1,9 +1,9 @@
 import { app, BrowserWindow, Menu } from "electron";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createDefaultExternalEditorSettings, type AfkSettings, type AppSettings } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import { JsonFileStore } from "../storage/JsonFileStore";
 
 /** 桌面端 settings.json（userData），与 pi agent settings 分离 */
 function desktopSettingsPath() {
@@ -230,30 +230,35 @@ Gitmoji 对应关系：
 
 export class SettingsStore {
   private readonly filePath = desktopSettingsPath();
+  /** 原子写 + 读指纹；get() 仍走内存快照，同步语义不变。 */
+  private readonly settingsFile = new JsonFileStore<Partial<AppSettings>>(this.filePath, {
+    deserialize: (raw) => {
+      const parsed: unknown = JSON.parse(raw);
+      // 非对象残留（null/标量/数组）按空对象处理，随后逐字段补默认值
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Partial<AppSettings>)
+        : {};
+    },
+  });
   private settings: AppSettings = { ...defaultSettings };
   /** 上次 get() 返回的快照：设置未变化时复用同一引用，下游 setState 可跳过重渲染 */
   private lastGetResult: AppSettings | null = null;
 
   async load() {
-    try {
-      const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<AppSettings>;
-      this.settings = {
-        ...defaultSettings,
-        ...parsed,
-        // afk 与 externalEditors 都是嵌套对象：顶层浅合并会用磁盘旧值整体替换默认值，
-        // 后续新增字段（如 targetProjectIds）会随默认值一起丢失 → 渲染/运行时报 undefined。
-        // afk 统一走 normalizeAfkSettings（含逐字段补默认 + 旧 targetProjectId 迁移 + 非法值校验），
-        // externalEditors 逐字段补默认。
-        afk: normalizeAfkSettings(parsed.afk ?? {}),
-        externalEditors: {
-          ...createDefaultExternalEditorSettings(),
-          ...(parsed.externalEditors ?? {}),
-        },
-      };
-    } catch {
-      this.settings = { ...defaultSettings };
-    }
+    const parsed = await this.settingsFile.read({});
+    this.settings = {
+      ...defaultSettings,
+      ...parsed,
+      // afk 与 externalEditors 都是嵌套对象：顶层浅合并会用磁盘旧值整体替换默认值，
+      // 后续新增字段（如 targetProjectIds）会随默认值一起丢失 → 渲染/运行时报 undefined。
+      // afk 统一走 normalizeAfkSettings（含逐字段补默认 + 旧 targetProjectId 迁移 + 非法值校验），
+      // externalEditors 逐字段补默认。
+      afk: normalizeAfkSettings(parsed.afk ?? {}),
+      externalEditors: {
+        ...createDefaultExternalEditorSettings(),
+        ...(parsed.externalEditors ?? {}),
+      },
+    };
     // showThinking 不再作为可持久化的独立配置项，完全跟随 pi agent 的 hideThinkingBlock。
     // 启动时重新读取以确保每次启动都使用最新值，而非缓存的 defaultSettings。
     const computedShowThinking = readPiAgentShowThinking();
@@ -365,10 +370,10 @@ export class SettingsStore {
   }
 
   private async save() {
-    await mkdir(app.getPath("userData"), { recursive: true });
     // showThinking 由 pi agent 的 hideThinkingBlock 决定，不持久化到桌面 settings.json
     const { showThinking: _unused, ...persistable } = this.settings;
-    await writeFile(this.filePath, JSON.stringify(persistable, null, 2), "utf8");
+    // 原子替换：否则写一半/进程退出会留下截断的 settings.json，下次启动整体回落默认值
+    await this.settingsFile.write(persistable);
   }
 
   /**

@@ -1,8 +1,8 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, normalize } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
+import { JsonFileStore } from "../storage/JsonFileStore";
 
 /**
  * TrustStore —— 项目信任决策（trust.json）专属模块。
@@ -54,6 +54,8 @@ const TRUST_REQUIRING_RESOURCE_FILES = [
 
 export class TrustStore {
 	private readonly deps: TrustStoreDeps;
+	/** trust.json 的原子/串行 store；configDir 可被 configureWsl 切换，故按完整路径缓存实例。 */
+	private readonly trustFiles = new Map<string, JsonFileStore<Record<string, boolean>>>();
 
 	constructor(deps: TrustStoreDeps) {
 		this.deps = deps;
@@ -63,25 +65,28 @@ export class TrustStore {
 		return this.deps.resolveConfigDir();
 	}
 
+	private trustFile(): JsonFileStore<Record<string, boolean>> {
+		const filePath = join(this.configDir, "trust.json");
+		const existing = this.trustFiles.get(filePath);
+		if (existing) return existing;
+		const created = new JsonFileStore<Record<string, boolean>>(filePath, {
+			deserialize: parseTrustEntries,
+		});
+		this.trustFiles.set(filePath, created);
+		return created;
+	}
+
 	/** trust.json 原文（供 IPC config.getTrust 裸读）。ENOENT = 空存储（正常首启）；其它读错误 ok=false。 */
 	async readTrust(): Promise<{ entries: Record<string, boolean>; ok: boolean; raw: string }> {
+		let raw: string | null;
 		try {
-			const raw = await readFile(join(this.configDir, "trust.json"), "utf8");
-			const parsed = JSON.parse(raw) as unknown;
-			return {
-				entries:
-					parsed && typeof parsed === "object" && !Array.isArray(parsed)
-						? (parsed as Record<string, boolean>)
-						: {},
-				ok: true,
-				raw,
-			};
-		} catch (e) {
-			// 文件不存在 = 空信任库（可安全写）；权限/损坏等真错误才拒绝写（不冒险覆盖）
-			const code = (e as NodeJS.ErrnoException).code;
-			if (code === "ENOENT") return { entries: {}, ok: true, raw: "" };
+			raw = await this.trustFile().readRaw();
+		} catch {
+			// 内容损坏/不可读：ok=false → 调用方拒绝写（不冒险覆盖用户数据）
 			return { entries: {}, ok: false, raw: "" };
 		}
+		if (raw === null) return { entries: {}, ok: true, raw: "" };
+		return { entries: await this.trustFile().read({}), ok: true, raw };
 	}
 
 	/** 干净项目自动信任：去重（不同大小写/分隔符已有记录则不写）；写失败静默。 */
@@ -93,7 +98,7 @@ export class TrustStore {
 			(key) => normalizeTrustPathKey(key) === normalizeTrustPathKey(normalizedPath),
 		);
 		if (existing !== undefined) return; // 已有记录（含显式 false）→ 尊重，不覆盖
-		await this.writeTrust({ ...entries, [normalizedPath]: true });
+		await this.mutateTrust((current) => ({ ...(current ?? {}), [normalizedPath]: true }));
 	}
 
 	/** 沿父链查最近决策（未记录或只记录了祖先/后代之外的路径时返回 null）。 */
@@ -108,7 +113,7 @@ export class TrustStore {
 		if (!ok) return;
 		const key = normalizeTrustPath(cwd);
 		if (entries[key] === decision) return;
-		await this.writeTrust({ ...entries, [key]: decision });
+		await this.mutateTrust((current) => ({ ...(current ?? {}), [key]: decision }));
 	}
 
 	/**
@@ -116,13 +121,17 @@ export class TrustStore {
 	 * 无效值由调用方过滤；现有条目整体保留（只覆盖同键），包赢。
 	 */
 	async importEntries(validEntries: Record<string, boolean>): Promise<void> {
-		const { entries, ok } = await this.readTrust();
+		const { ok } = await this.readTrust();
 		if (!ok) return;
-		const next = { ...entries };
-		for (const [pathKey, decision] of Object.entries(validEntries)) {
-			next[normalizeTrustPath(pathKey)] = decision;
-		}
-		await this.writeTrust(next);
+		// 归一化与合并都在队列内：以最新磁盘内容为基线，只覆盖同键（包赢），
+		// 并发新增的条目不会被本次导入的旧快照抹掉
+		await this.mutateTrust((current) => {
+			const merged = { ...(current ?? {}) };
+			for (const [pathKey, decision] of Object.entries(validEntries)) {
+				merged[normalizeTrustPath(pathKey)] = decision;
+			}
+			return merged;
+		});
 	}
 
 	/** 项目是否含需要信任才能加载的资源（.omp 配置/扩展/skills、逐级 .agents/skills）。 */
@@ -176,14 +185,27 @@ export class TrustStore {
 		return "no-approve"; // deny：本次以不信任模式启动
 	}
 
-	private async writeTrust(entries: Record<string, boolean>): Promise<void> {
+	/**
+	 * 队列内 read-modify-write：并发决策（decide/import 同路径）不会互相丢键；
+	 * 写失败静默（与原 writeTrust 一致：信任写入尽力而为）。
+	 */
+	private async mutateTrust(
+		mutate: (current: Record<string, boolean> | undefined) => Record<string, boolean>,
+	): Promise<void> {
 		try {
-			await mkdir(this.configDir, { recursive: true });
-			await writeFile(join(this.configDir, "trust.json"), JSON.stringify(entries, null, 2), "utf8");
+			await this.trustFile().update(mutate);
 		} catch {
-			// 写失败静默（与原实现一致：信任写入尽力而为）
+			// 写失败/读时发现损坏：尽力而为，不影响启动流程
 		}
 	}
+}
+
+/** trust.json 反序列化：非对象形状（数组/标量）按空存储处理，与 readTrust 原形状校验一致。 */
+function parseTrustEntries(raw: string): Record<string, boolean> {
+	const parsed: unknown = JSON.parse(raw);
+	return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+		? (parsed as Record<string, boolean>)
+		: {};
 }
 
 /**

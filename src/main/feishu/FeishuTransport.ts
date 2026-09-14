@@ -7,12 +7,17 @@
  * Q1 决策：auth.tenantToken 归端口（被 CardStream/open 复用），
  * testConnection 留在 Bridge（仅配置页探测，不属于运行时传输）。
  * Q2 决策：CardStream 实现 Transport 接口。
- * Q3 决策：端口暴露 startWs(handlers) + subscribe。
+ * Q3 决策：端口暴露 startWs(handlers) + stopWs()，调用方是 feishuConnection。
+ *   不提供 start 之后补注册的 subscribe：SDK dispatcher 要在 ws.start() 前拿到
+ *   全部处理器，事后补注册存在漏事件竞态，且原声明的退订函数是空实现（会误导）。
  * Q4 决策：一个 downloadMessageResource，内部自行回退到 image-key 路径。
  * Q5 决策：params 构造在 Bridge（业务规则），端口只负责发送。
  */
 
 import type { LarkClient, LarkSDK, FeishuGroupMember } from "./types";
+
+/** WS 事件名 → 处理器；必须整批交给 startWs，在 WS 启动前注册。 */
+export type FeishuWsHandlers = Record<string, (data: unknown) => Promise<void>>;
 
 export interface FeishuTransport {
   // --- messaging (CardStream + Bridge) ---
@@ -42,8 +47,7 @@ export interface FeishuTransport {
   getBotInfo(): Promise<{ openId: string; appName: string } | null>;
 
   // --- WS lifecycle (Q3) ---
-  startWs(handlers?: Record<string, (data: unknown) => Promise<void>>): Promise<void>;
-  subscribe(event: string, handler: (data: unknown) => Promise<void>): () => void;
+  startWs(handlers?: FeishuWsHandlers): Promise<void>;
   stopWs(): void;
 
   // --- escape hatch ---
@@ -242,7 +246,7 @@ export class FeishuTransportImpl implements FeishuTransport {
   }
 
   // Q3: WS lifecycle — handlers registered BEFORE ws.start() to preserve event ordering.
-  async startWs(handlers?: Record<string, (data: unknown) => Promise<void>>): Promise<void> {
+  async startWs(handlers?: FeishuWsHandlers): Promise<void> {
     const lark = await getLark();
     this.dispatcher = new lark.EventDispatcher({ loggerLevel: lark.LoggerLevel.error });
     if (handlers) {
@@ -257,12 +261,6 @@ export class FeishuTransportImpl implements FeishuTransport {
       loggerLevel: lark.LoggerLevel.error,
     });
     (this.wsClient as { start: (opts: { eventDispatcher: unknown }) => void }).start({ eventDispatcher: this.dispatcher });
-  }
-
-  subscribe(event: string, handler: (data: unknown) => Promise<void>): () => void {
-    if (!this.dispatcher) throw new Error("WS not started");
-    (this.dispatcher as { register: (map: Record<string, unknown>) => void }).register({ [event]: handler });
-    return () => {};
   }
 
   stopWs(): void {

@@ -71,12 +71,23 @@ type _WebAgentDepsDriftGuard = {
 } extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
+/**
+ * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 600ms
+ * fetch 轮询走 keep-alive，只要浏览器 tab 开着、或正好有请求在途，server.close()
+ * 的回调就要等对应连接结束才触发；连接迟迟不结束则 await applySettings 的 IPC
+ * 永不 settle（上层表现为「关闭 web 服务卡住」）。
+ */
+const DEFAULT_CLOSE_GRACE_MS = 1000;
+
 export class WebServiceManager {
 	private server: Server | null = null;
 	private current: { host: string; port: number } | null = null;
 	private readonly rendererRoot = join(__dirname, "../renderer");
 
-	constructor(private readonly deps: WebServiceDependencies) {}
+	constructor(
+		private readonly deps: WebServiceDependencies,
+		private readonly closeGraceMs: number = DEFAULT_CLOSE_GRACE_MS,
+	) {}
 
 	async applySettings(settings: WebServiceSettings) {
 		if (!settings.webServiceEnabled) {
@@ -87,18 +98,47 @@ export class WebServiceManager {
 		const host = settings.webServiceHost.trim() || "0.0.0.0";
 		const port = this.normalizePort(settings.webServicePort);
 		if (this.server && this.current?.host === host && this.current.port === port) return;
-		await this.stop();
+		// 先绑定新端口，成功后才关旧 server：端口被占用/非法时 start 会 reject，
+		// 旧服务原样继续服务，绝不因一次设置笔误把正在工作的服务打下来。
+		const previous = this.server;
 		await this.start(host, port);
+		if (previous) await this.closeServer(previous);
 	}
 
 	async stop() {
-		if (!this.server) return;
 		const server = this.server;
+		if (!server) return;
 		this.server = null;
 		this.current = null;
-		await new Promise<void>((resolve, reject) => {
-			server.close((error) => (error ? reject(error) : resolve()));
+		await this.closeServer(server);
+	}
+
+	/** 当前是否有 server 在监听：用于区分「新端口起不来但旧服务仍可用」与「确实没有任何服务」。 */
+	isRunning(): boolean {
+		// applySettings 失败路径不会给 this.server 赋新值，因此旧 server 仍登记在此，返回 true
+		return this.server !== null;
+	}
+
+	/**
+	 * 关闭 server 且有界 settle：先 closeIdleConnections() 踢掉 keep-alive 空闲连接
+	 * 让 close 回调尽快触发；超过宽限期用 closeAllConnections() 强断剩余连接，到点
+	 * 也 resolve。本方法刻意不 reject —— server 引用此时已从实例摘除，没有重试机会，
+	 * 卡住比报错更糟。
+	 */
+	private closeServer(server: Server): Promise<void> {
+		const closed = Promise.withResolvers<void>();
+		// resolve 幂等：宽限期到点与 close 回调谁先来都能安全收口
+		const timer = setTimeout(() => {
+			server.closeAllConnections();
+			closed.resolve();
+		}, this.closeGraceMs);
+		// 绝大多数情况下空闲连接一踢，close 回调立刻触发，无需等满宽限期
+		server.closeIdleConnections();
+		server.close(() => {
+			clearTimeout(timer);
+			closed.resolve();
 		});
+		return closed.promise;
 	}
 
 	private async start(host: string, port: number) {
@@ -114,13 +154,22 @@ export class WebServiceManager {
 			socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
 		});
 
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(port, host, () => {
-				server.off("error", reject);
-				resolve();
-			});
+		// 全生命周期常驻 error 监听：Node 对没有监听者的 'error' 事件直接抛未捕获异常。
+		// 旧代码只在 listen 成功前临时挂监听、成功即摘除，之后运行期或 close 竞争触发的
+		// error 会变成未处理 rejection。绑定阶段的一次性失败经 pendingReject 转成 promise
+		// reject 如实返回调用方；绑定成功后的运行期错误只在此收口，不再外抛。
+		const listening = Promise.withResolvers<void>();
+		let pendingReject: ((error: Error) => void) | null = listening.reject;
+		server.on("error", (error: Error) => {
+			const reject = pendingReject;
+			pendingReject = null;
+			reject?.(error);
 		});
+		server.listen(port, host, () => {
+			pendingReject = null;
+			listening.resolve();
+		});
+		await listening.promise;
 		this.server = server;
 		this.current = { host, port: this.getPort(server, port) };
 	}

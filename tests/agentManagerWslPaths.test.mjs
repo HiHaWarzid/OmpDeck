@@ -126,6 +126,13 @@ function loadAgentManager() {
 	registry["./askQuestionCard"] = loadModule("src/main/pi/askQuestionCard.ts", "askQuestionCard.ts");
 	registry["./messageTimeline"] = loadModule("src/main/pi/messageTimeline.ts", "messageTimeline.ts");
 	registry["./streamGate"] = loadModule("src/main/pi/streamGate.ts", "streamGate.ts");
+	// AgentManager 引入 ./agentProcessSlot（子进程租约与工厂；仅值导入 ./PiProcess，
+	// 由 sharedRequire 的 PiProcess 桩承接），测试文件的 require 会把它解析到 tests/ 而失败。
+	registry["./agentProcessSlot"] = loadModule("src/main/pi/agentProcessSlot.ts", "agentProcessSlot.ts");
+	// sessionJsonl 的归档缓存现由 ./boundedLruCache（纯 LRU，无内部依赖）提供；
+	// 测试文件自身的 require 会把 "./boundedLruCache" 解析到 tests/ 目录而失败，
+	// 必须按依赖顺序先转译注入真模块。
+	registry["./boundedLruCache"] = loadModule("src/main/pi/boundedLruCache.ts", "boundedLruCache.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
 	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
 	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");
@@ -143,7 +150,14 @@ function loadAgentManager() {
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
-	return { ...agentManagerExports, calls, wslPaths, agentTranscript, agentRunState };
+	return {
+		...agentManagerExports,
+		agentProcessSlot: registry["./agentProcessSlot"],
+		agentRunState,
+		agentTranscript,
+		calls,
+		wslPaths,
+	};
 }
 
 function createManager(AgentManager, configManager = {}) {
@@ -155,8 +169,33 @@ function createManager(AgentManager, configManager = {}) {
 	);
 }
 
+/**
+ * TrustStore 的沙箱加载器：TrustStore 现在值导入 ../storage/JsonFileStore（其再导入
+ * ../utils/fsRetry）。Node 的 ESM 解析器不接受无扩展名的 .ts 相对导入，故不再用
+ * `await import()` 直接加载源码，而是照本文件既有方式转译为 CJS 注入真模块；
+ * node 内建仍走真实实现，因此信任文件照常落盘到临时目录。
+ */
+function loadTrustStore() {
+	const cache = {};
+	function sandboxRequire(id) {
+		if (id === "../utils/fsRetry") {
+			return (cache.fsRetry ??= sandboxLoad("src/main/utils/fsRetry.ts", "fsRetry.ts"));
+		}
+		if (id === "../storage/JsonFileStore") {
+			return (cache.jsonFileStore ??= sandboxLoad("src/main/storage/JsonFileStore.ts", "JsonFileStore.ts"));
+		}
+		return require(id);
+	}
+	function sandboxLoad(filePath, filename) {
+		const sandbox = { exports: {}, process, require: sandboxRequire };
+		vm.runInNewContext(transpile(filePath), sandbox, { filename });
+		return sandbox.exports;
+	}
+	return sandboxLoad("src/main/config/TrustStore.ts", "TrustStore.ts");
+}
+
 test("maps WSL session file operations to host paths while deduping by Linux identity", async () => {
-	const { AgentManager, calls, wslPaths, agentTranscript, agentRunState } = loadAgentManager();
+	const { AgentManager, calls, wslPaths, agentProcessSlot, agentTranscript, agentRunState } = loadAgentManager();
 	const manager = createManager(AgentManager);
 	manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
 	const sessionPath = "/root/.pi/agent/sessions/session.jsonl";
@@ -182,7 +221,9 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 	await manager.sessionJsonl.backup(sessionPath);
 	const latestBackup = manager.sessionJsonl.findLatestBackup(sessionPath);
 	manager.agents.set("agent", {
-		process: { client: {} },
+		// 运行时形状已收敛为 slot（AgentProcessSlot 持有当前 child 与租约），
+		// 不再是裸 process 字段；用真模块构造，保持与生产 createAgentRuntime 同形。
+		slot: new agentProcessSlot.AgentProcessSlot({ client: {} }),
 		tab: {
 			id: "agent",
 			projectId: "project",
@@ -224,12 +265,14 @@ test("maps WSL session file operations to host paths while deduping by Linux ide
 });
 
 test("keeps switch_session RPC paths in Linux form", async () => {
-	const { AgentManager, wslPaths } = loadAgentManager();
+	const { AgentManager, agentProcessSlot, wslPaths } = loadAgentManager();
 	const manager = createManager(AgentManager);
 	manager.configureWsl(wslPaths.createWslEnvironment("Ubuntu-24.04", "root", "/root"));
 	const requests = [];
 	manager.agents.set("agent", {
-		process: { client: { request: async (request) => { requests.push(request); return { success: true }; } } },
+		slot: new agentProcessSlot.AgentProcessSlot({
+			client: { request: async (request) => { requests.push(request); return { success: true }; } },
+		}),
 		tab: { id: "agent", projectId: "project", title: "Agent", status: "idle", createdAt: 1 },
 	});
 	manager.refreshRuntimeAfterSessionReplacement = async () => {};
@@ -246,7 +289,7 @@ test("uses host paths for trust resource checks and Linux paths for trust keys",
 	const { AgentManager, calls, wslPaths } = loadAgentManager();
 	// 信任决策已收敛到 TrustStore：AgentManager 只注入弹窗适配器，这里给真 store +
 	// 临时 trust 目录，断言 Linux cwd 键落盘、资源探测全走宿主（UNC）路径。
-	const { TrustStore } = await import("../src/main/config/TrustStore.ts");
+	const { TrustStore } = loadTrustStore();
 	const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
 	const { join } = await import("node:path");
 	const { tmpdir } = await import("node:os");

@@ -34,11 +34,34 @@ type PiProcessLocator = Pick<
 /** 可选：覆盖扩展扫描用的用户 home（WSL 映射 Windows home 时传入）。 */
 type PiProcessOptions = {
   agentHomeDir?: string;
+  /** 停止宽限期覆盖：先温和终止，超期升级强杀。测试注入更短值。 */
+  stopGraceMs?: number;
+  /** 强杀后等待 exit 的确认窗口覆盖。测试注入更短值。 */
+  stopKillConfirmMs?: number;
 };
+
+/** 停止宽限期：温和终止后等待 exit 的时长，超期升级强杀（避免子进程活过应用）。 */
+export const STOP_GRACE_MS = 5_000;
+/** 强杀后等待 exit 的确认窗口；仍无 exit 也要收口状态，不能报假活。 */
+export const STOP_KILL_CONFIRM_MS = 1_000;
 
 type VersionCacheEntry =
   | { status: "pending"; promise: Promise<boolean> }
   | { status: "done"; ok: boolean; minorVersion: number | null };
+
+/** 启动失败 / 异常退出时的诊断信息。 */
+export type PiProcessDiagnostics = {
+  command: string;
+  args: string[];
+  cwd: string;
+  stderr: string[];
+  exitCode: number | null;
+  exitSignal: string | null;
+  customPiPath: string | undefined;
+  versionCheck: boolean;
+  /** 被桌面端 RPC 启动路径自动隔离的扩展名（如 codeisland） */
+  blockedExtensions?: string[];
+};
 
 export class PiProcess extends EventEmitter {
   private proc?: ChildProcessWithoutNullStreams;
@@ -80,19 +103,7 @@ export class PiProcess extends EventEmitter {
     return probe.ensureVersionCheck(command);
   }
 
-  /** 启动失败 / 异常退出时的诊断信息 */
-  private diagnostics: {
-    command: string;
-    args: string[];
-    cwd: string;
-    stderr: string[];
-    exitCode: number | null;
-    exitSignal: string | null;
-    customPiPath: string | undefined;
-    versionCheck: boolean;
-    /** 被桌面端 RPC 启动路径自动隔离的扩展名（如 codeisland） */
-    blockedExtensions?: string[];
-  } | null = null;
+  private diagnostics: PiProcessDiagnostics | null = null;
 
   constructor(
     private readonly cwd: string,
@@ -112,17 +123,7 @@ export class PiProcess extends EventEmitter {
   }
 
   /** 返回诊断信息（进程启动失败或异常退出后调用） */
-  getDiagnostics(): Readonly<{
-    command: string;
-    args: string[];
-    cwd: string;
-    stderr: string[];
-    exitCode: number | null;
-    exitSignal: string | null;
-    customPiPath: string | undefined;
-    versionCheck: boolean;
-    blockedExtensions?: string[];
-  }> | null {
+  getDiagnostics(): Readonly<PiProcessDiagnostics> | null {
     return this.diagnostics;
   }
 
@@ -158,6 +159,9 @@ export class PiProcess extends EventEmitter {
 
   async start(sessionPath?: string, trustOverride?: "approve" | "no-approve", noSession?: boolean) {
     if (this.proc) return this.rpc!;
+    // 同一实例「停止后重新启动」时，上一次的终止确认不再代表当前 child；
+    // 不清掉会让新 child 的 stop() 变成 no-op（永远够不到它）。
+    this.stopPromise = null;
 
     // 信任确认由桌面端 AgentManager.ensureProjectTrust 在启动 agent 前完成。
     // omp 在 RPC 模式下无 TUI，不需要主题/模型列表网络刷新。
@@ -317,14 +321,86 @@ export class PiProcess extends EventEmitter {
     return this.proc !== undefined && this.rpc !== undefined;
   }
 
-  stop() {
-    if (!this.proc) {
+  private stopPromise: Promise<void> | null = null;
+
+  /**
+   * 终止并确认退出。
+   *
+   * 裸 kill 只表示「信号已发出」：child 若忽略 SIGTERM，exit 永不到达，上层就会在
+   * 「进程已不可达但仍报 running」的状态下继续持有会话文件与模型连接。因此这里
+   * 先温和终止 → 宽限期内等 exit → 超期升级强杀（POSIX SIGKILL / Windows taskkill 树杀）
+   * → 再等一个确认窗口 → 仍未退出也清 proc/rpc，保证 isRunning() 不会骗人。
+   * 重复调用共享同一次终止确认：进程只能死一次，重复 kill 只会制造额外竞态。
+   */
+  stop(): Promise<void> {
+    this.stopPromise ??= this.terminateConfirmed();
+    return this.stopPromise;
+  }
+
+  private async terminateConfirmed(): Promise<void> {
+    const proc = this.proc;
+    if (!proc) {
       // 进程已不在仍可能残留停放态（例如 start 中途失败路径）。
       this.restoreParkedExtensions();
       return;
     }
-    this.proc.kill();
-    // 真正还原在 exit 回调里做；此处不提前 unpark，避免与仍在退出的 pi 竞态。
+    const exited = new Promise<void>((resolve) => {
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        resolve();
+        return;
+      }
+      proc.once("exit", () => resolve());
+    });
+    try {
+      proc.kill();
+    } catch {
+      // 可能刚好已退出；统一按下面的退出期限收口。
+    }
+    if (!(await this.waitExitOrTimeout(exited, this.options.stopGraceMs ?? STOP_GRACE_MS))) {
+      this.killProcessTree(proc);
+      await this.waitExitOrTimeout(exited, this.options.stopKillConfirmMs ?? STOP_KILL_CONFIRM_MS);
+    }
+    this.discardChild();
+  }
+
+  /** 等待退出或期限；返回 true 表示已确认退出。 */
+  private async waitExitOrTimeout(exited: Promise<void>, ms: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms);
+    });
+    const confirmed = await Promise.race([exited.then(() => true), timeout]);
+    clearTimeout(timer);
+    return confirmed;
+  }
+
+  /**
+   * 把 child 从运行态摘除（幂等）：close RPC、还原停放扩展，isRunning() 随即为 false。
+   * exit 回调此后仍可能到达（真实 exit 或迟到的强杀结果），两条路径都只做幂等收尾。
+   */
+  private discardChild(): void {
+    this.rpc?.close(new Error("omp process stopped"));
+    this.proc = undefined;
+    this.rpc = undefined;
+    // 进程不会再加载扩展：此时还原停放文件，避免 codeisland 等扩展被永久停用。
+    this.restoreParkedExtensions();
+  }
+
+  /**
+   * 强杀进程树。Windows 下 ChildProcess.kill 只作用于直接子进程，pi 可能派生出 node 子孙，
+   * 用 taskkill /T 整树终止；POSIX 用不可捕获的 SIGKILL。
+   * protected 仅为测试注入替身（真实分支会执行系统命令）。
+   */
+  protected killProcessTree(proc: ChildProcessWithoutNullStreams): void {
+    if (globalThis.process.platform === "win32" && proc.pid !== undefined) {
+      execFile("taskkill", ["/PID", String(proc.pid), "/T", "/F"], () => undefined);
+      return;
+    }
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // 已退出
+    }
   }
 
   /** 后台执行 pi --version：更新诊断缓存，但不阻塞 start()/spawn。 */

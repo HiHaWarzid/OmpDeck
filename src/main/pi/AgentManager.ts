@@ -21,8 +21,15 @@ import type {
 	ThinkingUpdate,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
-import { PiProcess } from "./PiProcess";
-import type { RpcResponse } from "./PiRpcClient";
+import {
+	AgentProcessSlot,
+	createRealAgentProcess,
+	type AgentProcessFactory,
+	type AgentProcessPort,
+	type ProcessLease,
+} from "./agentProcessSlot";
+import type { PiRpcClient, RpcResponse } from "./PiRpcClient";
+import type { PiProcessDiagnostics } from "./PiProcess";
 import { formatBashToolMessage } from "./bashResult";
 import { extractMessageText } from "./messageContent";
 import { mergeHistoryWithPreservedMessages } from "./historyMessages";
@@ -156,6 +163,14 @@ export class AgentManager {
 	 * 按 sessionKey（非 agentId）索引，因为 runtime 尚未创建前就需要去重。
 	 */
 	private readonly creatingSessionAgents = new Map<string, Promise<AgentTab>>();
+	/**
+	 * 退役 child 登记处：已从 agents 摘除、但退出尚未确认的 pi 子进程。
+	 *
+	 * stop/restart 会先把 runtime 摘出 agents（让 UI 立即响应，且不在册即不可达），
+	 * 但 child 可能仍在忽略信号地运行。若此时只靠遍历 agents 收口，stopAll 永远够不到它，
+	 * 子进程会带着会话文件与模型连接活过应用——这份登记就是它的兜底引用。
+	 */
+	private readonly retiringProcesses = new Set<AgentProcessPort>();
 	private readonly thinkingEmitter = new LatestByKeyEmitter<string, string>(
 		50,
 		(agentId, thinking) => this.emitThinkingNow(agentId, thinking),
@@ -237,10 +252,25 @@ export class AgentManager {
 		private readonly config: AgentConfigDeps,
 		private readonly rpcLogger?: RpcLogger,
 		private readonly appLogger?: AppLogger,
+		/**
+		 * pi 子进程工厂（默认即真实 PiProcess）。做成构造参数是为了让 create/stop/restart/exit/reattach
+		 * 整条进程生命周期可被测试驱动——此前 `new PiProcess(...)` 内联在各调用点，该层零测试。
+		 */
+		private readonly processFactory: AgentProcessFactory = createRealAgentProcess,
 	) {
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
 			logger: this.appLogger,
+		});
+	}
+
+	/**
+	 * 经工厂装配一个 pi child。cwd 与 tab.cwd 同源（AFK 派发到 worktree 时进程必须落在同一目录）；
+	 * agentHomeDir 供 WSL 模式扩展扫描使用（需与 ExtensionManager 一致）。
+	 */
+	private createAgentProcess(cwd: string): AgentProcessPort {
+		return this.processFactory(cwd, this.settingsStore.get(), undefined, {
+			agentHomeDir: this.wslEnvironment?.windowsHome,
 		});
 	}
 
@@ -332,13 +362,13 @@ export class AgentManager {
 
 		// 并行请求：get_messages 和 get_entries 互不依赖，可以同时发起
 		// 如果已有提前发出的请求（earlyMessagesPromise），直接复用，避免重复发送
-		const messagesPromise = earlyMessagesPromise ?? runtime.process.client.request({
+		const messagesPromise = earlyMessagesPromise ?? runtime.slot.process.client.request({
 			type: "get_messages",
 		});
 
 		let entriesPromise: Promise<any> | undefined;
 		if (!skipEntries) {
-			entriesPromise = runtime.process.client.request({
+			entriesPromise = runtime.slot.process.client.request({
 				type: "get_entries",
 			}, 15_000).catch(() => {
 				// get_entries 失败时不阻塞消息加载；编辑/删除走 fallback（_piDeckMsgSeq 计数）
@@ -613,36 +643,32 @@ export class AgentManager {
 		const t2 = Date.now();
 
 		void this.appLogger?.info("agent", "Agent pi process start", { agentId: id });
-		// agentHomeDir：WSL 模式下扩展目录在映射的 Windows home，需与 ExtensionManager 一致。
-		// cwd 与 tab.cwd 同源（input.cwd ?? project.path）：AFK 派发到 worktree 时进程必须落在同一目录。
-		const process = new PiProcess(input.cwd ?? project.path, this.settingsStore.get(), undefined, {
-			agentHomeDir: this.wslEnvironment?.windowsHome,
-		});
-		process.on("version-check", (payload) => {
+		// agentHomeDir / cwd 由 createAgentProcess 统一处理（与 tab.cwd 同源）。
+		const child = this.createAgentProcess(input.cwd ?? project.path);
+		child.on("version-check", (payload) => {
 			void this.appLogger?.info("agent", "Pi version check completed", {
 				agentId: id,
 				...(payload && typeof payload === "object" ? payload : {}),
 			});
 		});
-		const runtime = createAgentRuntime(tab, process);
+		const runtime = createAgentRuntime(tab, child);
 		this.agents.set(id, runtime);
 		this.emitState();
 
-		// 关键：监听器必须在 process.start() 之前挂上。
+		// 关键：监听器必须在 child.start() 之前挂上。
 		// spawn 的 ENOENT / EACCES 等 error 事件是异步的；若等 start() 返回后再 on("error")，
 		// 中间窗口可能 0 listener，EventEmitter 会把 error 升级成未捕获异常，
 		// 在部分 macOS arm 环境上表现为“一点启动 Agent 就闪退”。
-		this.attachPiProcessLifecycle(id, process, {
+		this.attachPiProcessLifecycle(id, child, {
 			projectPath: project.path,
-			// 捕获 runtime 引用而非仅 tab：进程退出可能在 agents.delete 之后触发
-			// （stop/restart 先删 map 再 stop 进程），此时仍需通过闭包读取 runtime 上的
-			// userInitiatedStop/compacting/autoRestartAttempted 等 flag 决定退出分支。
+			slot: runtime.slot,
+			lease: runtime.slot.lease,
 			onExit: (payload) => this.handleCreateProcessExit(id, runtime, payload),
 		});
 
-		let client: Awaited<ReturnType<PiProcess["start"]>>;
+		let client: PiRpcClient;
 		try {
-			client = await process.start(input.sessionPath, trustOverride, input.noSession);
+			client = await child.start(input.sessionPath, trustOverride, input.noSession);
 		} catch (error) {
 			// start() 同步失败（非法 cwd、spawn 抛错等）也要落到会话错误卡，而不是 IPC 裸抛。
 			tab.status = "error";
@@ -654,17 +680,16 @@ export class AgentManager {
 				projectId: project.id,
 				sessionPath: input.sessionPath,
 				error: rawMessage,
-				diagnostics: process.getDiagnostics(),
-				// 注意：局部变量 process 是 PiProcess，宿主平台要用 globalThis.process
+				diagnostics: child.getDiagnostics(),
 				platform: globalThis.process.platform,
 				arch: globalThis.process.arch,
 			});
-			this.addMessage(runtime, "error", this.buildStartupFailureMessage(rawMessage, process.getDiagnostics()));
+			this.addMessage(runtime, "error", this.buildStartupFailureMessage(rawMessage, child.getDiagnostics()));
 			this.emitState();
 			return tab;
 		}
 		const t3 = Date.now();
-		const diag = process.getDiagnostics();
+		const diag = child.getDiagnostics();
 		void this.appLogger?.info("agent", "Pi process spawned", {
 			agentId: id,
 			prepareMs: t1 - t0,
@@ -702,7 +727,7 @@ export class AgentManager {
 				try {
 					return await client.request({ type: "get_state" }, GET_STATE_TIMEOUT_MS);
 				} catch (err) {
-					const isRunning = process.isRunning();
+					const isRunning = child.isRunning();
 					void this.appLogger?.warn("agent", `Agent get_state attempt ${attempt + 1}/${GET_STATE_RETRIES + 1} failed`, {
 						agentId: id,
 						attempt: attempt + 1,
@@ -742,7 +767,7 @@ export class AgentManager {
 					: `${project.name} agent`);
 			tab.status = "idle";
 			// 若因桌面兼容性自动跳过了 codeisland 等扩展，给用户一条系统说明，避免「扩展在却不生效」困惑。
-			const blockedOnStart = process.getDiagnostics()?.blockedExtensions;
+			const blockedOnStart = child.getDiagnostics()?.blockedExtensions;
 			if (blockedOnStart && blockedOnStart.length > 0) {
 				this.addMessage(
 					runtime,
@@ -895,11 +920,11 @@ export class AgentManager {
 				projectId: project.id,
 				sessionPath: input.sessionPath,
 				error: rawMessage,
-				diagnostics: process.getDiagnostics(),
+				diagnostics: child.getDiagnostics(),
 				platform: globalThis.process.platform,
 				arch: globalThis.process.arch,
 			});
-			this.addMessage(runtime, "error", this.buildStartupFailureMessage(rawMessage, process.getDiagnostics()));
+			this.addMessage(runtime, "error", this.buildStartupFailureMessage(rawMessage, child.getDiagnostics()));
 		}
 
 		this.emitState();
@@ -912,7 +937,7 @@ export class AgentManager {
 		if (!trimmed) throw new Error("Agent name cannot be empty");
 
 		// 会话名属于 pi 原生 session 元数据；通过 RPC 修改，避免 desktop 手写 JSONL 后与 pi 格式演进脱节。
-		const response = await runtime.process.client.request(
+		const response = await runtime.slot.process.client.request(
 			{ type: "set_session_name", name: trimmed },
 			20_000,
 		);
@@ -921,7 +946,7 @@ export class AgentManager {
 		}
 
 		runtime.tab.title = trimmed;
-		const state = await runtime.process.client
+		const state = await runtime.slot.process.client
 			.request({ type: "get_state" }, 10_000)
 			.catch(() => ({ data: undefined }));
 		const data = state.data as
@@ -966,7 +991,7 @@ export class AgentManager {
 		const promptDeliveryBehavior = input.streamingBehavior ?? (alreadyBusy ? "steer" : undefined);
 
 		// 在设置状态为 running 之前检查进程是否还活着，避免进程崩溃后状态不一致
-		if (!runtime.process.isRunning()) {
+		if (!runtime.slot.process.isRunning()) {
 			const errorMessage = "Agent 进程已停止，请重启 Agent 后重试";
 			runtime.tab.status = "error";
 			runtime.tab.lastError = errorMessage;
@@ -1009,7 +1034,7 @@ export class AgentManager {
 				requestPayload.streamingBehavior = promptDeliveryBehavior;
 			}
 			// 使用用户配置的 RPC 超时时间，因为用户提示词可能触发长时间运行的命令或复杂操作
-			const response = await runtime.process.client.request(
+			const response = await runtime.slot.process.client.request(
 				requestPayload,
 				this.settingsStore.get().rpcTimeout,
 			);
@@ -1060,7 +1085,7 @@ export class AgentManager {
 		const statusBeforeCommand = runtime.tab.status;
 		
 		// 检查进程是否还活着
-		if (!runtime.process.isRunning()) {
+		if (!runtime.slot.process.isRunning()) {
 			const errorMessage = "Agent 进程已停止，请重启 Agent 后重试";
 			runtime.tab.status = "error";
 			runtime.tab.lastError = errorMessage;
@@ -1075,7 +1100,7 @@ export class AgentManager {
 		this.emitState();
 
 		try {
-			const response = await runtime.process.client.request(
+			const response = await runtime.slot.process.client.request(
 				{
 					type: "bash",
 					command,
@@ -1123,7 +1148,7 @@ export class AgentManager {
 			// 旧 pi 依赖 excludeFromContext 字段由 pi 写上下文；omp 下需宿主把 ! 命令的输出显式发回，
 			// 否则「!命令 → 执行并将输出发送给 LLM」的语义丢失。!!（excludeFromContext）保持只展示。
 			if (!excludeFromContext && output) {
-				void runtime.process.client
+				void runtime.slot.process.client
 					.request(
 						{
 							type: "prompt",
@@ -1171,7 +1196,7 @@ export class AgentManager {
 		if (pending.size > 0) {
 			runtime.run.abortedDuringAsk = true;
 			for (const [requestId] of pending) {
-				runtime.process.client.sendRaw({
+				runtime.slot.process.client.sendRaw({
 					type: "extension_ui_response",
 					id: requestId,
 					value: null,
@@ -1186,7 +1211,7 @@ export class AgentManager {
 		sealRun(runtime.run, Date.now());
 		this.scheduleAbortSettledFallback(runtime);
 
-		runtime.process.client
+		runtime.slot.process.client
 			.request({ type: "abort" }, 10_000)
 			.catch(() => {
 				// abort 超时或失败不影响前端状态切换
@@ -1267,7 +1292,7 @@ export class AgentManager {
 		}
 
 		try {
-			const response = await runtime.process.client.request(
+			const response = await runtime.slot.process.client.request(
 				customInstructions
 					? { type: "compact", customInstructions }
 					: { type: "compact" },
@@ -1295,7 +1320,7 @@ export class AgentManager {
 			});
 		} catch (error) {
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			const processAlive = runtime.process.isRunning();
+			const processAlive = runtime.slot.process.isRunning();
 			void this.appLogger?.error("agent", "Compact failed", {
 				agentId,
 				elapsedMs: Date.now() - startTime,
@@ -1371,25 +1396,24 @@ export class AgentManager {
 
 		// 非 AFK 路径（崩溃恢复/压缩重启）：不携带 CreateAgentInput.cwd，固定使用项目根目录；
 		// 若未来需要按 worktree 重连，需与 createUnlocked 的 cwd 解析保持一致。
-		const process = new PiProcess(project.path, this.settingsStore.get(), undefined, {
-			agentHomeDir: this.wslEnvironment?.windowsHome,
-		});
+		const child = this.createAgentProcess(project.path);
+		// 先装配新租约再挂监听：旧 child 的租约此刻失权，它的迟到 exit 不会再被当成当前进程退出。
+		const lease = runtime.slot.install(child);
 		// 与 createUnlocked 一致：先挂生命周期监听，再 start，避免 error 事件无 listener。
-		this.attachPiProcessLifecycle(agentId, process, {
+		this.attachPiProcessLifecycle(agentId, child, {
 			projectPath: project.path,
+			slot: runtime.slot,
+			lease,
 			onExit: (payload) => this.handleReattachProcessExit(agentId, runtime, payload),
 		});
-		const client = await process.start(sessionPath);
-		const restartDiag = process.getDiagnostics();
+		const client = await child.start(sessionPath);
+		const restartDiag = child.getDiagnostics();
 		void this.appLogger?.info("agent", "Pi process restarted", {
 			agentId,
 			command: restartDiag?.command,
 			args: restartDiag?.args?.join(' '),
 			cwd: restartDiag?.cwd,
 		});
-
-		// 替换旧进程引用（但不修改 agents map 中的 key）
-		runtime.process = process;
 
 		try {
 			const stateResponse = await client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
@@ -1426,10 +1450,10 @@ export class AgentManager {
 	async getRuntimeState(agentId: string): Promise<AgentRuntimeState> {
 		const runtime = this.requireRuntime(agentId);
 		const [stateResponse, statsResponse] = await Promise.all([
-			runtime.process.client
+			runtime.slot.process.client
 				.request({ type: "get_state" })
 				.catch(() => ({ data: undefined })),
-			runtime.process.client
+			runtime.slot.process.client
 				.request({ type: "get_session_stats" })
 				.catch(() => ({ data: undefined })),
 		]);
@@ -1630,13 +1654,13 @@ export class AgentManager {
 
 	async cycleModel(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		await runtime.process.client.request({ type: "cycle_model" }, 60_000);
+		await runtime.slot.process.client.request({ type: "cycle_model" }, 60_000);
 		return this.getRuntimeState(agentId);
 	}
 
 	async getAvailableModels(agentId: string): Promise<AvailableModel[]> {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request(
+		const response = await runtime.slot.process.client.request(
 			{ type: "get_available_models" },
 			60_000,
 		);
@@ -1647,7 +1671,7 @@ export class AgentManager {
 
 	async setModel(agentId: string, provider: string, modelId: string) {
 		const runtime = this.requireRuntime(agentId);
-		await runtime.process.client.request(
+		await runtime.slot.process.client.request(
 			{ type: "set_model", provider, modelId },
 			60_000,
 		);
@@ -1676,7 +1700,7 @@ export class AgentManager {
 		// 并重建所有 provider。当前 pi 0.80.10 的 RPC 协议尚未暴露此命令，
 		// 待 pi 合并 https://github.com/earendil-works/pi/issues/6890 后自动生效。
 		try {
-			const response = await runtime.process.client.request(
+			const response = await runtime.slot.process.client.request(
 				{ type: "reload_config" },
 				8_000,
 			);
@@ -1704,7 +1728,7 @@ export class AgentManager {
 		// this.modelRefreshing = true;
 	// try {
 	// 	const previousState = await this.getRuntimeState(agentId).catch(() => null);
-	// 	runtime.process.stop();
+	// 	runtime.slot.process.stop();
 	// 	await new Promise<void>((resolve) => setTimeout(resolve, 600));
 	// 	await this.reattachProcess(agentId, sessionPath);
 	// 	if (previousState?.provider && previousState?.modelId) {
@@ -1726,7 +1750,7 @@ export class AgentManager {
 
 	async cycleThinking(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		await runtime.process.client.request(
+		await runtime.slot.process.client.request(
 			{ type: "cycle_thinking_level" },
 			60_000,
 		);
@@ -1735,7 +1759,7 @@ export class AgentManager {
 
 	async setThinking(agentId: string, level: string) {
 		const runtime = this.requireRuntime(agentId);
-		await runtime.process.client.request(
+		await runtime.slot.process.client.request(
 			{ type: "set_thinking_level", level },
 			60_000,
 		);
@@ -1780,7 +1804,7 @@ export class AgentManager {
 				elapsedMs: Date.now() - startTime,
 			});
 
-			const response = await runtime.process.client.request({
+			const response = await runtime.slot.process.client.request({
 				type: "switch_session",
 				sessionPath: sessionProtocolPath,
 			}, 30_000);
@@ -2322,7 +2346,7 @@ export class AgentManager {
 		let sessionPath = runtime.tab.sessionPath;
 		if (!sessionPath) {
 			try {
-				const state = await runtime.process.client.request({
+				const state = await runtime.slot.process.client.request({
 					type: "get_state",
 				});
 				sessionPath =
@@ -2333,12 +2357,15 @@ export class AgentManager {
 			}
 		}
 
-		// 停止旧进程并清理状态
-		runtime.process.stop();
-		this.agents.delete(agentId);
-		this.lastEmittedTabStatus.delete(agentId);
-		this.clearStreamGate(runtime);
-		this.emitState();
+		// 退役属主并摘除 runtime：被终止的 child 要到下一个事件循环才报 exit，
+		// 退役后它的 exit 只有 no-op —— 不会把退役 runtime 置 starting、写错误卡或触发重连。
+		const child = this.retireRuntime(agentId, runtime);
+		try {
+			// 确认旧 child 已退出再拉起新进程：同一个 session 文件不允许两个 pi 同时持有。
+			await child.stop();
+		} finally {
+			this.retiringProcesses.delete(child);
+		}
 
 		// 用相同的 session 重新创建 agent，新进程会重新加载所有配置
 		return this.create({ projectId, sessionPath, title });
@@ -2346,7 +2373,7 @@ export class AgentManager {
 
 	async exportHtml(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request(
+		const response = await runtime.slot.process.client.request(
 			{ type: "export_html" },
 			120_000,
 		);
@@ -2358,8 +2385,8 @@ export class AgentManager {
 	 * 使用临时 pi 进程可以复用官方 export_html 样式，同时不切换当前桌面 Agent。
 	 */
 	async exportSessionHtml(projectId: string, sessionPath: string) {
-		return this.withTemporarySession(projectId, sessionPath, async (process) => {
-			const response = await process.client.request(
+		return this.withTemporarySession(projectId, sessionPath, async (child) => {
+			const response = await child.client.request(
 				{ type: "export_html" },
 				120_000,
 			);
@@ -2372,9 +2399,9 @@ export class AgentManager {
 	 * clone 会复制 active branch 到新 session；随后读取 get_state 拿到新 sessionFile 供历史列表刷新。
 	 */
 	async cloneSessionFile(projectId: string, sessionPath: string) {
-		return this.withTemporarySession(projectId, sessionPath, async (process) => {
-			const response = await process.client.request({ type: "clone" }, 120_000);
-			const state = await process.client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
+		return this.withTemporarySession(projectId, sessionPath, async (child) => {
+			const response = await child.client.request({ type: "clone" }, 120_000);
+			const state = await child.client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
 			return {
 				...((response.data as object | undefined) ?? {}),
 				sessionPath: (state.data as { sessionFile?: string } | undefined)?.sessionFile,
@@ -2385,33 +2412,32 @@ export class AgentManager {
 	private async withTemporarySession<T>(
 		projectId: string,
 		sessionPath: string,
-		run: (process: PiProcess) => Promise<T>,
+		run: (child: AgentProcessPort) => Promise<T>,
 	): Promise<T> {
 		const project = this.getProject(projectId);
 		if (!project) throw new Error(`Project not found: ${projectId}`);
 		// 临时会话（clone/export 等）非 AFK 路径：固定使用项目根目录，不接受 worktree cwd。
-		const process = new PiProcess(project.path, this.settingsStore.get(), undefined, {
-			agentHomeDir: this.wslEnvironment?.windowsHome,
-		});
+		const child = this.createAgentProcess(project.path);
 		// 临时会话同样可能触发 spawn error；先挂 sink 再 start，避免未捕获 error 拖垮主进程。
-		process.on("error", (error) => {
+		child.on("error", (error) => {
 			void this.appLogger?.error("agent", "Temporary session pi process error", {
 				projectId,
 				sessionPath,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		});
-		await process.start(sessionPath);
+		await child.start(sessionPath);
 		try {
-			return await run(process);
+			return await run(child);
 		} finally {
-			process.stop();
+			// 临时会话也必须确认退出：否则 clone/export 用的 pi 会留在后台占用会话文件。
+			await child.stop();
 		}
 	}
 
 	async getForkMessages(agentId: string): Promise<ForkMessage[]> {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request({
+		const response = await runtime.slot.process.client.request({
 			type: "get_fork_messages",
 		});
 		return (
@@ -2421,7 +2447,7 @@ export class AgentManager {
 
 	async forkSession(agentId: string, entryId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request(
+		const response = await runtime.slot.process.client.request(
 			{ type: "fork", entryId },
 			120_000,
 		);
@@ -2431,14 +2457,14 @@ export class AgentManager {
 
 	async cloneSession(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request({ type: "clone" }, 120_000);
+		const response = await runtime.slot.process.client.request({ type: "clone" }, 120_000);
 		await this.refreshRuntimeAfterSessionReplacement(agentId);
 		return response.data;
 	}
 
 	async switchSession(agentId: string, sessionPath: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request(
+		const response = await runtime.slot.process.client.request(
 			{ type: "switch_session", sessionPath: this.toSessionProtocolPath(sessionPath) },
 			120_000,
 		);
@@ -2448,7 +2474,7 @@ export class AgentManager {
 
 	private async refreshRuntimeAfterSessionReplacement(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const stateResponse = await runtime.process.client
+		const stateResponse = await runtime.slot.process.client
 			.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout)
 			.catch(() => ({ data: undefined }));
 		const state = stateResponse.data as { sessionFile?: string; sessionName?: string } | undefined;
@@ -2460,7 +2486,7 @@ export class AgentManager {
 
 	async getCommands(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.process.client.request({
+		const response = await runtime.slot.process.client.request({
 			type: "get_commands",
 		});
 		return (
@@ -2475,7 +2501,7 @@ export class AgentManager {
 		const commandName = trimmed.slice(1).split(/\s+/, 1)[0];
 		if (!commandName) return false;
 
-		const response = await runtime.process.client
+		const response = await runtime.slot.process.client
 			.request({ type: "get_commands" }, 10_000)
 			.catch(() => undefined);
 		const commands = (response?.data as { commands?: unknown[] } | undefined)?.commands ?? [];
@@ -2498,17 +2524,19 @@ export class AgentManager {
 		return this.agents.get(agentId)?.rpcLogging ?? false;
 	}
 
+	/**
+	 * 停止 agent：先退役属主（此后该 child 的迟到 exit/error 一律 no-op），再确认它真的退出。
+	 * 确认前 child 留在 retiringProcesses，保证应用退出时 stopAll 仍能兜底终止它。
+	 */
 	async stop(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime) return;
-		// 标记用户主动停止，退出处理器将跳过自动重连
-		runtime.userInitiatedStop = true;
-		const process = runtime.process;
-		this.agents.delete(agentId);
-		this.lastEmittedTabStatus.delete(agentId);
-		this.clearStreamGate(runtime);
-		process.stop();
-		this.emitState();
+		const child = this.retireRuntime(agentId, runtime);
+		try {
+			await child.stop();
+		} finally {
+			this.retiringProcesses.delete(child);
+		}
 	}
 
 	/** 注册本地事件监听器（供 FeishuBridge 等主进程内部模块使用） */
@@ -2545,30 +2573,56 @@ export class AgentManager {
 		}
 	}
 
-	stopAll() {
+	async stopAll(): Promise<void> {
 		// 应用退出时统一清理所有 pi 子进程，避免后台 agent 残留占用模型或文件句柄。
-		for (const runtime of this.agents.values()) {
-			runtime.userInitiatedStop = true;
-			runtime.process.stop();
+		for (const [agentId, runtime] of [...this.agents]) {
+			this.retireRuntime(agentId, runtime);
 		}
-		this.agents.clear();
 		this.lastEmittedTabStatus.clear();
-		this.emitState();
+		// 退役登记一并排空：stop/restart 已把 runtime 摘出 agents，但它们的 child 可能仍在
+		// 忽略信号地活着——只遍历 agents 的 stopAll 永远够不到它们，进程会活过应用。
+		const children = [...this.retiringProcesses];
+		this.retiringProcesses.clear();
+		await Promise.all(children.map((child) => child.stop()));
 	}
 
 	/**
-	 * 统一挂接 PiProcess 生命周期监听。
+	 * 退役一个 runtime：交回 child、登记退出确认，并清理 agent 级状态。
+	 *
+	 * 摘除 agents 是「UI 立即响应」与「不在册即不可达」的前提；但 child 的退出确认要
+	 * 等到 stop() 完成，因此它先进 retiringProcesses，由 stopAll 兜底。
+	 */
+	private retireRuntime(agentId: string, runtime: AgentRuntime): AgentProcessPort {
+		const child = runtime.slot.retire();
+		this.agents.delete(agentId);
+		this.lastEmittedTabStatus.delete(agentId);
+		this.clearStreamGate(runtime);
+		this.retiringProcesses.add(child);
+		this.emitState();
+		return child;
+	}
+
+	/**
+	 * 统一挂接 pi child 生命周期监听。
 	 * 必须在 start() 之前调用，避免 spawn error 在无 listener 窗口升级成未捕获异常。
+	 * 所有监听器都以租约为守卫：只服务租约内的 child，退役/换代后的迟到事件一律丢弃。
 	 */
 	private attachPiProcessLifecycle(
 		agentId: string,
-		piProcess: PiProcess,
+		child: AgentProcessPort,
 		options: {
 			projectPath?: string;
+			slot: AgentProcessSlot;
+			lease: ProcessLease;
 			onExit: (payload: { code: number | null; signal: string | null }) => void;
 		},
 	) {
-		piProcess.on("event", (event) => {
+		// 「这个 child 是否仍归本 agent」是结构事实：租约被退役或换代后，下面所有回调都
+		// 只做 no-op——否则会给已退役的 transcript 追加错误卡、把 status 拉回 starting，
+		// 或触发一次注定失败（agents.get 已查不到）的自动重连。
+		const owns = () => options.slot.owns(options.lease);
+		child.on("event", (event) => {
+			if (!owns()) return;
 			try {
 				this.handlePiEvent(agentId, event);
 			} catch (error) {
@@ -2584,10 +2638,12 @@ export class AgentManager {
 				});
 			}
 		});
-		piProcess.on("stderr", (text) =>
-			this.emit(ipcChannels.agentsLog, { agentId, text }),
-		);
-		piProcess.on("protocol-error", (line) => {
+		child.on("stderr", (text) => {
+			if (!owns()) return;
+			this.emit(ipcChannels.agentsLog, { agentId, text });
+		});
+		child.on("protocol-error", (line) => {
+			if (!owns()) return;
 			this.emit(ipcChannels.agentsLog, {
 				agentId,
 				text: `Protocol error: ${line}`,
@@ -2601,7 +2657,8 @@ export class AgentManager {
 				},
 			);
 		});
-		piProcess.on("rpc-log", (entry: { direction: string; data: unknown }) => {
+		child.on("rpc-log", (entry: { direction: string; data: unknown }) => {
+			if (!owns()) return;
 			// 渲染层的实时 RPC 控制台与文件日志共用同一个 per-agent 开关
 			//（renderer 的 onRpcLog 处理器在开关关闭时直接丢弃，见 App.tsx）。
 			// 默认（开关关闭）仍落盘低频事件（send/response/阶段事件），仅跳过
@@ -2652,14 +2709,19 @@ export class AgentManager {
 				});
 			}
 		});
-		piProcess.on("exit", (payload: { code: number | null; signal: string | null }) => {
+		child.on("exit", (payload: { code: number | null; signal: string | null }) => {
 			try {
 				void this.appLogger?.info("agent", "Pi process exit", {
 					agentId,
+					generation: options.lease.generation,
 					code: payload.code,
 					signal: payload.signal,
-					diagnostics: piProcess.getDiagnostics(),
+					owned: owns(),
+					diagnostics: child.getDiagnostics(),
 				});
+				// 退役/换代 child 的迟到 exit 必须整体 no-op：此刻 runtime 可能已被 stop 摘除，
+				// 继续走退出分支会把 status 拉回 starting、往已退役的 transcript 写错误卡。
+				if (!owns()) return;
 				options.onExit(payload);
 			} catch (error) {
 				void this.appLogger?.error("agent", "Pi process exit handler failed", {
@@ -2668,7 +2730,8 @@ export class AgentManager {
 				});
 			}
 		});
-		piProcess.on("error", (error: Error) => {
+		child.on("error", (error: Error) => {
+			if (!owns()) return;
 			const runtime = this.agents.get(agentId);
 			const message = error instanceof Error ? error.message : String(error);
 			if (runtime) {
@@ -2680,7 +2743,7 @@ export class AgentManager {
 				agentId,
 				error: message,
 				stack: error instanceof Error ? error.stack : undefined,
-				diagnostics: piProcess.getDiagnostics(),
+				diagnostics: child.getDiagnostics(),
 				platform: globalThis.process.platform,
 				arch: globalThis.process.arch,
 			});
@@ -2688,7 +2751,7 @@ export class AgentManager {
 				this.addMessage(
 					runtime,
 					"error",
-					this.buildStartupFailureMessage(message, piProcess.getDiagnostics()),
+					this.buildStartupFailureMessage(message, child.getDiagnostics()),
 				);
 			}
 			this.emitState();
@@ -2703,12 +2766,6 @@ export class AgentManager {
 	) {
 		const tab = runtime.tab;
 		if (runtime.modelRefreshing) return;
-		if (runtime.userInitiatedStop) {
-			runtime.userInitiatedStop = false;
-			tab.status = "closed";
-			this.emitState();
-			return;
-		}
 		if (runtime.compacting) {
 			tab.status = "closed";
 			this.emitState();
@@ -2740,7 +2797,7 @@ export class AgentManager {
 		tab.status = "closed";
 		// 非 0 退出且还没写过错误卡时，补一条可排查信息（避免用户只看到 closed）。
 		if (payload.code !== 0 && payload.code !== null) {
-			const diag = runtime.process.getDiagnostics();
+			const diag = runtime.slot.process.getDiagnostics();
 			this.addMessage(
 				runtime,
 				"error",
@@ -2760,12 +2817,6 @@ export class AgentManager {
 		payload: { code: number | null; signal: string | null },
 	) {
 		if (runtime.modelRefreshing) return;
-		if (runtime.userInitiatedStop) {
-			runtime.userInitiatedStop = false;
-			runtime.tab.status = "closed";
-			this.emitState();
-			return;
-		}
 		if (!runtime.autoRestartAttempted && runtime.tab.sessionPath && payload.code === 0) {
 			runtime.autoRestartAttempted = true;
 			runtime.tab.status = "starting";
@@ -2799,7 +2850,7 @@ export class AgentManager {
 	 */
 	private buildStartupFailureMessage(
 		rawMessage: string,
-		diag: ReturnType<PiProcess["getDiagnostics"]>,
+		diag: Readonly<PiProcessDiagnostics> | null,
 	): string {
 		if (!diag) {
 			return `⚠️ omp RPC 启动失败\n\n${rawMessage}\n\nplatform=${globalThis.process.platform} arch=${globalThis.process.arch}`;
@@ -3353,7 +3404,7 @@ export class AgentManager {
 		// pi 的 ctx.ui.confirm() 检查 confirmed 字段
 		if ("confirmed" in response) extPayload.confirmed = response.confirmed;
 		if (response.cancelled) extPayload.cancelled = true;
-		runtime.process.client.sendRaw(extPayload);
+		runtime.slot.process.client.sendRaw(extPayload);
 
 		// 清理 pending 记录
 		const pending = runtime.pendingUIRequests;
@@ -3745,7 +3796,7 @@ export class AgentManager {
 		const local = this.localWorkSignals(runtime);
 		if (hasLocalWork(local)) return;
 
-		const response = await runtime.process.client
+		const response = await runtime.slot.process.client
 			.request({ type: "get_state" }, 10_000)
 			.catch(() => undefined);
 		if (!response?.success || !response.data) return;
@@ -4039,7 +4090,11 @@ export class AgentManager {
 type AgentRuntime = {
 	// 身份与进程
 	tab: AgentTab;
-	process: PiProcess;
+	/**
+	 * pi 子进程属主：当前 child 与其租约都收在这里，退出回调据此求证归属，
+	 * 不再靠散落的 userInitiatedStop 等可变布尔推断「这次退出是不是我发起的」。
+	 */
+	slot: AgentProcessSlot;
 
 	/** 会话转录：消息时间线 + 流式思考 + 增量推送统计（见 agentTranscript.ts）。 */
 	transcript: AgentTranscriptState;
@@ -4075,17 +4130,15 @@ type AgentRuntime = {
 	rpcCompacting: boolean;
 	/** 模型配置刷新中，exit 处理器忽略退出事件（当前未写入，预留） */
 	modelRefreshing: boolean;
-	/** 用户主动停止，exit 处理器跳过自动重连 */
-	userInitiatedStop: boolean;
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
 };
 
 /** 创建一个带有全部 per-agent 状态默认值的 AgentRuntime。 */
-function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
+function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRuntime {
 	return {
 		tab,
-		process,
+		slot: new AgentProcessSlot(process),
 		transcript: createTranscriptState(),
 		run: createRunState(),
 		toolStateSequence: 0,
@@ -4097,7 +4150,6 @@ function createAgentRuntime(tab: AgentTab, process: PiProcess): AgentRuntime {
 		rpcCompacting: false,
 		runtimeStateSeq: 0,
 		modelRefreshing: false,
-		userInitiatedStop: false,
 		autoRestartAttempted: false,
 	};
 }

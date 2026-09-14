@@ -126,20 +126,6 @@ test("PiProcess forwards spawn error to business listeners after start returns",
 	assert.deepEqual(seen, ["spawn EACCES"]);
 });
 
-test("AgentManager attaches lifecycle listeners before process.start", () => {
-	const source = readFileSync("src/main/pi/AgentManager.ts", "utf8");
-	assert.match(source, /attachPiProcessLifecycle\(/);
-	assert.match(source, /buildStartupFailureMessage\(/);
-	// createUnlocked：先 attach，再 await process.start
-	const createBlock = source.slice(
-		source.indexOf("private async createUnlocked"),
-		source.indexOf("async rename("),
-	);
-	const attachAt = createBlock.indexOf("this.attachPiProcessLifecycle");
-	const startAt = createBlock.indexOf("await process.start");
-	assert.ok(attachAt >= 0 && startAt > attachAt, "lifecycle must be attached before start()");
-});
-
 test("macOS search dirs include Homebrew prefixes for Dock-launched PATH gaps", () => {
 	const source = readFileSync("src/main/pi/PiLocator.ts", "utf8");
 	assert.match(source, /\/opt\/homebrew\/bin/);

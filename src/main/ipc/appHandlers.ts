@@ -199,10 +199,14 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 					"webServiceHost" in patch ||
 					"webServicePort" in patch
 				) {
+					const webServiceManager = getWebServiceManager();
 					try {
-						await getWebServiceManager()?.applySettings(settings);
+						await webServiceManager?.applySettings(settings);
 					} catch (error) {
-						if (settings.webServiceEnabled) {
+						// applySettings 先绑新端口、成功后才关旧 server：新端口被占用时旧服务仍在正常服务。
+						// 这种情况回写 webServiceEnabled=false 会把一个可用服务误判为失败并强关，
+						// 所以只有确实没有任何实例在跑（启动失败且无旧实例）时才回退开关。
+						if (settings.webServiceEnabled && webServiceManager?.isRunning() !== true) {
 							await settingsStore.update({ webServiceEnabled: false });
 						}
 						throw error;

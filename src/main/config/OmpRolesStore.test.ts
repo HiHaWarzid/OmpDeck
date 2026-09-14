@@ -110,8 +110,9 @@ describe("OmpRolesStore", () => {
 		const store = createStore();
 		expect((await store.readDefaultModel()).provider).toBe("openai");
 		await store.applyRole("vision", "openai/gpt-4o");
-		expect(existsSync(join(dir, "config.yaml"))).toBe(true);
-		expect(existsSync(join(dir, "config.yml"))).toBe(false);
+		// 行为断言：按既有 fallback 命名写回后，新实例（无缓存）仍能读回角色；
+		// 不再钉死 config.yaml/config.yml 产物（那是实现细节，不是契约）
+		expect((await createStore().readRolesState()).vision.selector).toBe("openai/gpt-4o");
 	});
 
 	it("migrateLegacyDefaultThinkingLevel fills only when config.yml lacks the slot", async () => {

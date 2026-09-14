@@ -1,8 +1,9 @@
 import { app, dialog } from "electron";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { basename, join, normalize, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Project } from "../../shared/types";
+import { JsonFileStore } from "../storage/JsonFileStore";
 import {
   normalizeSelectedWslProjectPath,
   parseWslUncPath,
@@ -15,18 +16,26 @@ const CHAT_PROJECT_NAME = "Chat";
 
 export class ProjectStore {
   private readonly filePath = join(app.getPath("userData"), "projects.json");
+  /** projects.json 的原子写 + 读指纹（内存态仍是列表的权威视图）。 */
+  private readonly projectsFile = new JsonFileStore<Project[]>(this.filePath);
   private readonly chatPathFile = join(app.getPath("userData"), "chat-path.json");
+  /** chat-path.json 的原子写 + 读指纹；紧凑 JSON 落盘格式与历史一致。 */
+  private readonly chatPathStore = new JsonFileStore<{ path?: string }>(this.chatPathFile, {
+    serialize: (value) => JSON.stringify(value),
+    deserialize: (raw) => {
+      const parsed: unknown = JSON.parse(raw);
+      // 非对象残留（null/标量/数组）按空记录处理，随后回落默认 chat-workspace
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as { path?: string })
+        : {};
+    },
+  });
   // 聊天工作区目录：默认在 userData 下，用户可在侧栏聊天项目设置中改为任意目录并持久化。
   private chatProjectPath = join(app.getPath("userData"), "chat-workspace");
   private projects: Project[] = [];
 
   async load() {
-    try {
-      const raw = await readFile(this.filePath, "utf8");
-      this.projects = JSON.parse(raw) as Project[];
-    } catch {
-      this.projects = [];
-    }
+    this.projects = await this.projectsFile.read([]);
     // 先读取用户自定义的聊天目录（若存在），再据此修正内置聊天项目路径。
     await this.loadChatProjectPath();
     const chatChanged = this.ensureChatProject();
@@ -62,7 +71,8 @@ export class ProjectStore {
   async setChatProjectPath(path: string) {
     const normalized = this.normalizeProjectPath(path);
     this.chatProjectPath = normalized;
-    await writeFile(this.chatPathFile, JSON.stringify({ path: normalized }), "utf8");
+    // 原子替换：写到一半会让下次启动丢失自定义聊天目录（回落 userData/chat-workspace）
+    await this.chatPathStore.write({ path: normalized });
     const chat = this.projects.find(
       (project) => this.isChatProject(project) || project.id === CHAT_PROJECT_ID,
     );
@@ -74,13 +84,9 @@ export class ProjectStore {
 
   /** 读取用户自定义的聊天目录；不存在或解析失败时回退到默认 chat-workspace。 */
   private async loadChatProjectPath() {
-    try {
-      const raw = await readFile(this.chatPathFile, "utf8");
-      const parsed = JSON.parse(raw) as { path?: string };
-      if (parsed.path) this.chatProjectPath = this.normalizeProjectPath(parsed.path);
-    } catch {
-      // 无自定义路径时保持默认 userData/chat-workspace
-    }
+    // 损坏/缺失 → read 回落空记录，保持默认 userData/chat-workspace（原 catch 语义）
+    const parsed = await this.chatPathStore.read({});
+    if (parsed.path) this.chatProjectPath = this.normalizeProjectPath(parsed.path);
   }
 
   async chooseAndAdd(
@@ -305,7 +311,7 @@ export class ProjectStore {
 
   private async save() {
     // 项目列表是桌面端自己的轻量状态，不写入 pi session，避免影响 pi 原生会话格式。
-    await mkdir(app.getPath("userData"), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(this.projects, null, 2), "utf8");
+    // 原子替换：add/remove/toggle 并发落盘时不会互相截断成半个数组
+    await this.projectsFile.write(this.projects);
   }
 }

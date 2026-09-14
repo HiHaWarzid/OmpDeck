@@ -53,10 +53,21 @@ import { buildModelPickerCard, parseModelActionValue } from "./ModelPickerCard";
 import type { AgentManager } from "../pi/AgentManager";
 import { FeishuTransportImpl } from "./FeishuTransport";
 import type { FeishuTransport } from "./FeishuTransport";
+import { FeishuConnection } from "./feishuConnection";
 
 // ===== 常量 =====
 const DEDUP_MAX = 200;
 const GROUP_CACHE_TTL = 3600_000;
+
+// ===== SDK 延迟加载 =====
+// 静态 import 会让 Electron 主进程一启动就加载整个飞书 SDK（拖慢冷启动），
+// 而 SDK 只有真正连接时才用得到，因此保持运行期按需加载。
+let larkSDK: LarkSDK | null = null;
+/** SDK 只在真正连接时才 import；卡片回调的同步工具函数也复用这份缓存。 */
+async function importLark(): Promise<LarkSDK> {
+	if (!larkSDK) larkSDK = (await import("@larksuiteoapi/node-sdk")) as unknown as LarkSDK;
+	return larkSDK;
+}
 
 // ===== 安全日志 =====
 function safeLog(level: "log" | "warn" | "error", ...args: unknown[]): void {
@@ -67,8 +78,6 @@ const warn = (...args: unknown[]) => safeLog("warn", ...args);
 const logErr = (...args: unknown[]) => safeLog("error", ...args);
 
 export class FeishuBridge {
-	private wsClient: unknown = null;
-	private client: LarkClient | null = null;
 	private botConfig: FeishuBotConfig;
 	private readonly plainAppSecret?: string;
 	private agentManager: AgentManager;
@@ -96,10 +105,12 @@ export class FeishuBridge {
 
 	/** 流式卡片运行生命周期（状态/缓冲/终态交付）统一收进 SessionRunCards */
 	private readonly runCards: SessionRunCards;
-	/** SDK 传输层端口，CardStream 依赖它而不直接持有 LarkClient。 */
-	private transport: FeishuTransport | null = null;
+	/**
+	 * 连接生命周期（REST 会话 + 传输端口 + WS + AgentManager 订阅 + 单飞）唯一由该模块持有，
+	 * Bridge 只保留业务状态；调试与测试都以 `connected` 为准。
+	 */
+	private readonly connection: FeishuConnection<FeishuTransport>;
 
-	private unsubscribeLocalEvents: (() => void) | null = null;
 	// 哪些 session 是飞书发起的（不需要 session mirror）
 	private feishuSessions = new Set<string>();
 	/** 飞书消息触发中的运行，agent_end 期间不要再走 OmpDeck 本地同步，避免文件/文本重复发送。 */
@@ -121,11 +132,26 @@ export class FeishuBridge {
 		this.agentManager = agentManager;
 		this.getWindow = getWindow;
 		this.getProjects = getProjects;
+		this.connection = new FeishuConnection<FeishuTransport>({
+			// SDK 会话（REST client + 传输端口）只在连接时创建；断连即随会话一起丢弃。
+			createSession: async ({ appId, appSecret }) => {
+				const lark = await importLark();
+				const client = new lark.Client({
+					appId, appSecret,
+					appType: lark.AppType.SelfBuild, domain: lark.Domain.Feishu,
+					loggerLevel: lark.LoggerLevel.error,
+				} as Record<string, unknown>) as LarkClient;
+				return { client, transport: new FeishuTransportImpl(appId, appSecret) };
+			},
+			subscribeAgentEvents: (handler) => this.agentManager.addLocalEventListener(handler),
+			handleAgentEvent: (agentId, event) => this.handleAgentEvent(agentId, event),
+		});
 		this.runCards = new SessionRunCards({
 			// 卡片创建/更新都走注入端口，模块本身不依赖 lark SDK。
 			openStream: (chatId, initialCard, opts) => {
-				if (!this.transport) return Promise.reject(new Error("飞书 Transport 未初始化"));
-				return CardStream.open(this.transport, chatId, initialCard, opts);
+				const transport = this.transport;
+				if (!transport) return Promise.reject(new Error("飞书 Transport 未初始化"));
+				return CardStream.open(transport, chatId, initialCard, opts);
 			},
 			// 卡片只展示用户可见正文，去掉 thinking 标签与内部动作标记。
 			render: (state: RunState) => {
@@ -136,6 +162,11 @@ export class FeishuBridge {
 			},
 		});
 	}
+
+	/** 当前连接会话的 REST client；未连接为 null（原有 `if (!this.client)` 守卫语义不变）。 */
+	private get client(): LarkClient | null { return this.connection.client; }
+	/** SDK 传输层端口，CardStream 依赖它而不直接持有 LarkClient。 */
+	private get transport(): FeishuTransport | null { return this.connection.transport; }
 
 	getStatus(): FeishuBridgeStatus { return { ...this.status }; }
 	listBindings(): FeishuChatBinding[] { return Array.from(this.chatBindings.values()); }
@@ -213,52 +244,26 @@ export class FeishuBridge {
 		this.updateStatus({ status: "connecting" });
 
 		try {
-			const lark = (await import("@larksuiteoapi/node-sdk")) as unknown as LarkSDK;
-			this.client = new lark.Client({
-				appId, appSecret: plainSecret,
-				appType: lark.AppType.SelfBuild, domain: lark.Domain.Feishu,
-				loggerLevel: lark.LoggerLevel.error,
-			} as Record<string, unknown>) as LarkClient;
-			this.transport = new FeishuTransportImpl(appId, plainSecret);
-
-			try {
-				const botInfoResp = await this.client.request<{
-					code?: number; bot?: { open_id?: string; app_name?: string };
-					data?: { bot?: { open_id?: string; app_name?: string } };
-				}>({ method: "GET", url: "https://open.feishu.cn/open-apis/bot/v3/info/" });
-				this.botOpenId = botInfoResp?.bot?.open_id ?? botInfoResp?.data?.bot?.open_id ?? null;
-				if (this.botOpenId) {
-					log(`[飞书 Bridge] Bot 自身 open_id: ${this.botOpenId}`);
-					if (this.botConfig.defaultUserOpenId === this.botOpenId) {
-						warn(`[飞书 Bridge] ⚠️ 配置中的 defaultUserOpenId 是 Bot 自己的 open_id，不是你的！`);
-						warn(`[飞书 Bridge] 💡 请在飞书中给 Bot 发送 /whoami 获取你的真实 open_id，然后填入配置`);
-					}
-				}
-			} catch (e) { warn("[飞书 Bridge] 获取 Bot info 失败（非致命）:", e); }
-
-			const dispatcher = new lark.EventDispatcher({ loggerLevel: lark.LoggerLevel.error }).register({
-				"im.message.receive_v1": async (data: unknown) => {
-					await this.handleRawMessage(data as Record<string, unknown>).catch((err) =>
-						logErr("[飞书 Bridge] handleRawMessage 异常:", err));
+			// normalizeCardAction 是 SDK 的同步工具函数，先从缓存模块取出供卡片回调使用。
+			const lark = await importLark();
+			await this.connection.connect({ appId, appSecret: plainSecret }, {
+				// Bot info 需要 REST client，且必须在 WS 启动前完成，避免连接期间漏掉事件。
+				prepare: async (session) => { await this.refreshBotInfo(session.client); },
+				handlers: {
+					"im.message.receive_v1": async (data: unknown) => {
+						await this.handleRawMessage(data as Record<string, unknown>).catch((err) =>
+							logErr("[飞书 Bridge] handleRawMessage 异常:", err));
+					},
+					"card.action.trigger": async (data: unknown) => {
+						const event = lark.normalizeCardAction(data as Record<string, unknown>, { includeRaw: true });
+						if (event) await this.handleCardAction(event);
+					},
+					"im.message.reaction.created_v1": async () => {},
+					"im.chat.member.bot.added_v1": async () => {},
 				},
-				"card.action.trigger": async (data: unknown) => {
-					const event = lark.normalizeCardAction(data as Record<string, unknown>, { includeRaw: true });
-					if (event) await this.handleCardAction(event);
-				},
-				"im.message.reaction.created_v1": async () => {},
-				"im.chat.member.bot.added_v1": async () => {},
 			});
-
-			const ws = new lark.WSClient({
-				appId, appSecret: plainSecret, domain: lark.Domain.Feishu, loggerLevel: lark.LoggerLevel.error,
-			});
-			this.wsClient = ws;
-			ws.start({ eventDispatcher: dispatcher });
-			log("[飞书 Bridge] WSClient 已启动");
-
-			this.unsubscribeLocalEvents = this.agentManager.addLocalEventListener(
-				(agentId, event) => this.handleAgentEvent(agentId, event),
-			);
+			// 连接可能在 await 期间被 stop()（例如退出流程）拆掉，此时不能再把状态写成 connected。
+			if (!this.connection.connected) return;
 			this.loadPersistedBindings();
 			this.updateStatus({
 				status: "connected",
@@ -270,6 +275,7 @@ export class FeishuBridge {
 			});
 			log("[Feishu Bridge] connected");
 		} catch (error) {
+			// connect 内部已回滚（退订 + 停 WS + 置空），这里只负责暴露错误给调用方。
 			const message = error instanceof Error ? error.message : String(error);
 			this.updateStatus({ status: "error", errorMessage: message });
 			logErr("[飞书 Bridge] 启动失败:", error);
@@ -277,13 +283,39 @@ export class FeishuBridge {
 		}
 	}
 
-	stop(): void {
-		if (this.unsubscribeLocalEvents) { this.unsubscribeLocalEvents(); this.unsubscribeLocalEvents = null; }
-		this.runCards.closeAll();
+	/** 拉取 Bot 自身 open_id（非致命）；失败只告警，不阻断连接。 */
+	private async refreshBotInfo(client: LarkClient | null): Promise<void> {
+		if (!client) return;
+		try {
+			const botInfoResp = await client.request<{
+				code?: number; bot?: { open_id?: string; app_name?: string };
+				data?: { bot?: { open_id?: string; app_name?: string } };
+			}>({ method: "GET", url: "https://open.feishu.cn/open-apis/bot/v3/info/" });
+			this.botOpenId = botInfoResp?.bot?.open_id ?? botInfoResp?.data?.bot?.open_id ?? null;
+			if (this.botOpenId) {
+				log(`[飞书 Bridge] Bot 自身 open_id: ${this.botOpenId}`);
+				if (this.botConfig.defaultUserOpenId === this.botOpenId) {
+					warn(`[飞书 Bridge] ⚠️ 配置中的 defaultUserOpenId 是 Bot 自己的 open_id，不是你的！`);
+					warn(`[飞书 Bridge] 💡 请在飞书中给 Bot 发送 /whoami 获取你的真实 open_id，然后填入配置`);
+				}
+			}
+		} catch (e) { warn("[飞书 Bridge] 获取 Bot info 失败（非致命）:", e); }
+	}
 
-		const ws = this.wsClient as { stop?: () => void } | null;
-		if (ws?.stop) try { ws.stop(); } catch {}
-		this.wsClient = null; this.client = null; this.transport = null;
+	/** 同步语义的停止（quit / 移除 Bot 等场景）：状态立即归零，连接拆除交给模块队列排队完成。 */
+	stop(): void {
+		void this.connection.disconnect();
+		this.resetState();
+	}
+
+	/** 断开并等待连接真正拆完；IPC 断开走这里，返回时订阅与 WS 一定已释放。 */
+	async disconnect(): Promise<void> {
+		await this.connection.disconnect();
+		this.resetState();
+	}
+
+	private resetState(): void {
+		this.runCards.closeAll();
 		this.chatBindings.clear(); this.sessionToChat.clear(); this.feishuSessions.clear();
 		this.recentMessageIds.clear(); this.recentEventIds.clear(); this.recentContent.clear();
 		this.processingChats.clear();
@@ -291,7 +323,7 @@ export class FeishuBridge {
 		this.pendingDocRequests.clear();
 		this.pendingAttachments.clear();
 		this.updateStatus({ status: "disconnected", activeBindings: 0, botId: undefined, botName: undefined, botOpenId: undefined });
-		log("[Feishu Bridge] stopped");
+		log("[飞书 Bridge] stopped");
 	}
 
 	// ===== 配置热更新 =====
@@ -306,7 +338,7 @@ export class FeishuBridge {
 
 	async testConnection(appId: string, appSecret: string): Promise<FeishuTestResult> {
 		try {
-			const lark = (await import("@larksuiteoapi/node-sdk")) as unknown as LarkSDK;
+			const lark = await importLark();
 			const client = new lark.Client({ appId, appSecret, appType: lark.AppType.SelfBuild } as Record<string, unknown>) as LarkClient;
 			const resp = await client.auth.tenantAccessToken.internal({ data: { app_id: appId, app_secret: appSecret } });
 			if ((resp as Record<string, unknown>).code === 0) return { success: true, message: "连接成功！", botName: `App ${appId.slice(0, 8)}...` };
@@ -697,15 +729,11 @@ export class FeishuBridge {
 		const lastAssistant = assistantMessages.pop();
 		if (!lastAssistant?.text?.trim()) return;
 
-		// 去重：用最后一条 assistant 消息的 id + text 前50字符做指纹
+		// 去重：用最后一条 assistant 消息的 id + text 前50字符做指纹；指纹集由连接模块持有，
+		// 随连接生命周期清空（断连重连后不会拿旧连接的记录吞掉本次同步）。
 		const fingerprint = `${lastAssistant.id}|${lastAssistant.text.slice(0, 50)}`;
-		const syncedFingerprints = (this as Record<string, unknown>).__feishuSyncFp as Set<string> | undefined;
-		if (syncedFingerprints?.has(fingerprint)) return;
-
-		if (!syncedFingerprints) {
-			(this as Record<string, unknown>).__feishuSyncFp = new Set<string>();
-		}
-		((this as Record<string, unknown>).__feishuSyncFp as Set<string>).add(fingerprint);
+		if (this.connection.hasSyncedMessage(fingerprint)) return;
+		this.connection.markSyncedMessage(fingerprint);
 
 		// 只同步最终可见回复，避免把 thinking/内部指令带进飞书。
 		const cleanText = sanitizeFeishuUserVisibleText(lastAssistant.text);

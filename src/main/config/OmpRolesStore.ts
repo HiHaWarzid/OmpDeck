@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseDocument, type Document } from "yaml";
@@ -9,6 +9,7 @@ import {
 	type OmpModelRole,
 	type OmpRolesState,
 } from "../../shared/types/ompRoles";
+import { JsonFileStore } from "../storage/JsonFileStore";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
@@ -65,13 +66,23 @@ export class OmpRolesStore {
 		return this.deps.resolveConfigDir();
 	}
 
+	/** config.yml/yaml 的原子/串行 store（原文；YAML 解析与变更由本类负责）。 */
+	private readonly configFiles = new Map<string, JsonFileStore<string>>();
+
+	private yamlFile(filePath: string): JsonFileStore<string> {
+		const existing = this.configFiles.get(filePath);
+		if (existing) return existing;
+		const created = JsonFileStore.text(filePath);
+		this.configFiles.set(filePath, created);
+		return created;
+	}
+
 	/** 读取 config.yml/config.yaml 原文；两者都不存在返回 null。 */
 	private async readRawConfigYaml(): Promise<string | null> {
 		for (const name of ["config.yml", "config.yaml"]) {
-			const filePath = join(this.configDir, name);
 			try {
-				if (!existsSync(filePath)) continue;
-				return await readFile(filePath, "utf-8");
+				const raw = await this.yamlFile(join(this.configDir, name)).readRaw();
+				if (raw !== null) return raw;
 			} catch {
 				// 单个文件读失败继续尝试下一个
 			}
@@ -146,25 +157,27 @@ export class OmpRolesStore {
 			: undefined;
 	}
 
-	/** 通用写盘：一次 parse-mutate-write，保留注释与无关键。 */
+	/** 通用写盘：一次 parse-mutate-write（队列内），保留注释与无关键。 */
 	private async writeDoc(mutate: (doc: Document) => void): Promise<ConfigValidationResult> {
 		try {
-			await mkdir(this.configDir, { recursive: true });
-			const existing = await this.readRawConfigYaml();
-			const doc = parseDocument(existing ?? "", { prettyErrors: true });
-			mutate(doc);
-			// modelRoles 被清空时删除整块，避免写残留空对象
-			const rolesNode = doc.get("modelRoles");
-			if (
-				rolesNode &&
-				typeof rolesNode === "object" &&
-				!Array.isArray(rolesNode) &&
-				Object.keys(rolesNode as Record<string, unknown>).length === 0
-			) {
-				doc.delete("modelRoles");
-			}
 			const filePath = join(this.configDir, this.ompConfigYamlName());
-			await writeFile(filePath, doc.toString(), "utf8");
+			// 队列内 read-modify-write：并发的角色写入基于同一份最新文档变更，不互相覆盖；
+			// 写失败时旧文件保持完整（tmp 写完后才 rename 替换）
+			await this.yamlFile(filePath).update((current) => {
+				const doc = parseDocument(current ?? "", { prettyErrors: true });
+				mutate(doc);
+				// modelRoles 被清空时删除整块，避免写残留空对象
+				const rolesNode: unknown = doc.get("modelRoles");
+				if (
+					rolesNode &&
+					typeof rolesNode === "object" &&
+					!Array.isArray(rolesNode) &&
+					Object.keys(rolesNode).length === 0
+				) {
+					doc.delete("modelRoles");
+				}
+				return doc.toString();
+			});
 			return { valid: true };
 		} catch (e) {
 			return {

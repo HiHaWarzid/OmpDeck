@@ -27,9 +27,11 @@ vi.mock("electron", () => ({
 /** 覆盖本测试触达路径所需的 AgentRuntime 字段子集（AgentRuntime 未导出，按需声明）。 */
 type TestRuntime = {
 	tab: AgentTab;
-	process: {
-		client: {
-			request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
+	slot: {
+		process: {
+			client: {
+				request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
+			};
 		};
 	};
 	transcript: AgentTranscriptState;
@@ -44,21 +46,22 @@ type TestRuntime = {
 	compacting: boolean;
 	rpcCompacting: boolean;
 	modelRefreshing: boolean;
-	userInitiatedStop: boolean;
 	autoRestartAttempted: boolean;
 };
 
 /** 构造带全部默认字段的最小 runtime；client.request 默认抛错（RPC 路径由各测试按需覆盖）。 */
 function makeRuntime(
 	tab: AgentTab,
-	client?: TestRuntime["process"]["client"],
+	client?: TestRuntime["slot"]["process"]["client"],
 ): TestRuntime {
 	return {
 		tab,
-		process: {
-			client: client ?? {
-				request: async () => {
-					throw new Error("RPC stub not needed");
+		slot: {
+			process: {
+				client: client ?? {
+					request: async () => {
+						throw new Error("RPC stub not needed");
+					},
 				},
 			},
 		},
@@ -74,7 +77,6 @@ function makeRuntime(
 		compacting: false,
 		rpcCompacting: false,
 		modelRefreshing: false,
-		userInitiatedStop: false,
 		autoRestartAttempted: false,
 	};
 }

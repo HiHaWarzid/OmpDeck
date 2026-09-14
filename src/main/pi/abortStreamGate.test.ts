@@ -36,10 +36,12 @@ type Harness = {
 
 type TestRuntime = {
 	tab: AgentTab;
-	process: {
-		client: {
-			request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
-			sendRaw: (req: unknown) => void;
+	slot: {
+		process: {
+			client: {
+				request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
+				sendRaw: (req: unknown) => void;
+			};
 		};
 	};
 	transcript: AgentTranscriptState;
@@ -53,7 +55,6 @@ type TestRuntime = {
 	compacting: boolean;
 	rpcCompacting: boolean;
 	modelRefreshing: boolean;
-	userInitiatedStop: boolean;
 	autoRestartAttempted: boolean;
 };
 
@@ -85,10 +86,12 @@ function makeTab(id: string, status: AgentStatus): AgentTab {
 function makeRuntime(tab: AgentTab): TestRuntime {
 	return {
 		tab,
-		process: {
-			client: {
-				request: async () => ({ success: true }),
-				sendRaw: () => {},
+		slot: {
+			process: {
+				client: {
+					request: async () => ({ success: true }),
+					sendRaw: () => {},
+				},
 			},
 		},
 		transcript: createTranscriptState(),
@@ -102,7 +105,6 @@ function makeRuntime(tab: AgentTab): TestRuntime {
 		compacting: false,
 		rpcCompacting: false,
 		modelRefreshing: false,
-		userInitiatedStop: false,
 		autoRestartAttempted: false,
 	};
 }

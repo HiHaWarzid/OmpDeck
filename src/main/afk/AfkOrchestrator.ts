@@ -14,13 +14,14 @@
  * - 崩溃恢复：重启读 afk-state.json；agent 存活 → needs-review 等人，死亡 → 强清留 WIP → failed
  */
 import { app, type BrowserWindow } from "electron";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ipcChannels } from "../../shared/ipc";
 import type { AfkState, AfkTask, AfkTaskStatus, AppSettings, Project } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { ProjectStore } from "../projects/ProjectStore";
 import type { SettingsStore } from "../settings/SettingsStore";
+import { JsonFileStore } from "../storage/JsonFileStore";
 import { AFK_WIP_PREFIX, type WorktreeService } from "../git/WorktreeService";
 import { runGit } from "../utils/CommandRunner";
 import { GhTicketSource, type AfkTicket, type TicketSource } from "./ticketSources";
@@ -42,6 +43,20 @@ export type AfkEffects = {
 	/** 写状态文件（含父目录创建）。 */
 	writeStateText: (text: string) => Promise<void>;
 };
+
+/**
+ * afk-state.json 的原子写端口：saveState 被 init/dispatch/settle/timeout 多处
+ * fire-and-forget 并发调用，就地 writeFile 会互相截断；交给 JsonFileStore 做
+ * 按路径串行 + tmp/rename 替换（惰性求值：注入全部端口时不触碰 electron）。
+ */
+let stateFileStore: JsonFileStore<string> | null = null;
+
+function afkStateFile(): JsonFileStore<string> {
+	if (!stateFileStore) {
+		stateFileStore = JsonFileStore.text(join(app.getPath("userData"), "afk-state.json"));
+	}
+	return stateFileStore;
+}
 
 /**
  * 合成端口：缺省键用真实实现（惰性——userData 路径只在真正读写时求值，
@@ -67,11 +82,7 @@ function resolveAfkEffects(overrides?: Partial<AfkEffects>): AfkEffects {
 				},
 		writeStateText: overrides?.writeStateText
 			? (text) => overrides.writeStateText!(text)
-			: async (text) => {
-					const filePath = stateFilePath();
-					await mkdir(dirname(filePath), { recursive: true });
-					await writeFile(filePath, text, "utf8");
-				},
+			: (text) => afkStateFile().write(text),
 	};
 }
 

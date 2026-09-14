@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
@@ -19,6 +19,7 @@ import {
 } from "./providerProbe";
 import { OmpRolesStore } from "./OmpRolesStore";
 import { TrustStore } from "./TrustStore";
+import { JsonFileStore } from "../storage/JsonFileStore";
 import type { WslEnvironment } from "../wsl/WslPaths";
 
 /** pi 全局配置目录：~/.omp/agent/ */
@@ -101,6 +102,8 @@ export class ConfigManager {
 	readonly rolesStore: OmpRolesStore;
 	/** trust.json 专属存取（信任决策存储/探测/编排），configDir 经 accessor 注入。 */
 	readonly trustStore: TrustStore;
+	/** models/auth/settings.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
+	private readonly jsonFiles = new Map<string, JsonFileStore<string>>();
 
 	constructor(configDir?: string) {
 		this.configDir = configDir ?? PI_AGENT_DIR;
@@ -304,7 +307,9 @@ export class ConfigManager {
 				}
 			}
 		}
-		await writeFile(join(this.configDir, "models.yml"), lines.join("\n") + "\n", "utf-8");
+		// 原子替换：models.yml 是 omp 读取的镜像文件，截断的半个 YAML 会被 omp 当成损坏配置；
+		// 失败语义不变（调用方 catch 后忽略）
+		await this.jsonFile("models.yml").write(lines.join("\n") + "\n");
 	}
 
 	private escapeYmlKey(key: string): string {
@@ -354,7 +359,7 @@ export class ConfigManager {
 						changed = true;
 					}
 				}
-				if (changed) await writeFile(modelsPath, JSON.stringify(models, null, 2), "utf-8");
+				if (changed) await this.writeJsonFile("models.json", models);
 			}
 		} catch {
 			// 同步失败不影响 auth 保存
@@ -438,26 +443,40 @@ export class ConfigManager {
 
 	// ── 文件 IO ───────────────────────────────────────────
 
+	/** JSON 文件的原文 store（惰性按路径缓存：configureWsl 切换 home 后指针跟随）。 */
+	private jsonFile(fileName: string): JsonFileStore<string> {
+		const filePath = join(this.configDir, fileName);
+		const existing = this.jsonFiles.get(filePath);
+		if (existing) return existing;
+		const created = JsonFileStore.text(filePath);
+		this.jsonFiles.set(filePath, created);
+		return created;
+	}
+
 	private async readJsonFile<T>(
 		fileName: string,
 		fallback: T,
 	): Promise<ConfigFileReadResult<T>> {
-		const filePath = join(this.configDir, fileName);
+		let raw: string | null;
 		try {
-			const raw = await readFile(filePath, "utf8");
-			try {
-				const parsed = JSON.parse(raw) as T;
-				return { raw, parsed };
-			} catch (error) {
-				// 配置 JSON 写错时，配置弹窗仍要能打开 Raw 页让用户修复；同时返回精确诊断用于 UI 提示。
-				return {
-					raw,
-					parsed: fallback,
-					diagnostic: this.createJsonDiagnostic(fileName, raw, error),
-				};
-			}
+			raw = await this.jsonFile(fileName).readRaw();
 		} catch {
+			// 读失败（权限等）按文件缺失处理：与原 catch 语义一致
 			return { raw: JSON.stringify(fallback, null, 2), parsed: fallback };
+		}
+		if (raw === null) {
+			return { raw: JSON.stringify(fallback, null, 2), parsed: fallback };
+		}
+		try {
+			const parsed = JSON.parse(raw) as T;
+			return { raw, parsed };
+		} catch (error) {
+			// 配置 JSON 写错时，配置弹窗仍要能打开 Raw 页让用户修复；同时返回精确诊断用于 UI 提示。
+			return {
+				raw,
+				parsed: fallback,
+				diagnostic: this.createJsonDiagnostic(fileName, raw, error),
+			};
 		}
 	}
 
@@ -505,11 +524,10 @@ export class ConfigManager {
 		fileName: string,
 		content: unknown,
 	): Promise<void> {
-		await mkdir(this.configDir, { recursive: true });
-		const filePath = join(this.configDir, fileName);
 		const json =
 			typeof content === "string" ? content : JSON.stringify(content, null, 2);
-		await writeFile(filePath, json, "utf8");
+		// 原子替换：写一半失败/并发保存不会让 Raw 页读到截断的 JSON
+		await this.jsonFile(fileName).write(json);
 	}
 
 	// ── 远程拉取模型列表 ─────────────────────────────────

@@ -55,20 +55,36 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 		win.webContents.send(ipcChannels.feishuBotsChanged, listBots());
 	}
 
+	/**
+	 * 飞书连接是进程级单例资源，并发 connect 必须等前一次建连完全结束后再执行：
+	 * 否则第二个请求会 stop 掉仍卡在 lark 动态 import 中的第一个连接（它当时既没有
+	 * WS 可停、也没有订阅可退），第一个连接随后照常启动 WS 并挂上 AgentManager 监听器，
+	 * 于是同一个 App 留下两条 WS、一个永不释放的监听器。串行队列让第二个请求先等
+	 * 第一个连接落定，再干净地拆掉它换新连接。
+	 */
+	let connectChain: Promise<unknown> = Promise.resolve();
+	function serializeConnect<T>(op: () => Promise<T>): Promise<T> {
+		const run = connectChain.then(op, op);
+		connectChain = run.then(() => undefined, () => undefined);
+		return run;
+	}
+
 	return {
 		feishu: {
 			// 临时连接（不保存 bot 配置），用于添加 Bot 时先验证凭证可用性
-			connectTemp: async (_event, input: FeishuConnectInput) => {
+			connectTemp: async (_event, input: FeishuConnectInput) => serializeConnect(async () => {
 				const appId = input.appId?.trim() ?? "";
 				const appSecret = input.appSecret?.trim() ?? "";
 				console.log("[Feishu] 收到临时连接请求", JSON.stringify({ appId: appId ? appId.slice(0, 8) + "..." : "", name: input.name, hasSecret: Boolean(appSecret) }));
+				let bridge: FeishuBridge | null = null;
 				try {
 					if (!appId || !appSecret) {
 						return { success: false, message: "请填写 App ID 和 App Secret" };
 					}
 					const existing = getFeishuBridge();
 					if (existing) {
-						existing.stop();
+						await existing.disconnect();
+						setFeishuBridge(null);
 					}
 					// 临时构造 botConfig，不做持久化；明文 secret 只传给当前 bridge，不写入磁盘。
 					const botConfig: FeishuBotConfig = {
@@ -79,9 +95,10 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 						appSecret,
 						defaultUserOpenId: input.defaultUserOpenId,
 					};
-					const bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list(), appSecret);
-					setFeishuBridge(bridge);
+					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list(), appSecret);
+					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
+					setFeishuBridge(bridge);
 					const status = bridge.getStatus();
 					console.log("[Feishu] 临时连接成功，状态:", JSON.stringify(status));
 					return {
@@ -90,43 +107,51 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 						botInfo: { id: botConfig.id, name: botConfig.name },
 					};
 				} catch (error) {
+					// start() 内部已回滚连接 + 停 WS；已发布成功的连接不能在这里抹掉。
+					if (getFeishuBridge() !== bridge) setFeishuBridge(null);
 					const message = error instanceof Error ? error.message : String(error);
 					console.error("[Feishu] 临时连接失败:", message);
 					return { success: false, message };
 				}
-			},
+			}),
 
 			// 连接飞书（保存 bot）
-			connect: async (_event, input: FeishuConnectInput) => {
+			connect: async (_event, input: FeishuConnectInput) => serializeConnect(async () => {
 				console.log("[Feishu] 收到连接请求", JSON.stringify({ appId: input.appId?.slice(0, 8) + "...", name: input.name }));
+				let bridge: FeishuBridge | null = null;
 				try {
 					const existing = getFeishuBridge();
 					if (existing) {
 						console.log("[Feishu] 停止旧 bridge 状态:", JSON.stringify(existing.getStatus()));
-						existing.stop();
+						await existing.disconnect();
+						setFeishuBridge(null);
 					}
-		
+
 					const botConfig = addFeishuBot({
 						name: input.name || "飞书机器人",
 						appId: input.appId,
 						appSecret: input.appSecret,
 						defaultUserOpenId: input.defaultUserOpenId,
 					});
-		
-					const bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
-					setFeishuBridge(bridge);
+
+					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
+					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
+					setFeishuBridge(bridge);
 					console.log("[Feishu] 连接成功，状态:", JSON.stringify(bridge.getStatus()));
 					void appLogger.info("feishu", "Feishu connected", { botId: botConfig.id, name: botConfig.name });
 					broadcastBotsChanged();
 					return { success: true, message: "连接成功" };
 				} catch (error) {
+					// start() 内部已回滚连接 + 停 WS；已发布成功的连接不能在这里抹掉（否则没有引用能再停它），
+					// 只清空「从未发布成功」的引用，保证全局没有半成品。
+					if (getFeishuBridge() !== bridge) setFeishuBridge(null);
 					const message = error instanceof Error ? error.message : String(error);
 					console.error("[Feishu] 连接失败:", message);
 					void appLogger.error("feishu", "Feishu connect failed", error);
 					return { success: false, message };
 				}
-			},
+			}),
 
 			// 断开连接
 			disconnect: async () => {
@@ -134,7 +159,8 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 				const existing = getFeishuBridge();
 				if (existing) {
 					console.log("[Feishu] 停止 bridge，此前状态:", JSON.stringify(existing.getStatus()));
-					existing.stop();
+					// 等订阅与 WS 真正释放后再置空引用，避免后续 connect 与旧连接并发。
+					await existing.disconnect();
 					setFeishuBridge(null);
 					console.log("[Feishu] bridge 已置 null");
 				}
@@ -267,26 +293,31 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 			},
 
 			// 通过已保存的 Bot ID 连接（自动解密 Secret）
-			connectByBot: async (_event, botId: string) => {
+			connectByBot: async (_event, botId: string) => serializeConnect(async () => {
+				let bridge: FeishuBridge | null = null;
 				try {
-					const existing = getFeishuBridge();
-					if (existing) {
-						existing.stop();
-					}
 					const botConfig = getBot(botId);
 					if (!botConfig) {
 						return { success: false, message: "Bot 配置不存在" };
 					}
-					const bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
-					setFeishuBridge(bridge);
+					const existing = getFeishuBridge();
+					if (existing) {
+						await existing.disconnect();
+						setFeishuBridge(null);
+					}
+					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
+					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
+					setFeishuBridge(bridge);
 					void appLogger.info("feishu", "Feishu connected by saved bot", { botId, name: botConfig.name });
 					return { success: true, message: "连接成功" };
 				} catch (error) {
+					// start() 内部已回滚连接 + 停 WS；已发布成功的连接不能在这里抹掉。
+					if (getFeishuBridge() !== bridge) setFeishuBridge(null);
 					const message = error instanceof Error ? error.message : String(error);
 					return { success: false, message };
 				}
-			},
+			}),
 
 			// 获取 Agent 绑定的飞书 Bot ID
 			sessionBotGet: async (_event, agentId: string) => {

@@ -6,6 +6,7 @@ import type { ChatMessage } from "../../shared/types";
 import type { RpcResponse } from "./PiRpcClient";
 import { extractMessageText } from "./messageContent";
 import { convertAgentMessages, trimHistoryMessages } from "./messageTimeline";
+import { BoundedLruCache } from "./boundedLruCache";
 import { findLastUserMessageLine } from "./sessionEntryIds";
 
 /**
@@ -63,6 +64,26 @@ export interface SessionArchives {
 	/** key 为压缩条目 id */
 	archivedMessagesByCompactionId: Map<string, ChatMessage[]>;
 }
+
+/**
+ * 归档缓存条目的堆占用估算：文本按 UTF-16（2 字节/字符）计，图片按 base64 串长计，
+ * 另加每条消息的固定开销。只求量级正确——目的是给缓存一个上界，不需要精确的堆测量。
+ */
+function estimateArchivesBytes(archives: SessionArchives): number {
+	let bytes = 1024;
+	for (const messages of archives.archivedMessagesByCompactionId.values()) {
+		for (const message of messages) {
+			bytes += 512 + (message.text?.length ?? 0) * 2 + (message.thinking?.length ?? 0) * 2;
+			for (const image of message.images ?? []) bytes += image.data.length;
+		}
+	}
+	return bytes;
+}
+
+/** 归档缓存字节上限：压缩段归档是内存里最大的一类缓存，超限按 LRU 驱逐。 */
+const ARCHIVES_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+/** 命中率缓存条目上限：值很小，但 key（sessionPath）会随会话切换无限累积。 */
+const CACHE_HIT_RATE_MAX_ENTRIES = 512;
 
 /** locateEntry 返回的定位结果。 */
 export interface LocatedEntry {
@@ -390,11 +411,12 @@ export class SessionJsonl {
 	 * 边沿都会调用本方法，每次都 open/close 文件句柄 + 读尾部窗口 + 逐行 parse，
 	 * 属于流式期间唯一同步磁盘 IO 热点；5s 内重复请求直接复用（命中率展示
 	 * 延迟 5s 无感知，新 assistant 消息的 usage 在窗口过期后自然生效）。
+	 * 条目按 LRU 有界（key 是 sessionPath，会随会话切换无限累积）。
 	 */
-	private readonly cacheHitRateCache = new Map<
+	private readonly cacheHitRateCache = new BoundedLruCache<
 		string,
 		{ expiresAt: number; value: number | undefined }
-	>();
+	>(CACHE_HIT_RATE_MAX_ENTRIES, () => 1);
 	private static readonly CACHE_HIT_RATE_TTL_MS = 5_000;
 
 	async getLatestCacheMessageHitRate(
@@ -440,11 +462,13 @@ export class SessionJsonl {
 	 * parseArchives；压缩过的长会话每次都要整文件 readFile + 全行 JSON.parse +
 	 * 归档消息全量转换。文件指纹未变时直接复用，只有 mtime/size 变化才重解析。
 	 * 仅对未传 sessionContent 的调用生效（调用方自带内容时以调用方为准）。
+	 * 按估算字节数做 LRU 上限：归档是内存里最大的一类缓存，只增不减会把
+	 * 本次运行碰过的每个会话的整份归档永久钉在堆上。
 	 */
-	private readonly archivesCache = new Map<
+	private readonly archivesCache = new BoundedLruCache<
 		string,
 		{ size: number; mtimeMs: number; value: SessionArchives }
-	>();
+	>(ARCHIVES_CACHE_MAX_BYTES, (entry) => estimateArchivesBytes(entry.value));
 
 	/**
 	 * 从原始会话文件解析压缩（compaction）记录。

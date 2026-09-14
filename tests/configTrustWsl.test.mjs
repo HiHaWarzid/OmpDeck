@@ -26,7 +26,6 @@ function loadBaseUrlPath() {
 
 function loadConfigManager() {
 	let content;
-	const writes = [];
 	const source = readFileSync("src/main/config/ConfigManager.ts", "utf8");
 	const { outputText } = ts.transpileModule(source, {
 		compilerOptions: {
@@ -35,30 +34,70 @@ function loadConfigManager() {
 		},
 	});
 	// ConfigManager 值导入 ./OmpRolesStore 与 ./TrustStore（各自再导入 shared/
-	// 或 node 内建）；均以真实源码转译注入 + 共享的 fs/promises 假实现（EIO 语义：
-	// 首次读抛 ENOENT = 空存储，写操作收进 writes 供断言），避免测试文件自身的
+	// 或 node 内建）；均以真实源码转译注入 + 共享的 fs/promises 假实现（内存文件表：
+	// stat 缺失抛 ENOENT = 空存储，rename 收进 renames 供断言），避免测试文件自身的
 	// require 把相对路径解析到 tests/ 目录。
 	const sharedRoles = loadTranspiledModule("src/shared/types/ompRoles.ts");
+	// 内存文件表 + 递增时钟：覆盖 JsonFileStore 真实读写路径所需的 stat/rename/mkdir。
+	// JsonFileStore 只往同目录 tmp 写、再 rename 到目标；把两次动作都建模成对文件表
+	// 的操作，指纹（mtimeMs/size）随之变化，读缓存才会按真实语义失效重读。
+	const files = new Map();
+	const renames = [];
+	let clock = 0;
 	const fsPromisesFake = {
 		mkdir: async () => {},
-		readFile: async () => {
-			if (content == null) {
-				const err = new Error("ENOENT");
+		readFile: async (filePath) => {
+			const entry = files.get(filePath);
+			if (!entry) {
+				const err = new Error(`ENOENT: ${filePath}`);
 				err.code = "ENOENT";
 				throw err;
 			}
-			return content;
+			return entry.content;
 		},
 		writeFile: async (filePath, nextContent) => {
+			clock += 1;
+			files.set(filePath, { content: nextContent, mtimeMs: clock });
 			content = nextContent;
-			writes.push({ filePath, content: nextContent });
+		},
+		rename: async (from, to) => {
+			const entry = files.get(from);
+			if (!entry) {
+				const err = new Error(`ENOENT: ${from}`);
+				err.code = "ENOENT";
+				throw err;
+			}
+			files.delete(from);
+			clock += 1;
+			files.set(to, { content: entry.content, mtimeMs: clock });
+			renames.push({ from, to });
+		},
+		stat: async (filePath) => {
+			const entry = files.get(filePath);
+			if (!entry) {
+				const err = new Error(`ENOENT: ${filePath}`);
+				err.code = "ENOENT";
+				throw err;
+			}
+			return { mtimeMs: entry.mtimeMs, size: Buffer.byteLength(entry.content, "utf8") };
 		},
 	};
+	// ../utils/fsRetry（rename 重试）与 ../storage/JsonFileStore 都用同一份假 fs，
+	// 这样原子写路径（writeFile tmp → rename 目标）在假实现上真实执行。
+	const fsRetry = loadTranspiledModule("src/main/utils/fsRetry.ts", () => undefined, {
+		fsPromises: fsPromisesFake,
+	});
+	const jsonFileStore = loadTranspiledModule("src/main/storage/JsonFileStore.ts", (id) => {
+		if (id === "../utils/fsRetry") return fsRetry;
+		return undefined;
+	}, { fsPromises: fsPromisesFake });
 	const rolesStore = loadTranspiledModule("src/main/config/OmpRolesStore.ts", (id) => {
 		if (id === "../../shared/types/ompRoles") return sharedRoles;
+		if (id === "../storage/JsonFileStore") return jsonFileStore;
 		return undefined;
 	}, { fsPromises: fsPromisesFake });
 	const trustStore = loadTranspiledModule("src/main/config/TrustStore.ts", (id) => {
+		if (id === "../storage/JsonFileStore") return jsonFileStore;
 		return undefined;
 	}, { fsPromises: fsPromisesFake });
 	const probe = loadTranspiledModule("src/main/config/providerProbe.ts", (id) => {
@@ -77,6 +116,9 @@ function loadConfigManager() {
 			if (id === "./OmpRolesStore") return rolesStore;
 			if (id === "./TrustStore") return trustStore;
 			if (id === "./providerProbe") return probe;
+			// ConfigManager 自身也直接构造 JsonFileStore（provider 模型缓存等），
+			// 测试文件的 require 会把相对路径解析到 tests/ 而失败，须注入同一真模块。
+			if (id === "../storage/JsonFileStore") return jsonFileStore;
 			if (id === "node:path") return path.win32;
 			if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
 			if (id === "electron") return { net: {} };
@@ -84,7 +126,7 @@ function loadConfigManager() {
 		},
 	};
 	vm.runInNewContext(outputText, sandbox, { filename: "ConfigManager.ts" });
-	return { ...sandbox.exports, getContent: () => content, writes };
+	return { ...sandbox.exports, getContent: () => content, renames };
 }
 
 /** 把源码 TS 转译为 CommonJS 后在 vm 沙箱执行；extraRequire 返回 undefined 时走真实 require。 */
@@ -121,7 +163,7 @@ function loadProbeExportsForTest() {
 }
 
 test("preserves POSIX WSL trust keys under Windows path semantics", async () => {
-	const { ConfigManager, getContent, writes } = loadConfigManager();
+	const { ConfigManager, getContent, renames } = loadConfigManager();
 	const manager = new ConfigManager("C:\\OmpDeck\\config");
 
 	await manager.trustStore.ensureTrustedDirectory("/root/ba_cli/");
@@ -134,7 +176,14 @@ test("preserves POSIX WSL trust keys under Windows path semantics", async () => 
 		"/root/ba_cli/private": false,
 	});
 	assert.equal(await manager.trustStore.getDecision("/root/ba_cli/private/nested"), false);
-	assert.equal(writes.every((write) => write.filePath === "C:\\OmpDeck\\config\\trust.json"), true);
+	// JsonFileStore 原子写是「写同目录 tmp → rename 替换目标」：不改不变式，
+	// 只是把「每次落盘的路径」从 writeFile 的 tmp 改成 rename 的目标断言——
+	// 所有持久化都必须落在 trust.json，且确实发生过落盘。
+	assert.equal(renames.length > 0, true);
+	assert.equal(
+		renames.every((entry) => entry.to === "C:\\OmpDeck\\config\\trust.json"),
+		true,
+	);
 });
 
 test("retains case-insensitive matching for native Windows trust keys", async () => {

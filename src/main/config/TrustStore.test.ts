@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,7 +61,8 @@ describe("TrustStore storage semantics", () => {
 	it("ensureTrustedDirectory writes only when no equivalent record exists", async () => {
 		const store = createStore();
 		await store.ensureTrustedDirectory("C:\\Work\\proj");
-		expect(existsSync(join(dir, "trust.json"))).toBe(true);
+		// 行为断言：自动信任写回后新实例（无缓存）可读回；不钉死 trust.json 产物
+		expect(await createStore().getDecision("C:\\Work\\proj")).toBe(true);
 
 		// 已有显式 false（不同大小写）→ 不覆盖，尊重用户决策
 		await writeTrust({ "c:\\work\\proj": false });

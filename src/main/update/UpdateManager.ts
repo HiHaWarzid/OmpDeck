@@ -7,8 +7,7 @@
  * - 下载使用 Electron net 模块以继承 Chromium 的 TLS/代理能力，进度通过 IPC 推送给 renderer。
  */
 import { app, net, shell, type BrowserWindow } from "electron";
-import { basename, join } from "node:path";
-import { createWriteStream } from "node:fs";
+import { join } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { ipcChannels } from "../../shared/ipc";
 import type {
@@ -18,6 +17,7 @@ import type {
 	AppUpdateInfo,
 } from "../../shared/types";
 import type { AppLogger } from "../logging/AppLogger";
+import { UpdateArtifactDownloader, type UpdateDownloadTransport } from "./updateArtifact";
 
 // ── 常量 ──────────────────────────────────────────────
 
@@ -237,8 +237,22 @@ export interface UpdateManagerDeps {
 	getMainWindow: () => BrowserWindow | null;
 }
 
+/**
+ * 默认下载通道：electron net 继承 Chromium 的 TLS/代理能力。
+ * 单测通过 UpdateArtifactDeps.transport 注入假实现，所以这里不暴露到公开 API。
+ */
+function createNetTransport(): UpdateDownloadTransport {
+	return (url, userAgent) => {
+		const request = net.request({ method: "GET", url });
+		request.setHeader("User-Agent", userAgent);
+		return request;
+	};
+}
+
 export class UpdateManager {
 	private readonly deps: UpdateManagerDeps;
+	/** 首次下载时才创建：此时 app 已就绪，userData 路径稳定。 */
+	private artifacts: UpdateArtifactDownloader | undefined;
 
 	constructor(deps: UpdateManagerDeps) {
 		this.deps = deps;
@@ -249,6 +263,18 @@ export class UpdateManager {
 		const win = this.deps.getMainWindow();
 		if (!win || win.isDestroyed()) return;
 		win.webContents.send(ipcChannels.appUpdateProgress, progress);
+	}
+
+	/** 懒创建：首次下载时 app 已就绪（userData 稳定），没下载过就不建 net 通道。 */
+	private artifactDownloader(): UpdateArtifactDownloader {
+		this.artifacts ??= new UpdateArtifactDownloader({
+			downloadDir: join(app.getPath("userData"), "updates"),
+			transport: createNetTransport(),
+			userAgent: `OmpDeck/${app.getVersion()}`,
+			onProgress: (progress) => this.emitUpdateProgress(progress),
+			logger: this.deps.appLogger,
+		});
+		return this.artifacts;
 	}
 
 	async checkForAppUpdate(
@@ -315,78 +341,28 @@ export class UpdateManager {
 	}
 
 	async downloadUpdateAsset(asset: AppUpdateAsset): Promise<AppUpdateDownloadResult> {
-		const { appLogger } = this.deps;
 		if (!asset.url || !/^https:\/\//i.test(asset.url)) {
 			throw new Error("无效的更新下载地址");
 		}
 
-		const safeName = basename(asset.name).replace(/[<>:"/\\|?*]+/g, "-");
 		const downloadDir = join(app.getPath("userData"), "updates");
 		await mkdir(downloadDir, { recursive: true });
-		const filePath = join(downloadDir, safeName);
-		const startedAt = Date.now();
-		let receivedBytes = 0;
-		let totalBytes = asset.size > 0 ? asset.size : undefined;
-
-		// 使用 Electron net 下载可继承 Chromium 的 TLS/代理能力；进度通过 IPC 推送给 renderer。
-		return new Promise((resolve, reject) => {
-			void appLogger.info("update", "Download update asset started", { assetName: asset.name, url: asset.url });
-			const request = net.request({ method: "GET", url: asset.url });
-			request.setHeader("User-Agent", `OmpDeck/${app.getVersion()}`);
-			request.on("redirect", (_statusCode, _method, redirectUrl) => {
-				// GitHub browser_download_url 通常会 302 到对象存储,必须显式跟随重定向。
-				request.followRedirect();
-				void appLogger.debug("update", "Follow update download redirect", { redirectUrl });
-			});
-			request.on("response", (response) => {
-				if (response.statusCode < 200 || response.statusCode >= 300) {
-					const error = new Error(`下载失败：HTTP ${response.statusCode}`);
-					this.emitUpdateProgress({ assetName: asset.name, receivedBytes, totalBytes, state: "failed", error: error.message });
-					reject(error);
-					return;
-				}
-
-				const contentLength = Number(response.headers["content-length"]);
-				if (Number.isFinite(contentLength) && contentLength > 0) totalBytes = contentLength;
-				const output = createWriteStream(filePath);
-				response.on("data", (chunk: Buffer) => {
-					receivedBytes += chunk.length;
-					output.write(chunk);
-					const elapsedSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
-					this.emitUpdateProgress({
-						assetName: asset.name,
-						receivedBytes,
-						totalBytes,
-						percent: totalBytes ? Math.min(100, (receivedBytes / totalBytes) * 100) : undefined,
-						bytesPerSecond: receivedBytes / elapsedSeconds,
-						state: "downloading",
-					});
-				});
-				response.on("end", () => output.end());
-				output.on("finish", () => {
-					output.close(() => {
-						this.emitUpdateProgress({ assetName: asset.name, receivedBytes, totalBytes, percent: 100, state: "completed", filePath });
-						void appLogger.info("update", "Download update asset completed", { assetName: asset.name, filePath, receivedBytes });
-						resolve({ filePath, assetName: asset.name });
-					});
-				});
-				output.on("error", (error) => {
-					this.emitUpdateProgress({ assetName: asset.name, receivedBytes, totalBytes, state: "failed", error: error.message });
-					reject(error);
-				});
-			});
-			request.on("error", (error) => {
-				this.emitUpdateProgress({ assetName: asset.name, receivedBytes, totalBytes, state: "failed", error: error.message });
-				reject(error);
-			});
-			request.end();
-		});
+		// 真正的传输交给 UpdateArtifactDownloader：单飞 + 超时 + 背压 + temp rename，
+		// 这里只负责把结果映射回 IPC 契约。
+		const result = await this.artifactDownloader().fetchToFile(asset);
+		return { filePath: result.filePath, assetName: asset.name };
 	}
 
 	async installDownloadedUpdate(filePath: string) {
 		// Windows/Linux 不同包类型的真正静默自更新风险较高；这里交给系统打开安装包或文件位置。
 		// 便携版用户通常下载 zip/AppImage/tar.gz 后需要替换当前目录,避免在运行中覆盖自身可执行文件。
 		const { appLogger } = this.deps;
+		// 只认本次成功传输并完成 rename 的产物：路径上残留的截断文件、旧版本包或用户手填路径都不能打开。
+		if (!this.artifactDownloader().isVerified(filePath)) {
+			const message = "安装包未通过校验：不是本次成功下载的更新包";
+			await appLogger.warn("update", "Reject install of unverified update package", { filePath });
+			throw new Error(message);
+		}
 		await appLogger.info("update", "Open downloaded update package", { filePath });
 		await shell.openPath(filePath);
 	}
