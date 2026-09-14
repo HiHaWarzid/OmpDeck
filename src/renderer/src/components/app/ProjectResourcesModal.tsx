@@ -176,7 +176,8 @@ export function ProjectResourcesModal(props: {
 		setEditLoading(true);
 		setError(null);
 		try {
-			const content = await window.piDesktop.files.readContent(skill.path);
+			const { content, truncated } = await window.piDesktop.files.readContent(skill.path);
+			if (truncated) showNotice(t("editor.truncatedNotice"), 4000, "warning");
 			setEditContent(content);
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err));
@@ -283,7 +284,8 @@ export function ProjectResourcesModal(props: {
 		setEditProjectPromptSaved(false);
 		setError(null);
 		try {
-			const content = await window.piDesktop.files.readContent(prompt.path);
+			const { content, truncated } = await window.piDesktop.files.readContent(prompt.path);
+			if (truncated) showNotice(t("editor.truncatedNotice"), 4000, "warning");
 			setEditProjectPromptContent(content);
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err));

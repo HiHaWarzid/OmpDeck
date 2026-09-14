@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { IpcFailureKind } from "../../shared/ipcEnvelope";
 
 const execFileAsync = promisify(execFile);
 
 /**
  * git/gh 五个 CLI 执行约定的收敛 seam：超时、maxBuffer、stderr 归一化、allowFailure、
- * ENOENT 归类、cwd 全部收敛到这里，调用方只描述"跑什么"，不重复写执行细节。
+ * ENOENT 归类、git 非交互环境、cwd 全部收敛到这里，调用方只描述"跑什么"，不重复写执行细节。
  *
  * 语义对齐依据（Wave-3 换入前保持一致）：
  * - GitService.runGit：默认超时 30s、缓冲 32MB；blocking 变体用 4 倍超时覆盖；
@@ -16,7 +17,11 @@ const execFileAsync = promisify(execFile);
  *   不复制 PiLocator 的 wsl 路径定位逻辑——那是 ExtensionManager 自己的职责面）。
  */
 
-export type CommandErrorKind = "command" | "timeout" | "not-found";
+/**
+ * 命令失败分类：直接取 IPC 失败契约的分类去掉 "unknown"（命令错误必定已被分类），
+ * 使 envelope 的 kind 与本类型共用同一事实源 —— 改名/新增分类会在编译期同时暴露。
+ */
+export type CommandErrorKind = Exclude<IpcFailureKind, "unknown">;
 
 /**
  * 归一化后的命令错误：
@@ -91,6 +96,19 @@ const GH_TIMEOUT_MS = 30_000;
 /** gh 输出缓冲上限（对齐 ticketSources 16MB） */
 const GH_MAX_BUFFER = 16 * 1024 * 1024;
 
+/**
+ * git 非交互环境（执行端口统一注入，调用方不必各自处理）。
+ * 主进程的 git 命令都无人应答：凭据提示会让 git 一直等输入直到 30s 超时甚至更久
+ * （AFK 后台任务、IPC 调用都会卡住）。GIT_TERMINAL_PROMPT=0 关掉终端提示，
+ * GIT_ASKPASS/SSH_ASKPASS 指向 echo 抑制继承来的 GUI askpass（VS Code 等会注入），
+ * 缺凭据时立即失败并把原因交给调用方——凭据助手（credential.helper）不受影响。
+ */
+export const NON_INTERACTIVE_GIT_ENV: Readonly<Record<string, string>> = {
+	GIT_TERMINAL_PROMPT: "0",
+	GIT_ASKPASS: "echo",
+	SSH_ASKPASS: "echo",
+};
+
 const defaultExecutor: Executor = (bin, args, options) => execFileAsync(bin, args, options);
 
 function toCommandError(
@@ -156,6 +174,9 @@ export function createCommandRunner(deps: Partial<CommandRunnerDeps> = {}): Comm
 				cwd,
 				timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS,
 				maxBuffer: options.maxBuffer ?? GIT_MAX_BUFFER,
+				// env 在基线上合并而非整体替换：调用方只补 author 等变量（git:init），
+				// PATH 等继承环境必须保留，否则子进程找不到 git/ssh。
+				env: { ...process.env, ...options.env, ...NON_INTERACTIVE_GIT_ENV },
 			});
 			return stdout;
 		},

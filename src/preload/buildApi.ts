@@ -1,5 +1,6 @@
 import type { PiDesktopApi } from "../shared/api";
 import { ipcTable, type IpcOpEntry } from "../shared/ipc";
+import { unwrapIpcInvokeEnvelope, type IpcInvokeEnvelope } from "../shared/ipcEnvelope";
 
 /**
  * IPC bridge 抽象：把 ipcRenderer 的调用面收窄为 buildApi 需要的五个操作，
@@ -17,7 +18,8 @@ export interface IpcBridge {
 /**
  * 由通道表生成 window.piDesktop 的 api 对象。
  *
- * - invoke：`(...args) => bridge.invoke(channel, ...pack(args))`，pack 缺省原样展开
+ * - invoke：`(...args) => unwrap(bridge.invoke(channel, ...pack(args)))`，pack 缺省原样展开；
+ *   解包失败契约 envelope（成功取 value、失败抛带 kind 的错误，见 shared/ipcEnvelope）
  * - subscribe：注册 listener 并返回解除订阅函数（与历史 subscribe helper 语义一致）
  * - send / sendSync：单向通知 / 同步读取
  * - local：不生成——由 preload 覆盖层提供实现（webUtils、环境标志、fire-and-forget 等）
@@ -49,10 +51,12 @@ export function buildApi(bridge: IpcBridge): PiDesktopApi {
 				built[member] = (...args: unknown[]) => bridge.sendSync(op.channel ?? "", ...args);
 				continue;
 			}
-			// invoke
-			built[member] = (...args: unknown[]) => {
+			// invoke：过界的是失败契约 envelope（见 shared/ipcEnvelope），这里解包成历史形状——
+			// 成功直接给 value，失败抛 IpcInvokeError（保留 try/catch 语义与干净 message）
+			built[member] = async (...args: unknown[]) => {
 				const packed = op.pack ? op.pack(...args) : args;
-				return bridge.invoke(op.channel ?? "", ...packed);
+				const envelope = (await bridge.invoke(op.channel ?? "", ...packed)) as IpcInvokeEnvelope;
+				return unwrapIpcInvokeEnvelope(envelope);
 			};
 		}
 		api[namespace] = built;

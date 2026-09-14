@@ -13,21 +13,15 @@
  */
 
 import { useMemo, useRef, useState } from "react";
-import type {
-	AgentRuntimeState,
-	AgentTab,
-	ChatMessage,
-	SessionSummary,
-} from "../../../shared/types";
+import type { AgentTab, SessionSummary } from "../../../shared/types";
 import type { PiDesktopApi } from "../../../shared/api";
 import { isReplacementForPendingAgent, type PendingAgentTab } from "../agentListDisplay";
-import { migrateAgentRecord } from "./useAgentLifecycle";
-import { mergeAgentRuntimeState } from "../utils/agentRuntimeState";
 import { translateAgentErrorMessage } from "../utils/agentErrors";
 import { showNotice } from "../utils/notice";
 import { t } from "../i18n";
 import { withTimeout } from "../utils/withTimeout";
 import { sameSessionSummaryList as sameCatalogSummaryList } from "../agentListDisplay";
+import { applyAgentRuntimeState } from "../workspace/agentRuntime";
 
 /** 会话扫描超时：避免 IPC 无响应时 UI 永久等待。 */
 const SESSION_REFRESH_TIMEOUT_MS = 20_000;
@@ -62,9 +56,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const [activeAgentByProject, setActiveAgentByProject] = useState<
 		Record<string, string>
 	>({});
-	const [messagesByAgent, setMessagesByAgent] = useState<
-		Record<string, ChatMessage[]>
-	>({});
 	const [sessions, setSessions] = useState<SessionSummary[]>([]);
 	const [sessionsByProject, setSessionsByProject] = useState<
 		Record<string, SessionSummary[]>
@@ -76,23 +67,15 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const [sessionErrorByProject, setSessionErrorByProject] = useState<
 		Record<string, string>
 	>({});
-	const [runtimeStateByAgent, setRuntimeStateByAgent] = useState<
-		Record<string, AgentRuntimeState>
-	>({});
 
 	// ===== Refs =====
 	const activeAgentIdRef = useRef<string | undefined>(activeAgentId);
 	activeAgentIdRef.current = activeAgentId;
 	const agentsRef = useRef<AgentTab[]>(agents);
 	agentsRef.current = agents;
-	/** messagesByAgent 的同步镜像：挂载一次的 IPC 监听器（onMessages）需要读取最新消息缓存。 */
-	const messagesByAgentRef = useRef<Record<string, ChatMessage[]>>({});
-	messagesByAgentRef.current = messagesByAgent;
 	// pendingAgentsRef 不做 .current = pendingAgents 同步：createAgent 路径直接写 ref（先于 setState），
 	// 随后 setState 触发重渲染时会用 ref 中已更新的值，避免占位 Agent 闪烁。
 	const pendingAgentsRef = useRef<PendingAgentTab[]>([]);
-	const runtimeStateByAgentRef = useRef<Record<string, AgentRuntimeState>>({});
-	runtimeStateByAgentRef.current = runtimeStateByAgent;
 	/** 会话扫描可能由项目展开、运行态结束和周期同步同时触发；按项目丢弃旧响应，避免慢请求覆盖新子会话。 */
 	const sessionRequestByProjectRef = useRef<Record<string, number>>({});
 	const sessionRefreshRunningRef = useRef<Set<string>>(new Set());
@@ -130,9 +113,9 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		[activeAgentId, displayAgents, pendingAgents],
 	);
 
-	const activeMessages = activeAgentId
-		? (messagesByAgent[activeAgentId] ?? [])
-		: [];
+	// 消息缓存（messagesByAgent）与运行态（runtimeStateByAgent）已迁入会话工作区切片
+	// （批次 5a/5b）：App 经 useWorkspaceSlice 按 (agentId, slice) 订阅，本 hook 不再
+	// 持有、也不再暴露对应 state/ref/判空 op。
 
 	// ===== Actions（纯逻辑，无 UI 副作用） =====
 
@@ -148,50 +131,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		const next = updater(pendingAgentsRef.current);
 		pendingAgentsRef.current = next;
 		setPendingAgents(next);
-	}
-
-	/**
-	 * 写入指定 agent 的消息缓存。
-	 * messagesByAgentRef 是 messagesByAgent 的同步镜像（挂载一次的 onMessages
-	 * 监听器经 ref 读取最新缓存）；本 op 是唯一 sanctioned 写入路径，
-	 * 镜像同步是 hook 内部实现细节。
-	 */
-	function setAgentMessages(
-		agentId: string,
-		messages: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[]),
-	) {
-		setMessagesByAgent((current) => ({
-			...current,
-			[agentId]:
-				typeof messages === "function" ? messages(current[agentId] ?? []) : messages,
-		}));
-	}
-
-	/** 按 replacementById 迁移、按 draftIds 裁剪全部 agent 的消息缓存（agent 替换时调用）。 */
-	function migrateAgentMessages(
-		replacementById: Map<string, string>,
-		draftIds: Set<string>,
-	) {
-		setMessagesByAgent((current) =>
-			migrateAgentRecord(current, replacementById, draftIds),
-		);
-	}
-
-	/**
-	 * 合并传入的 runtime state 到对应 agent 的缓存。
-	 * 通过 ref 读写避免闭包陈旧，合并后同步到 state 触发重渲染。
-	 * 返回合并后的 state，供调用方（RPC effect / cycleModel 等）即时使用。
-	 */
-	function applyAgentRuntimeState(agentId: string, incoming: AgentRuntimeState) {
-		const currentState = runtimeStateByAgentRef.current[agentId];
-		const nextState = mergeAgentRuntimeState(currentState, incoming);
-		if (nextState === currentState) return nextState;
-		runtimeStateByAgentRef.current = {
-			...runtimeStateByAgentRef.current,
-			[agentId]: nextState,
-		};
-		setRuntimeStateByAgent(runtimeStateByAgentRef.current);
-		return nextState;
 	}
 
 	/**
@@ -364,18 +303,16 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	}
 
 	return {
-		// state
+		// state（messages/runtimeState 已迁入会话工作区切片：App 用 useWorkspaceSlice 订阅）
 		agents,
 		pendingAgents,
 		activeAgentId,
 		activeAgentByProject,
-		messagesByAgent,
-		runtimeStateByAgent,
 		sessions,
 		sessionsByProject,
 		sessionLoadingByProject,
 		sessionErrorByProject,
-		// setters（经 op 写入的切片不暴露裸 setter：pending/messages/runtimeState/sessionError）
+		// setters（经 op 写入的切片不暴露裸 setter：pending/sessionError）
 		setAgents,
 		setActiveAgentId,
 		setActiveAgentByProject,
@@ -385,16 +322,12 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		// refs（挂载一次的监听器/异步路径需要最新值；会话扫描内部序号仅 hook 内部使用）
 		agentsRef,
 		activeAgentIdRef,
-		messagesByAgentRef,
 		pendingAgentsRef,
-		runtimeStateByAgentRef,
 		displayAgentsRef,
 		// computed
 		displayAgents,
 		activeAgent,
-		activeMessages,
 		// actions
-		applyAgentRuntimeState,
 		refreshRuntimeState,
 		cycleModel,
 		cycleThinking,
@@ -402,7 +335,5 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		refreshSessions,
 		refreshProjectSessions,
 		updatePendingAgents,
-		setAgentMessages,
-		migrateAgentMessages,
 	};
 }

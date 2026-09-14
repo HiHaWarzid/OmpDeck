@@ -1,6 +1,12 @@
 import { composerSlice, type ComposerState } from "./slices/composerSlice";
+import {
+	extensionWidgetsSlice,
+	type ExtensionWidgetState,
+} from "./slices/extensionWidgetsSlice";
 import { rpcLogSlice, type RpcLogState } from "./slices/rpcLogSlice";
+import { runtimeSlice, type RuntimeState } from "./slices/runtimeSlice";
 import { thinkingSlice, type ThinkingState } from "./slices/thinkingSlice";
+import { transcriptSlice, type TranscriptState } from "./slices/transcriptSlice";
 
 /**
  * 会话工作区（SessionWorkspace）——渲染层深模块核心（切片 0，纯逻辑，零 React）。
@@ -74,6 +80,9 @@ export const workspaceSlices = {
   composer: composerSlice,
   thinking: thinkingSlice,
   rpcLog: rpcLogSlice,
+  transcript: transcriptSlice,
+  runtime: runtimeSlice,
+  extensionWidgets: extensionWidgetsSlice,
 } as const;
 
 type Slices = typeof workspaceSlices;
@@ -86,6 +95,9 @@ export type SliceStateMap = {
   composer: ComposerState;
   thinking: ThinkingState;
   rpcLog: RpcLogState;
+  transcript: TranscriptState;
+  runtime: RuntimeState;
+  extensionWidgets: ExtensionWidgetState;
 };
 
 /** 切片名（manifest 的键集合）：订阅与读取都按它定位。 */
@@ -145,6 +157,13 @@ export interface SessionWorkspaceStore {
    * 这是热路径（20Hz thinking）唯一该走的订阅面。
    */
   subscribeSlice(key: WorkspaceKey, slice: SliceName, listener: () => void): () => void;
+  /**
+   * 跨条目切片订阅：**任一条目**的该切片变化时触发（回调带变化的条目键）。
+   * 用于「必须感知任意条目热路径变化、但不该重渲染」的兜底逻辑（如运行态变化后
+   * 冲刷空闲 agent 的排队 prompt）：走 useSyncExternalStore 会把 20Hz 热路径重新
+   * 拉回根渲染，而命令式订阅只跑逻辑。
+   */
+  subscribeSliceChange(slice: SliceName, listener: (key: WorkspaceKey) => void): () => void;
   /** 读取某条目的某切片状态；条目不存在返回 undefined。引用稳定。 */
   getSlice<K extends SliceName>(key: WorkspaceKey, slice: K): SliceStateOf<K> | undefined;
 
@@ -177,6 +196,9 @@ function seedEntryData(kind: EntryKind): EntryData {
     composer: composerSlice.seed(kind),
     thinking: thinkingSlice.seed(kind),
     rpcLog: rpcLogSlice.seed(kind),
+    transcript: transcriptSlice.seed(kind),
+    runtime: runtimeSlice.seed(kind),
+    extensionWidgets: extensionWidgetsSlice.seed(kind),
   } as EntryData;
 }
 
@@ -213,24 +235,36 @@ export function createSessionWorkspaceStore(): SessionWorkspaceStore {
   const listeners = new Set<() => void>();
   /** 切片订阅者：key → slice → listeners（热路径精确唤醒）。 */
   const sliceListeners = new Map<WorkspaceKey, Map<SliceName, Set<() => void>>>();
+  /** 跨条目切片订阅者：slice → listeners（兜底逻辑用，见 subscribeSliceChange）。 */
+  const sliceChangeListeners = new Map<SliceName, Set<(key: WorkspaceKey) => void>>();
 
   function currentSnapshot(): WorkspaceSnapshot {
     // 快照缓存：真实结构变更间引用稳定（不变式 3），subscribe 只在替换后触发
     return (snapshot ??= { revision, entries: entryRefs, focus });
   }
 
-  /** 唤醒该 key 指定切片的订阅者（叶子组件）。 */
+  /** 唤醒该 key 指定切片的订阅者（叶子组件）与跨条目订阅者（兜底逻辑）。 */
   function notifySlices(key: WorkspaceKey, changedSlices: SliceName[] | "all") {
     const byKey = sliceListeners.get(key);
-    if (!byKey) return;
-    if (changedSlices === "all") {
-      for (const set of byKey.values()) for (const listener of [...set]) listener();
-      return;
+    if (byKey) {
+      if (changedSlices === "all") {
+        for (const set of byKey.values()) for (const listener of [...set]) listener();
+      } else {
+        for (const name of changedSlices) {
+          const set = byKey.get(name);
+          if (!set) continue;
+          for (const listener of [...set]) listener();
+        }
+      }
     }
-    for (const name of changedSlices) {
-      const set = byKey.get(name);
+    if (sliceChangeListeners.size === 0) return;
+    // 条目消失（leave）对每个切片都是变化：跨条目订阅者按 "all" 全部唤醒。
+    const names: readonly SliceName[] =
+      changedSlices === "all" ? (Object.keys(workspaceSlices) as SliceName[]) : changedSlices;
+    for (const name of names) {
+      const set = sliceChangeListeners.get(name);
       if (!set) continue;
-      for (const listener of [...set]) listener();
+      for (const listener of [...set]) listener(key);
     }
   }
 
@@ -290,6 +324,23 @@ export function createSessionWorkspaceStore(): SessionWorkspaceStore {
 
     getSlice<K extends SliceName>(key: WorkspaceKey, slice: K): SliceStateOf<K> | undefined {
       return entries.get(key)?.data[slice] as SliceStateOf<K> | undefined;
+    },
+
+    subscribeSliceChange(
+      slice: SliceName,
+      listener: (key: WorkspaceKey) => void,
+    ): () => void {
+      let set = sliceChangeListeners.get(slice);
+      if (!set) {
+        set = new Set();
+        sliceChangeListeners.set(slice, set);
+      }
+      set.add(listener);
+      return () => {
+        const current = sliceChangeListeners.get(slice);
+        current?.delete(listener);
+        if (current && current.size === 0) sliceChangeListeners.delete(slice);
+      };
     },
 
     joinTab(sessionKey: string): boolean {

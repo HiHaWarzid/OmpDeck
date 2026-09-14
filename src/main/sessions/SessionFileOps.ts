@@ -4,10 +4,11 @@ import { mkdir, rename, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import type { FileAdapter } from "../fs/adapters/fileAdapter";
+import { isJsonRecord, readEntries, type ReadEntriesOptions, type SessionEntriesFile } from "./sessionEntries";
 
 /**
  * 会话文件操作模块 —— 从 SessionScanner 中抽出的纯文件操作（rename/delete/
- * readMessages/readSessionMeta/readSessionRawText），与扫描管线解耦。
+ * readMessages/readSessionMeta/readSessionFile），与扫描管线解耦。
  *
  * 设计动机（deep module）：
  *   - SessionScanner 原本把扫描管线（collect→fingerprint→cache）、摘要打分与文件
@@ -15,6 +16,9 @@ import type { FileAdapter } from "../fs/adapters/fileAdapter";
  *     会话根路径，收拢为本模块后职责单一。
  *   - WSL/本地适配器随环境切换（configureWsl 会替换实例），因此通过 getAdapter
  *     访问器每次操作时读取当前适配器，避免持有过期实例。
+ *
+ * 读取半部分（解码/逐行解析/字节预算）委托给 sessionEntries 的单一实现；
+ * 写入半部分（session_info 追加、回收站回退删除、modifyLines 写回）留在本模块。
  *
  * 依赖方向：不依赖 SessionScanner、不依赖 AgentManager/RPC；
  * 可在无 WSL 环境下用 stub 适配器测试。
@@ -184,28 +188,40 @@ export class SessionFileOps {
 
   /** 读取会话消息列表，支持 WSL 路径 */
   async readMessages(filePath: string): Promise<Array<{ role: string; content: string; timestamp: number }>> {
-    const raw = await this.deps.getAdapter().read(filePath);
-    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const file = await this.readSessionFile(filePath);
+    if (file.unreadable) return [];
     const messages: Array<{ role: string; content: string; timestamp: number }> = [];
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        if (entry.type && entry.type !== "message") continue;
-        if (entry.sessionName && !entry.message) continue;
-        const message = (entry.message ?? (entry.data as Record<string, unknown> | undefined)?.message ?? entry) as Record<string, unknown> | undefined;
-        if (!message?.role) continue;
-        const content = extractText(message.content).trim();
-        if (!content) continue;
-        if (message.role !== "user" && message.role !== "assistant") continue;
-        messages.push({ role: String(message.role), content, timestamp: Number(entry.ts ?? entry.timestamp ?? Date.now()) });
-      } catch { console.warn(`[SessionFileOps] 跳过无法解析的 JSONL 行: ${filePath}`); }
+    for (const raw of file.entries) {
+      if (!isJsonRecord(raw)) continue;
+      const entry = raw;
+      if (entry.type && entry.type !== "message") continue;
+      if (entry.sessionName && !entry.message) continue;
+      const nested = isJsonRecord(entry.data) ? entry.data : undefined;
+      const candidate = entry.message ?? nested?.message ?? entry;
+      if (!isJsonRecord(candidate)) continue;
+      const message = candidate;
+      if (!message.role) continue;
+      const content = extractText(message.content).trim();
+      if (!content) continue;
+      if (message.role !== "user" && message.role !== "assistant") continue;
+      messages.push({
+        role: String(message.role),
+        content,
+        timestamp: Number(entry.ts ?? entry.timestamp ?? Date.now()),
+      });
+    }
+    if (file.malformedLines > 0) {
+      console.warn(`[SessionFileOps] 跳过无法解析的 JSONL 行: ${filePath}`);
     }
     return messages;
   }
 
-  /** 统一读取本地/WSL 会话原文，供 Viewer 与 AgentManager 共享转换管线。 */
-  async readSessionRawText(filePath: string): Promise<string> {
-    return this.deps.getAdapter().read(filePath);
+  /**
+   * 统一读取本地/WSL 会话原文（含解码与逐行解析），供 Viewer 与 AgentManager 共享转换管线。
+   * 预算超限时 raw 只含完整行，truncated 标记已截断。
+   */
+  async readSessionFile(filePath: string, options?: ReadEntriesOptions): Promise<SessionEntriesFile> {
+    return readEntries(this.deps.getAdapter(), filePath, options);
   }
 
   /**
@@ -217,21 +233,18 @@ export class SessionFileOps {
     modelId?: string;
     thinkingLevel?: string;
   }> {
-    const raw = await this.readSessionRawText(filePath);
-    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const file = await this.readSessionFile(filePath);
     let provider: string | undefined;
     let modelId: string | undefined;
     let thinkingLevel: string | undefined;
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        if (entry.type === "model_change") {
-          provider = typeof entry.provider === "string" ? entry.provider : provider;
-          modelId = typeof entry.modelId === "string" ? entry.modelId : modelId;
-        } else if (entry.type === "thinking_level_change") {
-          thinkingLevel = typeof entry.thinkingLevel === "string" ? entry.thinkingLevel : thinkingLevel;
-        }
-      } catch { /* skip malformed lines */ }
+    for (const raw of file.entries) {
+      if (!isJsonRecord(raw)) continue;
+      if (raw.type === "model_change") {
+        provider = typeof raw.provider === "string" ? raw.provider : provider;
+        modelId = typeof raw.modelId === "string" ? raw.modelId : modelId;
+      } else if (raw.type === "thinking_level_change") {
+        thinkingLevel = typeof raw.thinkingLevel === "string" ? raw.thinkingLevel : thinkingLevel;
+      }
     }
     return { provider, modelId, thinkingLevel };
   }

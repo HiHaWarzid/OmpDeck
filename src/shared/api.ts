@@ -142,9 +142,16 @@ export interface FilesApi {
 	list: (projectId: string) => Promise<FileTreeNode[]>;
 	open: (path: string) => Promise<void>;
 	showInFolder: (path: string) => Promise<void>;
-	readContent: (path: string) => Promise<string>;
-	/** 读取二进制文件为 data URL（粘贴资源管理器图片文件时用） */
-	readBase64: (path: string) => Promise<string>;
+	/**
+	 * 读取文本文件；超过字节预算（默认取设置 maxEditorFileSizeMB）时只返回头部，
+	 * truncated 标记已截断——调用方必须显式处理，不能当成完整内容展示。
+	 */
+	readContent: (path: string, maxBytes?: number) => Promise<{ content: string; truncated: boolean }>;
+	/**
+	 * 读取二进制文件为 data URL（粘贴资源管理器图片文件时用）。
+	 * 与 readContent 同预算同语义：truncated 为真时 content 是残片，不可直接当图片使用。
+	 */
+	readBase64: (path: string, maxBytes?: number) => Promise<{ content: string; truncated: boolean }>;
 	writeContent: (path: string, content: string) => Promise<void>;
 	delete: (path: string, recursive?: boolean) => Promise<void>;
 	rename: (path: string, newName: string) => Promise<string>;
@@ -178,7 +185,11 @@ export interface SessionsApi {
 	readMessages: (filePath: string) => Promise<Array<{ role: string; content: string; timestamp: number }>>;
 	readUserPrompts: (filePath: string, maxCount?: number) => Promise<string[]>;
 	readSessionMeta: (filePath: string) => Promise<{ provider?: string; modelId?: string; thinkingLevel?: string }>;
-	readChatMessages: (filePath: string) => Promise<ChatMessage[]>;
+	/**
+	 * 完整消息（查看器加载会话）；超过字节预算（默认 5MB，与 AgentManager 的
+	 * 自动加载上限同量级）时只解析头部，truncated 标记会话未被完整读取。
+	 */
+	readChatMessages: (filePath: string, maxBytes?: number) => Promise<{ messages: ChatMessage[]; truncated: boolean }>;
 	readMessageFullText: (agentId: string, messageId: string, entryId?: string) => Promise<{ text: string }>;
 }
 
@@ -600,8 +611,11 @@ export interface ScratchPadApi {
 export interface AfkApi {
 	/** 快照：运行态 + 历史归档 */
 	status: () => Promise<AfkState>;
-	/** 终止单任务：停止 agent、failed 收口（保留 WIP worktree）、回写 needs-info（面板「终止」按钮） */
-	terminate: (taskId: number) => Promise<void>;
+	/**
+	 * 终止单任务：停止 agent、failed 收口（保留 WIP worktree）、回写 needs-info（面板「终止」按钮）。
+	 * 身份为 (projectId, ticketRef)：两个仓库各有 #42 时编号不唯一，必须带项目 id 才不会杀错任务。
+	 */
+	terminate: (projectId: string, ticketRef: number) => Promise<void>;
 	/** 语义事件订阅：任务状态变更（AfkTask；含终态与 PR 完成推送） */
 	onStatusChanged: (callback: (task: AfkTask) => void) => () => void;
 }

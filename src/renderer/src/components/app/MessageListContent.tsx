@@ -11,15 +11,10 @@ import {
 	type MessageStreamState,
 } from "./streamStateSelector";
 import { useWorkspaceSlice } from "../../workspace/hooks";
-import {
-	AskQuestionCard,
-	CompactionCard,
-	DiagnosticMessageCard,
-	RespondingIndicator,
-	ThinkingBlock,
-	TurnRow,
-	UserBubble,
-} from "./AppParts";
+import { AskQuestionCard } from "./tools/AskQuestionCard";
+import { CompactionCard, DiagnosticMessageCard } from "./tools/DiagnosticCards";
+import { RespondingIndicator, ThinkingBlock } from "./timeline/ThinkingBlock";
+import { TurnRow, UserBubble } from "./timeline/TurnRow";
 
 export type { MessageStreamState } from "./streamStateSelector";
 

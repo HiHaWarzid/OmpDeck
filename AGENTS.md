@@ -18,6 +18,10 @@ src/
 │   ├── skills/        # SkillManager
 │   ├── extensions/    # ExtensionManager
 │   ├── settings/      # SettingsStore + DesktopProxy
+│   ├── storage/       # JsonFileStore（配置文件原子写 + 按路径串行 + 指纹缓存）
+│   ├── afk/           # AFK 编排器（GitHub 工单 → worktree → agent → PR）
+│   ├── update/        # 更新检查与安装包下载（UpdateArtifact）
+│   ├── editors/       # 外部编辑器探测（EditorProbe）
 │   ├── terminal/      # 终端会话管理
 │   ├── pet/           # 桌面宠物
 │   ├── feishu/        # 飞书集成
@@ -27,11 +31,12 @@ src/
 │   └── src/
 │       ├── components/
 │       │   ├── ui/        # ★ 共享 UI 组件（Button/IconButton/SelectField/TextField/Modal）
-│       │   ├── app/       # 业务组件（AppParts/GitPanel/BrowserPanel/FileDiffViewer 等）
+│       │   ├── app/       # 业务组件（按职责分目录：sidebar/ timeline/ composer/ drawers/ menus/ modals/ brand/ tools/ widgets/，加上 GitPanel/BrowserPanel/FileDiffViewer 等）
 │       │   ├── terminal/  # 终端 Dock
 │       │   ├── scratchPad/# 草稿本
 │       │   └── feishu/     # 飞书相关
 │       ├── config/        # 配置弹窗各 tab（Models/Auth/Settings/Skills/Prompts/Extensions）
+│       ├── workspace/     # 会话工作区 store（切片：transcript/runtime/composer/thinking/rpcLog/widgets）
 │       ├── assets/        # 字体、编辑器图标、git-logo
 │       ├── utils/         # monacoSetup、openExternal、notice、agentRuntimeState 等
 │       ├── i18n.ts        # 所有可见文案
@@ -45,6 +50,21 @@ src/
 - 注释应说明为什么这样做、对应的业务规则或边界条件，不要逐行解释显而易见的代码。
 - UI 调整应尽量保持现有桌面三栏布局和微信式交互风格，避免引入无关重构。
 - 修改后应根据影响范围运行必要验证，例如 `npm run typecheck`。
+
+## 主进程 ⇄ 渲染进程契约（IPC）
+
+> **核心规则：invoke 通道的失败以「返回值」过界，不要依赖 Electron 的异常包装。**
+
+- 通道表 `src/shared/ipc.ts` 是唯一事实源；新增/修改通道只改这一处，不要写裸通道字符串。
+- invoke 失败形状由 `src/shared/ipcEnvelope.ts` 定义：
+  - 成功 → `{ ok: true, value }`（`value` 即 handler 原始返回值，形状不变）
+  - 失败 → `{ ok: false, kind, message }`；`kind ∈ timeout | not-found | command | unknown`，
+    由命令层 `CommandRunner` 的 `CommandError.kind` 映射而来，`message` 是不含包装的干净信息。
+- 包装收口在 `src/main/ipc/registerIpc.ts`：**每个** invoke handler 都经同一层，
+  handler 里照旧 `throw`，不需要自己拼 envelope；preload（`buildApi`）负责解包并抛出 `IpcInvokeError`。
+- 渲染层**只依赖干净 message**：`contextBridge` 仅复制 `Error` 的 message/stack，自有属性 `kind`
+  在生产环境读不到（vitest 环回可读）。因此需要按失败分类分支的逻辑放在主进程侧。
+- 不要再用正则反解 `Error invoking remote method '...'`——该包装已不可能出现。
 
 ## 共享 UI 组件（必须使用）
 
@@ -96,13 +116,13 @@ src/
 
 项目 Logo 是一个**特定的 SVG 路径**，不是通用图标，不要用 lucide 的图标替代。
 
-- **品牌 Logo（应用图标/启动画面/Agent 头像）**：使用 `LogoMark` 组件（`AppParts.tsx`），它内嵌 PiDeck 标志的 SVG path。
+- **品牌 Logo（应用图标/启动画面/Agent 头像）**：使用 `LogoMark` 组件（`components/app/brand/Brand.tsx`），它内嵌 PiDeck 标志的 SVG path。
   ```tsx
   <LogoMark />  // 22x22 品牌标志
   ```
-- **Agent 头像**：使用 `AgentAvatar` 组件（`AppParts.tsx`），内嵌相同的 SVG path + 状态 class。
+- **Agent 头像**：使用 `AgentAvatar` 组件（`components/app/brand/Brand.tsx`），内嵌相同的 SVG path + 状态 class。
 - **启动画面 Logo**：见 `index.html` 中的 `#boot-logo`，SVG path 与 `LogoMark` 保持一致。
-- **项目头像**：使用 `ProjectAvatar` 组件（`AppParts.tsx`），区分 chat / project 两种 kind。
+- **项目头像**：使用 `ProjectAvatar` 组件（`components/app/brand/Brand.tsx`），区分 chat / project 两种 kind。
 - **编辑器 Logo**：使用 `src/renderer/src/assets/editors/` 下的对应图片，通过 `new URL("./assets/editors/vscode.png", import.meta.url).href` 引用，配合 `editor-logo` class。
 - **Git Logo**：`src/renderer/src/assets/git-logo.svg`。
 

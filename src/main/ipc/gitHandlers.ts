@@ -255,31 +255,13 @@ export function registerGitHandlers(deps: GitHandlerDeps): GitHandlerMaps {
 				await gitService.fetch(resolveProject(projectId).path);
 			},
 
+			/**
+			 * 初始化仓库（init / checkout -b main / 初始空提交）全部收在 GitService.initRepo：
+			 * 变更命令进按仓库串行队列，并复用 CommandRunner 的 30s 超时 + 32MB 缓冲与非交互 git 环境
+			 * （此前 handler 内动态 import node:child_process 裸调 execFileAsync，无超时且整体替换 env）。
+			 */
 			init: async (_event, projectId: string) => {
-				const project = resolveProject(projectId);
-				const { execFile } = await import("node:child_process");
-				const { promisify } = await import("node:util");
-				const execFileAsync = promisify(execFile);
-				// 初始化仓库并创建 main 分支，生成一个初始空提交
-				await execFileAsync("git", ["init"], { cwd: project.path });
-				// 此前非 git 仓库的失败状态可能还在冷却缓存内，init 后必须失效，否则抽屉仍提示"非 git 项目"。
-				gitService.invalidateStatusCache(project.path);
-				try {
-					await execFileAsync("git", ["checkout", "-b", "main"], { cwd: project.path });
-				} catch {
-					// 部分 git 版本在无提交时 checkout -b 可能失败，改用 branch -M
-					await execFileAsync("git", ["branch", "-M", "main"], { cwd: project.path });
-				}
-				await execFileAsync("git", ["commit", "--allow-empty", "-m", "Initial commit"], {
-					cwd: project.path,
-					env: {
-						...process.env,
-						GIT_AUTHOR_NAME: "OmpDeck",
-						GIT_AUTHOR_EMAIL: "ompdeck@local",
-						GIT_COMMITTER_NAME: "OmpDeck",
-						GIT_COMMITTER_EMAIL: "ompdeck@local",
-					},
-				});
+				await gitService.initRepo(resolveProject(projectId).path);
 			},
 		},
 	};

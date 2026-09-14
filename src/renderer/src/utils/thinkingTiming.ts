@@ -21,7 +21,7 @@ type ThinkingTimingMessage = Partial<
 >;
 
 /**
- * 计算一段思考的显示时机，收敛 TurnRow 两条分支（AppParts.tsx 已完成/流式）
+ * 计算一段思考的显示时机，收敛 TurnRow 两条分支（timeline/TurnRow.tsx 已完成/流式）
  * 与 AppUtils 分组的重复推导。
  *
  * startedAt 优先级（与 TurnRow 双来源修复 2046f757 一致）：

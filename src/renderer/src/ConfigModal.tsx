@@ -465,14 +465,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 		showNotice(msg, 2500);
 	};
 
-	/** 去掉 Electron IPC 包装前缀，只保留真正业务错误，方便 toast 阅读。 */
-	const formatIpcError = (error: unknown): string => {
-		const raw = error instanceof Error ? error.message : String(error);
-		const matched = raw.match(
-			/Error invoking remote method '[^']+':\s*(?:Error:\s*)?([\s\S]+)$/i,
-		);
-		return (matched?.[1] ?? raw).trim();
-	};
+	/** invoke 失败经失败契约解包后 message 已是干净业务错误（不再有 Electron 的包装前缀），可直接展示。 */
+	const formatIpcError = (error: unknown): string =>
+		(error instanceof Error ? error.message : String(error)).trim();
 
 	/**
 	 * 模型配置保存后，通知所有运行中的 Agent 尝试刷新模型配置。
@@ -1334,7 +1329,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 		setEditGlobalLoading(true);
 		setError(null);
 		try {
-			const content = await window.piDesktop.files.readContent(skill.path);
+			const { content, truncated } = await window.piDesktop.files.readContent(skill.path);
+			if (truncated) showNotice(t("editor.truncatedNotice"), 4000, "warning");
 			setEditGlobalContent(content);
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err));

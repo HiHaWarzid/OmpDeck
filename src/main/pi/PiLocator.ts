@@ -9,6 +9,14 @@ type PiProxySettings = Pick<
   "piProxyEnabled" | "piProxyUrl" | "piProxyBypass"
 >;
 
+/**
+ * getSearchDirs 缓存的保鲜期。
+ * 共享 PiLocator 实例（IPC「重新检测」、--list-models、扩展更新、快速生成）会随进程长期存活，
+ * 纯指纹缓存会让进程启动后才装好的 node/nvm 目录在本进程内永远发现不了；
+ * 短 TTL 既保证一次 agent 启动内的两次连续调用必然命中，又让人工重试（间隔通常远超此值）拿到最新盘面。
+ */
+const SEARCH_DIRS_TTL_MS = 5_000;
+
 export type PiCommandInvocation = {
   command: string;
   args: string[];
@@ -37,6 +45,43 @@ export class PiLocator {
   constructor(readonly binaryName = "omp") {}
 
   /**
+   * getSearchDirs 结果缓存，键为影响结果的输入指纹（见 searchDirsInputFingerprint）。
+   * 目录列表只由平台/home/env 决定，短时间内重复探测没有意义。
+   */
+  private searchDirsCache: { fingerprint: string; at: number; dirs: string[] } | null = null;
+
+  /**
+   * getCommandBinDir 结果缓存：一次 agent 启动里 createInvocation 会为业务命令与
+   * --version 各调一次，command 相同却要重复两次 existsSync。
+   */
+  private commandBinDirCache: { command: string; binDir: string | undefined } | null = null;
+
+  /**
+   * getSearchDirs 的输入指纹：只列真正决定目录列表的事实。
+   * - platform：决定 darwin/linux 专属目录分支；
+   * - home / APPDATA / LOCALAPPDATA：决定各包管理器目录的绝对路径；
+   * - PATH / Path：pathDirs 直接把它拆成候选目录；
+   * - HOME / USERPROFILE / SHELL / USER / LOGNAME：登录 shell 探测（/bin/sh -lc）依赖它们，
+   *   探测结果会并入 pathDirs，环境变了必须重探。
+   * 刻意不含自定义 pi 路径：它只决定 resolveCommand 是否提前返回，
+   * 不影响目录列表本身，放进来只会让同一份列表被反复重算。
+   */
+  private searchDirsInputFingerprint(home: string) {
+    return [
+      process.platform,
+      home,
+      process.env.PATH ?? process.env.Path ?? "",
+      process.env.APPDATA ?? "",
+      process.env.LOCALAPPDATA ?? "",
+      process.env.HOME ?? "",
+      process.env.USERPROFILE ?? "",
+      process.env.SHELL ?? "",
+      process.env.USER ?? "",
+      process.env.LOGNAME ?? "",
+    ].join("\u0000");
+  }
+
+  /**
    * Resolves the pi CLI across packaged Electron environments where shell PATH is often incomplete.
    * When `customPath` is provided, it takes priority over auto-detection —
    * this is the user's manually specified path from settings.
@@ -62,6 +107,14 @@ export class PiLocator {
 
   getSearchDirs() {
     const home = app.getPath("home");
+    const fingerprint = this.searchDirsInputFingerprint(home);
+    const now = Date.now();
+    // 开一个 agent 会走 resolveCommand（→getCandidates）与 createProcessEnv 各一次，
+    // 输入没变时直接复用上次结果：否则每次都要同步 fork 登录 shell 并 readdir 扫描 node 安装目录。
+    const cached = this.searchDirsCache;
+    if (cached && cached.fingerprint === fingerprint && now - cached.at < SEARCH_DIRS_TTL_MS) {
+      return cached.dirs;
+    }
     const appData = process.env.APPDATA ?? join(home, "AppData", "Roaming");
     const localAppData = process.env.LOCALAPPDATA ?? join(home, "AppData", "Local");
     const dirs = [
@@ -99,7 +152,9 @@ export class PiLocator {
     ];
 
     // These directories only locate an existing pi installation; pi itself is not bundled yet.
-    return [...new Set(dirs.filter(Boolean))];
+    const resolved = [...new Set(dirs.filter(Boolean))];
+    this.searchDirsCache = { fingerprint, at: now, dirs: resolved };
+    return resolved;
   }
 
   createProcessEnv(settings?: PiProxySettings, pathPrefix?: string, wsl?: PiCommandInvocation["wsl"]) {
@@ -489,13 +544,19 @@ export class PiLocator {
   }
 
   private getCommandBinDir(command: string) {
-    if (!/[\\/]/.test(command) || !existsSync(command)) return undefined;
-    const binDir = dirname(command);
-    // npm/nvm/asdf/mise shims resolve Node through env/PATH. Prepending the shim's own
-    // bin directory keeps that lookup on the Node version that installed pi, instead
-    // of a different Node inherited from Finder/Explorer/Electron.
-    const nodeName = process.platform === "win32" ? "node.exe" : "node";
-    return existsSync(join(binDir, nodeName)) ? binDir : undefined;
+    // 同一 command 的结果在一次启动内被问两次（业务命令 + --version），磁盘事实相同 → 复用。
+    if (this.commandBinDirCache?.command === command) return this.commandBinDirCache.binDir;
+    let binDir: string | undefined;
+    if (/[\\/]/.test(command) && existsSync(command)) {
+      const dir = dirname(command);
+      // npm/nvm/asdf/mise shims resolve Node through env/PATH. Prepending the shim's own
+      // bin directory keeps that lookup on the Node version that installed pi, instead
+      // of a different Node inherited from Finder/Explorer/Electron.
+      const nodeName = process.platform === "win32" ? "node.exe" : "node";
+      if (existsSync(join(dir, nodeName))) binDir = dir;
+    }
+    this.commandBinDirCache = { command, binDir };
+    return binDir;
   }
 
   private getCandidates() {

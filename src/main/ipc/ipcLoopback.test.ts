@@ -147,7 +147,9 @@ vi.mock("@electron-toolkit/utils", () => ({
 
 import type { BrowserWindow } from "electron";
 import { ipcChannels } from "../../shared/ipc";
+import { IpcInvokeError } from "../../shared/ipcEnvelope";
 import { buildApi } from "../../preload/buildApi";
+import { CommandError } from "../utils/CommandRunner";
 import { registerIpcHandlers } from "./registerIpc";
 import { registerAppHandlers, registerPreloadHandshakeHandlers } from "./appHandlers";
 import { registerGitHandlers } from "./gitHandlers";
@@ -171,11 +173,23 @@ const appLogger = {
 // （不 load，磁盘读不到 → 回落默认值；update 的 150ms 防抖写盘在测试内用 fake timers 掐掉）
 const settingsStore = new SettingsStore();
 
-// git.branches 的 service 假件：projectStore.get 返回假项目，gitService.getBranches 返回假分支
-const getBranches = vi.fn(async (_projectPath: string) => ["main", "dev"]);
+// git.branches 的 service 假件：projectStore.get 返回假项目，gitService.getBranches 返回假分支；
+// repo-timeout 项目让 service 抛命令层的 CommandError，用来验证命令分类能跨边界（handler →
+// 注册循环的失败契约 → buildApi 解包）而不被丢弃。
+const TIMEOUT_PROJECT_PATH = "C:/fake/repo-timeout";
+const TIMEOUT_MESSAGE = "git branches timed out after 30000ms: ";
+const getBranches = vi.fn(async (projectPath: string) => {
+	if (projectPath === TIMEOUT_PROJECT_PATH) throw new CommandError("timeout", TIMEOUT_MESSAGE);
+	return ["main", "dev"];
+});
 const projectStoreFake = {
-	get: (projectId: string) =>
-		projectId === "repo1" ? { id: "repo1", path: "C:/fake/repo", kind: "git" } : undefined,
+	get: (projectId: string) => {
+		if (projectId === "repo1") return { id: "repo1", path: "C:/fake/repo", kind: "git" };
+		if (projectId === "repo-timeout") {
+			return { id: "repo-timeout", path: TIMEOUT_PROJECT_PATH, kind: "git" };
+		}
+		return undefined;
+	},
 } as never;
 
 const getMainWindow = (): BrowserWindow | null => loopback.createWindow() as unknown as BrowserWindow;
@@ -228,9 +242,23 @@ describe("IPC 环回冒烟：真实 handler 结果到达渲染层 api", () => {
 		expect(getBranches).toHaveBeenCalledWith("C:/fake/repo");
 	});
 
-	test("handler 抛错 → 以 rejected promise 传播错误消息（error-shape 契约）", async () => {
+	test("handler 抛普通错误 → 解包出的 IpcInvokeError：kind=unknown、message 干净（无 Electron 包装）", async () => {
 		// git.branches 对未知项目走真实 handler 抛错路径（Project not found）
-		await expect(api.git.branches("missing-project")).rejects.toThrow("Project not found: missing-project");
+		const error = await api.git.branches("missing-project").catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(IpcInvokeError);
+		// 具名收窄（规则禁止内联断言访问成员）
+		const ipcError = error as IpcInvokeError;
+		expect(ipcError.kind).toBe("unknown");
+		// 干净信息：没有 "Error invoking remote method '<channel>': Error: " 前缀
+		expect(ipcError.message).toBe("Project not found: missing-project");
+	});
+
+	test("handler 抛 CommandError(timeout) → 命令层的 kind 跨边界保持 timeout", async () => {
+		const error = await api.git.branches("repo-timeout").catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(IpcInvokeError);
+		const ipcError = error as IpcInvokeError;
+		expect(ipcError.kind).toBe("timeout");
+		expect(ipcError.message).toBe(TIMEOUT_MESSAGE);
 	});
 
 	test("settings.onApplyWindow（subscribe 推送）→ settings.update 触发 webContents.send，payload 到达回调", async () => {

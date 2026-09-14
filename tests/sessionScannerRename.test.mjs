@@ -69,7 +69,13 @@ function loadSessionScanner(homePath) {
 	const wslFileAdapter = loadTranspiledModule("src/main/fs/adapters/wslFileAdapter.ts");
 	const subagentParentInference = loadTranspiledModule("src/main/sessions/subagentParentInference.ts");
 	// W4：文件操作拆分到 SessionFileOps（rename/copy/delete/read 族），SessionScanner 委托给注入实例。
-	const sessionFileOps = loadTranspiledModule("src/main/sessions/SessionFileOps.ts");
+	// 读取半部分（解码/逐行解析/字节预算）收敛到 sessionEntries，两个模块都依赖它：
+	// vm 沙箱不解析 .ts 扩展引入，需显式注入同一份加载结果。
+	const sessionEntries = loadTranspiledModule("src/main/sessions/sessionEntries.ts");
+	const sessionFileOps = loadTranspiledModule(
+		"src/main/sessions/SessionFileOps.ts",
+		new Map([["./sessionEntries", sessionEntries]]),
+	);
 	const sandbox = {
 		AbortController,
 		AbortSignal,
@@ -94,6 +100,7 @@ function loadSessionScanner(homePath) {
 			if (id === "../fs/adapters/wslFileAdapter") return wslFileAdapter;
 			if (id === "./subagentParentInference") return subagentParentInference;
 			if (id === "./SessionFileOps") return sessionFileOps;
+			if (id === "./sessionEntries") return sessionEntries;
 			return require(id);
 		},
 	};

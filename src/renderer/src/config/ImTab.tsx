@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { X } from "lucide-react";
-import { ConfirmDialog } from "../components/app/AppParts";
+import { ConfirmDialog } from "../components/app/menus/ContextMenus";
 import { writeClipboard } from "../utils/clipboard";
 import type {
 	FeishuBotConfig,

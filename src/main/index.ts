@@ -17,6 +17,7 @@ import {
 	isUsingLinuxXWaylandWorkaround,
 } from "./linuxDisplayBackend";
 import {
+	readDesktopSettingsSync,
 	readElectronChromiumSandboxPreference,
 	readPetEnabledPreference,
 	readSingleInstancePreference,
@@ -72,17 +73,22 @@ if (!app.isPackaged) {
 	}
 }
 
+// 三个 pre-ready 偏好（宠物、Chromium 沙箱、单实例）都取自同一份 settings.json：
+// 先同步读一次快照，再传给三个判定，省掉两次重复的 readFileSync + JSON.parse。
+// 快照必须在此处读取——即 dev userData 覆盖（见上）之后、app.ready 之前，
+// 否则 dev 模式会误读正式版的偏好。
+const desktopSettingsAtLaunch = readDesktopSettingsSync();
+
 // Linux XWayland 兼容层：仅当桌面宠物启用时才强制 ozone-platform=x11（#108，
 // 强制 XWayland 在部分 GNOME/Wayland 环境会导致主窗口不可见）。
 // ozone 平台一经启动不可更改，整个生命周期统一使用启动时快照。
-// 注意必须放在 dev userData 覆盖之后，否则 dev 模式会误读正式版的 petEnabled。
-const petEnabledAtLaunch = readPetEnabledPreference();
+const petEnabledAtLaunch = readPetEnabledPreference(desktopSettingsAtLaunch);
 applyLinuxDisplayBackendWorkaround(petEnabledAtLaunch);
 
 // Chromium 沙箱开关必须在 app.ready 前生效。
 // 默认关闭：Windows 上部分安全软件/旧 GPU 驱动会在沙箱初始化时触发原生断点（0x80000003）。
 // 用户可在「开发设置」中开启 electronChromiumSandbox，重启后走 Chromium 默认沙箱。
-const electronChromiumSandboxEnabled = readElectronChromiumSandboxPreference();
+const electronChromiumSandboxEnabled = readElectronChromiumSandboxPreference(desktopSettingsAtLaunch);
 if (!electronChromiumSandboxEnabled) {
 	// 关闭沙箱时显式附带 no-sandbox，避免部分环境仍按默认策略启用。
 	app.commandLine.appendSwitch("no-sandbox");
@@ -92,7 +98,7 @@ if (!electronChromiumSandboxEnabled) {
 // 不用 Electron requestSingleInstanceLock：它按 userData 全局互斥，会导致 0.6.7 与 0.6.8 无法同开。
 // focus 回调稍后挂到 focusMainWindow（定义在文件后部），避免顶层 TDZ。
 let focusExistingWindow: (() => void) | null = null;
-const singleInstanceEnabled = readSingleInstancePreference();
+const singleInstanceEnabled = readSingleInstancePreference(desktopSettingsAtLaunch);
 const versionSingleInstance = acquireVersionSingleInstance(
 	singleInstanceEnabled,
 	app.getVersion(),

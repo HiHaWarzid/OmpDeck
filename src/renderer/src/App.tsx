@@ -74,7 +74,7 @@ import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
-import { ComposerStatusChips } from "./components/app/AppParts";
+import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
 import {
   buildComposerPromptSubmission,
   decideComposerSubmit,
@@ -87,12 +87,8 @@ import {
 } from "./composerBehavior";
 import {
   getAgentForSessionPath,
-  getProjectAgentSessionDisplay,
   isSameSessionPath,
-  isSidebarSessionRowActive,
-  normalizeSessionPathForCompare,
   type PendingAgentTab,
-  type ProjectAgentSessionDisplay,
 } from "./agentListDisplay";
 import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
 import {
@@ -103,8 +99,6 @@ import {
   isAgentIdle,
   isAgentStarting,
   isAgentStreaming,
-  mergeAgentRuntimeState,
-  resolveIncomingRuntimeState,
 } from "./utils/agentRuntimeState";
 import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
@@ -116,8 +110,6 @@ import {
   QUEUED_PROMPT_VISIBLE,
   type QueuedPromptSnapshot,
 } from "./utils/queuedPromptQueue";
-import { resolveIncomingMessagesDelta, resolveFullPullResult } from "./utils/messageDeltaResolver";
-import { createSingleFlight } from "./utils/singleFlight";
 import { usePersistedState } from "./hooks/usePersistedState";
 import {
   TERMINAL_HEIGHT_STORAGE_KEY,
@@ -135,51 +127,63 @@ import { useSessionImport } from "./hooks/useSessionImport";
 import { reconcileAgentState } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
+import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState } from "./workspace/agentRuntime";
+import { dispatchToAgent } from "./workspace/dispatch";
+import { createTranscriptRuntime, reconcileTranscriptEntries, type TranscriptRuntime } from "./workspace/transcriptRuntime";
 import { composerActions } from "./workspace/slices/composerSlice";
+import { extensionWidgetActions } from "./workspace/slices/extensionWidgetsSlice";
 import { rpcLogActions } from "./workspace/slices/rpcLogSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
-import type { WorkspaceAction } from "./workspace/sessionWorkspace";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
 import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
-  ConversationOutline,
-  FilesDrawer,
-  SessionsDrawer,
-  EmptyState,
-  EnvironmentDialog,
-  FileContextMenu,
   ConfirmDialog,
-  ImagePreviewModal,
-  BrandLockup,
+  FileContextMenu,
+  ProjectContextMenu,
+  SessionContextMenu,
+} from "./components/app/menus/ContextMenus";
+import { ConversationOutline } from "./components/app/drawers/ConversationOutline";
+import { FilesDrawer } from "./components/app/drawers/FilesDrawer";
+import { SessionsDrawer } from "./components/app/drawers/SessionsDrawer";
+import {
   AgentStatusIndicator,
+  BrandLockup,
+  EmptyState,
+  ProjectAvatar,
+} from "./components/app/brand/Brand";
+import { EnvironmentDialog } from "./components/app/modals/EnvironmentDialog";
+import { ImagePreviewModal } from "./components/app/timeline/TurnRow";
+import {
+  ComposerModePicker,
   ModelPicker,
   PromptTemplatePicker,
-  ProjectAvatar,
-  ProjectContextMenu,
-  PromptSuggestions,
-  SessionContextMenu,
-  SessionManagerModal,
-  SessionStatus,
-
-  ComposerModePicker,
   ThinkingPicker,
-  BatchAskInlineBar,
-  ExtensionWidgetCard,
+} from "./components/app/composer/ComposerPickers";
+import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
+import { SessionManagerModal } from "./components/app/modals/SessionManagerModal";
+import { SessionStatus } from "./components/app/composer/ComposerToolbar";
+import { BatchAskInlineBar } from "./components/app/tools/AskQuestionCard";
+import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
+import {
   MERGED_TASK_WIDGET_KEY,
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
-  MultiSelectModal,
-  WorktreeCreateDialog,
-  stripMarkdown,
-  type DrawerPanel,
-  type SessionModifiedFile,
-  type WidgetLine,
-} from "./components/app/AppParts";
+} from "./components/app/widgets/widgetKeys";
+import { MultiSelectModal } from "./components/app/modals/MultiSelectModal";
+import { WorktreeCreateDialog } from "./components/app/modals/WorktreeCreateDialog";
+import { stripMarkdown } from "./components/app/format";
+import type { DrawerPanel, SessionModifiedFile, WidgetLine } from "./components/app/types";
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
 import { MessageListContent } from "./components/app/MessageListContent";
+import { SidebarTree } from "./components/app/sidebar/SidebarTree";
+import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
+import {
+  buildSidebarProjectDisplay,
+  SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
+} from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
 import { buildStreamState } from "./components/app/streamStateSelector";
 import {
@@ -197,7 +201,6 @@ import {
   getToolNewContent,
   getToolChangedLineCount,
   countTextLines,
-  formatTime,
   type MessageItem,
 } from "./components/app/AppUtils";
 import {
@@ -314,43 +317,12 @@ const COMPOSER_DEFAULT_TERMINAL_HEIGHT = 220;
 const COMPOSER_MIN_TIMELINE_HEIGHT = 160;
 const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
-const SIDEBAR_PROJECT_CHILD_PAGE_SIZE = 5;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
-// 共享空数组：侧栏按 projectId 查 agents 时作为默认值，避免每次 .get() miss 都新建 []。
-const EMPTY_AGENTS: AgentTab[] = Object.freeze([]) as unknown as AgentTab[];
-// 侧栏派生表查不到项目时的兜底空值（正常情况下 memo 覆盖全部 filteredProjects）。
-const EMPTY_SESSIONS: SessionSummary[] = Object.freeze([]) as unknown as SessionSummary[];
-const EMPTY_PROJECT_DISPLAY: ProjectAgentSessionDisplay = Object.freeze({
-  children: [],
-  visibleChildren: [],
-  hiddenChildCount: 0,
-  piSubagentsByParent: new Map(),
-});
+// 共享空数组：无焦点 agent / 条目尚未 join 时的消息默认值。必须是稳定引用——
+// useMessagePagination 与 renderedRuns 的记忆化依赖 messages 的引用相等，
+// 每次渲染新建 [] 会让这些派生全部失效；冻结防止任何路径写坏这份共享默认值。
+const EMPTY_MESSAGES: ChatMessage[] = Object.freeze([]) as unknown as ChatMessage[];
 
-
-
-
-function displayProjectDirectoryName(project: Project) {
-  if (isChatProject(project)) return "Chat";
-  const normalizedPath = project.path.replace(/\\/g, "/").replace(/\/+$/, "");
-  return normalizedPath.split("/").pop() || project.name || project.path;
-}
-
-function isChatProject(project?: Project) {
-  return project?.kind === "chat";
-}
-
-function formatCodexSubagentName(session: SessionSummary) {
-  const label = [session.codexAgentNickname, session.codexAgentRole]
-    .filter(Boolean)
-    .join(" · ");
-  return label || session.name || t("app.codexSubagent");
-}
-
-/** pi 原生子会话名称：优先使用会话名，回退到 "子会话" */
-function formatPiSubagentName(session: SessionSummary) {
-  return session.name || t("app.piSubagent");
-}
 
 function isAbsoluteFilePath(path: string) {
   return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/");
@@ -570,16 +542,16 @@ export function App() {
   // RPC effect / createAgent 等通过 setters/refs 更新，行为与原内联声明一致。
   const {
     agents, pendingAgents, activeAgentId, activeAgentByProject,
-    messagesByAgent, runtimeStateByAgent, sessions, sessionsByProject,
+    sessions, sessionsByProject,
     sessionLoadingByProject, sessionErrorByProject,
     setAgents, setActiveAgentId, setActiveAgentByProject,
     setSessions, setSessionsByProject, setSessionLoadingByProject,
-    agentsRef, activeAgentIdRef, messagesByAgentRef, pendingAgentsRef, runtimeStateByAgentRef,
+    agentsRef, activeAgentIdRef, pendingAgentsRef,
     displayAgentsRef,
-    displayAgents, activeAgent, activeMessages,
-    applyAgentRuntimeState, refreshRuntimeState, cycleModel, cycleThinking,
+    displayAgents, activeAgent,
+    refreshRuntimeState, cycleModel, cycleThinking,
     editMessage, refreshSessions, refreshProjectSessions,
-    updatePendingAgents, setAgentMessages, migrateAgentMessages,
+    updatePendingAgents,
   } = useAgentSessions({
     api,
     activeProjectId,
@@ -609,13 +581,20 @@ export function App() {
   const activeWorkspaceComposer = useWorkspaceSlice(activeAgentId, "composer");
   const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
   const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
-  /** 对活体 tab 条目 dispatch；条目缺失时先 join 自愈，避免成员同步的时序窗口。 */
-  const dispatchWorkspaceToAgent = (agentId: string, action: WorkspaceAction) => {
-    if (!sessionWorkspaceStore.has(agentId)) sessionWorkspaceStore.joinTab(agentId);
-    sessionWorkspaceStore.dispatchTo(agentId, action);
-  };
+  // 当前会话的消息与运行态：根只订阅「当前 agent」这两条切片。
+  // 迁出根 state 的意义在后台 agent——原来 messagesByAgent / runtimeStateByAgent 是
+  // 整张 record 落在根 state 上，任何 agent 的 50ms 消息增量、≤150ms 工具循环都
+  // 唤醒整个 App（9k 行组件体 + 内联侧栏）。现在后台条目的变化只唤醒订阅它的叶子。
+  // 当前会话仍会重渲染根：分页窗口（useMessagePagination）、renderedRuns、流式
+  // 滚动等派生链都在根上，本批次不动这条链（行为与迁移前一致）。
+  const activeTranscript = useWorkspaceSlice(activeAgentId, "transcript");
+  const activeMessages = activeTranscript?.messages ?? EMPTY_MESSAGES;
+  const agentRuntimeState = useWorkspaceSlice(activeAgentId, "runtime");
+  // Extension widget（批次 5d）：按 agent 隔离的 setWidget 内容。键 = 条目键，
+  // agent 离场即随条目 dispose；后台 agent 推 widget 只唤醒它自己的订阅者。
+  const activeExtensionWidgets = useWorkspaceSlice(activeAgentId, "extensionWidgets");
   const setComposerAgentModeForAgent = (agentId: string, mode: ComposerAgentMode) => {
-    dispatchWorkspaceToAgent(agentId, composerActions.setMode(mode));
+    dispatchToAgent(agentId, composerActions.setMode(mode));
   };
   const setCurrentComposerAgentMode = (mode: ComposerAgentMode) => {
     const targetAgentId = activeAgentIdRef.current;
@@ -624,11 +603,11 @@ export function App() {
   };
   /** busyDraft 释放：等价原「存在才删除」——reducer 对已 false 空转，不触发通知。 */
   const clearBusyDraftForAgent = (agentId: string) => {
-    dispatchWorkspaceToAgent(agentId, composerActions.setBusyDraft(false));
+    dispatchToAgent(agentId, composerActions.setBusyDraft(false));
   };
   /** busyDraft 置位：内容非空且 agent 忙碌时锁定分段发送控件（已 true 则空转）。 */
   const latchBusyDraftForAgent = (agentId: string) => {
-    dispatchWorkspaceToAgent(agentId, composerActions.setBusyDraft(true));
+    dispatchToAgent(agentId, composerActions.setBusyDraft(true));
   };
   // 成员同步 + 焦点同步：tab 加入/离开驱动条目 join/leave，选中 agent 驱动 Focus。
   useEffect(() => {
@@ -720,10 +699,6 @@ export function App() {
 
   /** 活跃的 Extension UI 请求 map（requestId → UiRequest），用于实时显示 ask_question 卡片 */
   const [activeUiRequest, setActiveUiRequest] = useState<Record<string, AgentUiRequest> | null>(null);
-  /** Extension 通过 RPC setWidget 推送的轻量状态块；按 agent 隔离，避免切换会话串台。 */
-  const [extensionWidgetsByAgent, setExtensionWidgetsByAgent] = useState<
-    Record<string, Record<string, WidgetLine[]>>
-  >({});
   /** Extension widget 容器折叠状态（全局持久化，不按 agentId 隔离，重启后恢复） */
   const [widgetsCollapsed, setWidgetsCollapsed] = useState(() => {
     try {
@@ -986,7 +961,13 @@ export function App() {
 
   // FileDiffViewer 会在读取函数变化时重载文件；这些 IO 入口必须保持引用稳定，避免 App 轮询/消息更新导致预览滚动回到顶部。
   const readEditorFileContent = useCallback(
-    (path: string) => api.files.readContent(path),
+    // 有界读返回 { content, truncated }：编辑器只吃字符串，这里解包；
+    // 被截断时必须提示，否则用户会以为看到的是完整文件。
+    async (path: string) => {
+      const { content, truncated } = await api.files.readContent(path);
+      if (truncated) showNotice(t("editor.truncatedNotice"), 4000, "warning");
+      return content;
+    },
     [],
   );
   const readEditorOriginalContent = useCallback(
@@ -1112,19 +1093,6 @@ export function App() {
       : tab));
     setActiveTabId(tabId);
   }, []);
-  /** 稳定版文件读写回调，避免内联函数导致 FileDiffViewer 的 useEffect 每轮渲染都重新触发。 */
-  const handleReadContent = useCallback(
-    (path: string) => api.files.readContent(path),
-    [],
-  );
-  const handleReadOriginalContent = useCallback(
-    (path: string) => api.git.originalContent(path),
-    [],
-  );
-  const handleSaveContent = useCallback(
-    (path: string, content: string) => api.files.writeContent(path, content),
-    [],
-  );
   // ── 会话导入（Codex / Claude / OpenCode）：一个状态机 + 一张源描述表 ──────────
   // 三源共用同一套类型与交互，差异（api 命名空间/默认勾选/文案前缀/子代理分组）
   // 全在 createImportSources 返回的描述表里。
@@ -1219,6 +1187,22 @@ export function App() {
       // 文件读取失败静默降级：消息窗口基线已提供最近记录
     }
   }
+
+  // transcript 运行时（增量合并 + 代数守卫 + 失同步自愈单飞）只造一次：端口读的都是
+  // ref（promptHistoryRef / displayAgentsRef，见 historyKeyForAgentId），因此首帧闭包
+  // 也能拿到最新值；自愈单飞的重跑登记表必须跨渲染存活，不能每次渲染重建。
+  const transcriptRuntimeRef = useRef<TranscriptRuntime | null>(null);
+  transcriptRuntimeRef.current ??= createTranscriptRuntime({
+    fetchMessages: (agentId) => api.agents.getMessages(agentId),
+    isActiveAgent: (agentId) => activeAgentIdRef.current === agentId,
+    promptHistory: {
+      isInited: (agentId) => promptHistoryInitedRef.current.has(historyKeyForAgentId(agentId)),
+      existing: (agentId) => promptHistoryRef.current[historyKeyForAgentId(agentId)],
+      rebuild: applyPromptHistoryRebuild,
+    },
+  });
+  const transcriptRuntime = transcriptRuntimeRef.current;
+
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [historyNavigating, setHistoryNavigating] = useState(false);
   const [savedPrompt, setSavedPrompt] = useState("");
@@ -1774,16 +1758,27 @@ export function App() {
     ? drawerPinnedByProject[activeProjectId]
     : undefined;
   const drawerPinned = Boolean(drawerPinnedPanel);
-  const agentRuntimeState = activeAgentId
-    ? runtimeStateByAgent[activeAgentId]
-    : undefined;
   const activeRuntimeState = agentRuntimeState;
-  const activeProjectHasBusyAgent = Boolean(
-    activeProjectId && displayAgents.some((agent) =>
-      agent.projectId === activeProjectId &&
-      agentBusy(agent, runtimeStateByAgent[agent.id]),
-    ),
-  );
+  // 活跃项目是否还有忙碌 agent：来自跨条目运行态订阅（subscribeSliceChange），
+  // 只在布尔翻转时 setState——运行态热路径（工具循环 ≤150ms）不再唤醒根渲染。
+  const [activeProjectHasBusyAgent, setActiveProjectHasBusyAgent] = useState(false);
+  useEffect(() => {
+    const recompute = () => {
+      setActiveProjectHasBusyAgent((previous) => {
+        const next = Boolean(
+          activeProjectId &&
+            displayAgents.some(
+              (agent) =>
+                agent.projectId === activeProjectId &&
+                agentBusy(agent, getAgentRuntimeState(agent.id)),
+            ),
+        );
+        return next === previous ? previous : next;
+      });
+    };
+    recompute();
+    return sessionWorkspaceStore.subscribeSliceChange("runtime", recompute);
+  }, [activeProjectId, displayAgents]);
   // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
   const {
     visibleMessages: paginatedMessages,
@@ -2259,54 +2254,39 @@ export function App() {
     return map;
   }, [displayAgents]);
   /**
-   * 侧栏每个项目行的派生数据（搜索/来源过滤 + 会话分组排序）。
+   * 侧栏每个项目行的派生数据（搜索/来源过滤 + 会话分组排序 + worktree 行解析）。
    * 流式/思考/击键期间 App 以 ~20Hz 重渲染；若在渲染体内联计算，每个项目行都要
-   * 做 O(sessions+agents) 的过滤与排序（大项目会话数百条）。这里按输入依赖 memo，
-   * 重渲染时退化为 O(1) 查表；输入未变则跳过全部计算。
+   * 做 O(sessions+agents) 的过滤与排序（大项目会话数百条），worktree 分支还要
+   * 每行 find 一次项目表。这里把全部计算收进纯函数投影并按输入依赖 memo：
+   * 重渲染时退化为 O(1) 查表；输入未变则跳过全部计算。侧栏组件只消费这张表。
    */
-  const sidebarProjectDisplayByProject = useMemo(() => {
-    const projectSearch = deferredSearch.trim();
-    const result: Record<string, { sessions: SessionSummary[]; display: ProjectAgentSessionDisplay }> = {};
-    for (const project of filteredProjects) {
-      const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
-      const projectSessions = ((projectSearch
-        ? (sessionsByProject[project.id] ?? []).filter((session) =>
-            matches(
-              `${session.name ?? ""}${session.preview}${session.filePath}`,
-              projectSearch,
-            ),
-          )
-        : (sessionsByProject[project.id] ?? [])).filter((session) => {
-          const filter = sessionSourceFilter[project.id] ?? null;
-          return filter === null
-            ? true
-            : filter.has(session.source ?? "pi");
-        }));
-      const visibleChildCount =
-        visibleProjectChildCountByProject[project.id] ??
-        SIDEBAR_PROJECT_CHILD_PAGE_SIZE;
-      result[project.id] = {
-        sessions: projectSessions,
-        display: getProjectAgentSessionDisplay({
-          agents: projectAgents,
-          sessions: projectSessions,
-          visibleChildCount,
-        }),
-      };
-    }
-    return result;
-  }, [
-    filteredProjects,
-    sessionsByProject,
-    filteredAgentsByProject,
-    deferredSearch,
-    sessionSourceFilter,
-    visibleProjectChildCountByProject,
-  ]);
+  const sidebarProjectDisplayByProject = useMemo(
+    () =>
+      buildSidebarProjectDisplay({
+        projects,
+        // worktree 子项目不进主列表（只在父项目下展示），投影内部按父 id 建索引
+        visibleProjects: filteredProjects,
+        sessionsByProject,
+        agentsByProject: filteredAgentsByProject,
+        search: deferredSearch,
+        sourceFilter: sessionSourceFilter,
+        visibleChildCountByProject: visibleProjectChildCountByProject,
+        worktreesByProject,
+        expandedWorktreeSessions,
+      }),
+    [
+      projects,
+      filteredProjects,
+      sessionsByProject,
+      filteredAgentsByProject,
+      deferredSearch,
+      sessionSourceFilter,
+      visibleProjectChildCountByProject,
+      worktreesByProject,
+      expandedWorktreeSessions,
+    ],
+  );
   const canReorderProjects = search.trim().length === 0;
-  // 增量推送代数计数器：每应用一个 agents:message delta 递增，失同步自愈的全量拉取
-  // 结果只在没有更新的 delta 到达时生效（见 onMessages），避免旧基线覆盖新消息。
-  const messageDeltaSeqRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     window.setTimeout(() => void refreshProjects(), 0);
@@ -2385,63 +2365,15 @@ export function App() {
       // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
       // terminalDock/drawerPinned/promptHistory/queueFlush）
       migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
-      // 裁剪已关闭 agent 的消息缓存，释放 renderer 内存；重启占位需要参与 liveIds，避免旧进程移除时聊天记录闪空。
-      migrateAgentMessages(pendingReplacementById, draftIds);
+      // transcript 条目对账：迁移重启占位期间的消息、回收已关闭 agent 的条目。
+      // liveIds 必须含占位（重启占位参与 liveIds），避免旧进程移除时聊天记录闪空。
+      reconcileTranscriptEntries(pendingReplacementById, draftIds);
     });
-    // applyPromptHistoryRebuild 为组件级函数（见上方定义）：onMessages 仅负责在
-    // 全量基线/失同步自愈时调用它落地 prompt history，并异步从会话文件补全更早记录。
-
-    // 优化:历史会话加载时消息更新频繁,只在消息真正变化时 update state,避免不必要的重渲染导致输入卡顿
-    // 主进程走增量推送（AgentMessagesDelta）：流式期间每条 text_delta 只发尾部变更，
-    // replaceFrom 之前的部分保持原数组引用，减少 IPC 传输与合并成本。
-    // 合并/失同步自愈标记/全量基线 prompt 历史重建已收敛为 messageDeltaResolver
-    // 纯函数（resolveIncomingMessagesDelta / resolveFullPullResult），此处只负责
-    // 闭包状态映射、代数序号落库与异步全量拉取流程。
-
-    /**
-     * 失同步自愈对每个 agent 单飞：在途时后续失同步 delta 只置 pending，
-     * settle 后再补拉一次。否则持续失同步（本地列表短于 replaceFrom）会让每个
-     * 50ms delta 都发起一次全量 transcript IPC，把一次自愈放大成 IPC 风暴。
-     */
-    const requestFullPull = createSingleFlight();
-    const pullFullBaseline = (id: string) => {
-      requestFullPull(id, async () => {
-        // 捕获发起时的代数：期间有更新 delta 到达则本次结果作废（resolveFullPullResult）。
-        const capturedSeq = messageDeltaSeqRef.current[id] ?? 0;
-        const pullKey = historyKeyForAgentId(id);
-        const full = await api.agents.getMessages(id);
-        const pull = resolveFullPullResult(capturedSeq, messageDeltaSeqRef.current[id] ?? 0, full, {
-          inited: promptHistoryInitedRef.current.has(pullKey),
-          existingHistory: promptHistoryRef.current[pullKey],
-        });
-        if (!pull) return;
-        setAgentMessages(id, pull.messages);
-        applyPromptHistoryRebuild(id, pull.promptHistory);
-      });
-    };
-
+    // 消息增量：合并/代数守卫/失同步自愈/prompt 历史重建都在 workspace/transcriptRuntime，
+    // 状态落进 transcript 切片——根组件只订阅当前 agent 的切片，后台 agent 的 50ms
+    // 增量不再唤醒整个 App。这里只剩「IPC 事件 → 动作」。
     const offMessages = api.agents.onMessages((payload) => {
-      const agentId = payload.agentId;
-      const key = historyKeyForAgentId(agentId);
-      // 每应用一个 delta 递增代数；失同步自愈的全量拉取结果只在没有更新的 delta
-      // 到达时生效（resolveFullPullResult 的 pure 形态），避免旧基线覆盖新消息。
-      const resolved = resolveIncomingMessagesDelta(
-        messagesByAgentRef.current[agentId],
-        payload,
-        {
-          currentSeq: messageDeltaSeqRef.current[agentId] ?? 0,
-          inited: promptHistoryInitedRef.current.has(key),
-          existingHistory: promptHistoryRef.current[key],
-        },
-      );
-      messageDeltaSeqRef.current[agentId] = resolved.seq;
-      if (resolved.promptHistory) {
-        applyPromptHistoryRebuild(agentId, resolved.promptHistory);
-      }
-      setAgentMessages(agentId, resolved.messages);
-      // 增量失同步（如渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）：
-      // 异步拉取全量基线补平。拉取期间的更新 delta 使代数前进，旧基线被丢弃。
-      if (resolved.needsFullPull) pullFullBaseline(agentId);
+      transcriptRuntime.ingestDelta(payload.agentId, payload);
     });
     const offLog = api.agents.onLog((payload) =>
       // 写入式调试日志：无 UI 消费。用模块级环形缓冲替代 React state，
@@ -2471,16 +2403,11 @@ export function App() {
       navigateTo(url);
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
-      // 解码逻辑（seq 守卫 + 状态合并 + tool true→false 边沿判定）已提炼为
-      // resolveIncomingRuntimeState 纯函数，保证 steer 投递窗口不因 React
-      // 批量渲染丢失；此处只负责落库与投递。
-      const resolved = resolveIncomingRuntimeState(
-        runtimeStateByAgentRef.current[payload.agentId],
-        payload.state,
-      );
-      if (!resolved) return;
-      const nextState = applyAgentRuntimeState(payload.agentId, resolved.state);
-      if (resolved.isToolCompletionEdge && isAgentCurrentlyBusy(payload.agentId)) {
+      // 解码（序号守卫 + 状态合并 + tool true→false 边沿判定）在 workspace/agentRuntime：
+      // 状态落进 runtime 切片（按 agent 精确订阅），边沿直接在原始事件上投递 steer，
+      // 不依赖 React 批处理时机——很快的 tool_start/tool_end 被合并成一次 render 会漏边沿。
+      const resolved = ingestAgentRuntimeState(payload.agentId, payload.state);
+      if (resolved?.isToolCompletionEdge && isAgentCurrentlyBusy(payload.agentId)) {
         void flushQueuedSteerPrompts(payload.agentId);
       }
     });
@@ -2489,7 +2416,7 @@ export function App() {
       // 纯归约（同文本空转、首次非空记起点、清空移除）收敛为 workspace thinking 切片；
       // dispatch 直接落进 store 自身最新状态，原镜像 ref 双写（streamingThinkingRef /
       // streamingThinkingStartedAtRef）随切片 2a 删除。reducer 同文本空转 = 20Hz 守卫。
-      dispatchWorkspaceToAgent(payload.agentId, thinkingActions.update(payload.thinking));
+      dispatchToAgent(payload.agentId, thinkingActions.update(payload.thinking));
     });
     const offNotice = api.agents.onNotice((payload) => {
       const text =
@@ -2531,12 +2458,13 @@ export function App() {
                 (typeof line === "object" && line !== null && typeof (line as { content?: unknown }).content === "string"),
             )
           : [];
-        setExtensionWidgetsByAgent((current) => {
-          const agentWidgets = { ...(current[request.agentId] ?? {}) };
-          if (widgetLines.length > 0) agentWidgets[widgetKey] = widgetLines;
-          else delete agentWidgets[widgetKey];
-          return { ...current, [request.agentId]: agentWidgets };
-        });
+        // widget 内容落进 workspace 切片（键 = agent 条目）：空 lines 由切片的
+        // set 动作解释为「撤下该 widget」，与原 delete 语义一致。App 只 dispatch——
+        // 后台 agent 的推送不再整表写回根 state，agent 离场时随条目一并回收。
+        dispatchToAgent(
+          request.agentId,
+          extensionWidgetActions.set(widgetKey, widgetLines),
+        );
         // agent 推送了新的 widget 内容，清除该 widget 的关闭标记使其重新显示
         // 使用与 onClose 一致的 sessionPath 作为 key，避免 key 不匹配导致关闭后无法恢复
         // ref: https://github.com/HiHaWarzid/OmpDeck/issues/73
@@ -3992,38 +3920,11 @@ export function App() {
     }
   }
 
-  /**
-   * 确保选中 agent 的消息已加载。
-   * agent 重启/恢复后历史消息由主进程后台加载（get_messages 可能耗时数秒），
-   * 期间渲染层的 messagesByAgent 为空——此时点击该 agent 聊天区空白，
-   * 直到发送消息触发增量推送、失同步自愈拉全量，历史才“瞬间出现”。
-   * 选中时主动拉一次；若主进程仍在后台加载，本次可能拿到空/部分结果，
-   * 加载完成后的全量基线（replaceFrom=0）会兜底整体替换。
-   */
+  // 确保选中 agent 的消息已加载：agent 重启/恢复后历史由主进程后台加载（get_messages
+  // 可能耗时数秒），期间 transcript 切片为空、聊天区空白，直到发送消息触发增量推送或
+  // 失同步自愈拉全量。选中时主动补拉一次（实现在 transcriptRuntime.ensureLoaded）。
   function ensureAgentMessagesLoaded(agentId: string) {
-    if (messagesByAgent[agentId]) return;
-    const seqAtRequest = messageDeltaSeqRef.current[agentId] ?? 0;
-    void api.agents
-      .getMessages(agentId)
-      .then((messages) => {
-        // 拉取期间有更新的 delta 到达时，增量合并路径负责更新，这里不覆盖；
-        // 用户已切走也不写入。
-        if (messageDeltaSeqRef.current[agentId] !== seqAtRequest) return;
-        if (activeAgentIdRef.current !== agentId) return;
-        // 手动全量拉取走与 onMessages 自愈路径相同的代数守卫 + prompt 历史重建
-        // （resolveFullPullResult pure 形态；capturedSeq 与 currentSeq 相等，
-        // 结果必然非 null，仅复用其替换与重建语义）。
-        const key = historyKeyForAgentId(agentId);
-        const pull = resolveFullPullResult(seqAtRequest, seqAtRequest, messages, {
-          inited: promptHistoryInitedRef.current.has(key),
-          existingHistory: promptHistoryRef.current[key],
-        });
-        if (!pull) return;
-        setAgentMessages(agentId, pull.messages);
-        // 渲染层重载后主进程不会重推基线，手动拉取的消息同样用于重建 prompt history
-        applyPromptHistoryRebuild(agentId, pull.promptHistory);
-      })
-      .catch(() => undefined);
+    transcriptRuntime.ensureLoaded(agentId);
   }
 
   async function openSidebarSession(
@@ -4554,13 +4455,10 @@ export function App() {
       applyAgentRuntimeState(agentId, state);
       showToast(t("app.compactDone"));
     } catch (e) {
-      // 主进程会把 pi 的可读错误（Already compacted / session too small / 鉴权失败）原样抛出。
-      // 对“会话太小”类错误做友好文案，避免把 IPC 包装层一起甩给用户。
-      const raw = e instanceof Error ? e.message.trim() : String(e ?? "").trim();
-      const detail = raw
-        .replace(/^Error invoking remote method ['"][^'"]+['"]:\s*/i, "")
-        .replace(/^Error:\s*/i, "")
-        .trim();
+      // 主进程把 pi 的可读错误（Already compacted / session too small / 鉴权失败）原样装进 IPC
+      // 失败契约，preload 解包后 message 已是干净信息，不再需要剥 Electron 的 IPC 包装前缀；
+      // 这里只按 pi 自己的文案做「会话太小」类友好映射。
+      const detail = (e instanceof Error ? e.message : String(e ?? "")).trim();
       const lower = detail.toLowerCase();
       const friendly =
         /nothing to compact|already compacted/i.test(lower)
@@ -4587,12 +4485,12 @@ export function App() {
     if (!agentId || isPendingAgentId(agentId)) return;
     // 立即清除流式状态与本地 thinking 缓存，让思考气泡和 loading 立刻消失，不等后端 RPC 返回。
     // 若不先清 streamingThinking，后端残留 delta 被拦截前 UI 仍会继续显示旧思考。
-    const previous = runtimeStateByAgentRef.current[agentId];
+    const previous = getAgentRuntimeState(agentId);
     if (previous) {
       applyAgentRuntimeState(agentId, { ...previous, isStreaming: false });
     }
     // thinking 切片：清空文本 + 移除起点（reducer 对已空状态空转）
-    dispatchWorkspaceToAgent(agentId, thinkingActions.update(""));
+    dispatchToAgent(agentId, thinkingActions.update(""));
     await api.agents.abort(agentId);
     // 不调用 refreshRuntimeState：AgentManager.abort() 会通过 emitState 推送正确状态，
     // 避免后端 get_state 返回过时的 isStreaming: true 覆盖前端立刻设的 false。
@@ -4669,8 +4567,7 @@ export function App() {
 
   function isAgentCurrentlyBusy(agentId: string) {
     const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    const runtimeState = runtimeStateByAgentRef.current[agentId];
-    return agentBusy(agent, runtimeState);
+    return agentBusy(agent, getAgentRuntimeState(agentId));
   }
 
   function canFlushQueuedPrompt(agentId: string) {
@@ -5067,13 +4964,19 @@ export function App() {
 
   // 处理所有 agent 的 idle 队列：隐藏会话也不会因切换选中项而卡住。
   // tool-end 的 steer 投递直接在 onRuntimeState 原始事件上处理，避免批量 render 漏边沿。
+  // 运行态不再住根 state，这里改用跨条目切片订阅（命令式，不触发渲染）——
+  // 若改回 root state 依赖，任一 agent 的工具循环都会唤醒整个 App（5b 要消除的开销）。
   useEffect(() => {
-    for (const agentId of Object.keys(queuedPrompts)) {
-      if (canFlushQueuedPrompt(agentId)) {
-        void flushNextQueuedPrompt(agentId);
+    const flushIdleQueues = () => {
+      for (const agentId of Object.keys(queuedPrompts)) {
+        if (canFlushQueuedPrompt(agentId)) {
+          void flushNextQueuedPrompt(agentId);
+        }
       }
-    }
-  }, [agents, runtimeStateByAgent, queuedPrompts]);
+    };
+    flushIdleQueues();
+    return sessionWorkspaceStore.subscribeSliceChange("runtime", flushIdleQueues);
+  }, [agents, queuedPrompts]);
 
   useEffect(() => {
     return () => {
@@ -5717,8 +5620,9 @@ export function App() {
         void (async () => {
           for (const path of imagePaths) {
             try {
-              const dataUrl = await api.files.readBase64(path);
-              if (!dataUrl) continue;
+              // 有界读会截断超大文件；截断的图片 base64 无法解码，宁可舍弃也不附加损坏数据。
+              const { content: dataUrl, truncated } = await api.files.readBase64(path);
+              if (!dataUrl || truncated) continue;
               setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
             } catch {
               // 单张失败不阻断其余
@@ -5745,8 +5649,9 @@ export function App() {
           void (async () => {
             for (const path of imagePaths) {
               try {
-                const dataUrl = await api.files.readBase64(path);
-                if (!dataUrl) continue;
+                // 同上：截断的 base64 无法解码，直接跳过。
+                const { content: dataUrl, truncated } = await api.files.readBase64(path);
+                if (!dataUrl || truncated) continue;
                 setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
               } catch {
                 /* ignore */
@@ -6047,7 +5952,7 @@ export function App() {
       ? displayAgents.filter(
           (a) =>
             a.projectId === childProject.id &&
-            agentBusy(a, runtimeStateByAgent[a.id]),
+            agentBusy(a, getAgentRuntimeState(a.id)),
         )
       : [];
     if (childAgents.length > 0) {
@@ -6384,990 +6289,66 @@ export function App() {
           <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
         </IconButton>
       )}
-      <aside
-        className="chat-list-pane v3-braun"
-      >
-        <div className="sidebar-body">
-          <div className="list-toolbar">
-          <div className="app-badge">
-            {/* 官方 π 标 + 字标；agent 启停时通过 replayToken 重播动画 */}
-            <BrandLockup replayToken={brandLogoReplayToken} />
-          </div>
-          {/* 左侧工具栏折叠入口：与右侧 header-drawer-toggle 共用 IconButton 尺寸 */}
-          <IconButton
-            label={t("app.collapseList")}
-            variant="outline"
-            buttonSize="sm"
-            className="list-toggle-native"
-            onClick={toggleListCollapsed}
-          >
-            <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
-          </IconButton>
-        </div>
-        <button
-          className="collapse-button list-collapse"
-          title={listCollapsed ? t("app.expandList") : t("app.collapseList")}
-          onClick={toggleListCollapsed}
-        >
-          {listCollapsed ? (
-            <ChevronRight size={16} />
-          ) : (
-            <ChevronLeft size={16} />
-          )}
-        </button>
-
-        <div className="search-row">
-          <div className="search-box">
-            <span className="search-icon">
-              <Search size={14} />
-            </span>
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder={t("app.search")}
-            />
-          </div>
-          <button className="round-add" onClick={addProject} title={t("app.addProject")}>
-            <FolderPlus size={18} />
-          </button>
-        </div>
-
-        <div className="conversation-list">
-          {filteredProjects.map((project) => {
-            const projectIsChat = isChatProject(project);
-            const projectDirectoryName = projectIsChat
-              ? t("app.chatProject")
-              : displayProjectDirectoryName(project);
-            const canDragProject = canReorderProjects && !projectIsChat;
-            const projectAgents = filteredAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
-            const allProjectAgents = displayAgentsByProject.get(project.id) ?? EMPTY_AGENTS;
-            // 搜索/来源过滤 + 分组排序已由 sidebarProjectDisplayByProject 按依赖 memo，
-            // 此处 O(1) 查表，避免流式重渲染时逐项目重算。
-            const projectDerived = sidebarProjectDisplayByProject[project.id];
-            const projectSessions = projectDerived?.sessions ?? EMPTY_SESSIONS;
-            const projectDisplay = projectDerived?.display ?? EMPTY_PROJECT_DISPLAY;
-            const projectSessionsLoading = Boolean(
-              sessionLoadingByProject[project.id],
-            );
-            const hasProjectChildren =
-              projectDisplay.children.length > 0 || projectSessionsLoading || !!project.worktreeEnabled;
-            const isCollapsed = !expandedSidebarProjects.has(project.id);
-            const isDraggingProject = draggingProjectId === project.id;
-            const isProjectDropTarget = dragOverProjectId === project.id;
-            const projectRowClass = [
-              "conversation",
-              canDragProject ? "project-draggable" : "",
-              projectIsChat ? "chat-project" : "",
-              isDraggingProject ? "dragging" : "",
-              isProjectDropTarget ? "drag-over" : "",
-              projectSessionsLoading ? "project-loading" : "",
-            ]
-              .filter(Boolean)
-              .join(" ");
-            return (
-              <div
-                key={project.id}
-                className={`project-group${projectIsChat ? " chat-project-group" : ""}${project.worktreeEnabled ? " worktree-enabled" : ""}`}
-              >
-                <button
-                  className={projectRowClass}
-                  draggable={canDragProject}
-                  onDragStart={(event) =>
-                    handleProjectDragStart(event, project.id)
-                  }
-                  onDragOver={(event) =>
-                    handleProjectDragOver(event, project.id)
-                  }
-                  onDragLeave={() => handleProjectDragLeave(project.id)}
-                  onDrop={(event) => void handleProjectDrop(event, project.id)}
-                  onDragEnd={finishProjectDrag}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    setProjectMenu({
-                      x: event.clientX,
-                      y: event.clientY,
-                      project,
-                    });
-                  }}
-                  onClick={(event) => {
-                    if (projectDragPreventClickRef.current) return;
-                    // 项目点击脉冲动画：给按钮临时加动画 class，提供即时视觉反馈
-                    const el = event.currentTarget;
-                    el.classList.add('click-animating');
-                    setTimeout(() => el.classList.remove('click-animating'), 400);
-
-                    // 点击项目行：普通项目始终「打开」（展开 + 确保加载），收起走行首箭头。
-                    // 展开集合从 localStorage 恢复，项目默认就是展开态——若行点击仍是 toggle，
-                    // 用户第一次点击会把已展开的项目收起（历史消失），第二次点击才展开显示，
-                    // 表现为“需要点击两次才能看到历史记录”。
-                    const hasLoadedSessions = project.id in sessionsByProject;
-                    if (!projectIsChat) {
-                      const wasCollapsed = isCollapsed;
-                      setProjectSidebarExpanded(project.id, true);
-                      // 折叠→展开时刷新保证最新；已展开但从未加载成功时补拉列表；
-                      // 已加载但列表为空也刷新一次（上次扫描可能异常，避免空列表卡死）。
-                      if (
-                        wasCollapsed ||
-                        !hasLoadedSessions ||
-                        (sessionsByProject[project.id]?.length ?? 0) === 0
-                      ) {
-                        void refreshProjectSessions(project.id).catch(() => undefined);
-                      }
-                    } else {
-                      const wasCollapsed = isCollapsed;
-                      setProjectSidebarExpanded(project.id);
-                      if (wasCollapsed && !(project.id in sessionsByProject)) {
-                        void refreshProjectSessions(project.id).catch(() => undefined);
-                      }
-                    }
-
-                    setActiveProjectId(project.id);
-                    setActiveAgentId(undefined);
-                  }}
-                >
-                  <span
-                    className={`project-fold${isCollapsed ? " folded" : ""}${hasProjectChildren ? " has-agents" : ""}`}
-                    title={
-                      isCollapsed
-                        ? t("app.projectExpand")
-                        : t("app.projectCollapse")
-                    }
-                    onClick={(e) => {
-                      // 点击折叠图标仅切换折叠状态；会话由 expanded 变化 effect 补加载
-                      e.stopPropagation();
-                      setProjectSidebarExpanded(project.id);
-                    }}
-                  >
-                    <Play size={12} />
-                  </span>
-                  <ProjectAvatar
-                    name={projectDirectoryName}
-                    kind={projectIsChat ? "chat" : "project"}
-                  />
-                  <div className="conversation-body">
-                    <div className="conversation-title">
-                      <strong title={project.path}>
-                        {projectDirectoryName}
-                      </strong>
-                      {projectSessionsLoading && (
-                        <span className="conversation-loading" />
-                      )}
-                      {(sessionSourceFilter[project.id] ?? null) !== null && (
-                        <Filter
-                          size={12}
-                          className="filter-indicator"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setSessionFilterOpen({
-                              ...adjustMenuPos(e.clientX, e.clientY, 180, 250),
-                              projectId: project.id,
-                            });
-                          }}
-                        />
-                      )}
-                    </div>
-                    {projectIsChat && (
-                      <p className="chat-project-guide">
-                        {t("app.projectChatGuide")}
-                      </p>
-                    )}
-                  </div>
-                  <span className="project-row-actions">
-                    {projectIsChat && (
-                      <span
-                        className="project-action"
-                        title={t("app.chatProjectSettings")}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          // 打开系统目录选择器（默认定位当前聊天目录），选中后保存并重新加载该目录下的会话。
-                          void (async () => {
-                            const picked = await api.projects.chooseChatPath();
-                            if (!picked || picked === project.path) return;
-                            await api.projects.setChatPath(picked);
-                            await refreshProjectSessions(project.id);
-                            showToast(t("app.chatProjectPathUpdated"), 1800);
-                          })().catch((err) => console.error("Failed to change chat directory", err));
-                        }}
-                      >
-                        <FolderCog size={14} />
-                      </span>
-                    )}
-                    <span
-                      className="project-action"
-                      title={t("app.projectNewAgent")}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void createAgent(project.id);
-                      }}
-                    >
-                      <Plus size={14} />
-                    </span>
-                    <span
-                      className="project-action"
-                      title={t("app.anonymousChat")}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void createAgent(project.id, undefined, undefined, true);
-                      }}
-                    >
-                      <HatGlasses size={14} />
-                    </span>
-                  </span>
-                </button>
-                {!isCollapsed && project.worktreeEnabled && (() => {
-                  const mainWtKey = `main:${project.id}`;
-                  const mainSessionsExpanded = !collapsedWorktrees.has(mainWtKey);
-                  const mainCanFold =
-                    projectDisplay.children.length > 0 ||
-                    projectDisplay.hiddenChildCount > 0;
-                  return (
-                  <div className="worktree-children worktree-main-header-only">
-                    <button
-                      type="button"
-                      // 与子工作区共用 worktree-row 视觉模型，避免 conversation 网格导致标题/分支挤成一行杂讯。
-                      className={`worktree-row worktree-main-row${
-                        activeProjectId === project.id ? " active" : ""
-                      }${mainSessionsExpanded ? "" : " is-folded"}`}
-                      // 首次点击：选中主工作区并展开会话；再次点击当前主工作区：折叠/展开会话。
-                      onClick={() => {
-                        const wasActive = activeProjectId === project.id;
-                        setActiveProjectId(project.id);
-                        setActiveAgentId(undefined);
-                        if (!projectIsChat && !sessionsByProject[project.id]?.length) {
-                          void refreshProjectSessions(project.id).catch(() => undefined);
-                        }
-                        if (!mainCanFold) return;
-                        setCollapsedWorktrees((prev) => {
-                          const next = new Set(prev);
-                          if (wasActive) {
-                            if (next.has(mainWtKey)) next.delete(mainWtKey);
-                            else next.add(mainWtKey);
-                          } else {
-                            // 切到主工作区时默认展开，避免“选中了却看不到会话”
-                            next.delete(mainWtKey);
-                          }
-                          return next;
-                        });
-                      }}
-                      title={
-                        mainCanFold
-                          ? mainSessionsExpanded
-                            ? t("app.projectCollapse")
-                            : t("app.projectExpand")
-                          : t("app.worktreeMainWorkspace")
-                      }
-                    >
-                      {mainCanFold && (
-                        <span
-                          className={`worktree-fold${mainSessionsExpanded ? "" : " folded"}`}
-                          aria-hidden="true"
-                        >
-                          <ChevronDown size={12} strokeWidth={1.8} />
-                        </span>
-                      )}
-                      <span className="worktree-branch-icon" aria-hidden="true">
-                        <GitBranch size={12} strokeWidth={1.8} />
-                      </span>
-                      <span className="worktree-branch-name">
-                        {t("app.worktreeMainWorkspace")}
-                      </span>
-                      <span className="worktree-branch-chip">
-                        {branchInfoByProject[project.id]?.current ?? t("app.worktreeBranchLoading")}
-                      </span>
-                    </button>
-                  </div>
-                  );
-                })()}
-                {/* 历史会话加载中/失败状态行：慢扫描或失败时提供可见反馈与重试入口，
-                    避免首次点击后长时间无反馈，用户误以为“没反应”而反复点击。 */}
-                {!isCollapsed &&
-                  projectSessionsLoading &&
-                  projectDisplay.visibleChildren.length === 0 &&
-                  projectDisplay.hiddenChildCount === 0 &&
-                  !(project.worktreeEnabled && collapsedWorktrees.has(`main:${project.id}`)) && (
-                  <div className="session-card sidebar-session-status">
-                    <div className="sidebar-session-status-row">
-                      <span className="conversation-loading" aria-hidden="true" />
-                      <span>{t("app.projectSessionsLoading")}</span>
-                    </div>
-                  </div>
-                )}
-                {!isCollapsed &&
-                  !projectSessionsLoading &&
-                  sessionErrorByProject[project.id] &&
-                  projectDisplay.visibleChildren.length === 0 &&
-                  projectDisplay.hiddenChildCount === 0 &&
-                  !(project.worktreeEnabled && collapsedWorktrees.has(`main:${project.id}`)) && (
-                  <div className="session-card sidebar-session-status">
-                    <div className="sidebar-session-status-row error">
-                      <span className="sidebar-session-error-text">
-                        {t("app.projectSessionsLoadFailed")}
-                      </span>
-                      <button
-                        className="sidebar-session-retry"
-                        onClick={() => void refreshProjectSessions(project.id).catch(() => undefined)}
-                      >
-                        {t("common.refresh")}
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {!isCollapsed &&
-                  (projectDisplay.visibleChildren.length > 0 ||
-                    projectDisplay.hiddenChildCount > 0) &&
-                  // worktree 模式下主会话可随主工作区折叠隐藏
-                  !(project.worktreeEnabled && collapsedWorktrees.has(`main:${project.id}`)) && (
-                  <div
-                    className={
-                      project.worktreeEnabled
-                        ? "session-card worktree-main-sessions"
-                        : "session-card"
-                    }
-                  >
-                    {projectDisplay.visibleChildren.map((child) => {
-                    const subagentGroupKey = `${project.id}:${child.key}`;
-                    const subagentsExpanded = expandedSubagentGroups.has(subagentGroupKey);
-                    const totalSubagentCount = (child.codexSubagents?.length ?? 0) + (child.piSubagents?.length ?? 0);
-                    const renderSubagentRow = (
-                      subagent: SessionSummary,
-                      label: ReactNode,
-                      toggle?: ReactNode,
-                    ) => {
-                      const subagentAgent = getAgentForSessionPath(
-                        allProjectAgents,
-                        subagent.filePath,
-                      );
-                      return (
-                        <button
-                          key={subagent.filePath}
-                          className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(subagent.filePath, displayedSidebarSessionPath) ? " active" : ""}`}
-                          title={subagent.filePath}
-                          onContextMenu={async (event) => {
-                            event.preventDefault();
-                            if (subagentAgent) {
-                              const logging = await window.piDesktop.rpcLogs.getLogging(subagentAgent.id);
-                              dispatchWorkspaceToAgent(subagentAgent.id, rpcLogActions.set(logging));
-                              setAgentMenu({
-                                x: event.clientX,
-                                y: event.clientY,
-                                agent: subagentAgent,
-                              });
-                              return;
-                            }
-                            setSessionMenu({
-                              x: event.clientX,
-                              y: event.clientY,
-                              projectId: project.id,
-                              session: subagent,
-                            });
-                          }}
-                          onClick={() => {
-                            if (subagentAgent) {
-                              setActiveProjectId(subagentAgent.projectId);
-                              setActiveAgentId(subagentAgent.id);
-                              ensureAgentMessagesLoaded(subagentAgent.id);
-                              return;
-                            }
-                            void openSidebarSession(project.id, subagent);
-                          }}
-                        >
-                          <div className="conversation-body">
-                            <div className="conversation-title">
-                              {label}
-                              {toggle}
-                              {subagentAgent?.status && (
-                                <AgentStatusIndicator status={subagentAgent.status} />
-                              )}
-                            </div>
-                            {(subagent.preview || subagent.updatedAt > 0) && (
-                              <div className="subagent-row-meta">
-                                {subagent.preview && (
-                                  <span className="subagent-row-preview">{subagent.preview}</span>
-                                )}
-                                {subagent.updatedAt > 0 && (
-                                  <span className="subagent-row-time">
-                                    {formatTime(subagent.updatedAt)}
-                                  </span>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        </button>
-                      );
-                    };
-                    const renderCodexSubagents = (subagents: SessionSummary[]) => {
-                      if (subagents.length === 0 || !subagentsExpanded) return null;
-                      return (
-                        <div className="codex-subagent-sidebar-group">
-                          {subagents.map((subagent) => renderSubagentRow(
-                            subagent,
-                            <>
-                              <strong>{formatCodexSubagentName(subagent)}</strong>
-                              <span className="session-source-badge codex subagent">
-                                {t("app.codexSubagent")}
-                              </span>
-                            </>,
-                          ))}
-                        </div>
-                      );
-                    };
-                    // 递归渲染 pi 子会话树（含孙级）：孙级挂在父子会话行下，不再被孤儿恢复平铺到顶层。
-                    // 根层展开由父行 toggle（subagentGroupKey）控制，孙级由各自的 toggle 控制。
-                    const renderPiSubagentTree = (
-                      subagents: SessionSummary[],
-                      groupKey: string,
-                      depth: number,
-                    ): ReactNode => {
-                      if (subagents.length === 0) return null;
-                      if (depth > 0 && !expandedSubagentGroups.has(groupKey)) return null;
-                      return (
-                        <div className={`codex-subagent-sidebar-group${depth > 0 ? " nested" : ""}`}>
-                          {subagents.map((subagent) => {
-                            const subagentKey = normalizeSessionPathForCompare(subagent.filePath) ?? subagent.filePath;
-                            const grandchildren = projectDisplay.piSubagentsByParent.get(subagentKey) ?? [];
-                            const grandGroupKey = `${groupKey}:${subagentKey}`;
-                            const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
-                            return (
-                              <Fragment key={subagent.filePath}>
-                                {renderSubagentRow(
-                                  subagent,
-                                  <strong>{formatPiSubagentName(subagent)}</strong>,
-                                  grandchildren.length > 0 ? (
-                                    <span
-                                      className="subagent-inline-toggle"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        toggleSubagentGroup(grandGroupKey);
-                                      }}
-                                      title={t("app.piSubagentCount", { count: grandchildren.length })}
-                                    >
-                                      <ChevronDown size={10} className={grandExpanded ? "expanded" : ""} />
-                                      <span className="subagent-inline-count">{grandchildren.length}</span>
-                                    </span>
-                                  ) : null,
-                                )}
-                                {renderPiSubagentTree(grandchildren, grandGroupKey, depth + 1)}
-                              </Fragment>
-                            );
-                          })}
-                        </div>
-                      );
-                    };
-                    const renderPiSubagents = (subagents: SessionSummary[]) => {
-                      if (subagents.length === 0 || !subagentsExpanded) return null;
-                      return renderPiSubagentTree(subagents, subagentGroupKey, 0);
-                    };
-                    const renderInlineSubagentToggle = totalSubagentCount > 0 ? (
-                      <span
-                        className="subagent-inline-toggle"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleSubagentGroup(subagentGroupKey);
-                        }}
-                        title={t("app.piSubagentCount", { count: totalSubagentCount })}
-                      >
-                        <ChevronDown size={10} className={subagentsExpanded ? "expanded" : ""} />
-                        <span className="subagent-inline-count">{totalSubagentCount}</span>
-                      </span>
-                    ) : null;
-                    if (child.type === "agent") {
-                      const agent = child.agent;
-                      const isActiveAgent = isSidebarSessionRowActive({
-                        rowSessionPath: agent.sessionPath,
-                        displayedSessionPath: displayedSidebarSessionPath,
-                        rowAgentId: agent.id,
-                        activeAgentId,
-                      });
-                      return (
-                        <Fragment key={child.key}>
-                        <button
-                          className={
-                            isActiveAgent
-                              ? "conversation agent-row active"
-                              : "conversation agent-row"
-                          }
-                          onContextMenu={async (event) => {
-                            event.preventDefault();
-                            // 菜单打开时查询 RPC 日志记录状态
-                            const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
-                            dispatchWorkspaceToAgent(agent.id, rpcLogActions.set(logging));
-                            setAgentMenu({
-                              x: event.clientX,
-                              y: event.clientY,
-                              agent,
-                            });
-                          }}
-                          onClick={() => {
-                            setActiveProjectId(project.id);
-                            setActiveAgentId(agent.id);
-                            ensureAgentMessagesLoaded(agent.id);
-                          }}
-                        >
-                          <span className="agent-node-marker" aria-hidden="true" />
-                          <div className="conversation-body">
-                            <div className="conversation-title">
-                              <strong>{agent.title}</strong>
-                              {agent.title.startsWith("AFK: #") && (
-                                <Badge variant="outline" badgeSize="sm" className="afk-sidebar-badge">
-                                  {t("afk.sidebar.badge")}
-                                </Badge>
-                              )}
-                              {child.source && child.source !== "pi" && (
-                                <span className={`session-source-badge ${child.source}`}>
-                                  {t(`sessionSource.${child.source}` as any)}
-                                </span>
-                              )}
-                              {renderInlineSubagentToggle}
-                              {/* 状态圆点放标题行最右侧，对齐最近会话列表风格 */}
-                              {agent.status && <AgentStatusIndicator status={agent.status} />}
-                            </div>
-                          </div>
-                        </button>
-                        {renderCodexSubagents(child.codexSubagents)}
-                        {renderPiSubagents(child.piSubagents)}
-                        </Fragment>
-                      );
-                    }
-
-                    const session = child.session;
-                    return (
-                      <Fragment key={child.key}>
-                      <button
-                        className={`conversation agent-row session-row${isSameSessionPath(session.filePath, displayedSidebarSessionPath) ? " active" : ""}`}
-                        title={session.filePath}
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          setSessionMenu({
-                            x: event.clientX,
-                            y: event.clientY,
-                            projectId: project.id,
-                            session,
-                          });
-                        }}
-                        onClick={() =>
-                          void openSidebarSession(project.id, session)
-                        }
-                      >
-                        <span
-                          className="session-node-marker"
-                          aria-hidden="true"
-                        />
-                        <div className="conversation-body">
-                          <div className="conversation-title">
-                            <strong title={session.name || t("common.untitled")}>
-                              {session.name || t("common.untitled")}
-                            </strong>
-                            {session.source && session.source !== "pi" && (
-                              <span className={`session-source-badge ${session.source}`}>
-                                {t(`sessionSource.${session.source}` as any)}
-                              </span>
-                            )}
-                            {renderInlineSubagentToggle}
-                          </div>
-                        </div>
-                      </button>
-                      {renderCodexSubagents(child.codexSubagents)}
-                      {renderPiSubagents(child.piSubagents)}
-                      </Fragment>
-                    );
-                  })}
-
-                {!isCollapsed && projectDisplay.hiddenChildCount > 0 && (
-                  <button
-                    className="session-more-row"
-                    onClick={() => {
-                      setVisibleProjectChildCountByProject((current) => ({
-                        ...current,
-                        [project.id]:
-                          (current[project.id] ?? SIDEBAR_PROJECT_CHILD_PAGE_SIZE) +
-                          SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
-                      }));
-                    }}
-                  >
-                    <span className="agent-more-branch" />
-                    <span>
-                      {t("app.projectShowMoreChildren", {
-                        count: projectDisplay.hiddenChildCount,
-                      })}
-                    </span>
-                  </button>
-                )}
-                  </div>
-                )}
-                {!isCollapsed && project.worktreeEnabled && (
-                  <div className="worktree-children worktree-sandbox-list">
-                    <div className="worktree-sandbox-toolbar">
-                      <span className="worktree-section-label">
-                        {t("app.worktreeOtherWorkspaces")}
-                      </span>
-                      <button
-                        type="button"
-                        className="worktree-create-btn"
-                        title={t("app.worktreeNew")}
-                        aria-label={t("app.worktreeNew")}
-                        onClick={() => {
-                          setWorktreeCreateDialog({ projectId: project.id });
-                        }}
-                      >
-                        <Plus size={12} strokeWidth={1.8} aria-hidden="true" />
-                        <span>{t("app.worktreeNewShort")}</span>
-                      </button>
-                    </div>
-                    {(() => {
-                      // 合并 git worktree 列表和已注册的子项目，确保外部 worktree 也能显示。
-                      const wtEntries = worktreesByProject[project.id] ?? [];
-                      const childProjects = projects.filter(p => p.worktreeParentId === project.id);
-                      const merged = [...wtEntries];
-                      for (const cp of childProjects) {
-                        if (!merged.some(e => e.path === cp.path)) {
-                          merged.push({ path: cp.path, branch: cp.name });
-                        }
-                      }
-                      return merged;
-                    })().map((wt) => {
-                      const childProject = projects.find(p => p.path === wt.path);
-                      const childAgents = childProject
-                        ? filteredAgents.filter((agent) => agent.projectId === childProject.id)
-                        : [];
-                      const rawChildSessions = childProject ? (sessionsByProject[childProject.id] ?? []) : [];
-                      // 默认只展示 3 条会话，展开后显示全部，避免子工作区会话过多时侧栏过长。
-                      const sessionsExpanded = expandedWorktreeSessions.has(wt.path);
-                      // 使用统一分组函数，使 worktree 子会话也能嵌套显示在父条目下
-                      const wtDisplay = childProject ? getProjectAgentSessionDisplay({
-                        agents: childAgents,
-                        sessions: rawChildSessions,
-                        visibleChildCount: sessionsExpanded ? Number.MAX_SAFE_INTEGER : 3,
-                      }) : null;
-                      const wtChildren = wtDisplay?.visibleChildren ?? [];
-                      const hiddenSessionCount = (wtDisplay?.hiddenChildCount ?? 0);
-                      // OmpDeck 创建的 worktree 分支使用 ompdeck/{slug} 命名；侧栏只展示 slug。
-                      // 完整路径放 title，不再行内显示目录名——分支与目录名不一致时会参差不齐。
-                      const displayBranchName = wt.branch.replace(/^ompdeck\//, "");
-                      const wtKey = `wt:${wt.path}`;
-                      // worktree 内 pi 子会话递归渲染（含孙级）：与主侧栏 renderPiSubagentTree 同构，
-                      // 根层展开由父行 toggle 控制，孙级由各自 toggle 控制。
-                      const renderWtPiSubagentTree = (
-                        subagents: SessionSummary[],
-                        groupKey: string,
-                        depth: number,
-                      ): ReactNode => {
-                        if (subagents.length === 0) return null;
-                        if (depth > 0 && !expandedSubagentGroups.has(groupKey)) return null;
-                        return (
-                          <div className={`codex-subagent-sidebar-group${depth > 0 ? " nested" : ""}`}>
-                            {subagents.map((sa) => {
-                              const saKey = normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath;
-                              const grandchildren = wtDisplay?.piSubagentsByParent.get(saKey) ?? [];
-                              const grandGroupKey = `${groupKey}:${saKey}`;
-                              const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
-                              return (
-                                <Fragment key={sa.filePath}>
-                                  <button
-                                    className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`}
-                                    title={sa.filePath}
-                                    onClick={() => void openSidebarSession(childProject!.id, sa)}
-                                  >
-                                    <div className="conversation-body">
-                                      <div className="conversation-title">
-                                        <strong>{formatPiSubagentName(sa)}</strong>
-                                        {grandchildren.length > 0 && (
-                                          <span
-                                            className="subagent-inline-toggle"
-                                            onClick={(e) => {
-                                              e.stopPropagation();
-                                              toggleSubagentGroup(grandGroupKey);
-                                            }}
-                                            title={t("app.piSubagentCount", { count: grandchildren.length })}
-                                          >
-                                            <ChevronDown size={10} className={grandExpanded ? "expanded" : ""} />
-                                            <span className="subagent-inline-count">{grandchildren.length}</span>
-                                          </span>
-                                        )}
-                                      </div>
-                                      {(sa.preview || sa.updatedAt > 0) && (
-                                        <div className="subagent-row-meta">
-                                          {sa.preview && <span className="subagent-row-preview">{sa.preview}</span>}
-                                          {sa.updatedAt > 0 && <span className="subagent-row-time">{formatTime(sa.updatedAt)}</span>}
-                                        </div>
-                                      )}
-                                    </div>
-                                  </button>
-                                  {renderWtPiSubagentTree(grandchildren, grandGroupKey, depth + 1)}
-                                </Fragment>
-                              );
-                            })}
-                          </div>
-                        );
-                      };
-                      const isChildActive =
-                        !!childProject && activeProjectId === childProject.id;
-                      const canFoldWorkspace =
-                        childAgents.length > 0 || rawChildSessions.length > 0;
-                      const workspaceSessionsOpen = !collapsedWorktrees.has(wtKey);
-                      // 折叠时不渲染会话树；展开时仍沿用 3 条 +「查看更多」策略
-                      const hasNestedChildren =
-                        workspaceSessionsOpen &&
-                        (wtChildren.length > 0 || hiddenSessionCount > 0);
-                      return (
-                        // 每个子工作区自含子树：header + 会话/Agent，避免与兄弟 worktree 扁平混排
-                        <div
-                          key={wt.path}
-                          className={`worktree-group${
-                            isChildActive ? " is-active-group" : ""
-                          }${removingWorktreePaths.has(wt.path) ? " worktree-removing" : ""}`}
-                        >
-                          <button
-                            type="button"
-                            className={`worktree-row${isChildActive ? " active" : ""}${workspaceSessionsOpen ? "" : " is-folded"}`}
-                            onClick={() => {
-                              if (!childProject) return;
-                              const wasActive = activeProjectId === childProject.id;
-                              setActiveProjectId(childProject.id);
-                              setActiveAgentId(undefined);
-                              if (!sessionsByProject[childProject.id]?.length) {
-                                void refreshProjectSessions(childProject.id).catch(() => undefined);
-                              }
-                              // 首次点中：选中并展开；再次点击当前工作区：折叠/展开会话
-                              if (!canFoldWorkspace) return;
-                              setCollapsedWorktrees((prev) => {
-                                const next = new Set(prev);
-                                if (wasActive) {
-                                  if (next.has(wtKey)) next.delete(wtKey);
-                                  else next.add(wtKey);
-                                } else {
-                                  next.delete(wtKey);
-                                }
-                                return next;
-                              });
-                            }}
-                            onContextMenu={(e) => {
-                              e.preventDefault();
-                              if (childProject) {
-                                setProjectMenu({
-                                  x: e.clientX,
-                                  y: e.clientY,
-                                  project: childProject,
-                                });
-                              }
-                            }}
-                            title={wt.path}
-                          >
-                            {canFoldWorkspace && (
-                              <span
-                                className={`worktree-fold${workspaceSessionsOpen ? "" : " folded"}`}
-                                aria-hidden="true"
-                              >
-                                <ChevronDown size={12} strokeWidth={1.8} />
-                              </span>
-                            )}
-                            <span className="worktree-branch-icon" aria-hidden="true">
-                              <GitBranch size={12} strokeWidth={1.8} />
-                            </span>
-                            <span className="worktree-branch-name">{displayBranchName}</span>
-                            {childProject && (
-                              // 子工作区直接新建 Agent，免去先选中再从别处创建的绕路操作。
-                              <span
-                                className="project-action worktree-new-agent"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  void createAgent(childProject.id);
-                                }}
-                                title={t("app.projectNewAgent")}
-                              >
-                                <Plus size={12} strokeWidth={1.8} />
-                              </span>
-                            )}
-                            {childProject && (
-                              <span
-                                className="project-action worktree-remove"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  requestRemoveWorktree(project.id, wt.path, childProject);
-                                }}
-                                title={t("menu.removeProject")}
-                              >
-                                <Trash2 size={12} strokeWidth={1.8} />
-                              </span>
-                            )}
-                          </button>
-                          {hasNestedChildren && (
-                          <div className="worktree-group-body">
-                          {wtChildren.filter(c => c.type === "agent").map((item) => {
-                            const agent = item.agent;
-                            const totalSubagentCount = (item.codexSubagents?.length ?? 0) + (item.piSubagents?.length ?? 0);
-                            const subagentGroupKey = `wt:${childProject!.id}:${item.key}`;
-                            const subagentExpanded = expandedSubagentGroups.has(subagentGroupKey);
-                            return (
-                              <Fragment key={item.key}>
-                                <button
-                                  className={`conversation agent-row worktree-nested-row${isSidebarSessionRowActive({
-                                    rowSessionPath: agent.sessionPath,
-                                    displayedSessionPath: displayedSidebarSessionPath,
-                                    rowAgentId: agent.id,
-                                    activeAgentId,
-                                  }) ? " active" : ""}`}
-                                  onContextMenu={async (event) => {
-                                    event.preventDefault();
-                                    const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
-                                    dispatchWorkspaceToAgent(agent.id, rpcLogActions.set(logging));
-                                    setAgentMenu({ x: event.clientX, y: event.clientY, agent });
-                                  }}
-                                  onClick={() => { setActiveProjectId(agent.projectId); setActiveAgentId(agent.id); ensureAgentMessagesLoaded(agent.id); }}
-                                >
-                                  <span className="agent-node-marker" aria-hidden="true" />
-                                  <div className="conversation-body">
-                                    <div className="conversation-title">
-                                      <strong>{agent.title}</strong>
-                                      {agent.title.startsWith("AFK: #") && (
-                                        <Badge variant="outline" badgeSize="sm" className="afk-sidebar-badge">
-                                          {t("afk.sidebar.badge")}
-                                        </Badge>
-                                      )}
-                                      {agent.noSession && (
-                                        <span
-                                          className="anonymous-indicator"
-                                          title={t("app.anonymousChat")}
-                                        >
-                                          <HatGlasses size={11} />
-                                        </span>
-                                      )}
-                                      {totalSubagentCount > 0 && (
-                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); toggleSubagentGroup(subagentGroupKey); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
-                                          <ChevronDown size={10} className={subagentExpanded ? "expanded" : ""} />
-                                          <span className="subagent-inline-count">{totalSubagentCount}</span>
-                                        </span>
-                                      )}
-                                      {/* 状态圆点放标题行最右侧，对齐最近会话列表风格 */}
-                                      {agent.status && <AgentStatusIndicator status={agent.status} />}
-                                    </div>
-                                  </div>
-                                </button>
-                                {subagentExpanded && item.codexSubagents?.length > 0 && (
-                                  <div className="codex-subagent-sidebar-group">
-                                    {item.codexSubagents.map((sa) => (
-                                      <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatCodexSubagentName(sa)}</strong><span className="session-source-badge codex subagent">{t("app.codexSubagent")}</span></div></div>
-                                      </button>
-                                    ))}
-                                  </div>
-                                )}
-                                {subagentExpanded && item.piSubagents?.length > 0 && (
-                                  renderWtPiSubagentTree(item.piSubagents, subagentGroupKey, 0)
-                                )}
-                              </Fragment>
-                            );
-                          })}
-                          {wtChildren.filter(c => c.type === "session").map((item) => {
-                            const session = item.session;
-                            const totalSubagentCount = (item.codexSubagents?.length ?? 0) + (item.piSubagents?.length ?? 0);
-                            const subagentGroupKey = `wt:${childProject!.id}:${item.key}`;
-                            const subagentExpanded = expandedSubagentGroups.has(subagentGroupKey);
-                            return (
-                              <Fragment key={item.key}>
-                                <button
-                                  className={`conversation agent-row session-row worktree-nested-row${isSameSessionPath(session.filePath, displayedSidebarSessionPath) ? " active" : ""}`}
-                                  title={session.filePath}
-                                  onClick={() => void openSidebarSession(childProject!.id, session)}
-                                >
-                                  <span className="session-node-marker" aria-hidden="true" />
-                                  <div className="conversation-body">
-                                    <div className="conversation-title">
-                                      <strong title={session.name || t("common.untitled")}>{session.name || t("common.untitled")}</strong>
-                                      {totalSubagentCount > 0 && (
-                                        <span className="subagent-inline-toggle" onClick={(e) => { e.stopPropagation(); toggleSubagentGroup(subagentGroupKey); }} title={t("app.piSubagentCount", { count: totalSubagentCount })}>
-                                          <ChevronDown size={10} className={subagentExpanded ? "expanded" : ""} />
-                                          <span className="subagent-inline-count">{totalSubagentCount}</span>
-                                        </span>
-                                      )}
-                                    </div>
-                                  </div>
-                                </button>
-                                {subagentExpanded && item.codexSubagents?.length > 0 && (
-                                  <div className="codex-subagent-sidebar-group">
-                                    {item.codexSubagents.map((sa) => (
-                                      <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatCodexSubagentName(sa)}</strong><span className="session-source-badge codex subagent">{t("app.codexSubagent")}</span></div></div>
-                                      </button>
-                                    ))}
-                                  </div>
-                                )}
-                                {subagentExpanded && item.piSubagents?.length > 0 && (
-                                  renderWtPiSubagentTree(item.piSubagents, subagentGroupKey, 0)
-                                )}
-                              </Fragment>
-                            );
-                          })}
-                          {hiddenSessionCount > 0 && (
-                            <button
-                              type="button"
-                              className="worktree-sessions-more"
-                              onClick={() => {
-                                setExpandedWorktreeSessions((prev) => {
-                                  const next = new Set(prev);
-                                  next.add(wt.path);
-                                  return next;
-                                });
-                              }}
-                            >
-                              {t("app.worktreeShowMoreSessions", { count: hiddenSessionCount })}
-                            </button>
-                          )}
-                          </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        {!isLanWeb && (
-          <div className="toolbar-actions sidebar-bottom-actions">
-            <div className="sidebar-bottom-primary-actions">
-              <button
-                className="icon-button settings-icon"
-                title={t("settings.title")}
-                onClick={() => setSettingsOpen(true)}
-              >
-                <Settings size={17} />
-              </button>
-              <button
-                className="icon-button config-icon"
-                title={t("config.title")}
-                onClick={() => setConfigOpen(true)}
-              >
-                <Sliders size={17} />
-              </button>
-              <button
-                className="icon-button feedback-icon"
-                title={t("feedback.title")}
-                onClick={() => setFeedbackOpen(true)}
-              >
-                <MessageSquare size={17} />
-              </button>
-              <button
-                className="icon-button afk-icon"
-                title={t("afk.openCenter")}
-                aria-label={t("afk.openCenter")}
-                onClick={() => setAfkOpen(true)}
-              >
-                <Bot size={17} />
-              </button>
-              <button
-                className="icon-button homepage-icon"
-                title={t("app.homepage")}
-                onClick={() => api.app.openExternal("https://github.com/HiHaWarzid/OmpDeck/")}
-              >
-                <Globe size={17} />
-              </button>
-            </div>
-
-          </div>
-        )}
-        </div>
-      </aside>
+      {/* 侧栏树（批次 5c）：数据面走窄 props——项目列表 + 已 memo 的行投影 + 活动 id +
+          展开集合 + 回调；组件内不再做 filter/find/分组，memo 边界让它不随 App 根
+          的无关重渲染（抽屉/弹框/输入/流式）一起重算。行为与内联版本逐字一致。 */}
+      <SidebarTree
+        projects={filteredProjects}
+        projectDisplayByProject={sidebarProjectDisplayByProject}
+        agentsByProject={displayAgentsByProject}
+        sessionsByProject={sessionsByProject}
+        sessionLoadingByProject={sessionLoadingByProject}
+        sessionErrorByProject={sessionErrorByProject}
+        branchInfoByProject={branchInfoByProject}
+        sessionSourceFilter={sessionSourceFilter}
+        expandedSidebarProjects={expandedSidebarProjects}
+        expandedSubagentGroups={expandedSubagentGroups}
+        collapsedWorktrees={collapsedWorktrees}
+        removingWorktreePaths={removingWorktreePaths}
+        draggingProjectId={draggingProjectId}
+        dragOverProjectId={dragOverProjectId}
+        activeProjectId={activeProjectId}
+        activeAgentId={activeAgentId}
+        displayedSidebarSessionPath={displayedSidebarSessionPath}
+        listCollapsed={listCollapsed}
+        search={search}
+        canReorderProjects={canReorderProjects}
+        brandLogoReplayToken={brandLogoReplayToken}
+        isLanWeb={isLanWeb}
+        projectDragPreventClickRef={projectDragPreventClickRef}
+        api={api}
+        setSearch={setSearch}
+        addProject={addProject}
+        toggleListCollapsed={toggleListCollapsed}
+        setProjectSidebarExpanded={setProjectSidebarExpanded}
+        handleProjectDragStart={handleProjectDragStart}
+        handleProjectDragOver={handleProjectDragOver}
+        handleProjectDragLeave={handleProjectDragLeave}
+        handleProjectDrop={handleProjectDrop}
+        finishProjectDrag={finishProjectDrag}
+        setProjectMenu={setProjectMenu}
+        setSessionMenu={setSessionMenu}
+        setAgentMenu={setAgentMenu}
+        setSessionFilterOpen={setSessionFilterOpen}
+        setWorktreeCreateDialog={setWorktreeCreateDialog}
+        setVisibleProjectChildCountByProject={setVisibleProjectChildCountByProject}
+        setCollapsedWorktrees={setCollapsedWorktrees}
+        setExpandedWorktreeSessions={setExpandedWorktreeSessions}
+        setActiveProjectId={setActiveProjectId}
+        setActiveAgentId={setActiveAgentId}
+        setSettingsOpen={setSettingsOpen}
+        setConfigOpen={setConfigOpen}
+        setFeedbackOpen={setFeedbackOpen}
+        setAfkOpen={setAfkOpen}
+        refreshProjectSessions={refreshProjectSessions}
+        ensureAgentMessagesLoaded={ensureAgentMessagesLoaded}
+        openSidebarSession={openSidebarSession}
+        createAgent={createAgent}
+        showToast={showToast}
+        requestRemoveWorktree={requestRemoveWorktree}
+        toggleSubagentGroup={toggleSubagentGroup}
+        adjustMenuPos={adjustMenuPos}
+      />
 
       <div
         className="splitter splitter-left"
@@ -7687,8 +6668,8 @@ export function App() {
         {activeAgent && (
         <footer ref={composerRef} className="composer">
           {/* 扩展 widget 固定在输入框上方；Todo+Plan 合并成一张任务卡，内部分区区分来源。 */}
-          {activeAgentId && extensionWidgetsByAgent[activeAgentId] && Object.keys(extensionWidgetsByAgent[activeAgentId]).length > 0 && (() => {
-            const entries = Object.entries(extensionWidgetsByAgent[activeAgentId]);
+          {activeAgentId && activeExtensionWidgets && Object.keys(activeExtensionWidgets).length > 0 && (() => {
+            const entries = Object.entries(activeExtensionWidgets);
             const widgetSessionKey = getAgentSessionStorageKey(activeAgent, activeAgentId);
             const isDismissed = (key: string) =>
               Boolean(widgetSessionKey && agentDismissedWidgets[widgetSessionKey]?.includes(key));
@@ -9181,7 +8162,7 @@ export function App() {
             const id = agentMenu.agent.id;
             const current = sessionWorkspaceStore.getSlice(id, "rpcLog")?.enabled ?? false;
             void window.piDesktop.rpcLogs.setLogging(id, !current).then((enabled) => {
-              dispatchWorkspaceToAgent(id, rpcLogActions.set(enabled));
+              dispatchToAgent(id, rpcLogActions.set(enabled));
               // 开启后在 console 提示一次，方便用户知道 F12 可直接看摘要。
               if (enabled) {
                 console.info(

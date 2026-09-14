@@ -10,6 +10,7 @@ import type { SessionScanner } from "../sessions/SessionScanner";
 import type { ImportPipeline } from "../sessions/importPipeline";
 import type { AgentManager } from "../pi/AgentManager";
 import type { SessionFileOps } from "../sessions/SessionFileOps";
+import { SESSION_READ_MAX_BYTES } from "../sessions/sessionEntries";
 import type { AppLogger } from "../logging/AppLogger";
 import { perfEnd, perfStart } from "../perf";
 
@@ -84,11 +85,18 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 			readSessionMeta: async (_event, filePath: string) => {
 				return sessionFileOps.readSessionMeta(filePath);
 			},
-			readChatMessages: async (_event, filePath: string) => {
-				// 统一文件读取（SessionFileOps 处理本地/WSL 路径）；
+			readChatMessages: async (_event, filePath: string, maxBytes?: number) => {
+				// 统一文件读取（SessionFileOps 处理本地/WSL 路径、编码守卫与字节预算）；
 				// 消息转换与压缩归档走 AgentManager 的单条 JSONL→ChatMessage 管线。
-				const content = await sessionFileOps.readSessionRawText(filePath);
-				return agentManager.readSessionDisplayMessages(filePath, "_viewer", content);
+				// 预算超限时只解析头部，truncated 透传给渲染层（否则 40MB 级会话会整份进内存）。
+				const file = await sessionFileOps.readSessionFile(filePath, {
+					maxBytes:
+						typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0
+							? Math.floor(maxBytes)
+							: SESSION_READ_MAX_BYTES,
+				});
+				const messages = await agentManager.readSessionDisplayMessages(filePath, "_viewer", file.raw);
+				return { messages, truncated: file.truncated };
 			},
 			readMessageFullText: async (_event, agentId, messageId, entryId?) => {
 				// 入参校验在边界（渲染层数据不可信），agentId/messageId 必须为非空字符串

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { buildApi, type IpcBridge } from "./buildApi";
 import { ipcTable, type IpcOpEntry } from "../shared/ipc";
+import { IpcInvokeError } from "../shared/ipcEnvelope";
 
 interface BridgeCall {
 	op: "invoke" | "send" | "sendSync";
@@ -8,13 +9,17 @@ interface BridgeCall {
 	args: unknown[];
 }
 
-function createFakeBridge() {
+/**
+ * 生成器假 bridge。invoke 必须回失败契约 envelope（真实链路里注册循环只会产出这种形状），
+ * 默认成功分支；需要断言解包语义时传入自定义 envelope。
+ */
+function createFakeBridge(result: unknown = { ok: true, value: undefined }) {
 	const calls: BridgeCall[] = [];
 	const listeners = new Map<string, Array<(event: unknown, payload: unknown) => void>>();
 	const bridge: IpcBridge = {
 		invoke: (channel, ...args) => {
 			calls.push({ op: "invoke", channel, args });
-			return Promise.resolve(undefined);
+			return Promise.resolve(result);
 		},
 		send: (channel, ...args) => {
 			calls.push({ op: "send", channel, args });
@@ -45,6 +50,27 @@ describe("buildApi", () => {
 
 		await api.files.delete("/a/b.ts", true);
 		expect(calls[1]).toEqual({ op: "invoke", channel: "files:delete", args: ["/a/b.ts", true] });
+	});
+
+	test("invoke 成功 envelope → 解包出 value，成员返回值形状不变", async () => {
+		const { bridge } = createFakeBridge({ ok: true, value: { branches: ["main"] } });
+		const api = buildApi(bridge);
+		await expect(api.git.branches("p1")).resolves.toEqual({ branches: ["main"] });
+	});
+
+	test("invoke 失败 envelope → 抛 IpcInvokeError，kind 与干净 message 原样带出", async () => {
+		const { bridge } = createFakeBridge({
+			ok: false,
+			kind: "timeout",
+			message: "git status timed out after 30000ms: ",
+		});
+		const api = buildApi(bridge);
+		const error = await api.git.branches("p1").catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(IpcInvokeError);
+		// 具名收窄（规则禁止内联断言访问成员）
+		const ipcError = error as IpcInvokeError;
+		expect(ipcError.kind).toBe("timeout");
+		expect(ipcError.message).toBe("git status timed out after 30000ms: ");
 	});
 
 	test("pack member folds member args into one invoke arg", async () => {

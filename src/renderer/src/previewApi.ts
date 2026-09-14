@@ -109,8 +109,8 @@ const previewOverrides: NamespaceOverrides = {
 	},
 	files: {
 		list: async () => files,
-		readContent: async () => "",
-		readBase64: async () => "",
+		readContent: async () => ({ content: "", truncated: false }),
+		readBase64: async () => ({ content: "", truncated: false }),
 		copy: async () => [],
 		move: async () => [],
 		rename: async () => "",
@@ -133,7 +133,7 @@ const previewOverrides: NamespaceOverrides = {
 		readSessionMeta: async () => ({}),
 		// 预览模式无主进程：返回固定 mock 用户消息
 		readUserPrompts: async () => ["Preview user message"],
-		readChatMessages: async () => [],
+		readChatMessages: async () => ({ messages: [], truncated: false }),
 		// 预览模式无主进程：完整输出按需读取直接返回空文本
 		readMessageFullText: async () => ({ text: "" }),
 	},

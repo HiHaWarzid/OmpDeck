@@ -75,7 +75,12 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 	const subagentParentInference = loadTranspiledModule("src/main/sessions/subagentParentInference.ts");
 	// W4：文件操作拆分到 SessionFileOps（rename/copy/delete/read 族），SessionScanner 委托给注入实例；
 	// extractText 为共享纯函数，一并来自该模块。
-	const sessionFileOps = loadTranspiledModule("src/main/sessions/SessionFileOps.ts");
+	// 读取半部分收敛到 sessionEntries，两个模块都依赖它：vm 沙箱不解析 .ts 扩展引入，需显式注入。
+	const sessionEntries = loadTranspiledModule("src/main/sessions/sessionEntries.ts");
+	const sessionFileOps = loadTranspiledModule(
+		"src/main/sessions/SessionFileOps.ts",
+		new Map([["./sessionEntries", sessionEntries]]),
+	);
 	const sandbox = {
 		AbortController,
 		AbortSignal,
@@ -100,6 +105,7 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 			if (id === "../fs/adapters/wslFileAdapter") return wslFileAdapter;
 			if (id === "./subagentParentInference") return subagentParentInference;
 			if (id === "./SessionFileOps") return sessionFileOps;
+			if (id === "./sessionEntries") return sessionEntries;
 			if (id === "node:fs") return { ...require(id), ...fsOverrides };
 			if (id === "node:fs/promises") return { ...require(id), ...fsPromisesOverrides };
 			return require(id);

@@ -152,6 +152,17 @@ export type AgentConfigDeps = {
 /** 项目信任确认弹窗的用户选择 */
 export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
 
+/**
+ * 估算单条消息经 IPC 序列化后的体积：文本/思考按 UTF-16（2 字节/字符）计，
+ * 图片按 base64 串长计，另加固定开销。只求量级正确——目的是给全量基线一个上界，
+ * 不需要精确的序列化测量（精确测量本身要先把整份 JSON 拼出来，正是要避免的成本）。
+ */
+function estimateMessageBytes(message: ChatMessage): number {
+	let bytes = 256 + message.text.length * 2 + (message.thinking?.length ?? 0) * 2;
+	for (const image of message.images ?? []) bytes += image.data.length;
+	return bytes;
+}
+
 export class AgentManager {
 	/**
 	 * 所有 agent 的运行态。per-agent 状态（消息/思考/工具/闸门/flag 等）全部收拢在
@@ -198,6 +209,12 @@ export class AgentManager {
 	 * 文件直接读取仅解析近尾部少量消息，避免大会话加载导致的界面冻结。
 	 */
 	private static readonly MAX_AUTO_HISTORY_LOAD_BYTES = 5 * 1024 * 1024;
+	/**
+	 * getMessages 内存快照经 IPC 序列化的字节上限：与 MAX_AUTO_HISTORY_LOAD_BYTES 同量级。
+	 * 运行态 transcript 是只增数组，长会话（大量巨型工具结果）会让每次全量基线拉取都
+	 * 序列化几十 MB，渲染层同样会卡死；返回形状不变，只丢掉最旧的一段。
+	 */
+	private static readonly MAX_GET_MESSAGES_BYTES = 5 * 1024 * 1024;
 	/**
 	 * 大会话直接从文件尾部读取时，最多保留的最近消息轮次（每条 user 消息算一轮）。
 	 * 原值 8 对于一些需要回看较多历史的长会话偏少，提高至 30 轮。
@@ -316,7 +333,26 @@ export class AgentManager {
 	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
 	 */
 	getMessages(agentId: string): ChatMessage[] {
-		return this.agents.get(agentId)?.transcript.messages ?? [];
+		const messages = this.agents.get(agentId)?.transcript.messages ?? [];
+		// 未超预算时返回原数组（保持既有引用语义）；超限时只保留尾部能装下的最近消息，
+		// 至少保留最后一条（单条即超限时也要给渲染层一个基线，否则历史基线永远拉不到）。
+		let total = 0;
+		let start = messages.length;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const size = estimateMessageBytes(messages[i]);
+			if (start < messages.length && total + size > AgentManager.MAX_GET_MESSAGES_BYTES) break;
+			total += size;
+			start = i;
+		}
+		if (start === 0) return messages;
+		void this.appLogger?.warn("agent", "Transcript truncated for IPC baseline", {
+			agentId,
+			totalMessages: messages.length,
+			keptMessages: messages.length - start,
+			estimatedBytes: total,
+			limitBytes: AgentManager.MAX_GET_MESSAGES_BYTES,
+		});
+		return messages.slice(start);
 	}
 
 	/**

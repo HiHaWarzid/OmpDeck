@@ -41,6 +41,12 @@ function loadAgentManager() {
 			calls.readFile.push(args);
 			return `${JSON.stringify({ id: "entry-user", type: "message", message: { role: "user", content: "hello" } })}\n`;
 		},
+		// sessionEntries 的读取管线先 stat 取指纹再决定读多少；桩文件内容固定，
+		// size 用与 fsPromises.open 同一份内容的字节数，保证指纹/尾窗计算一致。
+		stat: async (filePath) => {
+			const content = await fsPromises.readFile(filePath);
+			return { mtimeMs: 1_700_000_000_000, size: Buffer.byteLength(content, "utf8") };
+		},
 		readdir: async (...args) => {
 			calls.readdir.push(args);
 			return [];
@@ -133,6 +139,9 @@ function loadAgentManager() {
 	// 测试文件自身的 require 会把 "./boundedLruCache" 解析到 tests/ 目录而失败，
 	// 必须按依赖顺序先转译注入真模块。
 	registry["./boundedLruCache"] = loadModule("src/main/pi/boundedLruCache.ts", "boundedLruCache.ts");
+	// sessionJsonl 的读取管线收敛到 ../sessions/sessionEntries（唯一实现：编码守卫/逐行解析/
+	// 指纹/预算，仅依赖 node:fs/promises）；测试文件自身的 require 会把它解析到 tests/ 而失败。
+	registry["../sessions/sessionEntries"] = loadModule("src/main/sessions/sessionEntries.ts", "sessionEntries.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
 	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
 	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");

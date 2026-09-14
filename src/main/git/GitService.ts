@@ -4,7 +4,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GitBranchInfo, CommitDetail, CommitEntry, GitRef, BranchDiffResult, GitChangedFile, GitFileStatus, GitCommitFileDiff, GitResourceGroupType, GitWorkspaceFileDiff } from "../../shared/types";
 import { GitStatus } from "../../shared/types";
 import type { GitResource, GitResourceGroups } from "../../shared/types";
-import { runGit } from "../utils/CommandRunner";
+import { CommandError, runGit, type RunCommandOptions } from "../utils/CommandRunner";
+import { repoCommandQueue, type RepoCommandQueue } from "../utils/repoCommandQueue";
 
 const GIT_MUTATION_TIMEOUT_MS = 30_000;
 
@@ -15,9 +16,36 @@ type RunGitOptions = {
 	maxBuffer?: number;
 	/** 覆盖默认超时（默认 GIT_MUTATION_TIMEOUT_MS；push/pull/fetch 用 4 倍） */
 	timeout?: number;
+	/** 追加/覆盖环境变量（如 git:init 的 author）：在 process.env 基线上合并，不整体替换 */
+	env?: NodeJS.ProcessEnv;
+};
+
+/**
+ * GitService 的两个执行端口：
+ * - runGit：默认 CommandRunner.runGit（30s 超时、32MB 缓冲、stderr 归一化、allowFailure）；
+ * - queue：变更命令的按仓库串行队列。
+ * 两个端口都可注入 fake，测试即可记录命令顺序与选项，不碰真实仓库。
+ */
+export type GitServiceDeps = {
+	runGit: (cwd: string, args: string[], options?: RunCommandOptions) => Promise<string>;
+	queue: RepoCommandQueue;
+};
+
+const defaultDeps: GitServiceDeps = {
+	// CommandRunner 的模块级单例：30s 超时、32MB 缓冲、stderr 归一化、git 非交互环境
+	runGit,
+	// 共享单例：WorktreeService 走同一队列，跨服务的同仓库写命令才会真正串行。
+	queue: repoCommandQueue,
 };
 
 export class GitService {
+	private readonly deps: GitServiceDeps;
+
+	constructor(deps: Partial<GitServiceDeps> = {}) {
+		this.deps = { ...defaultDeps, ...deps };
+	}
+
+
 	/** 只缓存轻量 commit 元数据/文件清单；正文永不缓存，且 LRU 总预算不超过 2MB。 */
 	private readonly commitDetailCache = new Map<string, { detail: CommitDetail; bytes: number }>();
 	private readonly commitDetailCacheLimit = 16;
@@ -98,16 +126,34 @@ export class GitService {
 	}
 
 	/**
-	 * git 命令执行器：统一经 CommandRunner.runGit（超时 30s 默认/缓冲 32MB/stderr 归一化/
+	 * git 命令执行器：统一经 deps.runGit（默认 CommandRunner.runGit，超时/缓冲/stderr 归一化/
 	 * ENOENT 归类/allowFailure 全收敛），本方法只做参数名映射（RunGitOptions.timeout → timeoutMs），
 	 * 公共方法面与 per-op 超时/缓冲覆盖行为保持不变。
+	 * 变更命令必须再经 mutate() 排队；只读命令直接调用本方法（不进队列）。
 	 * execFile 错误对象的 stderr 已由 CommandRunner 并入错误消息（如 checkout 冲突、push 认证拒绝）。
 	 */
 	private async runGit(cwd: string, args: string[], options: RunGitOptions = {}): Promise<string> {
-		return runGit(cwd, args, {
+		return this.deps.runGit(cwd, args, {
 			allowFailure: options.allowFailure,
 			maxBuffer: options.maxBuffer,
 			timeoutMs: options.timeout,
+			env: options.env,
+		});
+	}
+
+	/**
+	 * 变更命令统一入口：同一仓库路径上的写命令按入队顺序串行，避免 UI 与 AFK 并发写同一仓库
+	 * 时的 index.lock 争用（不同仓库并行）；只读命令不进队列，UI 查询不会被写操作堵住。
+	 * 任务结束（含失败）后再次失效 status 冷却缓存：排队等待期间只读 status 请求
+	 * 可能已把变更前的状态写进 500ms 冷却窗口，不失效则 UI 在窗口内看到陈旧状态。
+	 */
+	private async mutate<T>(cwd: string, task: () => Promise<T>): Promise<T> {
+		return this.deps.queue.run(cwd, async () => {
+			try {
+				return await task();
+			} finally {
+				this.invalidateStatusCache(cwd);
+			}
 		});
 	}
 
@@ -173,7 +219,7 @@ export class GitService {
 			const fullRef = `refs/heads/${branch}`;
 			await this.runGit(cwd, ["check-ref-format", fullRef]);
 			await this.runGit(cwd, ["show-ref", "--verify", "--quiet", fullRef]);
-			await this.runGit(cwd, ["checkout", "--end-of-options", branch]);
+			await this.mutate(cwd, () => this.runGit(cwd, ["checkout", "--end-of-options", branch]));
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
 			// runGit 已把 stderr 并入错误消息，这里只补充分支名上下文。
@@ -191,7 +237,7 @@ export class GitService {
 		await this.runGit(cwd, ["check-ref-format", `refs/heads/${branchName}`]);
 		this.invalidateStatusCache(cwd);
 		this.invalidateBranchesCache(cwd);
-		await this.runGit(cwd, ["checkout", "-b", branchName]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["checkout", "-b", branchName]));
 		return this.getBranches(cwd);
 	}
 
@@ -293,11 +339,12 @@ export class GitService {
 		try {
 			return (await this.getStatusContext(cwd)).groups;
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			// 非 Git 仓库或 Git 未安装时抛出异常，让渲染层展示对应提示
-			if (/not a git repository|fatal:|command not found|ENOENT|spawn.*git.*ENOENT/i.test(msg)) {
-				throw err;
-			}
+			// 命令层已把 git 失败归一成 CommandError：not-found = git 不在 PATH、command = git 自身报错
+			// （"fatal: not a git repository" 属此类）、timeout = 超时被杀。三种都必须上抛，
+			// 渲染层才能分别给出安装引导 / 初始化仓库 / 超时重试的提示——按分类判断，不再反解错误文本。
+			// 非命令错误（工程目录的 fs 抖动、porcelain 解析异常）与历史一致按「无变更」吞掉，
+			// 免得一次抖动把整棵变更树标成失败。
+			if (err instanceof CommandError) throw err;
 			return { merge: [], index: [], workingTree: [], untracked: [] };
 		}
 	}
@@ -673,7 +720,7 @@ export class GitService {
 		const safePaths = await this.resolveMutationPaths(cwd, paths, "stage");
 		if (safePaths.length === 0) return;
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["--literal-pathspecs", "add", "--", ...safePaths]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["--literal-pathspecs", "add", "--", ...safePaths]));
 	}
 
 	/** Unstage 文件（git restore --staged） */
@@ -682,12 +729,14 @@ export class GitService {
 		if (safePaths.length === 0) return;
 		this.invalidateStatusCache(cwd);
 		const head = await this.resolveCommitHash(cwd, "HEAD");
-		if (head) {
-			await this.runGit(cwd, ["--literal-pathspecs", "restore", "--staged", "--", ...safePaths]);
-		} else {
-			// Unborn repository 没有 HEAD，restore --staged 无基线；从 index 移除但保留工作区文件。
-			await this.runGit(cwd, ["--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "--", ...safePaths]);
-		}
+		await this.mutate(cwd, async () => {
+			if (head) {
+				await this.runGit(cwd, ["--literal-pathspecs", "restore", "--staged", "--", ...safePaths]);
+			} else {
+				// Unborn repository 没有 HEAD，restore --staged 无基线；从 index 移除但保留工作区文件。
+				await this.runGit(cwd, ["--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "--", ...safePaths]);
+			}
+		});
 	}
 
 	/**
@@ -721,25 +770,26 @@ export class GitService {
 			return;
 		}
 
-		await this.runGit(repoRoot, ["--literal-pathspecs", "restore", "--worktree", "--", resource.path]);
+		await this.mutate(repoRoot, () =>
+			this.runGit(repoRoot, ["--literal-pathspecs", "restore", "--worktree", "--", resource.path]));
 	}
 
 	/** 创建提交 */
 	async commit(cwd: string, message: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["commit", "-m", message]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["commit", "-m", message]));
 	}
 
 	/** Cherry-pick：将指定提交应用到当前分支 */
 	async cherryPick(cwd: string, hash: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["cherry-pick", hash]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["cherry-pick", hash]));
 	}
 
 	/** Revert：创建一个反向提交撤销指定提交的变更 */
 	async revertCommit(cwd: string, hash: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["revert", "--no-edit", hash]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["revert", "--no-edit", hash]));
 	}
 
 	/**
@@ -748,7 +798,7 @@ export class GitService {
 	 */
 	async resetToCommit(cwd: string, hash: string, mode: "soft" | "mixed" | "hard" = "soft"): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["reset", `--${mode}`, hash]);
+		await this.mutate(cwd, () => this.runGit(cwd, ["reset", `--${mode}`, hash]));
 	}
 
 	/**
@@ -756,26 +806,56 @@ export class GitService {
 	 * 注意：只能删除非 HEAD 的提交
 	 */
 	async dropCommit(cwd: string, hash: string): Promise<void> {
-		// 先获取 parent hash
 		this.invalidateStatusCache(cwd);
-		const parentHash = await this.runGit(cwd, ["rev-parse", `${hash}^`]);
-		await this.runGit(cwd, ["rebase", "--onto", parentHash.trim(), hash]);
+		// rev-parse 与 rebase 必须同处一个队列单元：中间插入其他写命令会让 parent 指向已变化的 HEAD。
+		await this.mutate(cwd, async () => {
+			const parentHash = await this.runGit(cwd, ["rev-parse", `${hash}^`]);
+			await this.runGit(cwd, ["rebase", "--onto", parentHash.trim(), hash]);
+		});
 	}
 
 	/** Push：将当前分支推送到远程 */
 	async push(cwd: string): Promise<void> {
-		await this.runGit(cwd, ["push"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.mutate(cwd, () => this.runGit(cwd, ["push"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 }));
 	}
 
 	/** Pull：从远程拉取并合并到当前分支 */
 	async pull(cwd: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
-		await this.runGit(cwd, ["pull"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.mutate(cwd, () => this.runGit(cwd, ["pull"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 }));
 	}
 
 	/** Fetch：从远程获取最新数据但不合并 */
 	async fetch(cwd: string): Promise<void> {
-		await this.runGit(cwd, ["fetch"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 });
+		await this.mutate(cwd, () => this.runGit(cwd, ["fetch"], { timeout: GIT_MUTATION_TIMEOUT_MS * 4 }));
+	}
+
+	/**
+	 * 初始化仓库（git:init 通道的实现）：git init → 切到 main → 生成一个空提交。
+	 * 三条命令作为一个变更单元进队列，避免初始化与同仓库其他写命令交错；
+	 * 经 CommandRunner 获得 30s 超时与 32MB 缓冲（历史 handler 内的裸 execFileAsync 两者都没有）。
+	 * commit 只补 author/committer 变量：CommandRunner 在 process.env 基线上合并，PATH 等继承环境保留。
+	 */
+	async initRepo(cwd: string): Promise<void> {
+		this.invalidateStatusCache(cwd);
+		this.invalidateBranchesCache(cwd);
+		await this.mutate(cwd, async () => {
+			await this.runGit(cwd, ["init"]);
+			try {
+				await this.runGit(cwd, ["checkout", "-b", "main"]);
+			} catch {
+				// 部分 git 版本在无提交时 checkout -b 可能失败，改用 branch -M
+				await this.runGit(cwd, ["branch", "-M", "main"]);
+			}
+			await this.runGit(cwd, ["commit", "--allow-empty", "-m", "Initial commit"], {
+				env: {
+					GIT_AUTHOR_NAME: "OmpDeck",
+					GIT_AUTHOR_EMAIL: "ompdeck@local",
+					GIT_COMMITTER_NAME: "OmpDeck",
+					GIT_COMMITTER_EMAIL: "ompdeck@local",
+				},
+			});
+		});
 	}
 }
 

@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, copyFile, unlink, open, stat } from "node:fs/promises";
+import { readFile, writeFile, readdir, copyFile, unlink } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 
@@ -8,6 +8,15 @@ import { extractMessageText } from "./messageContent";
 import { convertAgentMessages, trimHistoryMessages } from "./messageTimeline";
 import { BoundedLruCache } from "./boundedLruCache";
 import { findLastUserMessageLine } from "./sessionEntryIds";
+import {
+	isJsonRecord,
+	nodeEntriesIo,
+	parseSessionText,
+	readEntries,
+	readTailEntries,
+	TAIL_READ_MAX_BYTES,
+	type SessionTailEntriesIo,
+} from "../sessions/sessionEntries";
 
 /**
  * 会话 JSONL 文件读写模块 —— 把 pi 会话文件（.jsonl）的所有磁盘 IO 与纯行级定位
@@ -45,6 +54,11 @@ export interface SessionJsonlDeps {
 	 * 调用方（AgentManager）传入的闭包应读取「当前」的 wslEnvironment，以支持运行时切换。
 	 */
 	resolveHostPath: (sessionPath: string) => string;
+	/**
+	 * 可选读取端口覆盖（测试注入计字节的假 IO）；默认走 node:fs。
+	 * 尾窗读取的字节成本必须有可观测的接缝，否则「不整文件读」只能靠读代码相信。
+	 */
+	entriesIo?: SessionTailEntriesIo;
 	/** 可选日志；未提供时静默。 */
 	logger?: SessionJsonlLogger;
 }
@@ -96,20 +110,13 @@ const BACKUP_SUFFIX = ".edit-backup";
 /** 最多保留的最近备份数量，超出时删除最旧。 */
 const MAX_BACKUPS = 3;
 
-/** 尾部读取初始窗口：大会话只需读末尾 ~1MB 即可覆盖最近几十轮对话。 */
-const TAIL_READ_INITIAL_BYTES = 1024 * 1024;
-/** 尾部读取总窗口上限：单行 JSON（巨型工具结果）超过此值时不再扩展。 */
-const TAIL_READ_MAX_BYTES = 16 * 1024 * 1024;
-
-/** JSONL 行解析结果的最小形状守卫（保留 unknown 收窄，便于逐字段检查）。 */
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
 export class SessionJsonl {
 	private readonly deps: SessionJsonlDeps;
+	/** 读取端口：解码/逐行解析/尾窗窗口策略都在 sessionEntries，本类只负责协议路径与缓存。 */
+	private readonly io: SessionTailEntriesIo;
 	constructor(deps: SessionJsonlDeps) {
 		this.deps = deps;
+		this.io = deps.entriesIo ?? nodeEntriesIo;
 	}
 
 	private resolve(sessionPath: string): string {
@@ -118,45 +125,16 @@ export class SessionJsonl {
 
 	/**
 	 * 从 JSONL 文件尾部读取最近若干完整行（含文件末尾未换行的残行，与旧整文件 split 行为一致）。
-	 * 窗口不足时按 2x 向前扩展，直到收集够 minLines 或到达文件头 / 达到 maxBytes 上限。
-	 * 窗口首行若从字节中部开始（UTF-8 多字节字符可能被截断），整行丢弃——该行必然不是
-	 * 我们需要的尾部最近行，且避免了解码损坏。
+	 * 窗口扩展策略与编码守卫在 sessionEntries.readTailEntries（唯一实现）；
+	 * 本方法只把窗口原文切成行，供各行级消费者复用。
 	 */
 	private async readTailLines(
 		hostPath: string,
 		minLines: number,
 		maxBytes: number,
 	): Promise<string[]> {
-		const handle = await open(hostPath, "r");
-		try {
-			const { size } = await handle.stat();
-			if (size === 0) return [];
-			const limit = Math.min(size, maxBytes);
-			let readSize = Math.min(TAIL_READ_INITIAL_BYTES, limit);
-			for (;;) {
-				const start = size - readSize;
-				const buffer = Buffer.alloc(readSize);
-				await handle.read(buffer, 0, readSize, start);
-				const text = buffer.toString("utf8");
-				const firstLf = text.indexOf("\n");
-				// 窗口内首个换行之前的部分可能跨窗口边界（不完整行），丢弃；
-				// 整个文件就是一个超长行时（start===0），它就是唯一且完整的行。
-				const completeFrom = firstLf === -1 ? (start === 0 ? 0 : -1) : firstLf + 1;
-				if (completeFrom >= 0) {
-					const lines = text.slice(completeFrom).split("\n");
-					// 已确认完整的行数（最后一段可能残，不计数）
-					const completeCount = lines.length - 1;
-					if (start === 0 || completeCount >= minLines || readSize >= limit) {
-						return lines.map((line) => line.trim()).filter(Boolean);
-					}
-				}
-				const nextSize = Math.min(readSize * 2, limit);
-				if (nextSize <= readSize) return [];
-				readSize = nextSize;
-			}
-		} finally {
-			await handle.close();
-		}
+		const { raw } = await readTailEntries(this.io, hostPath, { minLines, maxBytes });
+		return raw.split("\n").map((line) => line.trim()).filter(Boolean);
 	}
 
 	// ── 读取 ───────────────────────────────────────────────
@@ -236,7 +214,19 @@ export class SessionJsonl {
 		agentId: string,
 		sessionContent?: string,
 	): Promise<ChatMessage[]> {
-		const content = sessionContent ?? await readFile(this.resolve(sessionPath), "utf8");
+		// 调用方已读入原文时直接复用；否则整读走 sessionEntries（编码守卫与逐行解析的唯一实现）。
+		// content 保留解码后的原文，后续 parseArchives 复用同一份文本，避免第二次整读。
+		let content: string;
+		let parsedEntries: unknown[];
+		if (sessionContent === undefined) {
+			const file = await readEntries(this.io, this.resolve(sessionPath));
+			content = file.raw;
+			parsedEntries = file.entries;
+		} else {
+			const file = parseSessionText(sessionContent);
+			content = file.text;
+			parsedEntries = file.entries;
+		}
 		const entries: Array<{
 			id: string;
 			parentId: string | null;
@@ -248,24 +238,19 @@ export class SessionJsonl {
 			timestamp?: string;
 		}> = [];
 
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line);
-				if (!entry || typeof entry !== "object" || typeof entry.id !== "string") continue;
-				entries.push({
-					id: entry.id,
-					parentId: typeof entry.parentId === "string" ? entry.parentId : null,
-					type: typeof entry.type === "string" ? entry.type : "",
-					message: entry.message,
-					summary: typeof entry.summary === "string" ? entry.summary : undefined,
-					firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
-					tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
-					timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
-				});
-			} catch {
-				// 单行损坏不应阻断整个 Viewer。
-			}
+		for (const entry of parsedEntries) {
+			// 单行损坏已被 sessionEntries 隔离；这里只收窄字段，缺 id 的条目无法参与分支回溯。
+			if (!isJsonRecord(entry) || typeof entry.id !== "string") continue;
+			entries.push({
+				id: entry.id,
+				parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+				type: typeof entry.type === "string" ? entry.type : "",
+				message: entry.message,
+				summary: typeof entry.summary === "string" ? entry.summary : undefined,
+				firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
+				tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
+				timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+			});
 		}
 		if (entries.length === 0) return [];
 
@@ -373,31 +358,16 @@ export class SessionJsonl {
 		entryId: string,
 	): Promise<string | null> {
 		const hostPath = this.resolve(sessionPath);
-		const handle = await open(hostPath, "r");
-		try {
-			const { size } = await handle.stat();
-			const buffer = Buffer.alloc(Math.min(size, TAIL_READ_MAX_BYTES));
-			await handle.read(buffer, 0, buffer.length, 0);
-			for (const line of buffer.toString("utf8").split("\n")) {
-				const trimmed = line.trim();
-				if (!trimmed) continue;
-				try {
-					const entry = JSON.parse(trimmed) as {
-						id?: unknown;
-						type?: unknown;
-						message?: { content?: unknown };
-					};
-					if (entry.type === "message" && entry.id === entryId && entry.message?.content) {
-						return extractMessageText(entry.message.content);
-					}
-				} catch {
-					// 单行解析失败跳过
-				}
+		// 只读头部窗口（巨型工具结果所在的条目就在会话前段），解析与编码守卫交给 sessionEntries。
+		const file = await readEntries(this.io, hostPath, { maxBytes: TAIL_READ_MAX_BYTES });
+		for (const entry of file.entries) {
+			if (!isJsonRecord(entry)) continue;
+			const message = isJsonRecord(entry.message) ? entry.message : undefined;
+			if (entry.type === "message" && entry.id === entryId && message?.content) {
+				return extractMessageText(message.content);
 			}
-			return null;
-		} finally {
-			await handle.close();
 		}
+		return null;
 	}
 
 	/**
@@ -486,15 +456,17 @@ export class SessionJsonl {
 		sessionContent?: string,
 	): Promise<SessionArchives> {
 		// 指纹缓存：文件未变化（编辑/删除会改写 mtime）时复用上次解析结果
+		let fileFingerprint: { size: number; mtimeMs: number } | undefined;
 		if (sessionContent === undefined) {
 			const hostPath = this.resolve(sessionPath);
 			try {
-				const fileStat = await stat(hostPath);
+				const info = await this.io.stat(hostPath);
+				fileFingerprint = { size: info.size, mtimeMs: info.mtimeMs };
 				const cached = this.archivesCache.get(sessionPath);
 				if (
 					cached &&
-					cached.size === fileStat.size &&
-					cached.mtimeMs === fileStat.mtimeMs
+					cached.size === info.size &&
+					cached.mtimeMs === info.mtimeMs
 				) {
 					return cached.value;
 				}
@@ -503,20 +475,19 @@ export class SessionJsonl {
 			}
 		}
 
-		let content: string;
-		let fileFingerprint: { size: number; mtimeMs: number } | undefined;
+		let parsedEntries: unknown[];
 		if (sessionContent === undefined) {
 			const hostPath = this.resolve(sessionPath);
-			let readError: NodeJS.ErrnoException | undefined;
-			const [raw, fileStat] = await Promise.all([
-				readFile(hostPath, "utf8").catch((err: NodeJS.ErrnoException) => {
-					readError = err;
-					return undefined;
-				}),
-				stat(hostPath).catch(() => undefined),
-			]);
-			if (raw === undefined) {
-				if (readError?.code === "ENOENT") {
+			// 读取 → 解码 → 逐行解析走 sessionEntries（编码守卫唯一实现）；
+			// 已有指纹直接复用，读取失败仍按原语义降级为空归档（ENOENT 静默，其余 warn）。
+			try {
+				const file = await readEntries(this.io, hostPath, { fingerprint: fileFingerprint });
+				parsedEntries = file.entries;
+				fileFingerprint = { size: file.fingerprint.size, mtimeMs: file.fingerprint.mtimeMs };
+			} catch (error) {
+				const code =
+					error instanceof Error && "code" in error ? String(error.code) : undefined;
+				if (code === "ENOENT") {
 					// 会话刚创建、文件尚未落盘（创建与归档解析竞态）：正常时序，
 					// 静默降级为空归档，仅留 debug 线索，不打 warn 噪音。
 					void this.deps.logger?.debug?.(
@@ -527,16 +498,14 @@ export class SessionJsonl {
 				} else {
 					void this.deps.logger?.warn("agent", "Failed to read session file for archive parsing", {
 						sessionPath,
-						code: readError?.code,
-						message: readError?.message,
+						code,
+						message: error instanceof Error ? error.message : String(error),
 					});
 				}
 				return { compactions: [], archivedMessagesByCompactionId: new Map() };
 			}
-			content = raw;
-			if (fileStat) fileFingerprint = { size: fileStat.size, mtimeMs: fileStat.mtimeMs };
 		} else {
-			content = sessionContent;
+			parsedEntries = parseSessionText(sessionContent).entries;
 		}
 
 		// 一次遍历收集所有 entry 和原始消息
@@ -552,27 +521,23 @@ export class SessionJsonl {
 		}> = [];
 		const rawMessagesByEntryId = new Map<string, unknown>();
 
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line);
-				if (!entry || typeof entry !== "object") continue;
-				allEntries.push({
-					id: typeof entry.id === "string" ? entry.id : "",
-					parentId: typeof entry.parentId === "string" ? entry.parentId : null,
-					type: typeof entry.type === "string" ? entry.type : "",
-					message: entry.message,
-					summary: typeof entry.summary === "string" ? entry.summary : undefined,
-					firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
-					tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
-					timestamp: typeof entry.timestamp === "string" ? entry.timestamp : "",
-				});
-				// 缓存消息型 entry 的原始 message 对象，供后续 convertAgentMessages 使用
-				if (entry.type === "message" && entry.message && typeof entry.message === "object" && entry.id) {
-					rawMessagesByEntryId.set(entry.id, entry.message);
-				}
-			} catch {
-				// 跳过单行解析失败
+		for (const entry of parsedEntries) {
+			// 单行解析失败已由 sessionEntries 隔离：跳过该行，其余记录照常参与归档回溯。
+			if (!isJsonRecord(entry)) continue;
+			const entryId = typeof entry.id === "string" ? entry.id : "";
+			allEntries.push({
+				id: entryId,
+				parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+				type: typeof entry.type === "string" ? entry.type : "",
+				message: entry.message,
+				summary: typeof entry.summary === "string" ? entry.summary : undefined,
+				firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
+				tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
+				timestamp: typeof entry.timestamp === "string" ? entry.timestamp : "",
+			});
+			// 缓存消息型 entry 的原始 message 对象，供后续 convertAgentMessages 使用
+			if (entry.type === "message" && entry.message && typeof entry.message === "object" && entryId) {
+				rawMessagesByEntryId.set(entryId, entry.message);
 			}
 		}
 

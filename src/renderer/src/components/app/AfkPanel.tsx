@@ -7,7 +7,14 @@ import {
 	RefreshCw,
 	Square,
 } from "lucide-react";
-import type { AfkState, AfkTask, AfkTaskStatus } from "../../../../shared/types";
+import {
+	afkTaskKey,
+	isProjectBound,
+	upsertAfkTask,
+	type AfkState,
+	type AfkTask,
+	type AfkTaskStatus,
+} from "../../../../shared/types";
 import { t, type TranslationKey } from "../../i18n";
 import { showNotice } from "../../utils/notice";
 import { formatTime } from "./AppUtils";
@@ -102,16 +109,6 @@ function formatDuration(ms: number): string {
 	if (h > 0) return `${h}h ${m}m`;
 	if (m > 0) return `${m}m ${s}s`;
 	return `${s}s`;
-}
-/** 订阅事件推送的单任务更新：按 ticketRef 覆盖/插入（不整体替换，避免列表闪烁） */
-function upsertTask(state: AfkState, task: AfkTask): AfkState {
-	const exists = state.tasks.some((item) => item.ticketRef === task.ticketRef);
-	return {
-		...state,
-		tasks: exists
-			? state.tasks.map((item) => (item.ticketRef === task.ticketRef ? task : item))
-			: [task, ...state.tasks],
-	};
 }
 
 /**
@@ -252,11 +249,15 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 	const [refreshing, setRefreshing] = useState(false);
 	const [tab, setTab] = useState<AfkTab>("overview");
 	const [filter, setFilter] = useState<TaskFilter>("all");
-	const [detailTicketRef, setDetailTicketRef] = useState<number | null>(null);
+	/**
+	 * 详情/确认/终止武装都按身份键 (projectId, ticketRef) 记，不按 ticketRef：
+	 * 各仓库 issue 编号各自从 1 起，两个项目都有 #42 时按编号记会把两行当成同一行。
+	 */
+	const [detailKey, setDetailKey] = useState<string | null>(null);
 	/** 「已合并」两步确认：先点标记，再点确认 */
-	const [confirmMergedRef, setConfirmMergedRef] = useState<number | null>(null);
+	const [confirmMergedKey, setConfirmMergedKey] = useState<string | null>(null);
 	/** 「终止」两步确认：先点终止武装，3s 内再点确认才 terminate（防误触杀 agent） */
-	const [terminateArmed, setTerminateArmed] = useState<number | null>(null);
+	const [terminateArmedKey, setTerminateArmedKey] = useState<string | null>(null);
 	const [terminating, setTerminating] = useState(false);
 
 	const refresh = useCallback(async () => {
@@ -289,7 +290,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 		void refresh();
 		// 单订阅通道：终态（含 PR 完成）同走 afk:status-changed 增量更新
 		const offStatus = window.piDesktop.afk.onStatusChanged((task) => {
-			setState((prev) => upsertTask(prev, task));
+			setState((prev) => upsertAfkTask(prev, task));
 		});
 		return () => {
 			offStatus();
@@ -298,10 +299,10 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 
 	// 详情目标不存在（归档清理等）时自动关抽屉，避免指向幽灵任务
 	useEffect(() => {
-		if (detailTicketRef != null && !state.tasks.some((t) => t.ticketRef === detailTicketRef)) {
-			setDetailTicketRef(null);
+		if (detailKey != null && !state.tasks.some((t) => afkTaskKey(t) === detailKey)) {
+			setDetailKey(null);
 		}
-	}, [state.tasks, detailTicketRef]);
+	}, [state.tasks, detailKey]);
 
 	const stats = useMemo(() => countByStatus(state.tasks), [state.tasks]);
 	const activeTasks = useMemo(
@@ -323,10 +324,8 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 	);
 	const detailTask = useMemo(
 		() =>
-			detailTicketRef != null
-				? (state.tasks.find((task) => task.ticketRef === detailTicketRef) ?? null)
-				: null,
-		[state.tasks, detailTicketRef],
+			detailKey != null ? (state.tasks.find((task) => afkTaskKey(task) === detailKey) ?? null) : null,
+		[state.tasks, detailKey],
 	);
 	const timeline = useMemo(() => (detailTask ? buildTimeline(detailTask) : []), [detailTask]);
 
@@ -343,22 +342,24 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 	const switchTab = useCallback((next: AfkTab) => {
 		setTab(next);
 		// 切 tab 关闭详情抽屉，避免跨页残留叠层
-		setDetailTicketRef(null);
+		setDetailKey(null);
 	}, []);
 
 	const handleTerminateClick = useCallback(
 		(task: AfkTask) => {
-			if (!task.agentId) return;
-			if (terminateArmed !== task.ticketRef) {
-				setTerminateArmed(task.ticketRef);
+			// 未绑定来源项目的任务（unbound 旧存档）发不出 terminate 身份，按钮也不渲染
+			if (!task.agentId || !isProjectBound(task)) return;
+			const key = afkTaskKey(task);
+			if (terminateArmedKey !== key) {
+				setTerminateArmedKey(key);
 				window.setTimeout(() => {
-					setTerminateArmed((current) => (current === task.ticketRef ? null : current));
+					setTerminateArmedKey((current) => (current === key ? null : current));
 				}, 3000);
 				return;
 			}
 			setTerminating(true);
 			void window.piDesktop.afk
-				.terminate(task.ticketRef)
+				.terminate(task.projectId, task.ticketRef)
 				// 终止后的任务状态由 Orchestrator 语义事件（afk:status-changed）推送，无需本地改写
 				.catch((error) => {
 					showNotice(
@@ -371,15 +372,15 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 				})
 				.finally(() => {
 					setTerminating(false);
-					setTerminateArmed(null);
+					setTerminateArmedKey(null);
 				});
 		},
-		[terminateArmed],
+		[terminateArmedKey],
 	);
 
 	const confirmMerged = useCallback(() => {
 		// 「已合并」为 P0 半人工：UI 确认后提示分支 GC（renderer 无 afk 分支 GC 通道，不新增 IPC）
-		setConfirmMergedRef(null);
+		setConfirmMergedKey(null);
 		showNotice(t("afk.prs.gcHint"), 5000, "warning");
 	}, []);
 
@@ -475,9 +476,9 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 								<div className="afk-task-list">
 									{activeTasks.map((task) => (
 										<TaskRow
-											key={task.ticketRef}
+											key={afkTaskKey(task)}
 											task={task}
-											onOpen={(item) => setDetailTicketRef(item.ticketRef)}
+											onOpen={(item) => setDetailKey(afkTaskKey(item))}
 											onOpenPr={openExternal}
 										/>
 									))}
@@ -510,9 +511,9 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 							<div className="afk-task-list">
 								{visibleTasks.map((task) => (
 									<TaskRow
-										key={task.ticketRef}
+										key={afkTaskKey(task)}
 										task={task}
-										onOpen={(item) => setDetailTicketRef(item.ticketRef)}
+										onOpen={(item) => setDetailKey(afkTaskKey(item))}
 										onOpenPr={openExternal}
 									/>
 								))}
@@ -530,7 +531,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 									// 契约上 pr-pending 必有 prUrl；数据异常时静默跳过该行
 									if (!prUrl) return null;
 									return (
-									<div className="afk-pr-row" key={task.ticketRef}>
+									<div className="afk-pr-row" key={afkTaskKey(task)}>
 										<div className="afk-pr-main">
 											<button
 												type="button"
@@ -563,7 +564,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 													{t("afk.detail.openTicket")}
 												</Button>
 											) : null}
-											{confirmMergedRef === task.ticketRef ? (
+											{confirmMergedKey === afkTaskKey(task) ? (
 												<span className="afk-pr-confirm">
 													<Button buttonSize="sm" variant="danger" onClick={confirmMerged}>
 														{t("common.confirm")}
@@ -571,7 +572,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 													<Button
 														buttonSize="sm"
 														variant="ghost"
-														onClick={() => setConfirmMergedRef(null)}
+														onClick={() => setConfirmMergedKey(null)}
 													>
 														{t("common.cancel")}
 													</Button>
@@ -580,7 +581,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 												<Button
 													buttonSize="sm"
 													variant="ghost"
-													onClick={() => setConfirmMergedRef(task.ticketRef)}
+													onClick={() => setConfirmMergedKey(afkTaskKey(task))}
 												>
 													{t("afk.prs.markMerged")}
 												</Button>
@@ -596,7 +597,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 			</div>
 
 			{detailTask && (
-				<div className="afk-detail-backdrop" onClick={() => setDetailTicketRef(null)}>
+				<div className="afk-detail-backdrop" onClick={() => setDetailKey(null)}>
 					<aside
 						className="afk-detail-drawer"
 						role="dialog"
@@ -610,7 +611,7 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 							</Badge>
 							<CloseIconButton
 								label={t("common.close")}
-								onClick={() => setDetailTicketRef(null)}
+								onClick={() => setDetailKey(null)}
 							/>
 						</header>
 
@@ -692,14 +693,16 @@ export function AfkPanel({ open, onClose, onGoConfigure, onOpenSession }: AfkPan
 							>
 								{t("afk.detail.openWorktree")}
 							</Button>
-							{isActiveStatus(detailTask.status) && detailTask.agentId && (
+							{isActiveStatus(detailTask.status) &&
+								detailTask.agentId &&
+								isProjectBound(detailTask) && (
 								<Button
 									buttonSize="sm"
 									variant="danger"
 									loading={terminating}
 									onClick={() => handleTerminateClick(detailTask)}
 								>
-									{terminateArmed === detailTask.ticketRef ? (
+									{terminateArmedKey === afkTaskKey(detailTask) ? (
 										t("common.confirm")
 									) : (
 										<>

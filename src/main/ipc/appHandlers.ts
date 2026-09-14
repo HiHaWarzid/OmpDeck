@@ -203,12 +203,25 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 					try {
 						await webServiceManager?.applySettings(settings);
 					} catch (error) {
-						// applySettings 先绑新端口、成功后才关旧 server：新端口被占用时旧服务仍在正常服务。
-						// 这种情况回写 webServiceEnabled=false 会把一个可用服务误判为失败并强关，
-						// 所以只有确实没有任何实例在跑（启动失败且无旧实例）时才回退开关。
-						if (settings.webServiceEnabled && webServiceManager?.isRunning() !== true) {
-							await settingsStore.update({ webServiceEnabled: false });
+						// applySettings 先绑新端口、成功后才关旧 server：新端口被占用时旧服务仍在
+						// 正常服务。失败意味着这三个键没有生效，必须回滚到应用前的值——否则设置
+						// 面板会显示一个并未在服务的端口，用户以为已切换而实际仍在旧端口。
+						const rollback: Partial<AppSettings> = {};
+						if ("webServiceEnabled" in patch) {
+							rollback.webServiceEnabled = prevSettings.webServiceEnabled;
 						}
+						if ("webServiceHost" in patch) {
+							rollback.webServiceHost = prevSettings.webServiceHost;
+						}
+						if ("webServicePort" in patch) {
+							rollback.webServicePort = prevSettings.webServicePort;
+						}
+						// 启动失败且当前确无实例在跑（此前也没有服务）：明确关掉开关，
+						// 避免停在「开关是开、后端没有服务」的状态。
+						if (settings.webServiceEnabled && webServiceManager?.isRunning() !== true) {
+							rollback.webServiceEnabled = false;
+						}
+						if (Object.keys(rollback).length > 0) await settingsStore.update(rollback);
 						throw error;
 					}
 				}

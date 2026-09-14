@@ -10,8 +10,21 @@ import type { SessionSummary } from "../../shared/types";
 import { getCodexSessionThreadInfo } from "../../shared/codexSessionMeta";
 import { inferParentCandidatesFromPath, scoreSubagentConfidence, SUBAGENT_CONFIDENCE_THRESHOLD } from "./subagentParentInference";
 import { SessionFileOps, extractText } from "./SessionFileOps";
+import { isJsonRecord, parseSessionText, readEntries } from "./sessionEntries";
 import { toWslLinuxPath, type WslEnvironment } from "../wsl/WslPaths";
 import { SessionSummaryCache } from "./sessionSummaryCache";
+
+/**
+ * 取候选字段中第一个非空字符串。
+ * JSONL 行是外部持久化数据，字段类型不可信：早先把行当 any 处理时，非字符串的
+ * name/cwd 会被塞进 string 变量，并在后续 cleanTitle/normalize 的 .replace 上抛错。
+ */
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
 
 /** 本地模式扫描并发度：readFile/stat 是异步 IO，32 路足够打满磁盘吞吐且不爆句柄。 */
 const SCAN_CONCURRENCY_LOCAL = 32;
@@ -76,7 +89,7 @@ export class SessionScanner {
   private activeScanRoots: string[] = [];
 
   /**
-   * 会话文件操作（rename/delete/readMessages/readSessionMeta/readSessionRawText）。
+   * 会话文件操作（rename/delete/readMessages/readSessionMeta/readSessionFile）。
    * 适配器随 configureWsl 替换，经 getAdapter 访问器每次读取最新实例。
    * 对外直接暴露该模块：handler 调用的就是真正实现，不再经本类转发。
    */
@@ -448,14 +461,10 @@ export class SessionScanner {
   }
 
   private hasSessionHeader(raw: string): boolean {
-    for (const line of raw.split(/\r?\n/).filter(Boolean).slice(0, 12)) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed && typeof parsed === "object" && typeof parsed.type === "string") return true;
-      } catch {
-        // 跳过无法解析的行（损坏/二进制残留），继续检查后续行中的 type 字段
-        continue;
-      }
+    // 头部窗口内出现带 type 的对象即认定为会话文件（头部 4KB 足够容纳 pi 的首条 session 记录）；
+    // 解析与编码守卫与整读路径共用同一实现。
+    for (const parsed of parseSessionText(raw).entries.slice(0, 12)) {
+      if (isJsonRecord(parsed) && typeof parsed.type === "string") return true;
     }
     return false;
   }
@@ -468,23 +477,16 @@ export class SessionScanner {
     // 先读取轻量文件指纹；未变化时复用摘要，避免周期扫描反复读取和解析全部 JSONL。
     // 指纹优先用 scanOnce 的批量预取结果（WSL 单次进程拿全部），缺失时回退单文件 stat。
     const isWsl = this.isWslPath(filePath);
-    const info =
+    const version =
       prefetchedVersion ?? (await this.fileAdapter.stat(filePath, signal));
-    const version = { mtimeMs: info.mtimeMs, size: info.size };
     const cached = this.summaryCache.get(filePath, version);
     if (cached !== undefined) return cached;
 
-    const raw = await this.fileAdapter.read(filePath, signal);
-    // UTF-8 BOM 会让首行 JSON.parse 失败，导致会话头信息（name/cwd 等）丢失，先剥离。
-    const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-    // UTF-16 等双字节编码按 utf8 解码后几乎必然出现 NUL 字节，且每行都无法解析；
-    // 这类文件不是合法 JSONL，直接判定不可读并隐藏，避免显示成"空会话"的幽灵条目。
-    if (text.slice(0, 4096).includes("\u0000")) {
-      this.summaryCache.set(filePath, version, null);
-      return null;
-    }
-    const lines = text.split(/\r?\n/).filter(Boolean);
-    if (lines.length === 0) {
+    // 读取 → 解码 → 逐行解析由 sessionEntries 独占（BOM/UTF-16 守卫的唯一实现）；
+    // 复用已取到的指纹，避免同一次扫描对同一文件重复 stat。
+    const file = await readEntries(this.fileAdapter, filePath, { fingerprint: version, signal });
+    // 不可读（UTF-16/二进制）与空文件同等处理：隐藏，而不是显示成"空会话"的幽灵条目。
+    if (file.unreadable || !file.raw.trim()) {
       this.summaryCache.set(filePath, version, null);
       return null;
     }
@@ -496,8 +498,8 @@ export class SessionScanner {
     let firstAssistantText = "";
     let messageCount = 0;
     /** 可解析行与损坏行计数：全部损坏时隐藏会话，部分损坏时标记 degraded。 */
-    let parsedLines = 0;
-    let skippedLines = 0;
+    const parsedLines = file.entries.length;
+    const skippedLines = file.malformedLines;
     /** 会话来源：扫描前几行检测导入标记 */
     let source: SessionSummary["source"] = "pi";
     let codexSessionId: string | undefined;
@@ -510,34 +512,30 @@ export class SessionScanner {
     let forkParentSession: string | undefined;
     let hasSubagentChildMarker = false;
 
-    for (const line of lines) {
-      let entry: any;
-      try {
-        entry = JSON.parse(line);
-        parsedLines += 1;
-      } catch {
-        // 单行 JSON 损坏（进程中断导致的截断写入、编码损坏、并发写竞争）不应拖垮整个会话：
-        // 跳过该行继续解析其余记录，保证会话仍能出现在历史列表，而不是整个文件被判定为不可读而消失。
-        skippedLines += 1;
-        continue;
-      }
+    for (const parsedEntry of file.entries) {
       // JSONL 行可能是合法 JSON 但非对象（null/字符串/数字），访问属性前先判空，避免 TypeError。
-      if (!entry || typeof entry !== "object") continue;
-      if (entry.type === "session_info") {
+      if (!isJsonRecord(parsedEntry)) continue;
+      const entry = parsedEntry;
+      const data = isJsonRecord(entry.data) ? entry.data : undefined;
+      const header = isJsonRecord(entry.header) ? entry.header : undefined;
+      const sessionRecord = isJsonRecord(entry.session) ? entry.session : undefined;
+      const nestedSession = data && isJsonRecord(data.session) ? data.session : undefined;
+      const entryType = typeof entry.type === "string" ? entry.type : undefined;
+      if (entryType === "session_info") {
         // Forked sessions may contain an older copied name; only the latest marker is authoritative.
-        latestSessionInfoName = this.optionalString(entry.name ?? entry.data?.name);
+        latestSessionInfoName = this.optionalString(entry.name ?? data?.name);
       }
-      if (entry.type === "session") {
-        forkParentSession ||= this.optionalString(entry.parentSession ?? entry.header?.parentSession);
+      if (entryType === "session") {
+        forkParentSession ||= this.optionalString(entry.parentSession ?? header?.parentSession);
       }
       // 检测显式子会话标记：支持任何 "*.child-session" 格式，
       // 不仅限于 pi-subagents，未来其他扩展也可沿用此约定。
-      if (entry.type === "custom" && typeof entry.customType === "string" && entry.customType.endsWith(".child-session")) {
+      if (entryType === "custom" && typeof entry.customType === "string" && entry.customType.endsWith(".child-session")) {
         hasSubagentChildMarker = true;
       }
       // 扫描前几行的非消息条目，检测导入来源标记
       if (source === "pi") {
-        if (entry.type === "codex_import") {
+        if (entryType === "codex_import") {
           source = "codex";
           codexSessionId = this.optionalString(entry.codexSessionId);
           codexSourcePath = this.optionalString(entry.sourcePath);
@@ -546,15 +544,22 @@ export class SessionScanner {
           codexAgentRole = this.optionalString(entry.agentRole);
           codexAgentNickname = this.optionalString(entry.agentNickname);
         }
-        else if (entry.type === "claude_import") source = "claude";
-        else if (entry.type === "opencode_import") source = "opencode";
+        else if (entryType === "claude_import") source = "claude";
+        else if (entryType === "opencode_import") source = "opencode";
       }
 
-      name ||= entry.sessionName || entry.name || entry.data?.name || entry.header?.name || entry.session?.name;
-      projectPath ||= entry.cwd || entry.projectPath || entry.header?.cwd || entry.data?.cwd || entry.session?.cwd || entry.data?.session?.cwd;
+      name ||= firstString(entry.sessionName, entry.name, data?.name, header?.name, sessionRecord?.name);
+      projectPath ||= firstString(
+        entry.cwd,
+        entry.projectPath,
+        header?.cwd,
+        data?.cwd,
+        sessionRecord?.cwd,
+        nestedSession?.cwd,
+      );
 
-      const message = entry.message ?? entry.data?.message ?? entry;
-      if (message?.role) {
+      const message = entry.message ?? data?.message ?? entry;
+      if (isJsonRecord(message) && message.role) {
         messageCount += 1;
         const text = extractText(message.content).trim();
         if (text && preview === "空会话") preview = text;
@@ -641,7 +646,7 @@ export class SessionScanner {
       projectPath: projectPath ? this.normalize(projectPath) : this.inferProjectPathFromFile(filePath),
       name: inferredName,
       preview: preview.slice(0, 160),
-      updatedAt: info.mtimeMs,
+      updatedAt: version.mtimeMs,
       messageCount,
       source,
       codexSessionId,
@@ -673,16 +678,12 @@ export class SessionScanner {
       const root = this.normalize(this.codexRoot);
       const target = this.normalize(sourcePath);
       if (target !== root && !target.startsWith(`${root}/`)) return undefined;
-      const raw = await this.fileAdapter.read(sourcePath);
-      for (const line of raw.split(/\r?\n/).filter(Boolean).slice(0, 16)) {
-        try {
-          const entry = JSON.parse(line) as any;
-          if (entry.type === "session_meta" && entry.payload) {
-            return getCodexSessionThreadInfo(entry.payload);
-          }
-        } catch {
-          // 跳过损坏行，继续检查后续行，避免单行损坏导致整个 thread 元数据推断失败。
-        }
+      // 与 omp 会话共用同一条读取/解析管线；codex 的 session_meta 只出现在头部若干行。
+      const file = await readEntries(this.fileAdapter, sourcePath);
+      for (const entry of file.entries.slice(0, 16)) {
+        if (!isJsonRecord(entry) || entry.type !== "session_meta") continue;
+        const payload = isJsonRecord(entry.payload) ? entry.payload : undefined;
+        if (payload) return getCodexSessionThreadInfo(payload);
       }
     } catch {
       return undefined;
@@ -806,7 +807,8 @@ export class SessionScanner {
       if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
         return cached.text;
       }
-      const raw = await this.fileAdapter.read(filePath, signal);
+      // 命中判定用指纹，读取本身走 sessionEntries（BOM 守卫唯一实现）；指纹直接复用，不再重复 stat。
+      const { raw } = await readEntries(this.fileAdapter, filePath, { fingerprint: version, signal });
       const text = raw.replace(/\\/g, "/").toLowerCase();
       this.projectMatchTextCache.set(filePath, { version, text });
       return text;

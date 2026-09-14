@@ -1,4 +1,6 @@
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createRepoCommandQueue, type RepoCommandQueue } from "../utils/repoCommandQueue";
 import { WorktreeService } from "./WorktreeService";
 
 /**
@@ -44,6 +46,20 @@ const PORCELAIN = (branch: string, path: string) =>
 	["worktree /proj", "branch refs/heads/main", "", `worktree ${path}`, `branch refs/heads/${branch}`, ""].join(
 		"\n",
 	);
+
+/** 记录每个进入队列的 cwd；任务仍真实执行（串行语义由队列自身保证）。 */
+function recordingQueue() {
+	const queued: string[] = [];
+	const inner = createRepoCommandQueue();
+	const queue: RepoCommandQueue = {
+		run: (cwd, task) => {
+			queued.push(cwd);
+			return inner.run(cwd, task);
+		},
+		size: () => inner.size(),
+	};
+	return { queue, queued };
+}
 
 describe("createAfk 路由", () => {
 	it("分支已挂 worktree 即复用，不执行任何写操作", async () => {
@@ -122,5 +138,37 @@ describe("removeWithWip", () => {
 		const cmds = fake.calls.map((c) => c.args.join(" "));
 		expect(cmds.some((c) => c.includes("[afk-wip] #7"))).toBe(true);
 		expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(true);
+	});
+});
+
+describe("写命令进按仓库串行队列", () => {
+	it("create：worktree add 与 reset 进队列，show-ref 等只读探测不进", async () => {
+		const fake = fakeEffects({ branchExists: false });
+		const recorder = recordingQueue();
+		const svc = new WorktreeService({ ...fake.effects, queue: recorder.queue });
+
+		await svc.create("/proj", "p1", "feat");
+
+		const cmds = fake.calls.map((call) => call.args.join(" "));
+		// 三条 git 命令里只有两条写命令进队列；show-ref 是只读探测，直接执行
+		expect(cmds.some((cmd) => cmd.startsWith("show-ref"))).toBe(true);
+		expect(cmds.some((cmd) => cmd.startsWith("worktree add"))).toBe(true);
+		expect(cmds.some((cmd) => cmd.startsWith("reset --hard"))).toBe(true);
+		expect(recorder.queued).toHaveLength(2);
+		// 队列键：主仓库路径 + worktree 目录各自的仓库路径
+		expect(recorder.queued).toEqual(["/proj", join(resolve("/proj", ".."), "feat")]);
+	});
+
+	it("remove：worktree remove 与 branch -D 进队列，list 查询不进", async () => {
+		const fake = fakeEffects({ listStdout: PORCELAIN("afk-1-fix", "/wt/afk-1-fix") });
+		const recorder = recordingQueue();
+		const svc = new WorktreeService({ ...fake.effects, queue: recorder.queue });
+
+		await svc.remove("/wt/afk-1-fix", "/proj");
+
+		const cmds = fake.calls.map((call) => call.args.join(" "));
+		expect(cmds).toContain("worktree list --porcelain");
+		expect(cmds.filter((cmd) => cmd.startsWith("worktree remove"))).toHaveLength(1);
+		expect(recorder.queued).toEqual(["/proj", "/proj"]);
 	});
 });

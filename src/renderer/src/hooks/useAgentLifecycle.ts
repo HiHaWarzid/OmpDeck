@@ -26,7 +26,7 @@ import {
 	setTerminalDockOpen as applyTerminalDockOpen,
 	type TerminalDockStateByOwner,
 } from "../terminalDockState";
-import type { DrawerPanel } from "../components/app/AppParts";
+import type { DrawerPanel } from "../components/app/types";
 
 export type QueuedPrompt = QueuedPromptSnapshot;
 

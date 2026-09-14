@@ -26,12 +26,16 @@ function write(relativePath, content) {
 before(() => {
   // Compile only the service and its shared types so the integration test exercises
   // the real implementation without requiring a complete Electron build first.
+  // GitService 的变更执行/串行队列/错误分类收敛到 utils 后，编译入口必须带上这些依赖，
+  // 否则 tsc 解析相对导入失败（--moduleResolution node 会要求文件在编译列表内）。
   execFileSync(
     process.execPath,
     [
       resolve("node_modules/typescript/bin/tsc"),
       "src/main/git/GitService.ts",
       "src/shared/types.ts",
+      "src/main/utils/CommandRunner.ts",
+      "src/main/utils/repoCommandQueue.ts",
       "--module",
       "commonjs",
       "--target",
@@ -40,6 +44,9 @@ before(() => {
       "node",
       "--esModuleInterop",
       "--skipLibCheck",
+      // 与项目 tsconfig 一致地启用 strict：契约类型（IPC envelope 的 ok:true/false 判别联合）
+      // 依赖 strictNullChecks 才能正确收窄，关掉 strict 会得到假类型错误。
+      "--strict",
       "--outDir",
       buildDir,
     ],

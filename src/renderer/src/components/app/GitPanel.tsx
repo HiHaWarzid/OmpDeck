@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
-import { ConfirmDialog } from "./AppParts";
+import { ConfirmDialog } from "./menus/ContextMenus";
 import { showNotice } from "../../utils/notice";
 import type { PiDesktopApi } from "../../../../shared/api";
 import type {

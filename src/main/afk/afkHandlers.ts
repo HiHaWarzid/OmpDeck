@@ -23,9 +23,12 @@ export function registerAfkHandlers(deps: AfkHandlerDeps): AfkHandlerMaps {
 		afk: {
 			/** 快照：运行态 + 历史归档 */
 			status: async () => orchestrator.getState(),
-			/** 终止单任务（stop agent + failed 收口 + needs-info 回写） */
-			terminate: async (_event, taskId: number) => {
-				await orchestrator.terminate(taskId);
+			/**
+			 * 终止单任务（stop agent + failed 收口 + needs-info 回写）。
+			 * 身份 = (projectId, ticketRef)：多项目下 issue 编号不唯一，只传编号会杀错项目的任务。
+			 */
+			terminate: async (_event, projectId: string, ticketRef: number) => {
+				await orchestrator.terminate(projectId, ticketRef);
 			},
 		},
 	};

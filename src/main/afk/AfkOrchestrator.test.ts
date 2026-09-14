@@ -9,7 +9,7 @@
  * 不依赖真实墙钟（ts-no-test-timers）。
  */
 import assert from "node:assert/strict";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, test, vi } from "vitest";
 import type { AgentTab, AfkSettings, AfkState, AppSettings, CreateAgentInput, Project, SendPromptInput, SendPromptResult } from "../../shared/types";
 import type { AgentManagerEventListener } from "../../shared/types";
@@ -150,8 +150,10 @@ class FakeProjectStore {
 
 	async add(): Promise<void> {}
 
-	findByPath(): Project | null {
-		return null;
+	findByPath(path: string): Project | null {
+		// 真实 ProjectStore 做 Windows 感知的路径归一化比较；测试里路径都是 join() 产物，直接 resolve 比较即可
+		const normalized = resolve(path);
+		return this.projects.find((project) => resolve(project.path) === normalized) ?? null;
 	}
 
 	async remove(): Promise<void> {}
@@ -183,6 +185,11 @@ class FakeSettingsStore {
  */
 class FakeTicketSource implements TicketSource {
 	readonly readyList: AfkTicket[] = [];
+	/**
+	 * 按项目路径分池的 ready 列表：多项目重号场景（两个仓库各有 #42）必须能挂在不同项目下。
+	 * 命中该路径时用它，否则回落到 readyList（多数用例不关心工单位于哪个项目）。
+	 */
+	readonly readyByProject = new Map<string, AfkTicket[]>();
 	readonly bodies = new Map<number, string>();
 	readonly claimed: number[] = [];
 	readonly completed: Array<{ number: number; prUrl?: string }> = [];
@@ -196,7 +203,8 @@ class FakeTicketSource implements TicketSource {
 
 	async listReadyForAgent(cwd: string): Promise<AfkTicket[]> {
 		this.listCalls += 1;
-		return this.readyList
+		const pool = this.readyByProject.get(cwd) ?? this.readyList;
+		return pool
 			.filter((ticket) => {
 				const bound = this.ticketProjectPaths.get(ticket.number);
 				return bound === undefined || bound === cwd;
@@ -214,7 +222,7 @@ class FakeTicketSource implements TicketSource {
 
 	async claim(_cwd: string, number: number): Promise<void> {
 		this.claimed.push(number);
-		const ticket = this.readyList.find((item) => item.number === number);
+		const ticket = this.findTicket(number);
 		if (ticket) ticket.assignees = [this.me];
 	}
 
@@ -234,9 +242,27 @@ class FakeTicketSource implements TicketSource {
 		return { url: `https://github.com/org/repo/pull/${this.prCounter}` };
 	}
 
+	/** 所有就绪池（默认池 + 各项目池）：按编号查找/移除要覆盖到每一池，重号工单才不会漏 */
+	private allPools(): AfkTicket[][] {
+		return [this.readyList, ...this.readyByProject.values()];
+	}
+
+	private findTicket(number: number): AfkTicket | undefined {
+		for (const pool of this.allPools()) {
+			const ticket = pool.find((item) => item.number === number);
+			if (ticket) return ticket;
+		}
+		return undefined;
+	}
+
 	private removeTicket(number: number): void {
-		const index = this.readyList.findIndex((ticket) => ticket.number === number);
-		if (index >= 0) this.readyList.splice(index, 1);
+		for (const pool of this.allPools()) {
+			const index = pool.findIndex((item) => item.number === number);
+			if (index >= 0) {
+				pool.splice(index, 1);
+				return;
+			}
+		}
 	}
 }
 
@@ -246,16 +272,17 @@ function makeTicket(number: number, title: string, overrides: Partial<AfkTicket>
 	return { number, title, labels: ["ready-for-agent"], assignees: [], ...overrides };
 }
 
-function buildHarness(settings: Partial<AfkSettings> = {}) {
+/** 额外登记的项目：多项目身份用例要区分工单来源与 worktree 归属 */
+type HarnessProject = { id: string; name: string; worktreeParentId?: string };
+
+function buildHarness(settings: Partial<AfkSettings> = {}, extraProjects: HarnessProject[] = []) {
 	const agentManager = new FakeAgentManager();
 	const worktreeService = new FakeWorktreeService();
 	const projectStore = new FakeProjectStore();
-	projectStore.projects.push({
-		id: "p1",
-		name: "repo",
-		path: join(USER_DATA, "repo"),
-		lastOpenedAt: 0,
-	});
+	addProject(projectStore, "p1", "repo");
+	for (const project of extraProjects) {
+		addProject(projectStore, project.id, project.name, project.worktreeParentId);
+	}
 	const settingsStore = new FakeSettingsStore();
 	settingsStore.afk = { ...settingsStore.afk, ...settings };
 	const ticketSource = new FakeTicketSource();
@@ -271,6 +298,24 @@ function buildHarness(settings: Partial<AfkSettings> = {}) {
 	};
 	const orchestrator = new AfkOrchestrator(deps);
 	return { orchestrator, agentManager, worktreeService, projectStore, settingsStore, ticketSource, effects };
+}
+
+/** 项目路径：与 addProject 同源推导（用例注入工单来源、断言 worktree 归属用） */
+function projectPath(name: string): string {
+	return join(USER_DATA, name);
+}
+
+/** 登记项目：路径由项目名推导（多项目用例要能区分 repo / repo2 的 worktree 与工单来源） */
+function addProject(store: FakeProjectStore, id: string, name: string, worktreeParentId?: string): Project {
+	const project: Project = {
+		id,
+		name,
+		path: projectPath(name),
+		lastOpenedAt: 0,
+		...(worktreeParentId ? { worktreeParentId } : {}),
+	};
+	store.projects.push(project);
+	return project;
 }
 
 function writeStateFile(state: Partial<AfkState>): void {
@@ -617,7 +662,7 @@ describe("AfkOrchestrator 终止与工单地址", () => {
 		await h.orchestrator.stop();
 
 		const task = h.orchestrator.getState().tasks[0]!;
-		await h.orchestrator.terminate(task.ticketRef);
+		await h.orchestrator.terminate(task.projectId!, task.ticketRef);
 		await settleUntil(() => h.orchestrator.getState().tasks[0]!.status === "failed");
 
 		const terminated = h.orchestrator.getState().tasks[0]!;
@@ -638,10 +683,10 @@ describe("AfkOrchestrator 终止与工单地址", () => {
 		await h.orchestrator.stop();
 
 		const task = h.orchestrator.getState().tasks[0]!;
-		await h.orchestrator.terminate(task.ticketRef);
+		await h.orchestrator.terminate(task.projectId!, task.ticketRef);
 		await settleUntil(() => h.orchestrator.getState().tasks[0]!.status === "failed");
 		const failedCount = h.ticketSource.failed.length;
-		await h.orchestrator.terminate(task.ticketRef);
+		await h.orchestrator.terminate(task.projectId!, task.ticketRef);
 		assert.equal(h.ticketSource.failed.length, failedCount, "终态任务不重复回写");
 	});
 
@@ -658,5 +703,171 @@ describe("AfkOrchestrator 终止与工单地址", () => {
 		assert.ok(task.createdAt, "dispatch 应登记 createdAt");
 		assert.ok(task.claimedAt, "认领成功后应记录 claimedAt");
 		assert.ok(task.worktreeAt, "worktree 创建后应记录 worktreeAt");
+	});
+});
+
+describe("AfkOrchestrator 任务身份 (projectId, ticketRef)", () => {
+	test("两个项目各有 #42：一个项目的活跃任务不阻塞另一个项目的同号工单", async () => {
+		// 状态文件必须在 harness 构造前写好：构造函数立刻开始 loadState 崩溃恢复
+		writeStateFile({
+			tasks: [
+				// p1 的 #42 停在活跃态（agent 存活待审）：旧实现按 ticketRef 全局判定会永久挡住 p2 的同号工单
+				{ ticketRef: 42, title: "p1 的 42", projectId: "p1", agentId: "alive-agent", status: "needs-review" },
+			],
+			enabled: false,
+		});
+		const h = buildHarness({ pollIntervalMs: 600_000, targetProjectIds: ["p1", "p2"] }, [
+			{ id: "p2", name: "repo2" },
+		]);
+		h.ticketSource.readyByProject.set(projectPath("repo2"), [makeTicket(42, "p2 的 42")]);
+
+		await h.orchestrator.start();
+		await settleUntil(() => h.orchestrator.getState().tasks.length === 2);
+		await h.orchestrator.stop();
+
+		const p2Task = h.orchestrator.getState().tasks.find((task) => task.projectId === "p2")!;
+		assert.equal(p2Task.ticketRef, 42, "同号 issue 在不同项目下各自成立");
+		assert.equal(p2Task.status, "running");
+		assert.deepEqual(h.ticketSource.claimed, [42], "p2 的 #42 应被认领派发");
+		assert.equal(
+			h.orchestrator.getState().tasks.find((task) => task.projectId === "p1")!.status,
+			"needs-review",
+			"p1 的任务不受影响",
+		);
+		assert.equal(h.worktreeService.createAfkCalls.length, 1);
+		assert.equal(h.worktreeService.createAfkCalls[0]!.projectPath, projectPath("repo2"), "worktree 应建在 p2");
+	});
+
+	test("同一项目内的同号工单仍被活跃任务挡住（去重只收敛到项目内身份）", async () => {
+		writeStateFile({
+			tasks: [
+				{ ticketRef: 42, title: "p1 的 42", projectId: "p1", agentId: "alive-agent", status: "needs-review" },
+			],
+			enabled: false,
+		});
+		const h = buildHarness({ pollIntervalMs: 600_000 });
+		h.ticketSource.readyList.push(makeTicket(42, "p1 的 42 重派"));
+
+		await h.orchestrator.start();
+		await settleUntil(() => h.ticketSource.listCalls >= 1);
+		await flushAsync();
+		await h.orchestrator.stop();
+
+		assert.equal(h.orchestrator.getState().tasks.length, 1, "同项目同号工单不得重派");
+		assert.deepEqual(h.ticketSource.claimed, []);
+	});
+
+	test("terminate(projectId, ticketRef)：只终止该项目的 #42，另一个项目的同号任务不受影响", async () => {
+		// 先入表的是 p2 的 #42（早先跑完的项目）：旧实现按 ticketRef 找会命中它
+		writeStateFile({
+			tasks: [{ ticketRef: 42, title: "p2 的 42", projectId: "p2", status: "complete", endedAt: Date.now() }],
+			enabled: false,
+		});
+		const h = buildHarness({ pollIntervalMs: 600_000 }, [{ id: "p2", name: "repo2" }]);
+		h.ticketSource.readyList.push(makeTicket(42, "p1 的 42"));
+
+		await h.orchestrator.start();
+		await settleUntil(() => h.orchestrator.getState().tasks.length === 2);
+		await h.orchestrator.stop();
+
+		const p1Task = h.orchestrator.getState().tasks.find((task) => task.projectId === "p1")!;
+		await h.orchestrator.terminate("p1", 42);
+		await settleUntil(
+			() => h.orchestrator.getState().tasks.find((task) => task.projectId === "p1")!.status === "failed",
+		);
+
+		const tasks = h.orchestrator.getState().tasks;
+		const terminated = tasks.find((task) => task.projectId === "p1")!;
+		assert.equal(terminated.status, "failed");
+		assert.match(terminated.errorSummary!, /用户终止/);
+		assert.ok(h.agentManager.stopped.includes(p1Task.agentId!), "被终止的应是 p1 的 agent");
+		assert.deepEqual(
+			h.ticketSource.failed.map((f) => f.number),
+			[42],
+			"只有 p1 的任务回写 needs-info",
+		);
+		assert.equal(tasks.find((task) => task.projectId === "p2")!.status, "complete", "p2 的同号任务不被误杀");
+	});
+
+	test("旧 afk-state.json（缺 projectId）：能反推的补回项目，推不出的标记保留，写回即新形状", async () => {
+		const startedAt = Date.now() - 1000;
+		writeStateFile({
+			tasks: [
+				// 旧形状一：有 worktree 路径 → 可反推 p1（AFK 派发时显式登记的 worktree 子项目记录）
+				{
+					ticketRef: 42,
+					title: "Legacy bound",
+					worktreePath: projectPath("afk-42-fix"),
+					branch: "afk-42-fix",
+					agentId: "gone-agent",
+					status: "running",
+					startedAt,
+				},
+				// 旧形状二：无任何项目痕迹 → unbound（保留，不静默丢弃）
+				{ ticketRef: 43, title: "Legacy orphan", status: "running", startedAt },
+				// 旧形状三：终态记录同样缺 projectId → 标记保留，状态不动
+				{ ticketRef: 44, title: "Legacy done", status: "complete", endedAt: Date.now() },
+			],
+			enabled: false,
+		});
+		// wt-42 即 worktree 在 projects.json 里的子项目记录：worktreeParentId 指向父项目 p1
+		const h = buildHarness({ pollIntervalMs: 600_000 }, [
+			{ id: "wt-42", name: "afk-42-fix", worktreeParentId: "p1" },
+		]);
+
+		await h.orchestrator.start();
+		await h.orchestrator.stop();
+
+		const tasks = h.orchestrator.getState().tasks;
+		assert.equal(tasks.length, 3, "旧记录一条都不能丢");
+		const bound = tasks.find((task) => task.ticketRef === 42)!;
+		assert.equal(bound.projectId, "p1", "应经 worktree 子项目记录反推出父项目");
+		assert.equal(
+			h.worktreeService.removedWithWip[0]!.projectPath,
+			projectPath("repo"),
+			"反推出的项目即崩溃恢复的操作对象",
+		);
+		assert.deepEqual(h.ticketSource.failed.map((f) => f.number), [42], "回写只针对可归属的任务");
+		const orphan = tasks.find((task) => task.ticketRef === 43)!;
+		assert.equal(orphan.unbound, true);
+		assert.equal(orphan.status, "failed", "无法自动处理的活跃旧任务收口并保留");
+		assert.match(orphan.errorSummary!, /不可自动处理/);
+		assert.equal(tasks.find((task) => task.ticketRef === 44)!.unbound, true, "终态旧记录同样标记");
+
+		// 写回即升级形状：projectId 落盘、unbound 落盘、任务数不变
+		const written = JSON.parse(effects.stateText!) as {
+			tasks: Array<{ ticketRef: number; projectId?: string; unbound?: boolean }>;
+		};
+		assert.equal(written.tasks.length, 3);
+		assert.equal(written.tasks.find((task) => task.ticketRef === 42)!.projectId, "p1");
+		assert.equal(written.tasks.find((task) => task.ticketRef === 43)!.unbound, true);
+		assert.equal(written.tasks.find((task) => task.ticketRef === 44)!.unbound, true);
+	});
+
+	test("unbound 旧任务不阻塞派发，也不触发 worktree 清理", async () => {
+		// 只剩 worktree 路径、子项目记录已不在（历史清理过）→ 推不出项目 → unbound
+		writeStateFile({
+			tasks: [
+				{
+					ticketRef: 99,
+					title: "Orphan",
+					worktreePath: projectPath("wt-99"),
+					status: "running",
+					startedAt: Date.now() - 10_000,
+				},
+			],
+			enabled: false,
+		});
+		const h = buildHarness({ pollIntervalMs: 600_000 });
+		h.ticketSource.readyList.push(makeTicket(42, "New work"));
+
+		await h.orchestrator.start();
+		await settleUntil(() => h.orchestrator.getState().tasks.length === 2);
+		await h.orchestrator.stop();
+
+		assert.equal(h.orchestrator.getState().tasks.find((task) => task.ticketRef === 99)!.unbound, true);
+		assert.equal(h.worktreeService.removedWithWip.length, 0, "无来源项目不得动 worktree（ADR-0003）");
+		assert.deepEqual(h.ticketSource.claimed, [42], "unbound 任务不得阻塞派发");
+		assert.equal(h.orchestrator.getState().tasks.find((task) => task.ticketRef === 42)!.status, "running");
 	});
 });

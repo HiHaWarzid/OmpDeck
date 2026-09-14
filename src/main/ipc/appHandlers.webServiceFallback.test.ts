@@ -71,7 +71,7 @@ function register(webServiceManager: { applySettings: () => Promise<void>; isRun
 	return { settingsStore, update: handlers.settings.update };
 }
 
-test("旧服务仍在运行：失败不回写 webServiceEnabled，错误照常抛给 UI", async () => {
+test("旧服务仍在运行：失败不回写 webServiceEnabled，且端口回滚到实际在服务的值", async () => {
 	const manager = {
 		applySettings: async () => {
 			throw new Error("EADDRINUSE: 端口被占用");
@@ -84,9 +84,12 @@ test("旧服务仍在运行：失败不回写 webServiceEnabled，错误照常�
 	// 关键断言：可用服务没有被强关，也没有任何回写 webServiceEnabled 的调用。
 	expect(settingsStore.updateCalls.some((patch) => "webServiceEnabled" in patch)).toBe(false);
 	expect(settingsStore.state.webServiceEnabled).toBe(true);
+	// 端口未生效 → 必须回滚，否则面板显示 4321 而实际服务在 1234。
+	expect(settingsStore.state.webServicePort).toBe(1234);
+	expect(settingsStore.updateCalls.at(-1)).toEqual({ webServicePort: 1234 });
 });
 
-test("确实没有服务在跑：失败回写 webServiceEnabled=false", async () => {
+test("确实没有服务在跑：失败回写 webServiceEnabled=false 并回滚端口", async () => {
 	const manager = {
 		applySettings: async () => {
 			throw new Error("EADDRINUSE: 端口被占用");
@@ -96,6 +99,24 @@ test("确实没有服务在跑：失败回写 webServiceEnabled=false", async ()
 	const { settingsStore, update } = register(manager);
 
 	await expect(update({} as never, { webServicePort: 4321 })).rejects.toThrow("EADDRINUSE");
-	expect(settingsStore.updateCalls.at(-1)).toEqual({ webServiceEnabled: false });
 	expect(settingsStore.state.webServiceEnabled).toBe(false);
+	expect(settingsStore.state.webServicePort).toBe(1234);
+});
+
+test("同时改开关与端口且失败：两者都回滚", async () => {
+	const manager = {
+		applySettings: async () => {
+			throw new Error("EADDRINUSE: 端口被占用");
+		},
+		isRunning: () => true,
+	};
+	const { settingsStore, update } = register(manager);
+
+	await expect(
+		update({} as never, { webServiceEnabled: false, webServiceHost: "127.0.0.1", webServicePort: 4321 }),
+	).rejects.toThrow("EADDRINUSE");
+	// 旧服务仍在跑，所以三个键都回到应用前：面板与服务保持一致。
+	expect(settingsStore.state.webServiceEnabled).toBe(true);
+	expect(settingsStore.state.webServiceHost).toBe("0.0.0.0");
+	expect(settingsStore.state.webServicePort).toBe(1234);
 });

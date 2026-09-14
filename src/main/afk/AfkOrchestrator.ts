@@ -6,7 +6,8 @@
  * 不做 addStateListener 全量快照轮询（#2 杠杆点）。
  *
  * 关键业务规则（实现时逐条落实）：
- * - Selection：一次一个串行；gh issue list → 过滤已 assign 给别人/已有活跃 AfkTask → claim @me
+ * - Selection：一次一个串行；gh issue list → 过滤已 assign 给别人/同项目已有活跃 AfkTask → claim @me
+ * - Identity：(projectId, ticketRef) —— 各仓库 issue 编号各自从 1 起，去重/终止/面板行身份都必须带项目
  * - Worktree WIP 保留（ADR-0003）：删 worktree 前必须 [afk-wip] 快照（removeWithWip 内置）
  * - Timeout（30min 可配）：超时 → failed，WIP 快照提交但 worktree 保留，供重跑复用
  * - Failed（ADR-0005）：comment 附原因 + 重标 needs-info，不自动重试
@@ -17,13 +18,22 @@ import { app, type BrowserWindow } from "electron";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ipcChannels } from "../../shared/ipc";
-import type { AfkState, AfkTask, AfkTaskStatus, AppSettings, Project } from "../../shared/types";
+import {
+	afkTaskKey,
+	isProjectBound,
+	type AfkState,
+	type AfkTask,
+	type AfkTaskStatus,
+	type AppSettings,
+	type Project,
+} from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { ProjectStore } from "../projects/ProjectStore";
 import type { SettingsStore } from "../settings/SettingsStore";
 import { JsonFileStore } from "../storage/JsonFileStore";
 import { AFK_WIP_PREFIX, type WorktreeService } from "../git/WorktreeService";
 import { runGit } from "../utils/CommandRunner";
+import { repoCommandQueue } from "../utils/repoCommandQueue";
 import { GhTicketSource, type AfkTicket, type TicketSource } from "./ticketSources";
 
 /** 历史归档保留 30 天（handoff：afk-state.json 滚动清理） */
@@ -211,11 +221,15 @@ export class AfkOrchestrator {
 	 * 终止单任务（afk:terminate，面板「终止」按钮，取代裸 agents.stop）：
 	 * 停止 agent → failed 收口（ADR-0005 needs-info 回写）+ WIP 快照提交、worktree 保留
 	 * （ADR-0003，等同超时路径：人工终止不丢工作成果，供重跑复用）。
+	 * 身份 = (projectId, ticketRef)：各仓库的 issue 编号各自从 1 起，只按 ticketRef 找会杀错项目
+	 * 的任务（两个仓库都有 #42 时命中先入表的那条）。unbound（无来源项目）任务的身份键里
+	 * 没有项目段，调用方拿不到它的键 —— 它本就不参与自动流程，不需要在这里挡。
 	 * 幂等：非 queued/running 任务直接返回（settled/error 路径可能已抢先收口）。
 	 */
-	async terminate(taskId: number): Promise<void> {
+	async terminate(projectId: string, ticketRef: number): Promise<void> {
 		await this.initPromise;
-		const task = this.state.tasks.find((item) => item.ticketRef === taskId);
+		const key = afkTaskKey({ projectId, ticketRef });
+		const task = this.state.tasks.find((item) => afkTaskKey(item) === key);
 		if (!task || (task.status !== "queued" && task.status !== "running")) return;
 		await this.failTask(task, "用户终止：手动停止了 AFK 任务", { keepWorktree: true });
 	}
@@ -231,6 +245,9 @@ export class AfkOrchestrator {
 	 */
 	private async init(): Promise<void> {
 		await this.loadState();
+		// 旧存档升级放在 loadState 之外：反推过程的任何异常都不得回落到 loadState 的
+		// 「全新状态」分支——那等于把整份任务列表静默丢掉
+		this.normalizeLegacyTasks();
 		this.rollArchive();
 		await this.recoverInterruptedTasks();
 		this.state.enabled = this.settingsStore.get().afk.enabled;
@@ -258,6 +275,52 @@ export class AfkOrchestrator {
 			// 文件缺失/损坏：全新状态；损坏文件不阻断启动
 			this.state = { tasks: [], enabled: false };
 		}
+	}
+
+	/**
+	 * 旧 afk-state.json 升级（多项目轮转之前的形状：任务无 projectId）：
+	 * 1. 尽力反推来源项目并回填 projectId —— 下次 saveState 即统一为新形状；
+	 * 2. 推不出的标 unbound 并保留在状态里：**绝不静默丢弃**（丢任务 = 丢 worktree 与进度，
+	 *    ADR-0003），也绝不瞎猜项目（猜错会把别的仓库的 worktree 当成本任务的工作树去删）。
+	 * 反推不到项目就无法判定 agent 存活、无法定位 worktree 所属仓库，所以这类任务不参与
+	 * 任何自动流程；若它还是活跃态，就按「不可自动处理」收口为 failed 并在 errorSummary 里
+	 * 说明原因（面板据此展示，人可自行处理其工作树），工作树原样保留。
+	 */
+	private normalizeLegacyTasks(): void {
+		for (const task of this.state.tasks) {
+			if (task.projectId) continue;
+			const inferred = this.inferProjectId(task);
+			if (inferred) {
+				task.projectId = inferred;
+				continue;
+			}
+			task.unbound = true;
+			if (task.status === "queued" || task.status === "running") {
+				task.status = "failed";
+				task.endedAt = Date.now();
+				task.errorSummary =
+					"旧存档缺少 projectId 且无法反推来源项目：已标记为不可自动处理（工作树保留，请人工确认）";
+			}
+		}
+	}
+
+	/**
+	 * 从旧任务的既有痕迹反推来源项目：
+	 * 1. worktree 路径 → projectStore 里 AFK 显式登记的子项目记录（worktreeParentId 即父项目）；
+	 * 2. agentId → AgentManager 里该 tab 的 projectId（agent 还活着时的可靠来源）。
+	 * 分支名帮不上忙：afk-{ticketId}-{slug} 不含项目标识；按「同级目录猜父项目」需要重写
+	 * ProjectStore 的 Windows 路径归一化（私有逻辑），猜错代价是删错仓库的工作树，不做。
+	 */
+	private inferProjectId(task: AfkTask): string | undefined {
+		if (task.worktreePath) {
+			const child = this.projectStore.findByPath(task.worktreePath);
+			if (child?.worktreeParentId) return child.worktreeParentId;
+		}
+		if (task.agentId) {
+			const tab = this.agentManager.list().find((item) => item.id === task.agentId);
+			if (tab?.projectId) return tab.projectId;
+		}
+		return undefined;
 	}
 
 	private async saveState(): Promise<void> {
@@ -336,7 +399,7 @@ export class AfkOrchestrator {
 				// 认领基准 = gh 认证账户 @me（AFK Identity）；gh api user 失败时保守跳过所有已认领 ticket
 				const me = await this.ticketSource.getCurrentUser(project.path).catch(() => null);
 				for (const ticket of tickets) {
-					if (!this.isClaimable(ticket, me)) continue;
+					if (!this.isClaimable(ticket, project, me)) continue;
 					try {
 						await this.ticketSource.claim(project.path, ticket.number);
 					} catch (error) {
@@ -360,15 +423,20 @@ export class AfkOrchestrator {
 
 	/**
 	 * Selection 过滤：跳过已 assign 给别人（me 未知时保守跳过一切已认领 ticket），
-	 * 跳过已有活跃 AfkTask（queued/running/needs-review/pr-pending）的 ticket，防同 ticket 双跑。
+	 * 跳过同项目已有活跃 AfkTask（queued/running/needs-review/pr-pending）的 ticket，防同 ticket 双跑。
+	 * 身份 = (projectId, ticketRef)：各仓库 issue 编号各自从 1 起，按 ticketRef 跨项目判定会让
+	 * 一个仓库的活动任务永久阻塞另一个仓库的同号工单。
+	 * unbound（无来源项目）不参与阻塞：归属未知的任务不能变成全项目级永久锁（那正是本规则的旧缺陷），
+	 * 其收口由 normalizeLegacyTasks / 人工负责。
 	 */
-	private isClaimable(ticket: AfkTicket, me: string | null): boolean {
+	private isClaimable(ticket: AfkTicket, project: Project, me: string | null): boolean {
 		if (ticket.assignees.length > 0) {
 			if (me === null) return false;
 			if (ticket.assignees.some((login) => login !== me)) return false;
 		}
+		const key = afkTaskKey({ projectId: project.id, ticketRef: ticket.number });
 		return !this.state.tasks.some(
-			(t) => t.ticketRef === ticket.number && ACTIVE_STATUSES.has(t.status),
+			(t) => isProjectBound(t) && ACTIVE_STATUSES.has(t.status) && afkTaskKey(t) === key,
 		);
 	}
 
@@ -570,9 +638,15 @@ export class AfkOrchestrator {
 
 	// ── git 操作（统一经 CommandRunner.runGit：超时 30s 默认/缓冲 32MB/stderr 归一化/ENOENT 归类） ──
 
-	/** 推分支并设上游：git push -u origin {branch}（cwd 为项目主工作区）；网络大调用覆盖 120s 超时。 */
+	/**
+	 * 推分支并设上游：git push -u origin {branch}（cwd 为项目主工作区）；网络大调用覆盖 120s 超时。
+	 * push 是写命令，与 Git 面板/WorktreeService 的仓库写操作共用按仓库串行队列
+	 * （repoCommandQueue，见 batch 6b）：同一仓库并发写会争用 index.lock。
+	 */
 	private async pushBranch(projectPath: string, branch: string): Promise<void> {
-		await this.fx.runGit(projectPath, ["push", "-u", "origin", branch], { timeoutMs: 120_000 });
+		await repoCommandQueue.run(projectPath, () =>
+			this.fx.runGit(projectPath, ["push", "-u", "origin", branch], { timeoutMs: 120_000 }),
+		);
 	}
 
 	/**
@@ -604,15 +678,17 @@ export class AfkOrchestrator {
 	}
 
 	/**
-	 * 从任务解析其来源项目：优先 task.projectId（dispatch 时绑定），
-	 * 缺失（旧 afk-state.json 存档）时回落当前目标项目列表第一个。
+	 * 从任务解析其来源项目：只认 task.projectId（dispatch 时绑定，旧存档在 loadState 里已尽力回填）。
+	 * 刻意不回落「当前目标项目列表第一个」：多项目下那会把 A 项目的任务当成 B 项目的任务处理
+	 * （删错 worktree、回写错 issue、开错仓库的 PR），比不处理更糟。解不出项目时调用方各自
+	 * 走无项目的保守分支（failTask/handleSettled 内已有 project 守卫）。
 	 */
 	private resolveProject(task: AfkTask): Project | undefined {
 		if (task.projectId) {
 			const project = this.projectStore.get(task.projectId);
 			if (project) return project;
 		}
-		return this.targetProjects()[0];
+		return undefined;
 	}
 
 	/**

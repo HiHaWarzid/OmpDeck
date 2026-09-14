@@ -155,6 +155,21 @@ test("runGit 默认超时 30s、缓冲 32MB，返回 stdout 字符串", async ()
 	assert.equal(calls[0].options.maxBuffer, 32 * 1024 * 1024);
 });
 
+test("runGit：合并非交互 git 环境，继承 env 与调用方补丁都保留", async () => {
+	const { exec, calls } = createFakeExecutor([{ type: "ok", stdout: "" }]);
+	const runner = createCommandRunner({ exec });
+	await runner.runGit("D:/repo", ["fetch"], {
+		env: { GIT_AUTHOR_NAME: "OmpDeck", GIT_TERMINAL_PROMPT: "1" },
+	});
+	// 无人在场的 git 调用禁止弹凭据提示：强制值不能被调用方覆盖
+	assert.equal(calls[0].options.env?.GIT_TERMINAL_PROMPT, "0");
+	assert.equal(calls[0].options.env?.GIT_ASKPASS, "echo");
+	assert.equal(calls[0].options.env?.SSH_ASKPASS, "echo");
+	// 继承环境（PATH）与调用方补丁（author）都不能丢：env 是合并而非整体替换
+	assert.equal(calls[0].options.env?.PATH, process.env.PATH);
+	assert.equal(calls[0].options.env?.GIT_AUTHOR_NAME, "OmpDeck");
+});
+
 test("runGh 默认超时 30s、缓冲 16MB，可覆盖超时", async () => {
 	const { exec, calls } = createFakeExecutor([{ type: "ok", stdout: "[]" }]);
 	const runner = createCommandRunner({ exec });

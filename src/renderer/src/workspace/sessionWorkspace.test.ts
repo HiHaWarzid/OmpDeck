@@ -6,6 +6,7 @@ import {
   type WorkspaceFocus,
 } from "./sessionWorkspace";
 import { composerActions } from "./slices/composerSlice";
+import { runtimeActions } from "./slices/runtimeSlice";
 import { thinkingActions } from "./slices/thinkingSlice";
 
 describe("session workspace core", () => {
@@ -360,5 +361,47 @@ describe("session workspace core", () => {
       mode: "normal",
     });
     expect(store.getSlice(projectKey("proj-1"), "thinking")).toMatchObject({ text: "" });
+  });
+
+  it("subscribeSliceChange 报道任意条目的该切片变化，带变化的条目键", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.joinTab(sessionB);
+    const changed: string[] = [];
+    const unsubscribe = store.subscribeSliceChange("runtime", (key) => changed.push(key));
+
+    store.dispatchTo(sessionA, runtimeActions.set({ modelId: "m1" }));
+    store.dispatchTo(sessionB, runtimeActions.set({ modelId: "m2" }));
+    // 别的切片的变化不触发（订阅是按切片名登记的）
+    store.dispatchTo(sessionA, thinkingActions.update("x", 1));
+
+    expect(changed).toEqual([sessionA, sessionB]);
+    unsubscribe();
+    store.dispatchTo(sessionA, runtimeActions.set({ modelId: "m3" }));
+    expect(changed).toEqual([sessionA, sessionB]);
+  });
+
+  it("条目被移除对每个切片都是变化：跨条目订阅者收到该键", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    const changed: string[] = [];
+    store.subscribeSliceChange("transcript", (key) => changed.push(key));
+
+    store.leave(sessionA);
+
+    expect(changed).toEqual([sessionA]);
+  });
+
+  it("热路径空转（同引用写入）不唤醒跨条目订阅者", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(sessionA);
+    store.dispatchTo(sessionA, runtimeActions.set({ modelId: "m1" }));
+    const changed = vi.fn();
+    store.subscribeSliceChange("runtime", changed);
+    const current = store.getSlice(sessionA, "runtime");
+
+    store.dispatchTo(sessionA, runtimeActions.set(current!));
+
+    expect(changed).not.toHaveBeenCalled();
   });
 });

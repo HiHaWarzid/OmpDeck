@@ -15,8 +15,15 @@ function piAgentSettingsPath() {
 	return join(app.getPath("home"), ".omp", "agent", "settings.json");
 }
 
-/** 同步读取桌面 settings.json（app.ready 前可用）。文件缺失时返回空对象。 */
-function readDesktopSettingsSync(): Partial<AppSettings> {
+/**
+ * 同步读取桌面 settings.json（app.ready 前可用）。文件缺失时返回空对象。
+ *
+ * 导出供启动路径「一次读、三处用」：三个 pre-ready 偏好判定共用同一份快照，
+ * 避免对同一个文件三次 readFileSync + JSON.parse。
+ * 调用点必须在 dev userData 覆盖之后（见 main/index.ts），否则会误读正式版数据；
+ * 运行期（如重建宠物窗）不需要快照的调用方仍可省略入参，各自读最新盘面。
+ */
+export function readDesktopSettingsSync(): Partial<AppSettings> {
 	try {
 		const raw = readFileSync(desktopSettingsPath(), "utf8");
 		return JSON.parse(raw) as Partial<AppSettings>;
@@ -29,18 +36,24 @@ function readDesktopSettingsSync(): Partial<AppSettings> {
  * 在 app.ready 之前同步读取 Chromium 沙箱偏好。
  * `no-sandbox` 必须在 ready 前 append，否则本进程已无法改 Chromium 启动参数。
  * 缺省 false：保持历史兼容（Windows 安全软件/旧驱动）。
+ * 传入启动期快照可省掉一次读盘；不传则自读一次（运行期调用方需要最新值）。
  */
-export function readElectronChromiumSandboxPreference(): boolean {
-	return readDesktopSettingsSync().electronChromiumSandbox === true;
+export function readElectronChromiumSandboxPreference(
+	settings: Partial<AppSettings> = readDesktopSettingsSync(),
+): boolean {
+	return settings.electronChromiumSandbox === true;
 }
 
 /**
  * 在 app.ready 之前同步读取单实例偏好。
  * 版本级单实例锁必须在 ready 前申请（见 main/singleInstance.ts）。
  * 缺省 true：同一版本再次打开时复用窗口；不同版本始终可并行。
+ * 传入启动期快照可省掉一次读盘；不传则自读一次（运行期调用方需要最新值）。
  */
-export function readSingleInstancePreference(): boolean {
-	const value = readDesktopSettingsSync().singleInstance;
+export function readSingleInstancePreference(
+	settings: Partial<AppSettings> = readDesktopSettingsSync(),
+): boolean {
+	const value = settings.singleInstance;
 	// 未配置时默认开启单实例；只有显式 false 才允许同版本多开。
 	return value !== false;
 }
@@ -50,9 +63,12 @@ export function readSingleInstancePreference(): boolean {
  * Linux 的 XWayland 兼容层（见 main/linuxDisplayBackend.ts，#108）必须在 ready 前
  * 决定是否强制 ozone-platform=x11，而宠物是该兼容层的唯一受益者，故以此为准。
  * 缺省 false：未启用宠物的 Linux 用户走原生显示后端，主窗口不受兼容层影响。
+ * 传入启动期快照可省掉一次读盘；不传则自读一次（运行期调用方需要最新值）。
  */
-export function readPetEnabledPreference(): boolean {
-	return readDesktopSettingsSync().petEnabled === true;
+export function readPetEnabledPreference(
+	settings: Partial<AppSettings> = readDesktopSettingsSync(),
+): boolean {
+	return settings.petEnabled === true;
 }
 
 /**

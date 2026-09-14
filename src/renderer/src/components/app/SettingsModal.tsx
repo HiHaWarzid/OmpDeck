@@ -1,4 +1,4 @@
-// @ts-nocheck - extracted from AppParts, pre-existing type issues
+// @ts-nocheck - pre-existing type issues (was extracted from the old AppParts.tsx)
 import { Component, useState, useEffect, useRef, useMemo, type ReactNode } from "react";
 import {
 	Settings2,
