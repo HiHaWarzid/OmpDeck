@@ -53,6 +53,7 @@ import type {
 	ForkMessage,
 	GitBranchInfo,
 	GitCommitFileDiff,
+	GitProbeResult,
 	GitRef,
 	GitResourceGroups,
 	GitWorkspaceDiffGroup,
@@ -210,6 +211,11 @@ export interface OpenCodeSessionsApi {
 
 export interface GitApi {
 	branches: (projectId: string) => Promise<GitBranchInfo>;
+	/**
+	 * git 环境能力探测：git 是否可用 + 该目录是否仓库。
+	 * 界面据此在「未安装 git」与「不是仓库」之间分流，避免匹配命令失败的文案。
+	 */
+	probe: (projectId: string) => Promise<GitProbeResult>;
 	checkout: (projectId: string, branch: string) => Promise<GitBranchInfo>;
 	createBranch: (projectId: string, branchName: string) => Promise<GitBranchInfo>;
 	/** 读取文件的 Git HEAD 原始内容，供差异编辑器左侧基准列使用。 */

@@ -131,3 +131,16 @@ export type BranchDiffResult = {
 	ahead: number;   // target 比 base 多几个 commit
 	behind: number;  // target 比 base 少几个 commit（等于 0 时 base 是 target 的子集）
 };
+
+/**
+ * git 环境能力探测结果。
+ *
+ * 界面需要在「没装 git」与「这不是仓库」之间分流（安装指引 vs 初始化引导），
+ * 这两个事实由主进程直接回答，而不是让渲染层去匹配命令失败的英文文案。
+ */
+export type GitProbeResult = {
+	/** git 是否可用（PATH 中能找到）。仅 ENOENT 判定为不可用。 */
+	gitAvailable: boolean;
+	/** 该目录是否处于某个 git 仓库内（git 不可用时恒为 false）。 */
+	isRepo: boolean;
+};

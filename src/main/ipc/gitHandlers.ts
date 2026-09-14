@@ -38,6 +38,8 @@ export function registerGitHandlers(deps: GitHandlerDeps): GitHandlerMaps {
 		git: {
 			branches: async (_event, projectId: string) =>
 				gitService.getBranches(resolveProject(projectId).path),
+			probe: async (_event, projectId: string) =>
+				gitService.probe(resolveProject(projectId).path),
 
 			checkout: async (_event, projectId: string, branch: string) =>
 				gitService.checkout(resolveProject(projectId).path, branch),

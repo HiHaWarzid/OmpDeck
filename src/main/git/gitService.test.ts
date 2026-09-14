@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createCommandRunner, type Executor, type ExecutorOptions, type RunCommandOptions } from "../utils/CommandRunner";
 import { createRepoCommandQueue } from "../utils/repoCommandQueue";
+import { CommandError } from "../utils/CommandRunner";
 import { GitService } from "./GitService";
 
 type GitCall = { cwd: string; args: string[]; options?: RunCommandOptions };
@@ -198,6 +199,84 @@ describe("GitService.initRepo", () => {
 			await service.getStatus(fixture.repo);
 
 			expect(countStatus()).toBe(before + 1);
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+});
+
+describe("GitService.probe：环境能力探测", () => {
+	it("git 不在 PATH（kind=not-found）→ gitAvailable=false，且不再问仓库归属", async () => {
+		const fixture = await makeRepoFixture();
+		try {
+			const calls: string[][] = [];
+			const service = new GitService({
+				runGit: async (_cwd, args) => {
+					calls.push(args);
+					throw new CommandError("not-found", "spawn git ENOENT");
+				},
+				queue: createRepoCommandQueue(),
+			});
+
+			expect(await service.probe(fixture.repo)).toEqual({ gitAvailable: false, isRepo: false });
+			// 已判定未安装就不必再探仓库：省一次必然失败的进程。
+			expect(calls).toHaveLength(1);
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	it("git 可用但不是仓库 → gitAvailable=true, isRepo=false", async () => {
+		const fixture = await makeRepoFixture();
+		try {
+			const service = new GitService({
+				runGit: async (_cwd, args) => {
+					if (args.includes("--version")) return "git version 2.50.0\n";
+					// rev-parse 在非仓库目录失败；isGitRepo 走 allowFailure 降级为空串
+					return "";
+				},
+				queue: createRepoCommandQueue(),
+			});
+
+			expect(await service.probe(fixture.repo)).toEqual({ gitAvailable: true, isRepo: false });
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	it("git 可用且目录在仓库内 → 两者皆真", async () => {
+		const fixture = await makeRepoFixture();
+		try {
+			const service = new GitService({
+				runGit: async (_cwd, args) => {
+					if (args.includes("--version")) return "git version 2.50.0\n";
+					if (args.includes("--is-inside-work-tree")) return "true\n";
+					return "";
+				},
+				queue: createRepoCommandQueue(),
+			});
+
+			expect(await service.probe(fixture.repo)).toEqual({ gitAvailable: true, isRepo: true });
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	it("git 存在但命令失败（非 ENOENT）→ 不谎报未安装", async () => {
+		const fixture = await makeRepoFixture();
+		try {
+			const service = new GitService({
+				// allowFailure 由执行端口负责降级（真实 CommandRunner 的契约），假实现必须同样遵守，
+				// 否则 isGitRepo 会因为「假执行器不守约」而抛错——那是测试假体的问题，不是产品行为。
+				runGit: async (_cwd, _args, options) => {
+					if (options?.allowFailure) return "";
+					throw new CommandError("command", "fatal: 权限不足");
+				},
+				queue: createRepoCommandQueue(),
+			});
+
+			// 关键：只有 ENOENT 才算未安装，否则用户会被引导去重装已装好的 git。
+			expect(await service.probe(fixture.repo)).toEqual({ gitAvailable: true, isRepo: false });
 		} finally {
 			await fixture.cleanup();
 		}

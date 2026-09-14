@@ -4,7 +4,7 @@
  *
  * 领域文件：
  *   project / editor / agent / terminal / message / session / settings / pet
- *   pi / prompt / skill / git / feishu / app
+ *   pi / prompt / skill / git / feishu / app / config
  */
 export * from "./types/project";
 export * from "./types/editor";
@@ -23,3 +23,4 @@ export * from "./types/app";
 export * from "./types/afk";
 export * from "./types/agentEvents";
 export * from "./types/ompRoles";
+export * from "./types/config";

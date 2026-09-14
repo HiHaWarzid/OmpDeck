@@ -151,6 +151,8 @@ const previewOverrides: NamespaceOverrides = {
 	},
 	git: {
 		branches: async () => ({ current: "main", branches: ["main", "dev"] }),
+		// 预览模式假定 git 可用且目录是仓库：走正常分组展示，而不是安装指引。
+		probe: async () => ({ gitAvailable: true, isRepo: true }),
 		checkout: async (_projectId, branch) => ({
 			current: branch,
 			branches: ["main", "dev"],

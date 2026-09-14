@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 264（262 - 1 删 vision:test + 3 config 角色通道：get-omp-roles/set-omp-role/clear-omp-role）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(264);
+	test("总通道数 = 265（264 + 1 新增 git:probe 能力探测；264 = 262 - 1 删 vision:test + 3 config 角色通道）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(265);
 	});
 });

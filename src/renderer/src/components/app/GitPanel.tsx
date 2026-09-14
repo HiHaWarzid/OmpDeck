@@ -50,6 +50,7 @@ import { t, type TranslationKey } from "../../i18n";
 type GitServiceFacade = Pick<
   PiDesktopApi["git"],
   | "branches"
+  | "probe"
   | "commitLog"
   | "commitDetail"
   | "branchCompare"
@@ -1003,6 +1004,8 @@ export function GitPanel(props: GitPanelProps) {
     setShowSmartCommitPrompt(false);
     setDiscardTarget(null);
     setNotAGitRepo(false);
+    // 切项目时两个提示位一起清：它们是「当前项目此刻」的判断，不能跨项目沿用。
+    setGitNotInstalled(false);
   }, [props.projectId]);
 
   useEffect(() => {
@@ -1051,8 +1054,14 @@ export function GitPanel(props: GitPanelProps) {
         if (
           request === statusRequestRef.current &&
           projectId === projectIdRef.current
-        )
+        ) {
           setGroups(next);
+          // 状态成功即证明 git 可用且目录是仓库：两个提示位必须随之清零。
+          // 此前只有 notAGitRepo 会在切项目/init 后被重置，gitNotInstalled 一旦置位
+          // 就永久停留，用户重装 git 或切到正常项目后仍看到「未安装」引导。
+          setGitNotInstalled(false);
+          setNotAGitRepo(false);
+        }
       } catch (caught) {
         if (
           request === statusRequestRef.current &&
@@ -1060,16 +1069,20 @@ export function GitPanel(props: GitPanelProps) {
         ) {
           if (!silent) {
             setGroups(EMPTY_GROUPS);
-            const msg = errorMessage(caught);
-            // 检测"不是 Git 仓库"的错误，展示初始化提示
-            if (/not a git repository|fatal:/.test(msg)) {
-              setNotAGitRepo(true);
-              setError("");
-            } else if (/command not found|ENOENT|spawn.*git.*ENOENT/i.test(msg)) {
-              setGitNotInstalled(true);
-              setError("");
-            } else {
-              setError(msg);
+            // 失败分类不在渲染层猜：状态失败的两种可恢复原因（没装 git / 不是仓库）
+            // 由主进程的 probe 直接回答。此前靠正则匹配命令失败的英文文案，
+            // 文案一变（本地化、版本措辞）安装指引就会静默消失。
+            try {
+              const probe = await props.git.probe(projectId);
+              if (request !== statusRequestRef.current || projectId !== projectIdRef.current) {
+                return;
+              }
+              setGitNotInstalled(!probe.gitAvailable);
+              setNotAGitRepo(probe.gitAvailable && !probe.isRepo);
+              setError(probe.gitAvailable && probe.isRepo ? errorMessage(caught) : "");
+            } catch {
+              // probe 自身失败（项目被移除等）：退回显示干净的错误信息。
+              setError(errorMessage(caught));
             }
           }
           // 静默失败不影响已展示的旧分组数据；不做任何 UI 状态变更。
@@ -1085,7 +1098,7 @@ export function GitPanel(props: GitPanelProps) {
           setLoading(false);
       }
     },
-    [props.git.status, props.projectId],
+    [props.git.status, props.git.probe, props.projectId],
   );
 
   // 打开 Git drawer 时首次加载；依赖 refresh 引用稳定。

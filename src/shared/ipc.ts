@@ -196,6 +196,7 @@ export const ipcTable = {
 	},
 	git: {
 		branches: { channel: "git:branches", kind: "invoke" },
+		probe: { channel: "git:probe", kind: "invoke" },
 		checkout: { channel: "git:checkout", kind: "invoke" },
 		createBranch: { channel: "git:create-branch", kind: "invoke" },
 		originalContent: { channel: "git:original-content", kind: "invoke" },

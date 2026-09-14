@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { net } from "electron";
 import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
+import type { ConfigSaveWarning } from "../../shared/types";
 import {
 	buildModelsRequest,
 	buildTestRequest,
@@ -79,6 +80,11 @@ export type PiSettings = Record<string, unknown>;
 export type ConfigValidationResult = {
 	valid: boolean;
 	error?: string;
+	/**
+	 * 「已保存，但有降级」：例如 models.json 写成功而 pi 侧的 models.yml 镜像失败。
+	 * 调用方（渲染层）据此提示用户，而不是把成功当失败、或把失败当成功。
+	 */
+	warnings?: ConfigSaveWarning[];
 };
 
 type TestRequest = {
@@ -126,8 +132,15 @@ export class ConfigManager {
 		if (!existsSync(jsonPath)) {
 			const ymlResult = await this.readModelsYml();
 			if (ymlResult.parsed) {
-				// 同时写一份 models.json 供后续使用
-				this.writeJsonFile("models.json", ymlResult.parsed).catch(() => undefined);
+				// 同时写一份 models.json 供后续使用。这里不阻塞读取（迁移是尽力而为，
+				// 下次启动会重试），但失败要留痕：否则用户会一直读到 yml 回退路径。
+				void this.writeJsonFile("models.json", ymlResult.parsed).catch((error: unknown) => {
+					console.warn(
+						`[ConfigManager] models.json 迁移写入失败，本次仍从 models.yml 读取：${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				});
 			}
 			return ymlResult;
 		}
@@ -283,9 +296,17 @@ export class ConfigManager {
 		// 保存前统一迁移历史别名，确保写入 models.json 的 api 名称能被 pi 官方 registry 识别。
 		const normalized = this.normalizeModelsForPi(data);
 		await this.writeJsonFile("models.json", normalized);
-		// 同步更新 models.yml 保持 OMP 配置一致
-		await this.writeModelsYml(normalized).catch(() => undefined);
-		return { valid: true };
+		// 同步更新 models.yml 保持 OMP 配置一致。
+		// 镜像失败不能吞：models.json 已落盘（OmpDeck 读它），而 pi 读的是 models.yml，
+		// 静默失败会让两份表示分叉、pi 继续用旧配置。这里返回结构化提示让界面告知用户。
+		const warnings: ConfigSaveWarning[] = [];
+		try {
+			await this.writeModelsYml(normalized);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			warnings.push({ code: "models-yml-mirror-failed", detail });
+		}
+		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 	}
 
 	/** 将 models 数据写成 OMP models.yml 格式 */
@@ -403,13 +424,21 @@ export class ConfigManager {
 		}
 
 		await this.writeJsonFile(fileName, rawJson);
-		// models.json 原始编辑后同步更新 models.yml
+		// models.json 原始编辑后同步更新 models.yml（与表单保存同一处理：失败要可见）
 		if (fileName === "models.json") {
 			try {
 				const data = JSON.parse(rawJson) as PiModelsFile;
 				await this.writeModelsYml(data);
-			} catch {
-				// YAML 同步失败不影响 JSON 保存
+			} catch (error) {
+				return {
+					valid: true,
+					warnings: [
+						{
+							code: "models-yml-mirror-failed",
+							detail: error instanceof Error ? error.message : String(error),
+						},
+					],
+				};
 			}
 		}
 		return { valid: true };

@@ -105,3 +105,47 @@ describe("ConfigManager models.yml 镜像写", () => {
 		expect(raw).toContain("        reasoning: true\n");
 	});
 });
+
+describe("models.yml 镜像失败必须可见（不再静默吞掉）", () => {
+	/**
+	 * 让 models.yml 的写入失败：把它做成目录，写入时必然 EISDIR/EPERM。
+	 * 这模拟真实场景（Windows 上被杀软/同步工具占用、权限不足），而不是注入 mock。
+	 */
+	async function breakYmlTarget(): Promise<void> {
+		const { mkdir } = await import("node:fs/promises");
+		await mkdir(join(dir, "models.yml"), { recursive: true });
+	}
+
+	it("表单保存：models.json 已落盘，且返回结构化警告而不是假装成功", async () => {
+		const manager = new ConfigManager(dir);
+		await breakYmlTarget();
+
+		const result = await manager.saveModelsConfig(models("openai"));
+
+		// 保存本身是成功的：JSON 已写入，不能谎报「保存失败」让用户反复重试。
+		expect(result.valid).toBe(true);
+		expect(result.warnings?.[0]?.code).toBe("models-yml-mirror-failed");
+		expect(result.warnings?.[0]?.detail).toBeTruthy();
+		// 而 JSON 这份权威表示确实已更新。
+		const json = JSON.parse(await readFile(join(dir, "models.json"), "utf8")) as PiModelsFile;
+		expect(Object.keys(json.providers)).toContain("openai");
+	});
+
+	it("镜像成功时不产生任何警告（避免把正常路径也报成降级）", async () => {
+		const manager = new ConfigManager(dir);
+		const result = await manager.saveModelsConfig(models("openai"));
+		expect(result.valid).toBe(true);
+		expect(result.warnings).toBeUndefined();
+	});
+
+	it("原始 JSON 编辑路径同样返回警告", async () => {
+		const manager = new ConfigManager(dir);
+		await breakYmlTarget();
+
+		const raw = JSON.stringify(models("openai"));
+		const result = await manager.saveRawConfig("models.json", raw);
+
+		expect(result.valid).toBe(true);
+		expect(result.warnings?.[0]?.code).toBe("models-yml-mirror-failed");
+	});
+});

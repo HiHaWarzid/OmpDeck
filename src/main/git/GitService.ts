@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, readlink, realpath, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { GitBranchInfo, CommitDetail, CommitEntry, GitRef, BranchDiffResult, GitChangedFile, GitFileStatus, GitCommitFileDiff, GitResourceGroupType, GitWorkspaceFileDiff } from "../../shared/types";
+import type { GitBranchInfo, CommitDetail, CommitEntry, GitRef, BranchDiffResult, GitChangedFile, GitFileStatus, GitCommitFileDiff, GitResourceGroupType, GitWorkspaceFileDiff, GitProbeResult } from "../../shared/types";
 import { GitStatus } from "../../shared/types";
 import type { GitResource, GitResourceGroups } from "../../shared/types";
 import { CommandError, runGit, type RunCommandOptions } from "../utils/CommandRunner";
@@ -176,6 +176,30 @@ export class GitService {
 	async isGitRepo(cwd: string): Promise<boolean> {
 		const stdout = await this.runGit(cwd, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true });
 		return stdout.trim() !== "";
+	}
+
+	/**
+	 * 环境能力探测：git 是否可用 + 该目录是否仓库。
+	 *
+	 * 为什么需要它：界面原本靠正则匹配 status 失败的英文文案来区分「没装 git」与
+	 * 「这不是仓库」（GitPanel 里 `/command not found|ENOENT/` 那两行）。文案一旦被
+	 * 本地化、换版本措辞、或被包装过，安装指引就会静默消失。这里把分类变成主进程
+	 * 直接回答的类型化问题——失败分类（CommandError.kind）本来就只在这里可读，
+	 * 跨 IPC 的自有属性会被 contextBridge 剥掉。
+	 *
+	 * 只有 kind === "not-found"（ENOENT）才算「未安装」；其它失败（超时、仓库层错误）
+	 * 说明 git 存在但当前不可用，不能谎报成未安装。
+	 */
+	async probe(cwd: string): Promise<GitProbeResult> {
+		try {
+			await this.runGit(cwd, ["--version"]);
+		} catch (error) {
+			if (error instanceof CommandError && error.kind === "not-found") {
+				// git 不在 PATH：不必再问仓库归属，答案必然为否。
+				return { gitAvailable: false, isRepo: false };
+			}
+		}
+		return { gitAvailable: true, isRepo: await this.isGitRepo(cwd) };
 	}
 
 	async getBranches(cwd: string): Promise<GitBranchInfo> {

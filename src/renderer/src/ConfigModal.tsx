@@ -2,6 +2,7 @@ import { showNotice } from "./utils/notice";
 import { isAgentActiveOrIdle } from "./utils/agentRuntimeState";
 import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { PiDesktopApi } from "../../shared/api";
+import type { ConfigSaveWarning } from "../../shared/types";
 import { AuthTab } from "./config/AuthTab";
 import { ModelsTab } from "./config/ModelsTab";
 import { RawTab } from "./config/RawTab";
@@ -510,7 +511,11 @@ function ConfigModalContent(props: ConfigModalProps) {
 	};
 
 	const saveAndReload = async (
-		saveFn: () => Promise<{ valid: boolean; error?: string }>,
+		saveFn: () => Promise<{
+			valid: boolean;
+			error?: string;
+			warnings?: ConfigSaveWarning[];
+		}>,
 		successMessage?: string,
 	) => {
 		setSaving(true);
@@ -522,6 +527,19 @@ function ConfigModalContent(props: ConfigModalProps) {
 				return;
 			}
 			onSaved();
+			// 「已保存但有降级」必须说出来：例如 models.yml 镜像写失败时，
+			// 只报「已保存」会让用户以为 pi 侧也生效了，而实际仍在用旧配置。
+			const warning = result.warnings?.[0];
+			if (warning) {
+				showNotice(
+					warning.code === "models-yml-mirror-failed"
+						? t("config.modelsMirrorFailed", { detail: warning.detail })
+						: warning.detail,
+					6000,
+					"warning",
+				);
+				return;
+			}
 			showToast(successMessage ?? t("config.saved"));
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
