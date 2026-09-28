@@ -21,6 +21,7 @@ import {
 import { OmpRolesStore } from "./OmpRolesStore";
 import { TrustStore } from "./TrustStore";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { parseDocument } from "yaml";
 import type { WslEnvironment } from "../wsl/WslPaths";
 
 /** pi 全局配置目录：~/.omp/agent/ */
@@ -134,13 +135,17 @@ export class ConfigManager {
 			if (ymlResult.parsed) {
 				// 同时写一份 models.json 供后续使用。这里不阻塞读取（迁移是尽力而为，
 				// 下次启动会重试），但失败要留痕：否则用户会一直读到 yml 回退路径。
-				void this.writeJsonFile("models.json", ymlResult.parsed).catch((error: unknown) => {
-					console.warn(
-						`[ConfigManager] models.json 迁移写入失败，本次仍从 models.yml 读取：${
-							error instanceof Error ? error.message : String(error)
-						}`,
-					);
-				});
+				// 空 providers 不迁移：多半意味着 yml 损坏（或为空），落空配置会把
+				// 「用户手编 yml 暂不可读」固化成永久空配置（孤儿化）。
+				if (Object.keys(ymlResult.parsed.providers).length > 0) {
+					void this.writeJsonFile("models.json", ymlResult.parsed).catch((error: unknown) => {
+						console.warn(
+							`[ConfigManager] models.json 迁移写入失败，本次仍从 models.yml 读取：${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					});
+				}
 			}
 			return ymlResult;
 		}
@@ -188,62 +193,44 @@ export class ConfigManager {
 	}
 
 	/**
-	 * 解析 OMP models.yml 的简单缩进结构。
-	 * 只处理 providers -> providerName -> fields/models 两级嵌套。
-	 * 不支持数组嵌套对象以外的复杂 YAML。
+	 * 解析 OMP models.yml（回退路径，仅 models.json 缺失时走）。
+	 * 用真正的 YAML 解析器而非手写缩进解析：镜像现在包含 compat/thinking 等任意
+	 * 深度的嵌套块，旧的两级缩进解析器会把嵌套字段误读成模型条目（例如 compat 下的
+	 * `supportsReasoningEffort: true` 会被当成一个 id 叫这个名字的模型）。
+	 * 解析失败按空配置处理（与旧实现 catch 后返回空的语义一致），绝不因 yml 异常
+	 * 阻塞启动；脏数据逐条剔除而不是让整个文件读失败。
 	 */
 	private parseSimpleYaml(raw: string): PiModelsFile {
-		const lines = raw.split("\n");
 		const result: PiModelsFile = { providers: {} };
-		let currentProvider: string | null = null;
-		let currentModel: Partial<PiModelItem> | null = null;
-		const models: PiModelItem[] = [];
-
-		for (const line of lines) {
-			const trimmed = line.trimEnd();
-			if (!trimmed || trimmed.startsWith("#")) continue;
-
-			const indent = line.length - line.trimStart().length;
-			// Strip YAML array prefix `- ` at array-item indent levels
-			const content = trimmed.startsWith("- ") ? trimmed.slice(2) : trimmed;
-			const match = content.match(/^(\S[^:]*):\s*(.*)$/);
-			if (!match) continue;
-
-			const key = match[1].trim();
-			const value = match[2].trim();
-
-			if (indent === 0 && key === "providers") {
-				currentProvider = null;
-			} else if (indent === 2 && currentProvider === null) {
-				currentProvider = key;
-				result.providers[currentProvider] = { models: [] };
-			} else if (currentProvider && indent === 4) {
-				if (key === "models") {
-					// models array starts next line
-				} else if (value) {
-					(result.providers[currentProvider] as Record<string, unknown>)[key] = this.parseYamlValue(value);
-				}
-			} else if (currentProvider && indent === 6) {
-				if (currentModel) models.push(currentModel as PiModelItem);
-				currentModel = { id: key };
-				if (value) (currentModel as Record<string, unknown>)[key] = this.parseYamlValue(value);
-			} else if (currentProvider && indent === 8 && currentModel) {
-				(currentModel as Record<string, unknown>)[key] = this.parseYamlValue(value);
+		try {
+			const doc = parseDocument(raw);
+			// yaml 的 parseDocument 有错误恢复能力：部分损坏的文件 toJS() 仍能给出未损坏
+			// 部分。全有或全无地丢弃会让「手编 yml 手滑 + models.json 缺失」变成配置孤儿化
+			// （迁移写会把空 providers 落进 models.json，此后永远读 json）。因此即使有解析
+			// 错误也先尝试恢复内容，完全不可用才返回空。
+			const js = doc.toJS() as unknown;
+			const providers = (js as { providers?: unknown } | null)?.providers;
+			if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+				return result;
 			}
+			for (const [name, providerValue] of Object.entries(providers as Record<string, unknown>)) {
+				if (!providerValue || typeof providerValue !== "object" || Array.isArray(providerValue)) {
+					continue;
+				}
+				const provider = { ...(providerValue as Record<string, unknown>) };
+				const models = Array.isArray(provider.models) ? provider.models : [];
+				provider.models = models.filter(
+					(model): model is PiModelItem =>
+						!!model &&
+						typeof model === "object" &&
+						typeof (model as { id?: unknown }).id === "string",
+					);
+				result.providers[name] = provider as PiProviderConfig;
+			}
+			return result;
+		} catch {
+			return result;
 		}
-		if (currentModel) models.push(currentModel as PiModelItem);
-		if (currentProvider) {
-			result.providers[currentProvider].models = models;
-		}
-		return result;
-	}
-
-	private parseYamlValue(value: string): unknown {
-		if (value === "true") return true;
-		if (value === "false") return false;
-		if (/^\d+$/.test(value)) return Number(value);
-		if (value.startsWith("\"") && value.endsWith("\"")) return value.slice(1, -1);
-		return value;
 	}
 
 	async getAuthConfig(): Promise<ConfigFileReadResult<PiAuthFile>> {
@@ -309,22 +296,35 @@ export class ConfigManager {
 		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 	}
 
-	/** 将 models 数据写成 OMP models.yml 格式 */
+	/**
+	 * 将 models 数据写成 OMP models.yml 格式。
+	 *
+	 * 必须是无损镜像：omp 运行时读的是这份 yml，models.json 只是 OmpDeck 侧的权威源。
+	 * 只镜像标量字段的话，compat（含手工加的 reasoningEffortMap）、模型级 thinking、
+	 * thinkingLevelMap、input 等扩展字段会在每次保存后从 yml 消失，用户在 omp 侧
+	 * 生效的兼容配置被静默清掉（历史缺陷：MiniMax-M3 的 reasoning_effort 映射丢失后
+	 * 会话 400）。因此除 models 数组外，所有字段都原样镜像。
+	 */
 	private async writeModelsYml(data: PiModelsFile): Promise<void> {
 		const lines: string[] = ["providers:"];
 		for (const [name, provider] of Object.entries(data.providers)) {
+			if (!provider || typeof provider !== "object") continue;
 			lines.push(`  ${this.escapeYmlKey(name)}:`);
-			if (provider.baseUrl) lines.push(`    baseUrl: ${this.escapeYmlValue(provider.baseUrl)}`);
-			if (provider.apiKey) lines.push(`    apiKey: ${this.escapeYmlValue(provider.apiKey)}`);
-			if (provider.api) lines.push(`    api: ${this.escapeYmlValue(provider.api)}`);
-			if (provider.models?.length) {
+			// 已知标量字段固定顺序在前（保证历史镜像 diff 稳定），扩展字段按对象键序随后
+			this.pushYmlFields(lines, provider as Record<string, unknown>, "    ", ["baseUrl", "apiKey", "api"], ["models"]);
+			const models = Array.isArray(provider.models) ? provider.models : [];
+			if (models.length > 0) {
 				lines.push(`    models:`);
-				for (const model of provider.models) {
+				for (const model of models) {
+					if (!model || typeof model !== "object" || typeof model.id !== "string") continue;
 					lines.push(`      - id: ${this.escapeYmlValue(model.id)}`);
-					if (model.name) lines.push(`        name: ${this.escapeYmlValue(model.name)}`);
-					if (model.reasoning) lines.push(`        reasoning: true`);
-					if (model.contextWindow) lines.push(`        contextWindow: ${model.contextWindow}`);
-					if (model.maxTokens) lines.push(`        maxTokens: ${model.maxTokens}`);
+					this.pushYmlFields(
+						lines,
+						model as Record<string, unknown>,
+						"        ",
+						["id", "name", "reasoning", "contextWindow", "maxTokens"],
+						["id"],
+					);
 				}
 			}
 		}
@@ -333,13 +333,87 @@ export class ConfigManager {
 		await this.jsonFile("models.yml").write(lines.join("\n") + "\n");
 	}
 
+	/**
+	 * 按固定顺序输出对象字段：knownOrder 里的已知字段在前（与历史镜像逐字节一致），
+	 * 其余扩展字段按对象键序跟在后面。skip 的字段由调用方专门处理（如 models 数组）。
+	 */
+	private pushYmlFields(
+		lines: string[],
+		source: Record<string, unknown>,
+		indent: string,
+		knownOrder: readonly string[],
+		skip: readonly string[] = [],
+	): void {
+		const keys = Object.keys(source).filter((key) => !skip.includes(key));
+		const ordered = [
+			...knownOrder.filter((key) => keys.includes(key)),
+			...keys.filter((key) => !knownOrder.includes(key)),
+		];
+		for (const key of ordered) {
+			this.pushYmlEntry(lines, key, source[key], indent, false);
+		}
+	}
+
+	/**
+	 * 递归输出单个键值对。
+	 *
+	 * 顶层字段（nested=false）沿用历史 skip 规则：undefined/null/空串及空集合不落盘
+	 * （比旧实现更无损的一点是 false/0 现在会落盘，UI 勾选框提交 reasoning:false 时
+	 * 不再丢失）。嵌套字段（nested=true，如 compat/thinkingLevelMap 内部）只跳过
+	 * undefined：false/0/null 都有语义——compat 布尔开关必须显式落盘，thinkingLevelMap 的
+	 * null 表示「禁用该档位映射」。
+	 * 数组一律用 JSON flow 风格：JSON 是 YAML 1.2 flow 的子集，转义交给
+	 * JSON.stringify，避免手写数组转义漏掉逗号/引号。
+	 */
+	private pushYmlEntry(
+		lines: string[],
+		key: string,
+		value: unknown,
+		indent: string,
+		nested: boolean,
+	): void {
+		if (value === undefined) return;
+		if (!nested && (value === null || value === "")) return;
+		if (Array.isArray(value)) {
+			if (value.length === 0) return;
+			lines.push(`${indent}${this.escapeYmlKey(key)}: ${JSON.stringify(value)}`);
+			return;
+		}
+		if (value !== null && typeof value === "object") {
+			const entries = Object.entries(value as Record<string, unknown>).filter(
+				([, childValue]) => childValue !== undefined,
+			);
+			if (entries.length === 0) return;
+			lines.push(`${indent}${this.escapeYmlKey(key)}:`);
+			for (const [childKey, childValue] of entries) {
+				this.pushYmlEntry(lines, childKey, childValue, `${indent}  `, true);
+			}
+			return;
+		}
+		if (value === null) {
+			lines.push(`${indent}${this.escapeYmlKey(key)}: null`);
+			return;
+		}
+		lines.push(`${indent}${this.escapeYmlKey(key)}: ${this.escapeYmlValue(value as string | number | boolean)}`);
+	}
+
 	private escapeYmlKey(key: string): string {
-		return /[:\[\]{}#]|^\s/.test(key) ? `"${key}"` : key;
+		// 与 escapeYmlValue 同规则并用 JSON.stringify 包裹：递归镜像后任意用户键（compat
+		// 子键、扩展字段名）都会流经这里，键名以 YAML 指示符开头（如 `*weird`、`- item`）
+		// 会让整份 yml 解析报错甚至静默结构腐蚀；顺带修复内嵌引号/换行
+		return /[:\[\]{}#"']|\s|^$|^[-?&*!%@`|>,]/.test(key) ? JSON.stringify(key) : key;
 	}
 
 	private escapeYmlValue(value: string | number | boolean): string {
 		if (typeof value === "number" || typeof value === "boolean") return String(value);
-		if (/[:\[\]{}#"']|\s|^$/.test(value)) return JSON.stringify(value);
+		// YAML 指示符开头（含 flow 指示符 `,`）的裸标量会被解析成别名/锚点/块标量等，
+		// 一律加引号；其余沿用历史规则（含冒号/括号/引号/空白才转义）
+		if (/[:\[\]{}#"']|\s|^$|^[-?&*!%@`|>,]/.test(value)) return JSON.stringify(value);
+		// YAML 1.2 core schema 会把 null/布尔/数字样式的裸标量解析成非字符串；不引号的话
+		// 字符串 id "20250101" 回读变成 number，会被 parseSimpleYaml 的字符串 id 过滤
+		// 剔除，经 models.json 迁移写后模型被永久丢失
+		if (/^(~|null|true|false)$/i.test(value)) return JSON.stringify(value);
+		if (/^[-+]?\.?\d/.test(value) && !Number.isNaN(Number(value))) return JSON.stringify(value);
 		return value;
 	}
 

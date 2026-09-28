@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseDocument } from "yaml";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigManager, type PiModelsFile } from "./ConfigManager";
 
 let dir: string;
@@ -103,6 +104,164 @@ describe("ConfigManager models.yml 镜像写", () => {
 		expect(raw.startsWith("providers:\n")).toBe(true);
 		expect(raw).toContain("  openai:\n");
 		expect(raw).toContain("        reasoning: true\n");
+	});
+
+	/** 回归背景：omp 读的是 yml，镜像丢字段会让用户手工加的兼容配置在下次保存后静默失效。 */
+	it("镜像无损：compat/thinking/thinkingLevelMap/input 等扩展字段全部落盘", async () => {
+		const manager = new ConfigManager(dir);
+		await manager.saveModelsConfig({
+			providers: {
+				minimax: {
+					baseUrl: "https://api.minimax.cn/v1",
+					apiKey: "sk-test",
+					api: "openai-completions",
+					compat: {
+						supportsDeveloperRole: true,
+						supportsReasoningEffort: false,
+						reasoningEffortMap: { low: "low", high: "high" },
+					},
+					models: [
+						{
+							id: "MiniMax-M3",
+							reasoning: true,
+							contextWindow: 1000000,
+							input: ["text", "image"],
+							thinkingLevelMap: { xhigh: "max", low: null },
+							thinking: {
+								mode: "effort",
+								efforts: ["low", "medium", "high", "xhigh", "max"],
+								effortMap: { low: "low", xhigh: "xhigh" },
+							},
+						},
+					],
+				},
+			},
+		});
+
+		const raw = await readFile(join(dir, "models.yml"), "utf8");
+		const parsed = parseDocument(raw).toJS() as PiModelsFile;
+		const provider = parsed.providers.minimax;
+		// false 必须保留：compat 布尔开关不落盘等价于没配置
+		expect(provider.compat).toEqual({
+			supportsDeveloperRole: true,
+			supportsReasoningEffort: false,
+			reasoningEffortMap: { low: "low", high: "high" },
+		});
+		const model = provider.models![0];
+		expect(model.input).toEqual(["text", "image"]);
+		// null 必须保留：thinkingLevelMap 的 null 表示「禁用该档位映射」
+		expect(model.thinkingLevelMap).toEqual({ xhigh: "max", low: null });
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			efforts: ["low", "medium", "high", "xhigh", "max"],
+			effortMap: { low: "low", xhigh: "xhigh" },
+		});
+	});
+
+	it("models.json 缺失时回退读 yml：嵌套扩展字段完整读回而非误读成模型条目", async () => {
+		const manager = new ConfigManager(dir);
+		await manager.saveModelsConfig({
+			providers: {
+				minimax: {
+					baseUrl: "https://api.minimax.cn/v1",
+					api: "openai-completions",
+					compat: { supportsDeveloperRole: true, supportsReasoningEffort: false },
+					models: [
+						{
+							id: "MiniMax-M3",
+							reasoning: true,
+							thinking: {
+								mode: "effort",
+								effortMap: { high: "high" },
+							},
+						},
+					],
+				},
+			},
+		});
+		await rm(join(dir, "models.json"), { force: true });
+
+		const read = await manager.getModelsConfig();
+		const provider = read.parsed?.providers.minimax;
+		// 旧缩进解析器会把 compat 下的键读成一个 id 叫 supportsDeveloperRole 的模型
+		expect(provider?.compat).toEqual({
+			supportsDeveloperRole: true,
+			supportsReasoningEffort: false,
+		});
+		expect(provider?.models).toHaveLength(1);
+		expect(provider?.models?.[0]?.id).toBe("MiniMax-M3");
+		expect(provider?.models?.[0]?.thinking).toEqual({
+			mode: "effort",
+			effortMap: { high: "high" },
+		});
+	});
+
+	it("models.yml 语法损坏时回退读返回空 providers，不抛错不阻塞启动", async () => {
+		const manager = new ConfigManager(dir);
+		await writeFile(join(dir, "models.yml"), "providers:\n  bad: [unclosed\n", "utf8");
+
+		const read = await manager.getModelsConfig();
+		expect(read.parsed).toEqual({ providers: {} });
+		// 孤儿化防护：yml 暂不可读时不得把空 providers 固化进 models.json。
+		// 先让事件循环把可能存在的迁移写冲刷掉，再断言文件未产生。
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(existsSync(join(dir, "models.json"))).toBe(false);
+	});
+
+	/** 钉住类型腐蚀回归：裸标量 id "20250101" 回读变 number 后会被字符串 id 过滤剔除。 */
+	it("数值样/null/布尔样字符串值镜像时加引号，往返类型稳定", async () => {
+		const manager = new ConfigManager(dir);
+		await manager.saveModelsConfig({
+			providers: {
+				gateway: {
+					apiKey: "20250101",
+					models: [
+						{ id: "20250101", name: "true" },
+						{ id: "0x10", name: "~" },
+						{ id: "5e3" },
+					],
+				},
+			},
+		});
+		await rm(join(dir, "models.json"), { force: true });
+
+		const read = await manager.getModelsConfig();
+		const models = read.parsed?.providers.gateway.models ?? [];
+		expect(models.map((model) => model.id)).toEqual(["20250101", "0x10", "5e3"]);
+		expect(models.every((model) => typeof model.id === "string")).toBe(true);
+		expect(models[0].name).toBe("true");
+		expect(models[1].name).toBe("~");
+		expect(read.parsed?.providers.gateway.apiKey).toBe("20250101");
+		// 回退读会 fire-and-forget 地触发 models.json 迁移写；等它落盘再结束，
+		// 避免异步写与 afterEach 的目录清理竞态
+		await vi.waitFor(() => expect(existsSync(join(dir, "models.json"))).toBe(true));
+	});
+
+	/** 钉住指示符键/值回归：特殊键曾会让整份 yml 解析报错或静默结构腐蚀。 */
+	it("指示符开头的键与逗号开头的值镜像后可无损读回", async () => {
+		const manager = new ConfigManager(dir);
+		const source: PiModelsFile = {
+			providers: {
+				weird: {
+					apiKey: ",comma-start",
+					models: [
+						{
+							id: "m1",
+							"*weird*": "value",
+							"- item": 1,
+						},
+					],
+				},
+			},
+		};
+		await manager.saveModelsConfig(source);
+
+		const raw = await readFile(join(dir, "models.yml"), "utf8");
+		const parsed = parseDocument(raw);
+		expect(parsed.errors).toEqual([]);
+		const model = (parsed.toJS() as PiModelsFile).providers.weird.models![0];
+		expect(model["*weird*"]).toBe("value");
+		expect(model["- item"]).toBe(1);
 	});
 });
 
