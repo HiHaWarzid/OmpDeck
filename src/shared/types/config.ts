@@ -9,7 +9,9 @@
  * 因此失败以**结构化提示码**返回：code 供渲染层映射 i18n 文案（可见文本不跨边界
  * 传自由文本），detail 是技术细节，用于让用户/日志定位原因。
  */
-export type ConfigSaveWarningCode = "models-yml-mirror-failed";
+export type ConfigSaveWarningCode =
+	| "models-yml-mirror-failed"
+	| "auth-json-sync-failed";
 
 export type ConfigSaveWarning = {
 	code: ConfigSaveWarningCode;

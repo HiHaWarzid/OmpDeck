@@ -27,6 +27,7 @@ import type {
 } from "./config/configTypes";
 import type { ConfigFileDiagnostic, CreatePiPromptTemplateInput, PiExtensionListResult, PiExtensionSummary, PiPromptTemplateListResult, PiPromptTemplateSummary, PiSkillListResult, PiSkillLocation, PiSkillSummary } from "../../shared/types";
 import { getProviderHeaders, KNOWN_PROVIDER_ENDPOINTS } from "./config/providerHeaders";
+import { lookupBuiltinApiRoute } from "../../shared/providerApiRoutes";
 
 const api: PiDesktopApi = (window as unknown as { piDesktop: PiDesktopApi })
 	.piDesktop;
@@ -534,7 +535,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 				showNotice(
 					warning.code === "models-yml-mirror-failed"
 						? t("config.modelsMirrorFailed", { detail: warning.detail })
-						: warning.detail,
+						: warning.code === "auth-json-sync-failed"
+							? t("config.authJsonSyncFailed", { detail: warning.detail })
+							: warning.detail,
 					6000,
 					"warning",
 				);
@@ -800,11 +803,16 @@ function ConfigModalContent(props: ConfigModalProps) {
 		setTestResult(null);
 		setError(null);
 		try {
+			// pi 内置 provider（如 commandcode）按 model id 选端点，provider 级别 `api`
+			// 字段被忽略。如果只按用户写的 api 测试，会与实际会话打不同端点：测试 200、
+			// 会话 400/404。先查内置路由表，覆盖真实会话路径。
+			const builtinApi = lookupBuiltinApiRoute(providerName, modelId);
+			const effectiveApi = builtinApi ?? (provider.api as string | undefined);
 			const result = await api.config.testProvider(
 				provider.baseUrl,
 				provider.apiKey,
 				modelId,
-				provider.api as string | undefined,
+				effectiveApi,
 				getProviderHeaders(provider.headers),
 			);
 			setTestResult({ providerName, ...result });

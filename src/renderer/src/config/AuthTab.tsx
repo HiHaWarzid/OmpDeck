@@ -32,6 +32,9 @@ const PRESET_PROVIDERS = [
 	{ value: "kimi-coding", label: "Kimi For Coding", env: "KIMI_API_KEY", url: "" },
 	{ value: "minimax", label: "MiniMax", env: "MINIMAX_API_KEY", url: "" },
 	{ value: "minimax-cn", label: "MiniMax (China)", env: "MINIMAX_CN_API_KEY", url: "" },
+	// Command Code：pi 内置 provider,env 取自 compat/rules/auth/commandcode.kdl。
+	// 复数 env 表明 pi 同时接受 COMMAND_CODE_API_KEY 和 COMMANDCODE_API_KEY,展示第一个。
+	{ value: "commandcode", label: "Command Code", env: "COMMANDCODE_API_KEY", url: "https://commandcode.ai/studio" },
 	{ value: "xiaomi", label: "Xiaomi MiMo", env: "XIAOMI_API_KEY", url: "" },
 	{ value: "xiaomi-token-plan-cn", label: "Xiaomi MiMo Token (China)", env: "XIAOMI_TOKEN_PLAN_CN_API_KEY", url: "" },
 	{ value: "xiaomi-token-plan-ams", label: "Xiaomi MiMo Token (Amsterdam)", env: "XIAOMI_TOKEN_PLAN_AMS_API_KEY", url: "" },

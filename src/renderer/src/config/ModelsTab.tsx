@@ -10,6 +10,7 @@ import {
 	setHeaderValue,
 } from "./providerHeaders";
 import { buildModelsFromFetchedSelection } from "./modelsUtils";
+import { lookupBuiltinApiRoute } from "../../../shared/providerApiRoutes";
 
 type FetchedModel = { id: string; name?: string };
 
@@ -646,6 +647,15 @@ export function ModelsTab(props: {
 													props.onChangeProvider(name, "api", value)
 												}
 											/>
+											{/* pi 内置 provider 的 api 由 model id 路由，models.json 里写的
+											    api 字段会被忽略；为避免误导，附一行小字提示。 */}
+											{provider.models?.some((m) =>
+												lookupBuiltinApiRoute(name, m.id),
+											) && (
+												<span className="config-field-hint">
+													{t("config.apiTypeBuiltinHint")}
+												</span>
+											)}
 										</div>
 										<div className="config-form-row">
 											<label>{t("config.field.apiKey")}</label>
@@ -655,6 +665,11 @@ export function ModelsTab(props: {
 													props.onChangeProvider(name, "apiKey", v)
 												}
 											/>
+											{/* 非空 apiKey 会同步到 auth.json；从表单删除 provider
+											    不会自动清除 auth.json 里已写入的 key。 */}
+											<span className="config-field-hint">
+												{t("config.authOrphanKeyNote")}
+											</span>
 										</div>
 										<div className="config-form-row">
 											<label>{t("config.field.userAgent")}</label>

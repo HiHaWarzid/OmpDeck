@@ -115,4 +115,9 @@ export const KNOWN_PROVIDER_ENDPOINTS: Record<
 	"opencode-go": { baseUrl: "https://opencode.ai/zen/go/v1", apiType: "openai-completions" },
 	"minimax": { baseUrl: "https://api.minimax.io/v1", apiType: "openai-completions" },
 	"minimax-cn": { baseUrl: "https://api.minimaxi.com/v1", apiType: "openai-completions" },
+	// Command Code：pi 内置 provider，baseUrl 必须是 /provider 前缀（不是 /v1），
+	// pi 的 normalizeCommandCodeBasePath 会把 /v1 剥掉再加回来。OmpDeck 探测侧
+	// 用 ensureVersionPath 补 /v1，两侧最终都打到 /provider/v1/...。不要写
+	// https://api.commandcode.ai/（无 /provider 前缀），会话侧 404。
+	"commandcode": { baseUrl: "https://api.commandcode.ai/provider", apiType: "openai-completions" },
 };

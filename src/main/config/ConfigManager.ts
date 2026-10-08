@@ -283,17 +283,49 @@ export class ConfigManager {
 		// 保存前统一迁移历史别名，确保写入 models.json 的 api 名称能被 pi 官方 registry 识别。
 		const normalized = this.normalizeModelsForPi(data);
 		await this.writeJsonFile("models.json", normalized);
+		const warnings: ConfigSaveWarning[] = [];
 		// 同步更新 models.yml 保持 OMP 配置一致。
 		// 镜像失败不能吞：models.json 已落盘（OmpDeck 读它），而 pi 读的是 models.yml，
 		// 静默失败会让两份表示分叉、pi 继续用旧配置。这里返回结构化提示让界面告知用户。
-		const warnings: ConfigSaveWarning[] = [];
 		try {
 			await this.writeModelsYml(normalized);
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
 			warnings.push({ code: "models-yml-mirror-failed", detail });
 		}
+		// 同步 apiKey 到 auth.json：pi 内置 provider（如 commandcode）走 auth.json
+		// 取 key，不读 models.json 里的 apiKey 字段（也不读 yml 回退）。OmpDeck 镜像
+		// 到 yml 仅是给 getAuthConfig 做读路径回退，会话侧仍取 auth.json。不在保存时
+		// 同步的话,用户在表单改 key 看似成功,实际会话 401。仅同步非空 apiKey；oauth
+		// provider 的 auth 走专用通道,不在此覆盖。auth.json 失败仅警告、不回滚
+		// models.json(用户可手动补 auth.json)。
+		try {
+			await this.syncAuthFromModels(normalized);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			warnings.push({ code: "auth-json-sync-failed", detail });
+		}
 		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
+	}
+
+	/**
+	 * 把 models.json 里非空 apiKey 同步到 auth.json。不删旧条目（其他 provider 的 key
+	 * 可能仍生效,只是当前没列在 models.json 中,如 disabled 状态）。不覆盖已有 key
+	 * 不同的条目:AuthTab 直接编辑的 key 是用户最新意图,不应被 stale 的 models.json 改写。
+	 */
+	private async syncAuthFromModels(data: PiModelsFile): Promise<void> {
+		const authResult = await this.readJsonFile<PiAuthFile>("auth.json", {});
+		const auth = authResult.parsed ?? {};
+		let changed = false;
+		for (const [name, provider] of Object.entries(data.providers)) {
+			const key = typeof provider.apiKey === "string" ? provider.apiKey.trim() : "";
+			if (!key) continue;
+			const existing = auth[name];
+			if (existing?.key === key) continue;
+			auth[name] = { type: "api_key", key };
+			changed = true;
+		}
+		if (changed) await this.writeJsonFile("auth.json", auth);
 	}
 
 	/**
@@ -500,20 +532,33 @@ export class ConfigManager {
 		await this.writeJsonFile(fileName, rawJson);
 		// models.json 原始编辑后同步更新 models.yml（与表单保存同一处理：失败要可见）
 		if (fileName === "models.json") {
+			const warnings: ConfigSaveWarning[] = [];
+			// JSON.parse 提到 try 外：避免重复解析同一份字符串，且只在这一个
+			// 失败点返回错误——后续 yml/auth 同步的因果就清晰了。
+			let data: PiModelsFile;
 			try {
-				const data = JSON.parse(rawJson) as PiModelsFile;
-				await this.writeModelsYml(data);
+				data = JSON.parse(rawJson) as PiModelsFile;
 			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
 				return {
 					valid: true,
-					warnings: [
-						{
-							code: "models-yml-mirror-failed",
-							detail: error instanceof Error ? error.message : String(error),
-						},
-					],
+					warnings: [{ code: "models-yml-mirror-failed", detail }],
 				};
 			}
+			try {
+				await this.writeModelsYml(data);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				warnings.push({ code: "models-yml-mirror-failed", detail });
+			}
+			// 同步 apiKey 到 auth.json(与 saveModelsConfig 同一处理:内置 provider 走 auth.json 取 key)
+			try {
+				await this.syncAuthFromModels(data);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				warnings.push({ code: "auth-json-sync-failed", detail });
+			}
+			return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 		}
 		return { valid: true };
 	}

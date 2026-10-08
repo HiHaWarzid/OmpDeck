@@ -778,6 +778,9 @@ const zhCN = {
   // 检测侧兼容补了 /v1 且实际走通时，自动把表单 baseUrl 改成会话可用路径
   "config.baseUrlAutoNormalized": "检测实际走通版本路径，已将 Base URL 更新为 {url}。请保存配置后启动会话。",
   "config.baseUrlHint": "获取/测试会兼容尝试 / 与 /v1；会话会原样使用此处地址。建议填写到 /v1（或 /v1beta）。",
+  // pi 内置 provider（如 commandcode）按 model id 选端点，models.json 里的 api
+  // 字段被忽略。提示用户测试连接可能与会话实际走的路径不同。
+  "config.apiTypeBuiltinHint": "此 provider 是 pi 内置 provider，实际 API 路由由 model id 决定，上方的 api 字段会被忽略。测试连接已自动按实际路由探测。",
   "config.imported": "配置已导入",
   "config.importFailed": "导入失败",
   "config.loadFailed": "配置管理加载失败",
@@ -789,6 +792,12 @@ const zhCN = {
   "config.renderCrashedHelpSuffix": "，并把控制台错误和配置片段反馈给我们。",
   "config.saveFailed": "保存失败",
   "config.modelsMirrorFailed": "已保存 models.json，但同步 OMP 的 models.yml 失败（{detail}）。pi 侧仍在用旧配置，请重试保存。",
+  // 同步到 auth.json 失败：常见 = 权限已文件被占用。会话侧仍会从老键继续工作，
+  // 但新增 key 不会生效,需要重试保存或在 auth 标签页手动调整。
+  "config.authJsonSyncFailed": "已保存 models.json，但同步 apiKey 到 auth.json 失败（{detail}）。新增 provider 的会话仍会 401，请到 auth 标签页手动添加对应 key 后重试保存。",
+  // Models 表单中删除一个 provider 不会清除 auth.json 里已写入的 key(可能仍在
+  // 其他流程中被引用)。需要到 auth 标签页手动删除对应条目。
+  "config.authOrphanKeyNote": "从表单删除 provider 不会自动删除 auth.json 中已写入的 API Key。如需彻底清理，请到 auth 标签页手动删除对应条目。",
   "config.saved": "配置已保存",
   "config.ompDefaultTitle": "OMP 默认",
   "config.ompDefaultActive": "当前 OMP 默认",
@@ -2599,6 +2608,8 @@ const enUS: Record<TranslationKey, string> = {
   "config.fetchedModels": "Fetched {count} models",
   "config.baseUrlAutoNormalized": "Versioned path worked during probe; Base URL updated to {url}. Save the config before starting a session.",
   "config.baseUrlHint": "Fetch/test may try both / and /v1; sessions use this URL as-is. Prefer a versioned path such as /v1 (or /v1beta).",
+  // Built-in pi providers (e.g. commandcode) route by model id; the value above is ignored.
+  "config.apiTypeBuiltinHint": "This provider is built into pi. The actual API route is chosen by the model id, so the api field above is ignored. Test connection automatically probes the real route.",
   "config.imported": "Configuration imported",
   "config.importFailed": "Import failed",
   "config.loadFailed": "omp Management failed to load",
@@ -2610,6 +2621,8 @@ const enUS: Record<TranslationKey, string> = {
   "config.renderCrashedHelpSuffix": ", then send us the console error and config snippet.",
   "config.saveFailed": "Save failed",
   "config.modelsMirrorFailed": "models.json was saved, but syncing OMP's models.yml failed ({detail}). pi still uses the previous config — please save again.",
+  "config.authJsonSyncFailed": "models.json was saved, but syncing the apiKey to auth.json failed ({detail}). New providers will keep returning 401; add the key in the auth tab and save again.",
+  "config.authOrphanKeyNote": "Removing a provider from the form does not delete its API key from auth.json. To clean up, remove the entry in the auth tab.",
   "config.saved": "Configuration saved",
   "config.ompDefaultTitle": "OMP Default",
   "config.ompDefaultActive": "Current OMP default",
