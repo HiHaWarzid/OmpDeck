@@ -196,6 +196,21 @@ export class PiLocator {
       // Chromium/打包壳相关变量对 pi 无意义，避免污染工具链探测。
       if (key.startsWith("CHROME_") || key.startsWith("GOOGLE_API_")) {
         delete next[key];
+        continue;
+      }
+      // 桌面端 omp 子进程不应继承 shell 的 HTTP(S) 代理：常见本地代理（clash /
+      // v2rayN 7897、mitmproxy 等）会对长流式 AI 请求按 idle timeout 掐断，
+      // 表现为"socket connection was closed unexpectedly"。omp 走系统直连更稳。
+      // 用户若要强行让 omp 走代理，仍可在 piProxy 开关里显式配（见 applyPiProxyEnv）。
+      // 覆盖 *_PROXY / *_proxy / NO_PROXY / no_proxy 五种大小写形式 + ALL_PROXY 别名。
+      const lower = key.toLowerCase();
+      if (
+        lower === "http_proxy" ||
+        lower === "https_proxy" ||
+        lower === "all_proxy" ||
+        lower === "no_proxy"
+      ) {
+        delete next[key];
       }
     }
 

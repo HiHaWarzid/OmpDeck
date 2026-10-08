@@ -97,3 +97,47 @@ test("places an explicit WSL cwd before the pi command", () => {
 	);
 	assert.equal(invocation.wsl.distro, "Ubuntu-24.04");
 });
+
+test("sanitizePiChildEnv strips shell HTTP(S) proxy env so omp long-streams bypass local proxies", () => {
+	const { PiLocator } = loadPiLocatorModule("win32");
+	const dirty = {
+		PATH: "C:\\Windows",
+		USERPROFILE: "C:\\Users\\EthanZhang",
+		HTTPS_PROXY: "http://127.0.0.1:7897",
+		HTTP_PROXY: "http://127.0.0.1:7897",
+		ALL_PROXY: "socks5://127.0.0.1:1080",
+		NO_PROXY: "localhost,127.0.0.1",
+		https_proxy: "http://proxy.example:8080",
+		no_proxy: "internal.example",
+		NODE_OPTIONS: "--require /x/electron-vite/hook",
+	};
+	const clean = new PiLocator().sanitizePiChildEnv(dirty);
+
+	// 桌面端 omp 子进程不应继承任何 shell 代理变量，否则 clash/v2rayN 等本地代理
+	// 会按 idle timeout 掐断长流式 AI 请求（症状：socket connection was closed unexpectedly）。
+	for (const key of [
+		"HTTPS_PROXY",
+		"HTTP_PROXY",
+		"ALL_PROXY",
+		"NO_PROXY",
+		"https_proxy",
+		"no_proxy",
+	]) {
+		assert.equal(clean[key], undefined, `${key} should be stripped`);
+	}
+	// 业务/宿主变量不动。
+	assert.equal(clean.PATH, "C:\\Windows");
+	assert.equal(clean.USERPROFILE, "C:\\Users\\EthanZhang");
+	// NODE_OPTIONS 中的 electron-vite 钩子仍需被剥（与原逻辑保持一致）：
+	// " --require /x/electron-vite/hook " 按空格分词后过滤掉含 electron/asar/electron-vite 的 token，
+	// 留下 "--require"。
+	assert.equal(clean.NODE_OPTIONS, "--require");
+});
+
+test("sanitizePiChildEnv keeps unrelated env untouched when no proxy is set", () => {
+	const { PiLocator } = loadPiLocatorModule("win32");
+	const input = { PATH: "C:\\Windows", FOO: "bar" };
+	const clean = new PiLocator().sanitizePiChildEnv(input);
+	assert.equal(clean.PATH, "C:\\Windows");
+	assert.equal(clean.FOO, "bar");
+});
