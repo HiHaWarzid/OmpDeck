@@ -8,9 +8,10 @@
  *   - extractThinking: 从 content 数组提取 thinking 块文本（自动 stripAnsi）
  *   - truncateForDetail: 超长文本首尾截断（保留头部和尾部以兼顾开头信息和错误堆栈）
  *   - extractToolResultText: 从 toolResult.content 提取文本
+ *   - estimateMessageBytes: 估算单条消息过 IPC / 驻留的体积（容量预算的度量口径）
  */
 
-import type { ImageContent } from "../../shared/types";
+import type { ChatMessage, ImageContent } from "../../shared/types";
 
 /** 工具结果文本截断阈值（字符数）；超出时 meta 标记 truncated 并缓存全文供「查看完整输出」。 */
 export const MAX_TOOL_RESULT_CHARS = 8000;
@@ -90,4 +91,34 @@ export function extractToolResultText(result: unknown): string {
 		.map((item) => (typeof (item as Record<string, unknown>)?.text === "string" ? (item as Record<string, unknown>).text as string : ""))
 		.filter(Boolean)
 		.join("\n");
+}
+
+/** meta 中未截断的嵌套结构：值本身可能很大，只能在存在时序列化估算（绝大多数消息没有）。 */
+const NESTED_META_BYTES_KEYS = ["details", "archivedMessages", "_askCard"] as const;
+
+/**
+ * 估算单条消息的驻留 / IPC 体积（字节），作为 transcript 容量预算的度量口径。
+ *
+ * 只求量级正确：文本按 UTF-16（2 字节/字符）计，图片按 base64 串长计，另加固定开销。
+ * 精确测量要先拼出整份 JSON——那正是容量保护要避免的成本。
+ * 必须计入 meta：detailText / result / args 每条最多 8K 字符，工具卡详情与压缩归档
+ * （details / archivedMessages）未截断。旧实现只算 text/thinking/images，于是
+ * 「几十条工具卡详情 + 归档」的会话对预算完全不可见，5MB 快照上限形同虚设。
+ */
+export function estimateMessageBytes(message: ChatMessage): number {
+	let bytes = 256 + message.text.length * 2 + (message.thinking?.length ?? 0) * 2;
+	for (const image of message.images ?? []) bytes += image.data.length;
+	const meta = message.meta;
+	if (!meta) return bytes;
+	// 已被 truncateForDetail 截断的字段直接按长度累加，不触发序列化。
+	for (const key of ["detailText", "result", "args"] as const) {
+		const value = meta[key];
+		if (typeof value === "string") bytes += value.length * 2;
+	}
+	for (const key of NESTED_META_BYTES_KEYS) {
+		const value = meta[key];
+		if (value === undefined || value === null) continue;
+		bytes += safeJson(value).length * 2;
+	}
+	return bytes;
 }

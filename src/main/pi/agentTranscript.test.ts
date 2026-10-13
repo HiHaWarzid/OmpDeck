@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../../shared/types";
 import {
+	MAX_TRANSCRIPT_BYTES,
 	appendMessage,
 	appendThinkingDelta,
 	beginAssistantMessage,
@@ -194,5 +195,68 @@ describe("agent transcript", () => {
 		expect(s.thinkingEndedAt).toBeUndefined();
 		// 消息本身保留：运行态清空不等于清空转录
 		expect(s.messages).toHaveLength(1);
+	});
+});
+
+describe("agent transcript 容量预算", () => {
+	/** 每条约 0.8MB 估算体积（400K 字符 × 2 字节）：32 条即 25MB，远超 8MB 预算。 */
+	const BIG_TEXT = 400_000;
+
+	it("超预算时只裁头部，保留最近窗口，并强制下一次推送走全量基线", () => {
+		const s = createTranscriptState();
+		const all: ChatMessage[] = [];
+		// 追加 40 条越过 32 条的校验步长，必然触发裁剪
+		for (let i = 0; i < 40; i += 1) {
+			all.push(
+				appendMessage(s, { agentId: AGENT, role: "assistant", text: `${i}` + "x".repeat(BIG_TEXT), now: i }),
+			);
+		}
+
+		const kept = s.messages;
+		expect(kept.length).toBeGreaterThan(0);
+		expect(kept.length).toBeLessThan(all.length);
+		// 只裁头部：保留的必须是原数组的连续尾段，最新一条永远在
+		expect(kept.map((message) => message.id)).toEqual(
+			all.slice(all.length - kept.length).map((message) => message.id),
+		);
+		expect(kept.at(-1)).toBe(all.at(-1));
+		// 裁剪后必须全量基线重推：否则渲染层还握着旧头部，两侧窗口错位
+		expect(takeDirtySlice(s).replaceFrom).toBe(0);
+		// 裁剪记录对应裁剪发生的那一刻（第 32 条追加后），不是最终长度
+		const trim = s.pendingBudgetTrim;
+		expect(trim?.limitBytes).toBe(MAX_TRANSCRIPT_BYTES);
+		expect((trim?.droppedMessages ?? 0) + (trim?.keptMessages ?? 0)).toBe(32);
+		expect(trim?.estimatedBytes).toBeLessThanOrEqual(MAX_TRANSCRIPT_BYTES);
+	});
+
+	it("预算内的会话不裁剪：数组保持同一引用，也不产生裁剪记录", () => {
+		const s = createTranscriptState();
+		for (let i = 0; i < 40; i += 1) {
+			appendMessage(s, { agentId: AGENT, role: "assistant", text: `${i}` + "x".repeat(1_000), now: i });
+		}
+
+		// 超预算才会重建数组：预算内连追加都不该换引用（渲染层按引用做 diff）
+		expect(s.messages).toHaveLength(40);
+		expect(s.pendingBudgetTrim).toBeUndefined();
+	});
+
+	it("被裁掉的消息 id 会从工具/重试登记里清掉，避免迟到事件重复 push 一张卡", () => {
+		const s = createTranscriptState();
+		upsertToolMessage(s, {
+			agentId: AGENT,
+			event: { toolName: "bash", toolCallId: "t1", result: "ok" },
+			status: "done",
+			abortedDuringAsk: false,
+			now: 0,
+		});
+		const toolMessage = s.messages[0];
+		s.retryStatusMessageId = toolMessage.id;
+		for (let i = 0; i < 32; i += 1) {
+			appendMessage(s, { agentId: AGENT, role: "assistant", text: `${i}` + "x".repeat(BIG_TEXT), now: i + 1 });
+		}
+
+		expect(s.messages).not.toContain(toolMessage);
+		expect(s.toolMessageIds.size).toBe(0);
+		expect(s.retryStatusMessageId).toBeUndefined();
 	});
 });

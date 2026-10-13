@@ -37,6 +37,12 @@ import { resetTranscriptRun, type AgentTranscriptState } from "./agentTranscript
 export type PiStateFields = {
 	isStreaming?: unknown;
 	isCompacting?: unknown;
+	/**
+	 * pi 自身的静默判据（与 session_settled / agent_settled 同一份结论）：
+	 * true 表示 pi 已无任何后续工作（无流式、无自动重试、无压缩、无排队 follow-up）。
+	 * 老 pi / 字段缺失时 undefined——此时只能依赖 isStreaming/isCompacting 快照与静默兜底。
+	 */
+	isSettled?: unknown;
 	pendingMessageCount?: unknown;
 	queuedMessageCount?: unknown;
 };
@@ -110,10 +116,15 @@ export function decideSettle(input: {
 }): SettleDecision {
 	const remote = input.remote;
 	const queued = remote ? normalizeCount(remote.pendingMessageCount) + normalizeCount(remote.queuedMessageCount) : 0;
+	// 本地忙碌信号（等待回答的扩展提问、压缩中、工具执行中、活跃 assistant 消息）是 app 的
+	// 一手证据：只要本地认定还在忙，就不采信 pi 的 isSettled 快照（两者冲突时以本地为准）。
+	const localBusy = hasLocalWork(input.local);
 	return resolveSettle({
 		isStreaming: remote?.isStreaming,
+		// pi 自报 settled：唯一能压过陈旧 isStreaming/isCompacting 快照的证据（见 settleReducer 优先级 3.5）。
+		piSettled: localBusy ? false : remote?.isSettled,
 		hasPendingGetState:
-			hasLocalWork(input.local) ||
+			localBusy ||
 			(remote ? normalizePiBoolean(remote.isCompacting) || queued > 0 : false),
 		gateWaitingAbort: input.run.streamGate.waitingForAbortSettled,
 		now: input.now,
@@ -124,6 +135,18 @@ export function decideSettle(input: {
 
 /** 默认 settle 轮询窗口（与 scheduleSettleCheck 一致）。 */
 export const SETTLE_POLL_TIMEOUT_MS = AGENT_SETTLED_TIMEOUT_MS;
+
+/**
+ * 静默兜底窗口：run 结束（agent_end）后 pi 若仍报忙碌，但事件流已完全静默这么久，
+ * 就按「忙碌标志是陈旧真值」强制收口 idle（见 AgentManager.forceIdleOnDeadSilence）。
+ *
+ * 取值取舍：
+ * - 太短会把真实长任务误判空闲——因此必须以「事件流完全静默」为前置，pi 只要还在推
+ *   任何事件（含流式增量）时间戳就被刷新，长任务不会命中；
+ * - 太长则陈旧标志一直挂着，UI 三点指示器卡住（录制故障卡了 6 分钟直到用户手动停止）。
+ * 30s 足以跨过 provider 抖动、重试退避窗口与压缩中的瞬时静默，又不至于让用户觉得卡死。
+ */
+export const RUN_SILENCE_FORCE_IDLE_MS = 30_000;
 
 /** abort 后的 agent_settled：结束 waiting，必要时解封 pending start。 */
 export function noteRunAbortSettled(run: AgentRunState): void {

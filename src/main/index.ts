@@ -25,6 +25,12 @@ import {
 import { acquireVersionSingleInstance } from "./singleInstance";
 import { resolveNativeThemeSource } from "./nativeThemeSource";
 import { readLastWindowBounds, saveLastWindowBounds } from "./windowState";
+import { cleanupStaleTempFiles } from "./storage/staleTempFileCleanup";
+import {
+	RENDERER_RECOVERY_MAX_ATTEMPTS,
+	RENDERER_RECOVERY_WINDOW_MS,
+	decideRendererRecovery,
+} from "./rendererRecovery";
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
@@ -336,6 +342,84 @@ function mainWindowNeedsRecovery(window: BrowserWindow): boolean {
 	if (window.isDestroyed()) return true;
 	if (window.webContents.isCrashed()) return true;
 	return mainFrameLoadFailed;
+}
+
+/** 最近窗口内的自动恢复时间戳：只在主进程内存里，重启应用即清零。 */
+let rendererRecoveryAttempts: number[] = [];
+
+/**
+ * 渲染进程崩溃后的自愈：判定（是否还值得重载）在 rendererRecovery.decideRendererRecovery，
+ * 这里只负责副作用（日志、重载、超限时弹窗）。
+ */
+function handleRendererProcessGone(window: BrowserWindow, details: Electron.RenderProcessGoneDetails): void {
+	const decision = decideRendererRecovery(rendererRecoveryAttempts, Date.now());
+	rendererRecoveryAttempts = decision.attempts;
+	if (decision.action === "prompt") {
+		void appLogger.error("app", "Renderer recovery attempts exhausted", {
+			attempts: decision.attempts.length,
+			windowMs: RENDERER_RECOVERY_WINDOW_MS,
+			reason: details.reason,
+		});
+		void promptRendererRecoveryExhausted(window);
+		return;
+	}
+	void appLogger.warn("app", "Reloading main window after renderer crash", {
+		attempt: decision.attempts.length,
+		maxAttempts: RENDERER_RECOVERY_MAX_ATTEMPTS,
+		reason: details.reason,
+		exitCode: details.exitCode,
+	});
+	window.webContents.reload();
+}
+
+/**
+ * 连续崩溃超过上限时询问用户。原生弹窗不走 i18n.ts（那是渲染层模块），
+ * 但仍按应用的 language 设置选文案，避免英文用户看到中文。
+ */
+async function promptRendererRecoveryExhausted(window: BrowserWindow): Promise<void> {
+	const language = settingsStore.get().language;
+	const useChinese = language === "zh-CN" || (language === "system" && app.getLocale().toLowerCase().startsWith("zh"));
+	const text = useChinese
+		? {
+				title: "界面连续崩溃",
+				message: "界面进程多次意外退出，已停止自动恢复。",
+				detail:
+					"会话与 Agent 仍在后台运行。可以再次尝试恢复界面；若仍然崩溃，请重启应用，并考虑清理超长会话的上下文。",
+				reload: "重新恢复界面",
+				quit: "退出应用",
+			}
+		: {
+				title: "Interface crashed repeatedly",
+				message: "The interface process exited unexpectedly several times; automatic recovery stopped.",
+				detail:
+					"Sessions and agents keep running in the background. You can try restoring the interface again; if it keeps crashing, restart the app and consider clearing an over-long session context.",
+				reload: "Restore interface",
+				quit: "Quit app",
+			};
+	const options: Electron.MessageBoxOptions = {
+		type: "error",
+		title: text.title,
+		message: text.message,
+		detail: text.detail,
+		buttons: [text.reload, text.quit],
+		defaultId: 0,
+		cancelId: 1,
+		noLink: true,
+	};
+	// 窗口已销毁时只能裸弹（没有可挂载的父窗口）。
+	const { response } = window.isDestroyed()
+		? await dialog.showMessageBox(options)
+		: await dialog.showMessageBox(window, options);
+	if (window.isDestroyed()) return;
+	if (response === 0) {
+		// 用户显式要求再试：清空计数，让下一次崩溃重新走自动恢复而不是立刻弹窗。
+		rendererRecoveryAttempts = [];
+		void appLogger.warn("app", "Renderer recovery retried by user");
+		window.webContents.reload();
+		return;
+	}
+	void appLogger.warn("app", "Renderer recovery declined by user, quitting app");
+	app.quit();
 }
 
 /**
@@ -697,6 +781,9 @@ async function createWindow() {
 			platform: process.platform,
 			arch: process.arch,
 		});
+		// clean-exit 是正常离开（关窗/退出），窗口已销毁时也无处可恢复。
+		if (details.reason === "clean-exit" || createdWindow.isDestroyed()) return;
+		handleRendererProcessGone(createdWindow, details);
 	});
 	mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
 		void appLogger.error("app", "Main window preload failed", {
@@ -1213,6 +1300,19 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		}
 	} catch (error) {
 		console.error("Failed to restore parked extensions:", error);
+	}
+
+	// 清理上次崩溃/强杀遗留在 userData 的原子写临时文件（JsonFileStore 的 `.<pid>.tmp`）。
+	try {
+		const removed = await cleanupStaleTempFiles(app.getPath("userData"));
+		if (removed.length > 0) {
+			void appLogger.info("app", "Removed stale atomic-write temp files", {
+				count: removed.length,
+				paths: removed.map((item) => item.path),
+			});
+		}
+	} catch (error) {
+		console.error("Failed to clean stale temp files:", error);
 	}
 
 

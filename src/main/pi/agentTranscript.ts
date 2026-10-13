@@ -6,6 +6,7 @@ import { formatToolDetail } from "./messageTimeline";
 import { buildAskCard, extractAskQuestionDetails } from "./askQuestionCard";
 import {
 	MAX_TOOL_RESULT_CHARS,
+	estimateMessageBytes,
 	extractThinking,
 	extractToolResultText,
 	safeJson,
@@ -33,6 +34,37 @@ import {
 /** 工具完整结果文本的内存缓存上限：超出按插入序淘汰最旧一条。 */
 const TOOL_FULL_TEXT_LRU_MAX = 200;
 
+/**
+ * transcript 驻留预算（估算字节，度量口径见 estimateMessageBytes）。
+ *
+ * 为什么需要：messages 只增不减，而它同时要过两次 IPC——每次全量基线推送都结构化克隆
+ * 整个数组，渲染层镜像也一直握着同一批对象。长会话（巨型工具结果 + 压缩归档）实测
+ * 达到 20MB 量级会话文件、单会话 4.7GB RPC 流，并出现过渲染进程 OOM
+ * （render-process-gone reason=oom）。预算让主进程与渲染层驻留都有确定上界。
+ *
+ * 语义与快照上限（AgentManager.getMessages）完全一致：只丢最旧的一段、最近若干轮始终完整。
+ * 裁剪后强制下一次 flush 走全量基线，抹掉渲染层握着旧头部造成的两侧窗口错位。
+ */
+export const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+
+/** 触发总量校验所需的新增消息数：把 O(n) 扫描摊薄到与消息条数同阶（每 32 条一次）。 */
+const TRANSCRIPT_BUDGET_CHECK_STEP = 32;
+
+/** 裁剪水位：一次裁到预算的 70%，避免「追加一条裁一条」让扫描退化成每次都跑。 */
+const TRANSCRIPT_TRIM_WATERMARK = 0.7;
+
+/** 一次容量裁剪的结果，供调用方取走写日志（本模块不持有 logger，不碰 IPC）。 */
+export type TranscriptBudgetTrim = {
+	/** 被丢弃的头部消息条数。 */
+	droppedMessages: number;
+	/** 裁剪后保留的消息条数。 */
+	keptMessages: number;
+	/** 裁剪后保留部分的估算字节数。 */
+	estimatedBytes: number;
+	/** 触发裁剪的预算上限。 */
+	limitBytes: number;
+};
+
 export type AgentTranscriptState = {
 	/** 会话时间线：user / assistant / tool / system 混排，append-only（就地更新不改顺序）。 */
 	messages: ChatMessage[];
@@ -58,6 +90,10 @@ export type AgentTranscriptState = {
 	pendingMessage: boolean;
 	/** 节流定时器由调用方创建/清理（回调要触发 IPC），仅在此登记以便统一取消。 */
 	messageFlushTimer?: NodeJS.Timeout;
+	/** 上次容量校验时的 messages.length：每新增 TRANSCRIPT_BUDGET_CHECK_STEP 条才重算总量。 */
+	budgetCheckedLength: number;
+	/** 最近一次容量裁剪的结果，由 AgentManager 取走写日志；取走即清，避免重复刷。 */
+	pendingBudgetTrim?: TranscriptBudgetTrim;
 };
 
 export function createTranscriptState(): AgentTranscriptState {
@@ -68,6 +104,7 @@ export function createTranscriptState(): AgentTranscriptState {
 		messageDirtyFrom: 0,
 		fullTextByMessageId: new Map(),
 		pendingMessage: false,
+		budgetCheckedLength: 0,
 	};
 }
 
@@ -139,9 +176,65 @@ export function markMessageDirty(state: AgentTranscriptState, message: ChatMessa
 	if (index !== -1) markDirtyFrom(state, index);
 }
 
-/** 整组消息被重建（历史加载/重启替换），下一次 flush 必须全量推送基线。 */
+/** 整组消息被重建（历史加载/重启替换/容量裁剪），下一次 flush 必须全量推送基线。 */
 export function markAllMessagesDirty(state: AgentTranscriptState): void {
 	state.messageDirtyFrom = 0;
+	// 数组已整体替换，之前的校验基准作废：下一次写入立即重算总量。
+	state.budgetCheckedLength = 0;
+}
+
+/**
+ * 写入后按预算裁剪窗口（三个写入收口统一调用）。
+ *
+ * 只裁头部，最近的消息永远保留——正在流式更新的 assistant 消息、工具结果卡都在尾部。
+ * 丢弃的消息 id 要同步清理 toolMessageIds / retryStatusMessageId：迟到的事件若找不到
+ * 目标会重新 push 一张卡，同一轮回答/同一次重试就变成两条。
+ */
+function enforceTranscriptBudget(state: AgentTranscriptState): void {
+	const messages = state.messages;
+	if (messages.length - state.budgetCheckedLength < TRANSCRIPT_BUDGET_CHECK_STEP) return;
+	state.budgetCheckedLength = messages.length;
+	let total = 0;
+	for (const message of messages) total += estimateMessageBytes(message);
+	if (total <= MAX_TRANSCRIPT_BYTES) return;
+
+	const target = MAX_TRANSCRIPT_BYTES * TRANSCRIPT_TRIM_WATERMARK;
+	let keepFrom = messages.length;
+	let kept = 0;
+	for (let i = messages.length - 1; i >= 0 && kept < target; i--) {
+		kept += estimateMessageBytes(messages[i]);
+		keepFrom = i;
+	}
+	// 正在流式更新的 assistant 消息即使落在裁剪线之前也保留（正常情形它在尾部）：
+	// 否则迟到的 text_delta 会让它在尾部重新出现一份，同一轮回答变成两条。
+	const activeId = state.activeAssistantMessageId;
+	if (activeId !== undefined) {
+		const activeIndex = messages.findIndex((message) => message.id === activeId);
+		if (activeIndex !== -1 && activeIndex < keepFrom) keepFrom = activeIndex;
+	}
+	// 头部为空说明尾部本身已超水位（单条巨型消息）：不裁，至少留一条消息做基线，
+	// 与 getMessages「基线绝不被裁空」的约定一致。
+	if (keepFrom <= 0) return;
+
+	const keptMessages = messages.slice(keepFrom);
+	const keptBytes = keptMessages.reduce((sum, message) => sum + estimateMessageBytes(message), 0);
+	state.messages = keptMessages;
+	// markAllMessagesDirty 会把校验基准归零，随后按新长度重设，避免刚裁完又触发一次扫描。
+	markAllMessagesDirty(state);
+	state.budgetCheckedLength = keptMessages.length;
+	const keptIds = new Set(keptMessages.map((message) => message.id));
+	for (const [toolCallId, messageId] of state.toolMessageIds) {
+		if (!keptIds.has(messageId)) state.toolMessageIds.delete(toolCallId);
+	}
+	if (state.retryStatusMessageId !== undefined && !keptIds.has(state.retryStatusMessageId)) {
+		state.retryStatusMessageId = undefined;
+	}
+	state.pendingBudgetTrim = {
+		droppedMessages: keepFrom,
+		keptMessages: keptMessages.length,
+		estimatedBytes: keptBytes,
+		limitBytes: MAX_TRANSCRIPT_BYTES,
+	};
 }
 
 /** 取走本轮增量：replaceFrom 起为变更内容；replaceFrom === 0 表示全量基线。 */
@@ -187,6 +280,7 @@ export function appendMessage(
 	};
 	state.messages.push(message);
 	markDirtyFrom(state, state.messages.length - 1);
+	enforceTranscriptBudget(state);
 	return message;
 }
 
@@ -264,6 +358,7 @@ export function upsertAssistantMessage(
 		markDirtyFrom(state, list.length - 1);
 	}
 
+	enforceTranscriptBudget(state);
 	return { clearedThinking: Boolean(nextThinking && (extractedText || fallbackDelta)) };
 }
 
@@ -357,6 +452,7 @@ export function upsertToolMessage(
 		});
 		markDirtyFrom(state, list.length - 1);
 	}
+	enforceTranscriptBudget(state);
 }
 
 /** 缓存工具完整结果全文（LRU：超出上限按插入序淘汰最旧一条）。 */

@@ -18,7 +18,7 @@ AFK 的工作单元来源。**单一来源 = GitHub Issue**（via `gh` CLI，仓
 派发给 spawned agent 的工单内容。**原样派发**：issue title 作 goal，issue body 作 brief 原文，`workflow:*` 标签作工作流提示。AFK 不解析改写——工单声明什么就派什么。
 
 ### Complete（完成）
-AFK 终态之一。判据：spawned agent 的 `AgentStatus` 由 `running` 经 `agent_settled` 转为 `idle`，且未触发 `error`。**`complete` 只表示"跑到停"，不表示"做对了"。**
+AFK 终态之一。判据：spawned agent 的 `AgentStatus` 由 `running` 经一次 `settled` 事件（`agent_settled` 或新 pi 的 `session_settled`，两者在 AgentManager 内映射为同一语义事件）转为 `idle`，且未触发 `error`。**`complete` 只表示"跑到停"，不表示"做对了"。**
 
 ### Success（成功）
 独立于 AFK 的判断：afk 分支/PR 是否可合并、是否真正解决工单。**由独立 review 判定，不在 AFK 内做。** `complete ≠ success`。
@@ -66,7 +66,7 @@ AFK 不自动重试失败任务。人修 issue 后重标 `ready-for-agent` 触�
 PR 合并后删 afk 分支；P0 半人工（AFK 不监听合并，人删或后续 webhook）。
 
 ### Double Timeout（双超时）
-`AGENT_SETTLED_TIMEOUT_MS=5000`（AgentManager 已有，settled 检测）与 AFK `30min`（任务预算，可配）叠加：5s 判"agent 停了"，30min 判"任务超时"。
+`AGENT_SETTLED_TIMEOUT_MS=1200ms`（`settleReducer.ts`，settle-check 轮询窗口）与 AFK `30min`（任务预算，可配）叠加：agent_end/自动压缩后 1.2s 起复核 `get_state`，其间若事件流静默满 `RUN_SILENCE_FORCE_IDLE_MS=30s` 则强制收口 idle（`agentRunState.ts`，防 pi 报忙碌卡死）——即最迟约 30s 判"agent 停了"，30min 判"任务超时"。
 
 ### AFK Identity（AFK 身份）
 P0 用 `gh auth` 认证账户 `@me` 作 assignee（显示为启 AFK 的人）；bot 账户留作未来优化。

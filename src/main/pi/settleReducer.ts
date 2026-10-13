@@ -20,7 +20,7 @@
  * omp 可能以字符串形式返回布尔字段（"true"/"false" 均为 truthy），宽松判定会让空闲检查
  * 永远无法通过、UI 停在 running/三点指示器不消失；故只有严格 `=== true` 才算真，
  * 字符串/undefined/其它 truthy 非布尔一律归 false。
- * - 本 reducer 用它归一化 isStreaming（内部 settle 判定）；
+ * - 本 reducer 用它归一化 isStreaming / isSettled（内部 settle 判定）；
  * - getRuntimeState 用它归一化 isStreaming/isCompacting（对外 API 输出，语义相同）。
  */
 export function normalizePiBoolean(value: unknown): boolean {
@@ -38,7 +38,7 @@ export type SettleDecision =
 	| { decision: "stay-running"; reason: "poll"; normalizedIsStreaming: boolean }
 	| {
 			decision: "idle";
-			reason: "event" | "abort-fallback" | "no-work";
+			reason: "event" | "abort-fallback" | "no-work" | "pi-settled";
 			normalizedIsStreaming: boolean;
 	  }
 	| { decision: "wait"; reason: "abort-fallback"; normalizedIsStreaming: boolean };
@@ -57,6 +57,14 @@ export type ResolveSettleInput = {
 	 * 对应原实现 markIdleIfPiReportsNoWork 的提前返回条件与 ensureAgentIdle 的 isExecutingTool 判定。
 	 */
 	hasPendingGetState?: boolean;
+	/**
+	 * get_state RPC 返回的原始 isSettled 字段（同样经 normalizePiBoolean 严格归一化）。
+	 * 这是 pi 自身的静默判据（与它发 session_settled / agent_settled 用的是同一份结论）：
+	 * 为真即已排除流式输出、自动重试、自动压缩、排队的 follow-up 与计划中的后续轮次。
+	 * 因此它比 isStreaming/isCompacting 这类"状态快照"更权威——后者在 run 结束后可能
+	 * 仍是陈旧真值（pi 侧标志未及时清或降级为后台维护任务），压过本字段就会永久卡在 running。
+	 */
+	piSettled?: unknown;
 	/** streamGate.waitingForAbortSettled：abort 封印后仍在等待对应的 agent_settled。 */
 	gateWaitingAbort?: boolean;
 	/** 当前时间戳（ms）。 */
@@ -88,7 +96,8 @@ export type ResolveSettleInput = {
  *    否则 settled 前残留的 delta 会从已解封的/未封印的 generation 泄漏（原实现
  *    markIdleIfPiReportsNoWork 不查 gate，abort 后它可能抢先置 idle 并误发 settled，
  *    这是本函数统一收口的语义修正点）。
- * 3. 常规 poll 路径：hasPendingGetState 为 true（本地忙碌信号 / 排队消息）或
+ * 3. 常规 poll 路径：pi 自报 isSettled（最权威，'pi-settled'）→ idle；否则
+ *    hasPendingGetState 为 true（本地忙碌信号 / 排队消息）或
  *    normalizedIsStreaming 为 true（远端仍在流式）→ 保持 running（'poll'）；
  *    且 settle-check 轮询必须已安排（timeoutMs 有值），否则无 poll 结论可言。
  * 4. 其余情况 → 无工作，收口 idle（'no-work'，对应 markIdleIfPiReportsNoWork 置 idle
@@ -127,6 +136,15 @@ export function resolveSettle(
 	// 3) poll 路径：settle-check 轮询未安排 → 无权给出 no-work 结论。
 	if (input.timeoutMs === undefined) {
 		return { decision: "stay-running", reason: "poll", normalizedIsStreaming };
+	}
+
+	// 3.5) pi 自报 settled（get_state.isSettled）是比标志快照更权威的证据：它已排除
+	// 流式输出、自动重试、自动压缩、排队的 follow-up 与计划中的后续轮次。
+	// 此时不再采信 isStreaming/isCompacting 等快照——它们可能是 run 结束后未清干净的
+	// 陈旧真值（录制故障：agent_end 后 6 分钟零事件、get_state 仍报忙碌，UI 三点指示器
+	// 永不消失，只能手动停止）。gate 封印仍优先（见上一步），abort 语义不受影响。
+	if (normalizePiBoolean(input.piSettled)) {
+		return { decision: "idle", reason: "pi-settled", normalizedIsStreaming };
 	}
 
 	if (input.hasPendingGetState === true || normalizedIsStreaming) {

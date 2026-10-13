@@ -122,4 +122,49 @@ describe("agent run state", () => {
 		expect(transcript.streamingThinking).toBe("");
 		expect(transcript.thinkingStartedAt).toBeUndefined();
 	});
+
+	it("pi 自报 isSettled 压过陈旧的 isStreaming/isCompacting/排队快照", () => {
+		// 陈旧标志形态：run 已结束但 get_state 仍报忙碌——若继续采信快照，UI 永久停在 running。
+		const decision = decideSettle({
+			run: createRunState(),
+			local: idleSignals,
+			remote: { isStreaming: true, isCompacting: true, pendingMessageCount: 3, isSettled: true },
+			now: 9_000,
+			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
+		});
+		expect(decision.decision).toBe("idle");
+		expect(decision.reason).toBe("pi-settled");
+	});
+
+	it("本地忙碌信号优先于 pi 的 isSettled（app 一手证据不被远端快照覆盖）", () => {
+		// 例如扩展正在等用户回答、或本地仍在压缩：此时不能因为 pi 说 settled 就收口。
+		const decision = decideSettle({
+			run: createRunState(),
+			local: { ...idleSignals, hasPendingUiRequest: true },
+			remote: { isSettled: true },
+			now: 9_000,
+			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
+		});
+		expect(decision.decision).toBe("stay-running");
+	});
+
+	it("无 isSettled 字段（老 pi）时沿用原忙碌判定", () => {
+		const busy = decideSettle({
+			run: createRunState(),
+			local: idleSignals,
+			remote: { isStreaming: true },
+			now: 9_000,
+			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
+		});
+		const idle = decideSettle({
+			run: createRunState(),
+			local: idleSignals,
+			remote: { isStreaming: false, isCompacting: false },
+			now: 9_000,
+			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
+		});
+		expect(busy.decision).toBe("stay-running");
+		expect(idle.decision).toBe("idle");
+		expect(idle.reason).toBe("no-work");
+	});
 });

@@ -13,7 +13,8 @@ import {
  * - 事件路径最优先：agent_settled 到达即无条件 idle，不受 gate / polling 干扰；
  * - abort 封印中：deadline 未到必须 wait（poll 不得越过 gate 抢先置 idle 发 settled）；
  * - 双重超时博弈：settle 窗口（AGENT_SETTLED_TIMEOUT_MS）与 abort 兜底（ABORT_SETTLED_FALLBACK_MS）
- *   是独立纯输入，abort 兜底先到期先解封。
+ *   是独立纯输入，abort 兜底先到期先解封；
+ * - pi 自报 isSettled 优先于 isStreaming/isCompacting 快照（后者在 run 结束后可能是陈旧真值）。
  */
 
 describe("strict boolean normalization（仅此处归一化一次）", () => {
@@ -264,5 +265,71 @@ describe("双重超时博弈（AGENT_SETTLED_TIMEOUT_MS vs 任务预算）", () 
 		});
 		expect(result.decision).toBe("idle");
 		expect(result.reason).toBe("no-work");
+	});
+});
+
+describe("pi 自报 isSettled（压过陈旧的忙碌快照）", () => {
+	it("isSettled=true 时即使 isStreaming/isCompacting/排队计数全为真也收口 idle", () => {
+		// 录制故障正是这一形态：run 已结束（agent_end 之后 6 分钟零事件），但 get_state
+		// 一直报忙碌，一次性兜底轮询被挡回后再无观察者，UI 三点指示器永久停在 running。
+		const result = resolveSettle({
+			isStreaming: true,
+			piSettled: true,
+			hasPendingGetState: true,
+			now: 0,
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		expect(result.decision).toBe("idle");
+		expect(result.reason).toBe("pi-settled");
+	});
+
+	it('isSettled 非严格真值（字符串 "true"）不生效 → 仍按忙碌保持 running', () => {
+		const result = resolveSettle({
+			isStreaming: false,
+			piSettled: "true",
+			hasPendingGetState: true,
+			now: 0,
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		expect(result.decision).toBe("stay-running");
+		expect(result.reason).toBe("poll");
+	});
+
+	it("isSettled=false 且无其它忙碌信号 → 仍走 no-work（缺省/老 pi 字段行为不变）", () => {
+		const missing = resolveSettle({
+			isStreaming: false,
+			now: 0,
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		const explicitFalse = resolveSettle({
+			isStreaming: false,
+			piSettled: false,
+			now: 0,
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		expect(missing.decision).toBe("idle");
+		expect(missing.reason).toBe("no-work");
+		expect(explicitFalse).toEqual(missing);
+	});
+
+	it("未安排 settle 轮询（timeoutMs 缺省）时 isSettled 不产生 poll 结论", () => {
+		// 无轮询就无权下 poll 结论：isSettled 只在 get_state 应答里出现，
+		// 没有轮询窗口的调用方（如 abort 兜底定时器）不该因此被改判。
+		const result = resolveSettle({ isStreaming: false, piSettled: true, now: 0 });
+		expect(result.decision).toBe("stay-running");
+		expect(result.reason).toBe("poll");
+	});
+
+	it("abort 封印优先于 isSettled：gate 未解封仍 wait", () => {
+		const result = resolveSettle({
+			isStreaming: false,
+			piSettled: true,
+			gateWaitingAbort: true,
+			now: 1_000,
+			abortFallbackDeadline: 1_000 + ABORT_SETTLED_FALLBACK_MS,
+			timeoutMs: AGENT_SETTLED_TIMEOUT_MS,
+		});
+		expect(result.decision).toBe("wait");
+		expect(result.reason).toBe("abort-fallback");
 	});
 });

@@ -44,6 +44,7 @@ import {
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
 import {
+	estimateMessageBytes,
 	extractImages,
 	stripAnsi,
 } from "./messageTextUtils";
@@ -82,6 +83,7 @@ import {
 	type StreamGateState,
 } from "./streamGate";
 import {
+	MAX_TRANSCRIPT_BYTES,
 	appendMessage as appendTranscriptMessage,
 	beginAssistantMessage,
 	appendThinkingDelta,
@@ -107,7 +109,9 @@ import {
 	hasLocalWork,
 	isRunSealed,
 	noteRunAbortSettled,
+	normalizeCount,
 	sealRun,
+	RUN_SILENCE_FORCE_IDLE_MS,
 	SETTLE_POLL_TIMEOUT_MS,
 	type AgentRunState,
 	type LocalWorkSignals,
@@ -151,17 +155,6 @@ export type AgentConfigDeps = {
 
 /** 项目信任确认弹窗的用户选择 */
 export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
-
-/**
- * 估算单条消息经 IPC 序列化后的体积：文本/思考按 UTF-16（2 字节/字符）计，
- * 图片按 base64 串长计，另加固定开销。只求量级正确——目的是给全量基线一个上界，
- * 不需要精确的序列化测量（精确测量本身要先把整份 JSON 拼出来，正是要避免的成本）。
- */
-function estimateMessageBytes(message: ChatMessage): number {
-	let bytes = 256 + message.text.length * 2 + (message.thinking?.length ?? 0) * 2;
-	for (const image of message.images ?? []) bytes += image.data.length;
-	return bytes;
-}
 
 export class AgentManager {
 	/**
@@ -210,12 +203,6 @@ export class AgentManager {
 	 */
 	private static readonly MAX_AUTO_HISTORY_LOAD_BYTES = 5 * 1024 * 1024;
 	/**
-	 * getMessages 内存快照经 IPC 序列化的字节上限：与 MAX_AUTO_HISTORY_LOAD_BYTES 同量级。
-	 * 运行态 transcript 是只增数组，长会话（大量巨型工具结果）会让每次全量基线拉取都
-	 * 序列化几十 MB，渲染层同样会卡死；返回形状不变，只丢掉最旧的一段。
-	 */
-	private static readonly MAX_GET_MESSAGES_BYTES = 5 * 1024 * 1024;
-	/**
 	 * 大会话直接从文件尾部读取时，最多保留的最近消息轮次（每条 user 消息算一轮）。
 	 * 原值 8 对于一些需要回看较多历史的长会话偏少，提高至 30 轮。
 	 */
@@ -254,6 +241,21 @@ export class AgentManager {
 	private static readonly RUNTIME_STATE_MIN_INTERVAL_MS = 150;
 	private readonly runtimeStateLastEmitAt = new Map<string, number>();
 	private readonly runtimeStateThrottleTimers = new Map<string, NodeJS.Timeout>();
+	/**
+	 * 空响应兜底：sendPrompt accepted 后登记定时器，任意流式生命信号
+	 * (agent_start / message_start(assistant) / auto_retry_start) 到达即 clear。
+	 * 到点未清除则判定上游 provider 空响应，commandcode 等仅返 HTTP 200 + 空 stream
+	 * 的端点会落到这条路径。值与 abort 兜底同量级（30s），足够覆盖 Pi get_state 慢启动
+	 * 同时短于绝大多数 LLM 首 token 时间。
+	 */
+	private static readonly EMPTY_RESPONSE_TIMEOUT_MS = 30_000;
+	/** per-agent 空响应兜底定时器实例；与 EMPTY_RESPONSE_TIMEOUT_MS 配对使用。 */
+	private readonly emptyResponseTimers = new Map<string, NodeJS.Timeout>();
+	/**
+	 * 空响应兜底实际超时（毫秒）。默认 = EMPTY_RESPONSE_TIMEOUT_MS；测试可通过构造参数
+	 * 注入更小值以避免 30s 真实等待。
+	 */
+	private readonly emptyResponseTimeoutMs: number;
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -274,7 +276,10 @@ export class AgentManager {
 		 * 整条进程生命周期可被测试驱动——此前 `new PiProcess(...)` 内联在各调用点，该层零测试。
 		 */
 		private readonly processFactory: AgentProcessFactory = createRealAgentProcess,
+		/** 空响应兜底超时（毫秒）；测试可注入更小值。 */
+		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
 	) {
+		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
 			logger: this.appLogger,
@@ -334,13 +339,15 @@ export class AgentManager {
 	 */
 	getMessages(agentId: string): ChatMessage[] {
 		const messages = this.agents.get(agentId)?.transcript.messages ?? [];
+		// 预算与写入端 transcript 裁剪共用同一个常量（见 agentTranscript.MAX_TRANSCRIPT_BYTES）：
+		// 正常路径下写入端已把数组压回预算内，此处只在历史整段注入超过预算时兜底。
 		// 未超预算时返回原数组（保持既有引用语义）；超限时只保留尾部能装下的最近消息，
 		// 至少保留最后一条（单条即超限时也要给渲染层一个基线，否则历史基线永远拉不到）。
 		let total = 0;
 		let start = messages.length;
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const size = estimateMessageBytes(messages[i]);
-			if (start < messages.length && total + size > AgentManager.MAX_GET_MESSAGES_BYTES) break;
+			if (start < messages.length && total + size > MAX_TRANSCRIPT_BYTES) break;
 			total += size;
 			start = i;
 		}
@@ -350,7 +357,7 @@ export class AgentManager {
 			totalMessages: messages.length,
 			keptMessages: messages.length - start,
 			estimatedBytes: total,
-			limitBytes: AgentManager.MAX_GET_MESSAGES_BYTES,
+			limitBytes: MAX_TRANSCRIPT_BYTES,
 		});
 		return messages.slice(start);
 	}
@@ -1090,6 +1097,11 @@ export class AgentManager {
 				//      先调用 _tryExecuteExtensionCommand()；命中后 return，不再调用 _runAgentPrompt()。
 				// 推导：不能等 agent_end；只有 Pi get_state 明确报告无剩余工作时才恢复 idle。
 				this.scheduleIdleCheckAfterExtensionCommand(input.agentId);
+			} else {
+				// 非扩展命令：omp 真的去问上游 provider，必须挂空响应兜底。
+				// commandcode / 类 API 网关会在 HTTP 200 + 空 stream 后挂死，没有这个兜底
+				// 用户只能看到"半天没反应"，状态机一直停在 running。
+				this.scheduleEmptyResponseFallback(runtime);
 			}
 			return { accepted: true };
 		} catch (error) {
@@ -1547,6 +1559,13 @@ export class AgentManager {
 		const cacheHitPercent = this.clampPercent(
 			directCacheHitPercent ?? computedCacheHitPercent,
 		);
+		// 已收口（idle/error/closed）时不再对外上报 pi 的 isStreaming/isCompacting 快照：
+		// status 是本地对"本轮是否还有工作"的最终裁定，pi 侧标志在 run 结束后可能仍是陈旧真值
+		// （录制故障：agent_end 后标志未清，左下角三点指示器永远转下去，只能手动停止）。
+		const runClosed =
+			runtime.tab.status === "idle" ||
+			runtime.tab.status === "error" ||
+			runtime.tab.status === "closed";
 		return {
 			modelName: model?.name ?? model?.id,
 			provider: model?.provider,
@@ -1556,11 +1575,12 @@ export class AgentManager {
 			// 把 "false" 当成真值，导致响应完成后 isStreaming/isCompacting 永远为真、
 			// 空闲检查无法通过、左下角三点指示器卡住。这里与 settleReducer 共用同一
 			// normalizePiBoolean 严格归一化（`=== true`，字符串/undefined/其它 truthy 一律 false）。
-			isStreaming: normalizePiBoolean(state?.isStreaming),
+			isStreaming: !runClosed && normalizePiBoolean(state?.isStreaming),
 			isCompacting:
-				normalizePiBoolean(state?.isCompacting) ||
-				runtime.rpcCompacting ||
-				runtime.compacting,
+				!runClosed &&
+				(normalizePiBoolean(state?.isCompacting) ||
+					runtime.rpcCompacting ||
+					runtime.compacting),
 			/** 工具执行状态从本地追踪，无需 Pi 进程查询 */
 			isExecutingTool: !!runtime.toolExecuting,
 			executingToolName: runtime.toolExecuting ?? undefined,
@@ -2633,6 +2653,8 @@ export class AgentManager {
 		this.agents.delete(agentId);
 		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
+		// agent 退役时清空响应兜底定时器，避免退役后兜底误打到空 runtime。
+		this.clearEmptyResponseTimer(runtime);
 		this.retiringProcesses.add(child);
 		this.emitState();
 		return child;
@@ -2968,6 +2990,10 @@ export class AgentManager {
 		// 对一个已不存在的 runtime 改状态只会造成内存泄漏与 UI 串台。
 		if (!runtime) return;
 
+		// 事件流活性戳：静默兜底（forceIdleOnDeadSilence）据此判断 pi 是否真的什么都不做了。
+		// 必须在任何提前 return 之前刷新——流式增量、被封印丢弃的 delta 同样是活性证据。
+		runtime.lastPiEventAt = Date.now();
+
 		// 扩展/RPC 调用 setSessionName 后 Pi 发 session_info_changed（旧 pi）/ session_info_update（omp）事件；
 		// 同步到 tab.title，使侧边栏与手动 rename 路径看到同一标题。
 		// 忽略空 name，避免把已有标题抹掉。
@@ -2983,6 +3009,8 @@ export class AgentManager {
 		}
 
 		if (typed.type === "agent_start") {
+			// 流式生命信号：上游 provider 已开始跑 run，空响应兜底不再需要。
+			this.clearEmptyResponseTimer(runtime);
 			// agent_start 表示一轮新的 agent run 开始：
 			// 1) 清理 recentlyAborted，允许状态机恢复 running
 			// 2) 推进 stream generation，解封流式闸门（唯一合法解封点）
@@ -3006,6 +3034,8 @@ export class AgentManager {
 		}
 
 		if (typed.type === "message_start" && typed.message?.role === "assistant") {
+			// 流式生命信号：assistant 首个 message 到达，空响应兜底不再需要。
+			this.clearEmptyResponseTimer(runtime);
 			// abort 封印后的残留 assistant 事件应丢弃，防止误重新激活流式状态。
 			if (this.isAgentStreamSealed(runtime)) {
 				return;
@@ -3017,6 +3047,9 @@ export class AgentManager {
 		}
 
 		if (typed.type === "auto_retry_start") {
+			// 流式生命信号：pi 进入自动重试窗口（说明上游在尝试 provider 切换），
+			// 不算空响应，兜底清掉。
+			this.clearEmptyResponseTimer(runtime);
 			this.upsertRetryStatusMessage(runtime, typed, "running");
 			// 用户已主动中止时不重新激活 running 状态，避免 abort 后 auto-retry 事件误覆盖 state
 			if (!runtime.run.recentlyAborted) {
@@ -3090,6 +3123,8 @@ export class AgentManager {
 		}
 
 		if (typed.type === "agent_end") {
+			// 一次 run 结束：清理空响应兜底定时器，避免 run 结束后兜底误触发。
+			this.clearEmptyResponseTimer(runtime);
 			// agent_end 只表示一次底层 run 结束；Pi 之后仍可能执行自动重试、自动压缩，
 			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
 			runtime.transcript.activeAssistantMessageId = undefined;
@@ -3176,8 +3211,11 @@ export class AgentManager {
 			this.scheduleSettleCheck(runtime, agentId);
 		}
 
-		if (typed.type === "agent_settled") {
-			// agent_settled 是旧 pi 的最终稳定点（omp 无此事件，走 scheduleSettleCheck 兜底）。
+		if (typed.type === "agent_settled" || typed.type === "session_settled") {
+			// agent_settled（旧 pi）与 session_settled（新 pi 在自己 settle 判据满足时推送）
+			// 是同一个最终稳定点：pi 已无自动重试、自动压缩、压缩 retry 或 queued follow-up。
+			// 二者共用本收口路径——只认 agent_settled 会让新 pi 永远等不到事件路径，
+			// 只能靠兜底轮询，而轮询一旦被 pi 的陈旧忙碌标志挡住就会永久卡在 running（录制故障）。
 			// 通知 stream gate：abort 对应的 settled 已到。
 			// 若 settled 前已有 agent_start（用户立刻重发），此处才真正解封；
 			// 若还没有新 start，则保持封印，防止 settled 后残留 delta 复活旧气泡。
@@ -3191,7 +3229,7 @@ export class AgentManager {
 				clearTimeout(runtime.settleCheckTimer);
 				runtime.settleCheckTimer = undefined;
 			}
-			// 事件路径：agent_settled 到达即无条件收口 idle（reason 'event'）。
+			// 事件路径：agent_settled / session_settled 到达即无条件收口 idle（reason 'event'）。
 			// 转移判定仍走同一决策器（settledAt 分支），便于单点维护事件路径语义。
 			const settleDecision = resolveSettle({ isStreaming: undefined, now: Date.now(), settledAt: Date.now() });
 			if (
@@ -3199,27 +3237,17 @@ export class AgentManager {
 				runtime.tab.status !== "error" &&
 				runtime.tab.status !== "closed"
 			) {
-				// agent_settled 是 Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry
-				// 或 queued follow-up 会继续执行，此时才允许恢复 idle 并通知用户完成。
-				// 语义事件：仅当本次把 busy 状态收口为 idle 时发 settled——若 omp 兜底
+				// Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry 或 queued follow-up
+				// 会继续执行，此时才允许恢复 idle 并通知用户完成。
+				// 语义事件：仅当本次把 busy 状态收口为 idle 时发 settled——若兜底轮询
 				// （markIdleIfPiReportsNoWork）已先置 idle，此处幂等跳过，避免重复通知。
 				const settledFromBusy =
 					runtime.tab.status === "running" || runtime.tab.status === "starting";
-				runtime.tab.status = "idle";
-				// 清转录运行态，但**不动闸门**：gate 由上面的 noteAgentAbortSettled 管理，
-				// 按设计要一直封印到下一轮 agent_start，否则 settled 与 start 之间的残留
-				// delta 会被放行，重新长出已被中止的气泡（abortStreamRegression 的原始问题）。
-				resetTranscriptRun(runtime.transcript);
-				runtime.activeToolCalls.clear();
-				runtime.toolExecuting = null;
-				runtime.rpcCompacting = false;
-				this.thinkingEmitter.cancel(agentId);
-				this.emitThinking(agentId, "");
-				this.emitState();
-				void this.emitRuntimeState(agentId);
-				if (settledFromBusy) {
-					this.notifyEventListeners({ type: "settled", agentId });
-				}
+				// 清态语义与轮询/静默兜底收口共用（见 finishRunAsIdle）：
+				// 转录运行态、工具残留、压缩标志一律清掉，闸门保持封印（由 noteAgentAbortSettled
+				// 与下一轮 agent_start 管理），否则 settled 与 start 之间的残留 delta 会被
+				// 放行，重新长出已被中止的气泡（abortStreamRegression 的原始问题）。
+				this.finishRunAsIdle(runtime, agentId, settledFromBusy);
 
 				const messages = runtime.transcript.messages;
 				const lastMessage = messages[messages.length - 1];
@@ -3810,11 +3838,12 @@ export class AgentManager {
 	}
 
 	/**
-	 * 调度一次最终空闲检查（omp 没有 agent_settled 事件）。
+	 * 调度一次最终空闲检查（omp / 新 pi 的 settled 事件之前的兜底）。
 	 * agent_end / auto_compaction_end 后调用；延迟后通过 get_state 校验
-	 * （isStreaming/isCompacting/pendingMessageCount）确认 pi 已无工作才置 idle，
+	 * （isSettled/isStreaming/isCompacting/pendingMessageCount）确认 pi 已无工作才置 idle，
 	 * 因此提前检查不会误判压缩中或 queued follow-up 为完成。
-	 * 窗口时长收敛在 settleReducer.AGENT_SETTLED_TIMEOUT_MS。
+	 * 窗口时长收敛在 settleReducer.AGENT_SETTLED_TIMEOUT_MS；pi 报忙碌且事件流静默时
+	 * 本检查会自我重排（见 rearmSettleCheck），直到收口或 pi 重新产出事件。
 	 */
 	private scheduleSettleCheck(runtime: AgentRuntime, agentId: string) {
 		clearTimeout(runtime.settleCheckTimer);
@@ -3825,23 +3854,115 @@ export class AgentManager {
 		runtime.settleCheckTimer.unref?.();
 	}
 
+	/**
+	 * 再排一次空闲检查：pi 报了忙碌却又不推任何事件时，必须继续观察——
+	 * 只查一次就放弃（原实现）意味着陈旧忙碌标志永远没人清，UI 永久停在 running。
+	 * 只在事件流已静默时重排：pi 仍在推事件说明 run 明显活着，重排只会白烧 RPC 与日志，
+	 * 等下一次 agent_end / 压缩结束重新调度即可。
+	 */
+	private rearmSettleCheck(runtime: AgentRuntime, agentId: string) {
+		const lastEvent = runtime.lastPiEventAt ?? 0;
+		if (Date.now() - lastEvent < AGENT_SETTLED_TIMEOUT_MS) return;
+		this.scheduleSettleCheck(runtime, agentId);
+	}
+
+	/** 自动重试是否仍在进行（upsertRetryStatusMessage 写入 meta.status="running" 表示退避等待中）。 */
+	private isAutoRetryPending(runtime: AgentRuntime): boolean {
+		const messageId = runtime.transcript.retryStatusMessageId;
+		if (messageId === undefined) return false;
+		const message = runtime.transcript.messages.find((item) => item.id === messageId);
+		return message?.meta?.status === "running";
+	}
+
+	/**
+	 * 运行收口：清本地运行痕迹、置 idle 并广播。三条收口路径共用同一份清态语义：
+	 * agent_settled / session_settled 事件、轮询判定无工作、静默兜底强制收口。
+	 *
+	 * 刻意不动 stream gate：封印与解封只由 abort 与 agent_start 管理，settled 与下一个
+	 * start 之间的残留 delta 必须继续被丢弃（abortStreamRegression 的原始问题）。
+	 */
+	private finishRunAsIdle(runtime: AgentRuntime, agentId: string, notifySettled: boolean) {
+		runtime.tab.status = "idle";
+		resetTranscriptRun(runtime.transcript);
+		runtime.activeToolCalls.clear();
+		runtime.toolExecuting = null;
+		runtime.rpcCompacting = false;
+		this.thinkingEmitter.cancel(agentId);
+		this.emitThinking(agentId, "");
+		this.emitState();
+		void this.emitRuntimeState(agentId);
+		if (notifySettled) this.notifyEventListeners({ type: "settled", agentId });
+	}
+
+	/**
+	 * 静默兜底：pi 报告仍有工作，但事件流已完全静默超过 RUN_SILENCE_FORCE_IDLE_MS 时，
+	 * 判定忙碌标志是陈旧真值，强制收口 idle——否则三点指示器与侧边栏状态永久停在 running。
+	 *
+	 * 录制故障正是这一形态：agent_end 之后 6 分钟零事件（pi 日志证实无压缩、无重试、无后续轮次），
+	 * 而 get_state 一直报忙碌，一次性兜底轮询被挡回后再无观察者，用户只能手动停止。
+	 *
+	 * 反向误判（把真实长任务当成空闲）由这些条件共同压低：
+	 *  - pi 只要还在推任何事件（含流式增量）就会刷新 lastPiEventAt，静默窗口从头计算；
+	 *  - 本地忙碌信号（等待回答的扩展 UI 请求、压缩中、工具执行中）与自动重试窗口一律不收口；
+	 *  - agent_start（新 run 开始）会清掉本兜底定时器，run 期间的轮询不会走到这里。
+	 * 返回 true 表示本轮已处理（强制收口或状态已被其它路径接管），调用方不再重排轮询。
+	 */
+	private forceIdleOnDeadSilence(
+		runtime: AgentRuntime,
+		agentId: string,
+		remote: PiStateFields,
+	): boolean {
+		const silentMs = Date.now() - (runtime.lastPiEventAt ?? Date.now());
+		if (silentMs < RUN_SILENCE_FORCE_IDLE_MS) return false;
+		// get_state 往返期间状态可能已被事件路径接管（agent_settled 置 idle / agent_start 置 running）。
+		if (runtime.tab.status !== "running") return true;
+		// 本地忙碌信号以最新为准：往返期间可能刚起压缩、刚进入等待提问。
+		if (hasLocalWork(this.localWorkSignals(runtime))) return false;
+		if (this.isAutoRetryPending(runtime)) return false;
+
+		// 远端排队计数不阻止收口：pi 若真有排队的 follow-up，它会立刻开新 run 并推
+		// agent_start（那时 status 变 running，本兜底自然失效）；而该计数与陈旧忙碌标志
+		// 同样可能不可信，用它挡住收口等于把故障原样保留。仅作为日志证据记录。
+		const queued =
+			normalizeCount(remote.pendingMessageCount) + normalizeCount(remote.queuedMessageCount);
+		void this.appLogger?.warn("agent", "pi 静默兜底：强制收口 idle", {
+			agentId,
+			silentMs,
+			queuedMessages: queued,
+			remoteIsStreaming: remote.isStreaming,
+			remoteIsCompacting: remote.isCompacting,
+			remoteIsSettled: remote.isSettled,
+		});
+		this.finishRunAsIdle(runtime, agentId, true);
+		return true;
+	}
+
 	private async markIdleIfPiReportsNoWork(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime || runtime.tab.status !== "running") return;
-		// 本地忙碌信号：命中任一即无需 RPC 查询（保持原提前返回，省一次 get_state）。
+		// 本地忙碌信号：命中任一即无需 RPC 查询（省一次 get_state）。
+		// 但不能就此放弃观察：本地信号也可能陈旧，且 pi 可能已经空闲——重排一次，
+		// 等本地信号消失或静默兜底窗口到点后再下结论。
 		const local = this.localWorkSignals(runtime);
-		if (hasLocalWork(local)) return;
+		if (hasLocalWork(local)) {
+			this.rearmSettleCheck(runtime, agentId);
+			return;
+		}
 
 		const response = await runtime.slot.process.client
 			.request({ type: "get_state" }, 10_000)
 			.catch(() => undefined);
-		if (!response?.success || !response.data) return;
+		if (!response?.success || !response.data) {
+			// RPC 失败/无数据同样是"未能确认"：重排继续观察，而不是把 run 永远挂着。
+			this.rearmSettleCheck(runtime, agentId);
+			return;
+		}
 
-		// 统一收口到 agentRunState.decideSettle：isStreaming 严格归一化、gate 封印（wait）、
+		// 统一收口到 agentRunState.decideSettle：isStreaming/isSettled 严格归一化、gate 封印（wait）、
 		// 本地/远端忙碌信号与 abort 兜底截止的裁定全部在单一决策器里完成。
 		// 轮询已触发（无论 100ms 扩展命令窗口还是 1200ms settle 窗口）：timeoutMs 有值即有权
 		// 给出 no-work 结论。
-		// get_state 的 data 走本应用自有协议：只读 4 个可选字段，逐个在决策器内归一化，
+		// get_state 的 data 走本应用自有协议：只读可选字段，逐个在决策器内归一化，
 		// 因此这里按已知形态收口一次，避免在读取点散布断言。
 		const remoteState = response.data as PiStateFields;
 		const decision = decideSettle({
@@ -3851,12 +3972,16 @@ export class AgentManager {
 			now: Date.now(),
 			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
 		});
-		// stay-running / wait 一律不产生转移。wait 是本次语义修正点：abort 封印中
-		// poll 不得越过 gate 抢先置 idle 发 settled（原实现不查 gate 会误发）。
-		if (
-			decision.decision === "stay-running" ||
-			decision.decision === "wait"
-		) return;
+		// wait：abort 封印中，poll 不得越过 gate 抢先置 idle 发 settled
+		//（原实现不查 gate 会误发）。gate 的解封由 abort 兜底定时器负责，无需重排。
+		if (decision.decision === "wait") return;
+		if (decision.decision === "stay-running") {
+			// pi 仍报忙碌：真忙则等它推事件，标志陈旧则由静默兜底收口。
+			if (!this.forceIdleOnDeadSilence(runtime, agentId, remoteState)) {
+				this.rearmSettleCheck(runtime, agentId);
+			}
+			return;
+		}
 		if (decision.reason === "abort-fallback") {
 			// 封印窗口已超时（兜底定时器已/即将解封）：按 settled 解封即可。
 			// 不置 idle、不发 settled——abort 已把 status 置 idle，settled 通知留给
@@ -3864,19 +3989,13 @@ export class AgentManager {
 			this.noteAgentAbortSettled(runtime);
 			return;
 		}
-
-		runtime.tab.status = "idle";
-		// 运行结束：思考缓冲与时间戳一并清空（与 abort/agent_end 共用同一清态语义）。
-		clearThinkingBuffer(runtime.transcript);
-		runtime.transcript.thinkingStartedAt = undefined;
-		runtime.transcript.thinkingEndedAt = undefined;
-		this.emitThinking(agentId, "");
-		this.emitState();
-		void this.emitRuntimeState(agentId);
+		// 判定收敛为 idle 期间的竞态：get_state 往返期间事件路径可能已收口或新 run 已开始，
+		// 此时再收口会重复发 settled（重复"已完成"通知），直接放弃本次结论。
+		if (runtime.tab.status !== "running") return;
 		// 语义事件：omp 无 agent_settled 事件，本函数（get_state 校验后确认无后续工作）
 		// 就是 omp 下唯一真实的 settled 汇聚点；进入本函数时 status 必为 running，
 		// 因此不会与 agent_settled 分支重复发（该分支先到会清掉本兜底定时器）。
-		this.notifyEventListeners({ type: "settled", agentId });
+		this.finishRunAsIdle(runtime, agentId, true);
 	}
 
 	private requireRuntime(agentId: string) {
@@ -3958,6 +4077,49 @@ export class AgentManager {
 		}, ABORT_SETTLED_FALLBACK_MS);
 		timer.unref?.();
 		runtime.abortSettledFallbackTimer = timer;
+	}
+
+	/**
+	 * 空响应兜底：sendPrompt accepted 后启动窗口倒计时，到点若 status 仍是 running
+	 * 且流式闸门 generation 未推进（说明 agent_start 没来），按上游 provider 空响应处理：
+	 * 落 error 状态 + 追加 chat error 卡片 + 引导重试/换 provider。
+	 *
+	 * 设计取舍：仅看 tab.status === "running" + 30s 内无流式生命信号。慢思考/长 thinking
+	 * 都会先有 message_start(assistant) 到达，不会误判；OmpDeck 既有的流式闸门不会因为
+	 * 此处置 error 而被破坏（abort 路径单独 seal generation）。
+	 */
+	private scheduleEmptyResponseFallback(runtime: AgentRuntime) {
+		this.clearEmptyResponseTimer(runtime);
+		const agentId = runtime.tab.id;
+		const timer = setTimeout(() => {
+			// agent 可能已被 stop；按 agentId 重新查，避免操作已脱离 map 的 runtime。
+			const current = this.agents.get(agentId);
+			this.emptyResponseTimers.delete(agentId);
+			if (!current) return;
+			// 已收到流式生命信号但忘了 clear（防御，正常路径都 clear 了）。
+			if (current.tab.status !== "running") return;
+			const raw = "Provider 接收了请求但未返回流式响应。可能是 commandcode 等代理服务在请求被 provider 接收后流被掐断；建议重试一次或换用其它模型。";
+			current.tab.status = "error";
+			current.tab.lastError = raw;
+			this.addMessage(current, "error", raw);
+			void this.appLogger?.warn("agent", "Empty response fallback fired", {
+				agentId,
+				timeoutMs: this.emptyResponseTimeoutMs,
+			});
+			this.emitState();
+		}, this.emptyResponseTimeoutMs);
+		timer.unref?.();
+		this.emptyResponseTimers.set(agentId, timer);
+	}
+
+	/** 流式生命信号到达 / agent 停 / 主动取消时调用，幂等。 */
+	private clearEmptyResponseTimer(runtime: AgentRuntime) {
+		const agentId = runtime.tab.id;
+		const timer = this.emptyResponseTimers.get(agentId);
+		if (timer) {
+			clearTimeout(timer);
+			this.emptyResponseTimers.delete(agentId);
+		}
 	}
 
 	private clearAbortSettledFallback(runtime: AgentRuntime) {
@@ -4050,6 +4212,15 @@ export class AgentManager {
 			sent: messages.length,
 			total: runtime.transcript.messages.length,
 		});
+		// 容量裁剪是静默丢最旧消息，必须留一条日志，否则用户无法解释「历史消息为什么少了」。
+		const trim = runtime.transcript.pendingBudgetTrim;
+		if (trim) {
+			runtime.transcript.pendingBudgetTrim = undefined;
+			void this.appLogger?.warn("agent", "Transcript window trimmed to memory budget", {
+				agentId: runtime.tab.id,
+				...trim,
+			});
+		}
 	}
 
 	private emitThinking(agentId: string, thinking: string) {
@@ -4147,6 +4318,11 @@ type AgentRuntime = {
 
 	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
 	settleCheckTimer?: NodeJS.Timeout;
+	/**
+	 * 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
+	 * 只由 handlePiEvent 刷新——get_state 是我们主动发的请求，其响应不算事件流活性。
+	 */
+	lastPiEventAt?: number;
 	/** abort 后等 pi 确认的兜底定时器（见 scheduleAbortSettledFallback） */
 	abortSettledFallbackTimer?: NodeJS.Timeout;
 
