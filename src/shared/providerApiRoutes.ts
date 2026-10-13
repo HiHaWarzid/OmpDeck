@@ -11,11 +11,21 @@
  * provider 的路由不在此表，返回 undefined 让探测继续用 `apiType` 字段
  * （行为与改前一致）。待 kdl 抽取工具稳定后再扩到全集。
  *
- * 数据源（截至 pi 0.80.10，command-code@1.67.0）：
- * - runtime/behavior.kdl `api-routes provider="commandcode"`
- *   default=openai-completions；prefix claude- → anthropic-messages；
- *   exact 列表 → openai-responses（含 deepseek/deepseek-v4-flash、
- *   deepseek/deepseek-v4.1-flash、meta/muse-spark-1.3-contributor 等）。
+ * 数据源：
+ * - commandcode: runtime/behavior.kdl `api-routes provider="commandcode"`
+ *   (pi 0.80.10, command-code@1.67.0), default=openai-completions;
+ *   prefix claude- -> anthropic-messages; exact list -> openai-responses
+ *   (含 deepseek/deepseek-v4-flash, deepseek/deepseek-v4.1-flash,
+ *   meta/muse-spark-1.3-contributor 等).
+ * - opencode-go: https://opencode.ai/docs/go 公布的 endpoints 表;
+ *   同 provider 名下混用三种 API 形态 (按 model id 分流):
+ *     /v1/chat/completions 用于 GLM/Kimi/LongCat/DeepSeek V4 flash/pro/vision-exp/
+ *       MiMo V2.5 & V2.6/Hy3/Hy4 preview/Space Bunny/LongCat 2.5 preview free/
+ *       Step 5 preview free 等 (default).
+ *     /v1/responses 用于 Grok 4.6 & 4.7, GPT 6 Luna, GPT 5.6 Luna,
+ *       Muse Spark 1.2 contributor & 1.3 contributor.
+ *     /v1/messages 用于 Claude Haiku 5.5, MiniMax M3 & M2.7,
+ *       Qwen3.8 max & Qwen3.8 flash, Qwen3.7 plus.
  */
 
 export type BuiltinApiRouteApi =
@@ -64,6 +74,27 @@ const BUILTIN_PROVIDER_API_ROUTES: Record<string, BuiltinApiRouteTable> = {
 			"meta/muse-spark-1.3-contributor": "openai-responses",
 			"stealth/pixel-canary": "openai-responses",
 			"sakana/fugu-ultra": "openai-responses",
+		},
+	},
+	// opencode-go：见上方注释；三种 API 形态按 model id 精确路由。
+	// 大多数模型落在 default=openai-completions，所以 responses/messages 单独列。
+	"opencode-go": {
+		default: "openai-completions",
+		exactRoutes: {
+			// responses (openai-responses)
+			"grok-4.6": "openai-responses",
+			"grok-4.7": "openai-responses",
+			"gpt-6-luna": "openai-responses",
+			"gpt-5.6-luna": "openai-responses",
+			"muse-spark-1.2-contributor": "openai-responses",
+			"muse-spark-1.3-contributor": "openai-responses",
+			// anthropic-messages
+			"claude-haiku-5-5": "anthropic-messages",
+			"minimax-m3": "anthropic-messages",
+			"minimax-m2.7": "anthropic-messages",
+			"qwen3.8-max": "anthropic-messages",
+			"qwen3.8-flash": "anthropic-messages",
+			"qwen3.7-plus": "anthropic-messages",
 		},
 	},
 };

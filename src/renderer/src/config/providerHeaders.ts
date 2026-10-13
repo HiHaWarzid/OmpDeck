@@ -112,7 +112,12 @@ export const KNOWN_PROVIDER_ENDPOINTS: Record<
 	"fireworks": { baseUrl: "https://api.fireworks.ai/inference/v1", apiType: "openai-completions" },
 	"huggingface": { baseUrl: "https://api-inference.huggingface.co/v1", apiType: "openai-completions" },
 	"opencode": { baseUrl: "https://opencode.ai/zen/v1", apiType: "openai-completions" },
-	"opencode-go": { baseUrl: "https://opencode.ai/zen/go/v1", apiType: "openai-completions" },
+	// OpenCode Go 与 OpenCode Zen 是独立的两个 provider（不同订阅、不同端点家族）。
+	// Zen 走 https://opencode.ai/zen/v1；Go 实际服务域名是 opencode.ai，路径前缀为
+	// /inference/go/，并非 /zen/go/。该 provider 同名内置若干 API 形态（chat-completions /
+	// responses / anthropic-messages），具体路由在 src/shared/providerApiRoutes.ts 中按
+	// model id 匹配。会话侧必须命中其中一种端点家族，否则 404。
+	"opencode-go": { baseUrl: "https://opencode.ai/inference/go/v1", apiType: "openai-completions" },
 	"minimax": { baseUrl: "https://api.minimax.io/v1", apiType: "openai-completions" },
 	"minimax-cn": { baseUrl: "https://api.minimaxi.com/v1", apiType: "openai-completions" },
 	// Command Code：pi 内置 provider，baseUrl 必须是 /provider 前缀（不是 /v1），

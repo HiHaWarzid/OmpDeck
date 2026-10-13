@@ -48,3 +48,57 @@ describe("lookupBuiltinApiRoute (commandcode)", () => {
 		);
 	});
 });
+
+describe("lookupBuiltinApiRoute (opencode-go)", () => {
+	// 参考 https://opencode.ai/docs/go Endpoints 表。
+	// 三种端点形态按 model id 区分：chat-completions 默认，responses / anthropic-messages 命中后走对应路由。
+
+	it("默认走 openai-completions(deepseek-v4.1-flash 在 Go 上仍为 chat completions)", () => {
+		expect(lookupBuiltinApiRoute("opencode-go", "deepseek-v4.1-flash")).toBe(
+			"openai-completions",
+		);
+	});
+
+	it("grok / gpt-6 / gpt-5.6 / muse-spark-* 走 openai-responses", () => {
+		expect(lookupBuiltinApiRoute("opencode-go", "grok-4.7")).toBe("openai-responses");
+		expect(lookupBuiltinApiRoute("opencode-go", "grok-4.6")).toBe("openai-responses");
+		expect(lookupBuiltinApiRoute("opencode-go", "gpt-6-luna")).toBe("openai-responses");
+		expect(lookupBuiltinApiRoute("opencode-go", "gpt-5.6-luna")).toBe("openai-responses");
+		expect(lookupBuiltinApiRoute("opencode-go", "muse-spark-1.3-contributor")).toBe(
+			"openai-responses",
+		);
+	});
+
+	it("claude-haiku / minimax-* / qwen3.8 / qwen3.7 走 anthropic-messages", () => {
+		expect(lookupBuiltinApiRoute("opencode-go", "claude-haiku-5-5")).toBe(
+			"anthropic-messages",
+		);
+		expect(lookupBuiltinApiRoute("opencode-go", "minimax-m3")).toBe("anthropic-messages");
+		expect(lookupBuiltinApiRoute("opencode-go", "minimax-m2.7")).toBe(
+			"anthropic-messages",
+		);
+		expect(lookupBuiltinApiRoute("opencode-go", "qwen3.8-max")).toBe(
+			"anthropic-messages",
+		);
+		expect(lookupBuiltinApiRoute("opencode-go", "qwen3.7-plus")).toBe(
+			"anthropic-messages",
+		);
+	});
+
+	it("其余未列出的模型回退到默认 openai-completions", () => {
+		expect(lookupBuiltinApiRoute("opencode-go", "kimi-k3")).toBe(
+			"openai-completions",
+		);
+		expect(lookupBuiltinApiRoute("opencode-go", "longcat-2.0")).toBe(
+			"openai-completions",
+		);
+		expect(lookupBuiltinApiRoute("opencode-go", "mimo-v2.6-flash")).toBe(
+			"openai-completions",
+		);
+	});
+
+	it("非 opencode-go provider 返回 undefined（调用方回退到用户 api 字段）", () => {
+		expect(lookupBuiltinApiRoute("opencode", "deepseek-v4.1-flash")).toBeUndefined();
+		expect(lookupBuiltinApiRoute("anthropic", "claude-haiku-5-5")).toBeUndefined();
+	});
+});
