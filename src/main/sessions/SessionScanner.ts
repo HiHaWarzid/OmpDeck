@@ -28,6 +28,14 @@ function firstString(...values: unknown[]): string | undefined {
 
 /** 本地模式扫描并发度：readFile/stat 是异步 IO，32 路足够打满磁盘吞吐且不爆句柄。 */
 const SCAN_CONCURRENCY_LOCAL = 32;
+
+/**
+ * 项目匹配结果缓存的 key：`文件 + 项目`。
+ * 分隔符用 NUL：Windows/POSIX 路径都不允许包含它，因此不会与路径本身混淆。
+ */
+function projectMatchKey(filePath: string, projectPath: string) {
+  return `${filePath}\u0000${projectPath}`;
+}
 /** WSL 模式扫描并发度：每个 stat/read 都 spawn 一个 wsl.exe（100~300ms 进程启动），
  *  8 路并发已能占满 wsl.exe 吞吐，数百文件全并发会进程句柄爆炸。 */
 const SCAN_CONCURRENCY_WSL = 8;
@@ -70,15 +78,21 @@ export class SessionScanner {
   private readonly summaryCache = new SessionSummaryCache<SessionSummary | null>();
   private summaryCacheFileSetKey = "";
   /**
-   * isSameProject 内容校验的文本缓存：以 (mtimeMs, size) 为指纹。
+   * isSameProject 内容校验的结果缓存：key 为「文件 + 项目」，值只有布尔 + 指纹。
    * 只有「父目录 cwd 会话」才需要整读内容匹配项目路径（isParentSessionForProject），
-   * 重复扫描时避免对同一文件反复整读；随 summaryCache 的 fileSetKey 变化一起修剪。
+   * 这里缓存「某个项目是否在该文件里出现过」，避免重复扫描时对同一文件反复整读。
+   * 只存布尔不存全文：早期实现按文件缓存整读文本，同一文件对每个项目各存一份，
+   * 常驻内存 = O(会话数 × 项目数 × 文件体积)，随会话规模线性增长；结果缓存是每会话字节级。
+   * 随 summaryCache 的 fileSetKey 变化一起修剪。
    */
-  private readonly projectMatchTextCache = new Map<string, { version: FileVersion; text: string }>();
+  private readonly projectMatchCache = new Map<
+    string,
+    { filePath: string; version: FileVersion; matched: boolean }
+  >();
   /**
    * isSessionFile 校验结果的指纹缓存：父会话候选文件（<stem>.jsonl）只在子会话
    * 结束时才更新，每次扫描对每个候选父做 stat + readHead(4096) 的成本可省。
-   * 与 projectMatchTextCache 同一处修剪。
+   * 与 projectMatchCache 同一处修剪。
    */
   private readonly sessionFileCheckCache = new Map<string, { version: FileVersion; valid: boolean }>();
   /**
@@ -230,10 +244,10 @@ export class SessionScanner {
       if (fileSetKey !== this.summaryCacheFileSetKey) {
         // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
         this.summaryCache.prune(files, this.wslConfig ? "wsl" : "local");
-        // 同步修剪项目匹配文本缓存，避免已删除会话的整读文本长期残留内存。
+        // 同步修剪项目匹配结果缓存，避免已删除会话的条目长期残留内存。
         const fileSet = new Set(files.map((f) => this.normalize(f)));
-        for (const key of this.projectMatchTextCache.keys()) {
-          if (!fileSet.has(this.normalize(key))) this.projectMatchTextCache.delete(key);
+        for (const [key, entry] of this.projectMatchCache) {
+          if (!fileSet.has(this.normalize(entry.filePath))) this.projectMatchCache.delete(key);
         }
         // 父会话校验缓存同样只保留当前扫描集合内的条目。
         for (const key of this.sessionFileCheckCache.keys()) {
@@ -795,26 +809,29 @@ export class SessionScanner {
     // 早期用户常在 home 目录启动 pi 再操作子项目；这类历史 session 的 cwd 是父目录，
     // 但文件内容可能明确提到当前项目。仅对父目录 session 做内容校验，避免把无关 home 会话全部展示到子项目下。
     if (!sessionProject || !projectPath.startsWith(`${sessionProject}/`)) return false;
-    const text = await this.readCachedText(filePath, signal);
-    return text.includes(projectPath);
-  }
-
-  private async readCachedText(filePath: string, signal?: AbortSignal) {
+    const key = projectMatchKey(filePath, projectPath);
+    let version: FileVersion;
     try {
-      const info = await this.fileAdapter.stat(filePath, signal);
-      const version = { mtimeMs: info.mtimeMs, size: info.size };
-      const cached = this.projectMatchTextCache.get(filePath);
-      if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
-        return cached.text;
-      }
-      // 命中判定用指纹，读取本身走 sessionEntries（BOM 守卫唯一实现）；指纹直接复用，不再重复 stat。
-      const { raw } = await readEntries(this.fileAdapter, filePath, { fingerprint: version, signal });
-      const text = raw.replace(/\\/g, "/").toLowerCase();
-      this.projectMatchTextCache.set(filePath, { version, text });
-      return text;
+      version = await this.fileAdapter.stat(filePath, signal);
     } catch {
-      return "";
+      return false;
     }
+    const cached = this.projectMatchCache.get(key);
+    if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
+      return cached.matched;
+    }
+    let matched: boolean;
+    try {
+      // 只需要子串命中，不需要逐行 JSON.parse：直接整读原文（BOM/UTF-16 文件在扫描摘要阶段
+      // 已被判为不可读并隐藏，不会走到这里），比 readEntries 少一次全文解析。
+      const raw = await this.fileAdapter.read(filePath, signal);
+      matched = raw.replace(/\\/g, "/").toLowerCase().includes(projectPath);
+    } catch {
+      // 读取失败（含扫描取消）：按不匹配处理但不落缓存，下次扫描重试，避免瞬时错误把会话永久隐藏。
+      return false;
+    }
+    this.projectMatchCache.set(key, { filePath, version, matched });
+    return matched;
   }
 
   private normalize(path: string) {

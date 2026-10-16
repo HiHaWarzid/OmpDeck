@@ -454,6 +454,8 @@ export const AssistantText = memo(
 						src={`data:${img.mimeType};base64,${img.data}`}
 						alt={t("app.imageAlt", { index: index + 1 })}
 						className="message-image"
+						loading="lazy"
+						decoding="async"
 						onClick={() => props.onPreviewImage(img)}
 					/>
 				))}

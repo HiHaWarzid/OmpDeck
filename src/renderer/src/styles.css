@@ -3949,6 +3949,22 @@ body.is-terminal-resizing {
   min-width: 0;
   margin: 0 auto;
 }
+/* 分页窗口的上/下边界入口：翻页按钮与"回到最新"提示条。
+   两者都贴着列表边缘，用语义 token 保持暗色适配，不写死颜色。 */
+.timeline-load-more {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+/* 「还有 N 条新消息」入口：与 .scroll-to-bottom-btn 同一锚点悬浮在输入框上方。
+   bottom 由 App 按 composer/终端高度内联设置，这里只管水平居中与层级。 */
+.timeline-newer-strip {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+}
 .multi-select-image-export {
   position: fixed;
   left: 0;

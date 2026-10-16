@@ -72,6 +72,8 @@ import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
+import { Button } from "./components/ui/Button";
+import { pickTimelineAnchorIndex } from "./utils/timelineAnchor";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
@@ -1333,8 +1335,8 @@ export function App() {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   /** 会话定位跳转到尚未加载的旧消息时，先扩展分页再在 effect 中滚动定位；此状态保存待跳转的消息 id。 */
   const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
-  /** 加载更多历史消息前的滚动锚点（旧 scrollHeight + scrollTop），用于渲染后按顶部锚定恢复滚动位置。 */
-  const loadMoreAnchorRef = useRef<{ height: number; top: number } | null>(null);
+  /** 加载更多历史消息前的滚动锚点（窗口首条消息的 id + 视口坐标），用于渲染后按元素位移恢复滚动位置。 */
+  const loadMoreAnchorRef = useRef<{ id: string; top: number } | null>(null);
 
   const [settings, setSettings] = useState<AppSettings>({
     useNativeTitleBar: true,
@@ -1780,17 +1782,24 @@ export function App() {
     return sessionWorkspaceStore.subscribeSliceChange("runtime", recompute);
   }, [activeProjectId, displayAgents]);
   // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
+  // 窗口上限（默认 200 条）在 hook 内：超过后从顶部上收，避免长会话把上千条消息全量渲染进 DOM。
   const {
     visibleMessages: paginatedMessages,
     hasMore: hasMoreMessages,
+    messagesAbove: messagesAboveWindow,
+    messagesBelow: messagesBelowWindow,
     loadMore: loadMoreMessages,
     loadUntilIncluded: loadMessagesUntilIncluded,
+    jumpToLatest: jumpMessagesToLatest,
     isLoading: isLoadingMoreMessages,
   } = useMessagePagination({
     messages: activeMessages,
     initialPageSize: 50,
     pageSize: 50,
     enabled: activeMessages.length > 50,
+    resetKey: activeAgentId ?? undefined,
+    // 贴底跟随：autoScroll=false（用户在看历史）时冻结窗口，新消息不再塞进 DOM 顶走阅读位置。
+    followTail: autoScroll,
   });
 
   /** 最后一条用户消息的 id，用于决定重发按钮只在最新消息上显示。 */
@@ -2894,6 +2903,9 @@ export function App() {
   function scrollToBottom() {
     const timeline = timelineRef.current;
     if (!timeline) return;
+    // 回看历史时窗口可能冻结在旧位置，最新消息尚未渲染：先把窗口复位到尾部，再滚到底。
+    // 复位后 DOM 会变高，由 ResizeObserver(programmaticScrollRef/autoScroll) 二次校准到真正的底部。
+    jumpMessagesToLatest();
     programmaticScrollRef.current = true;
     timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
     setAutoScroll(true);
@@ -2910,17 +2922,29 @@ export function App() {
     window.setTimeout(() => el.classList.remove("message-jump-highlight"), 2000);
   }
 
-  // 点击“加载更多历史消息”：先记录当前滚动锚点，再触发分页加载，
-  // 渲染后的 effect 会根据新增高度补偿 scrollTop，保持视图稳定。
+  // 点击“加载更多历史消息”：先记录窗口首条消息的视口位置，再触发分页加载，
+  // 渲染后的 effect 按该锚点位移补偿 scrollTop，保持视图稳定。
+  // 用元素位移而不是高度差：窗口到上限后翻页是“顶部加、底部收”，高度差 ≠ 视图位移。
   function handleLoadMoreMessages() {
-    const timeline = timelineRef.current;
-    if (timeline) {
-      loadMoreAnchorRef.current = {
-        height: timeline.scrollHeight,
-        top: timeline.scrollTop,
-      };
-    }
+    loadMoreAnchorRef.current = captureTimelineAnchor();
     loadMoreMessages();
+  }
+
+  /**
+   * 记录一个"视口内的稳定行"的 id 与视口坐标，供翻页/滑窗后恢复滚动位置使用。
+   * 选取规则与原因见 `utils/timelineAnchor.ts`。
+   */
+  function captureTimelineAnchor(): { id: string; top: number } | null {
+    const timeline = timelineRef.current;
+    if (!timeline) return null;
+    const rows = Array.from(timeline.querySelectorAll<HTMLElement>("[data-message-id]")).map((row) => {
+      const rect = row.getBoundingClientRect();
+      return { id: row.dataset.messageId ?? "", rectTop: rect.top, rectBottom: rect.bottom };
+    });
+    const index = pickTimelineAnchorIndex(rows, timeline.getBoundingClientRect().top);
+    const picked = index >= 0 ? rows[index] : undefined;
+    if (!picked?.id) return null;
+    return { id: picked.id, top: picked.rectTop };
   }
 
   // 会话定位跳转：若目标消息已在当前分页内则直接滚动定位；
@@ -3170,19 +3194,22 @@ export function App() {
     };
   }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length]);
 
-  // 加载更多历史消息后，按顶部锁定的方式恢复滚动位置。
-  // 历史消息会插入到 .message-list 顶部，若不补偿新增高度，浏览器保持原 scrollTop 会导致视图跳动，
-  // 用户会感觉输入框/内容错位。这里把新增高度增量加回 scrollTop，让当前看到的消息留在原位。
-  // 使用 useLayoutEffect 在浏览器绘制前同步补偿，避免用户看到中间跳动的一帧。
+  // 加载更多历史消息/滑窗后恢复滚动位置：翻页会在窗口顶部插入内容（滑窗还会在底部收起内容），
+  // 浏览器保持 scrollTop 不变会让正在看的内容上下跳动。这里按锚点消息的视口位移做补偿，
+  // 让同一批消息停在原来的位置。用 useLayoutEffect 在绘制前同步补偿，避免中间帧抖动。
   useLayoutEffect(() => {
     const anchor = loadMoreAnchorRef.current;
     if (!anchor) return;
+    loadMoreAnchorRef.current = null;
     const el = timelineRef.current;
     if (!el) return;
-    const delta = el.scrollHeight - anchor.height;
-    if (delta !== 0) el.scrollTop = anchor.top + delta;
-    loadMoreAnchorRef.current = null;
-  }, [paginatedMessages.length]);
+    const target = el.querySelector(
+      `[data-message-id="${CSS.escape(anchor.id)}"]`,
+    ) as HTMLElement | null;
+    if (!target) return;
+    const delta = target.getBoundingClientRect().top - anchor.top;
+    if (delta !== 0) el.scrollTop += delta;
+  }, [paginatedMessages]);
 
   // 会话定位跳转到尚未加载的消息时，先通过 loadMessagesUntilIncluded 扩展分页窗口；
   // 该消息被渲染进 DOM 后，在此 effect 中真正滚动定位并短暂高亮，提示用户落点。
@@ -6552,34 +6579,17 @@ export function App() {
         </header>
 
         <section className="message-timeline" ref={timelineRef}>
-          {/* 加载更多历史消息按钮 */}
+          {/* 加载更多历史消息按钮：计数取"窗口上方未渲染的条数"，滑窗后仍准确。 */}
           {hasMoreMessages && activeAgent && activeAgent.status !== "starting" && (
-            <div style={{
-              display: "flex",
-              justifyContent: "center",
-              padding: "12px 0",
-              borderBottom: "1px solid var(--border-color)"
-            }}>
-              <button
+            <div className="timeline-load-more">
+              <Button
+                buttonSize="sm"
+                variant="secondary"
                 onClick={handleLoadMoreMessages}
-                disabled={isLoadingMoreMessages}
-                style={{
-                  padding: "6px 16px",
-                  border: "1px solid var(--border-color)",
-                  borderRadius: "6px",
-                  background: "var(--bg-secondary)",
-                  color: "var(--text-primary)",
-                  fontSize: "13px",
-                  cursor: isLoadingMoreMessages ? "not-allowed" : "pointer",
-                  opacity: isLoadingMoreMessages ? 0.6 : 1,
-                  transition: "all 0.2s"
-                }}
+                loading={isLoadingMoreMessages}
               >
-                {isLoadingMoreMessages
-                  ? "加载中..."
-                  : `加载更多历史消息 (${activeMessages.length - paginatedMessages.length} 条)`
-                }
-              </button>
+                {t("app.loadMoreHistory", { count: messagesAboveWindow })}
+              </Button>
             </div>
           )}
 
@@ -6663,7 +6673,21 @@ export function App() {
 
         </section>
 
-          {showScrollToBottom && (
+          {/* 回看历史时窗口冻结，较新的消息没有渲染进 DOM（否则每条流式增量都会顶走阅读位置）：
+              用「还有 N 条新消息」入口替代单纯的回到最新箭头，位置与箭头一致（悬浮在输入框上方，
+              不随滚动内容飘走），让用户知道下方仍在新消息并一键回到最新。 */}
+          {messagesBelowWindow > 0 ? (
+            <div
+              className="timeline-newer-strip"
+              // 与 scroll-to-bottom-btn 同一锚点：由 composer 实际高度 + 终端高度决定 bottom。
+              style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
+            >
+              <Button buttonSize="sm" variant="secondary" onClick={scrollToBottom} title={t("app.jumpToNewest")}>
+                <ChevronDown size={14} aria-hidden="true" />
+                {t("app.newerMessagesHint", { count: messagesBelowWindow })}
+              </Button>
+            </div>
+          ) : showScrollToBottom ? (
             <button
               className="scroll-to-bottom-btn"
               // 按钮脱离滚动容器后，由 composer 实际高度 + 终端高度决定 bottom，避免输入框增高或终端打开时遮挡。
@@ -6673,7 +6697,7 @@ export function App() {
             >
               <ChevronDown size={18} />
             </button>
-          )}
+          ) : null}
 
         {activeAgent && (
         <footer ref={composerRef} className="composer">

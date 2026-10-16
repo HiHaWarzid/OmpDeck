@@ -116,7 +116,11 @@ export function sameChatMessageForRender(previous: ChatMessage, next: ChatMessag
 		previous.role !== next.role ||
 		previous.text !== next.text ||
 		previous.thinking !== next.thinking ||
-		previous.timestamp !== next.timestamp
+		previous.timestamp !== next.timestamp ||
+		// meta 按引用比较：工具卡的状态/参数/详情都住在 meta 里，且主进程每次推送都是新对象
+		// （渲染层不就地改 meta）。只比较上面几个字段会让「工具从 running 变 completed」被判为
+		// 未变化，卡片状态停留在 running。
+		previous.meta !== next.meta
 	) {
 		return false;
 	}

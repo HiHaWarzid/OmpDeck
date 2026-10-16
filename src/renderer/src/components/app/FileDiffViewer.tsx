@@ -67,6 +67,11 @@ export function FileDiffViewer(props: {
 
 	const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
 	const diffEditorRef = useRef<Monaco.editor.IStandaloneDiffEditor | null>(null);
+	/** DiffEditor 挂载时创建的 original/modified 模型：keepCurrent*Model 让库不再释放它们，需自己 dispose。 */
+	const diffModelsRef = useRef<{
+		original: Monaco.editor.ITextModel;
+		modified: Monaco.editor.ITextModel;
+	} | null>(null);
 
 	const isDiffMode = props.mode === "diff";
 	const fileName = props.filePath.split(/[/\\]/).pop() ?? props.filePath;
@@ -217,6 +222,17 @@ export function FileDiffViewer(props: {
 
 	const handleDiffEditorMount = useCallback((editor: Monaco.editor.IStandaloneDiffEditor) => {
 		diffEditorRef.current = editor;
+		// 记下本次挂载创建的两个模型：卸载时由本组件负责释放（见下方 cleanup）。
+		// 分栏/合并切换会让 DiffEditor 按 key 重新挂载并新建一对模型，旧的一对因
+		// keepCurrent*Model 不会被库释放，必须先在这里释放，否则每次切换都常驻一份文件全文。
+		const previous = diffModelsRef.current;
+		const mounted = editor.getModel();
+		const next = mounted ? { original: mounted.original, modified: mounted.modified } : null;
+		if (previous && previous.original !== next?.original) {
+			previous.original.dispose();
+			previous.modified.dispose();
+		}
+		diffModelsRef.current = next;
 		// 差异编辑器没有统一的 onChange；手动监听 modified 模型变化以跟踪未保存状态。
 		const modified = editor.getModifiedEditor();
 		modified.onDidChangeModelContent(() => {
@@ -228,8 +244,15 @@ export function FileDiffViewer(props: {
 	// 组件卸载前先清理 Monaco 编辑器引用，避免异步清理造成 TextModel disposed 竞态。
 	useEffect(() => {
 		return () => {
+			// DiffEditor 传了 keepCurrentOriginalModel/ModifiedModel（避免分栏切换时模型被重建），
+			// 库在卸载时因此不会 dispose 这两个 TextModel；而 Monaco 的模型挂在全局注册表上，
+			// 不手动释放就等于每次打开 diff 常驻最多两个文件全文（单侧上限 5MB）且永不回收。
+			const diffModels = diffModelsRef.current;
+			diffModelsRef.current = null;
 			editorRef.current?.dispose();
 			diffEditorRef.current?.dispose();
+			diffModels?.original.dispose();
+			diffModels?.modified.dispose();
 			editorRef.current = null;
 			diffEditorRef.current = null;
 		};

@@ -5,8 +5,12 @@ import { App } from "./App";
 import { AppErrorBoundary } from "./components/ui/AppErrorBoundary";
 import { t } from "./i18n";
 import { showNotice } from "./utils/notice";
+import { installDevPerformanceTrackGuard } from "./utils/devPerformanceTrackGuard";
 import "./styles.css";
 import "./file-icons.css";
+
+// React dev 构建每次渲染都会写 performance.measure 条目且无人清理，长时间运行会持续吃内存。
+installDevPerformanceTrackGuard();
 
 function writeStartupLog(level: AppLogLevel, message: string, detail?: unknown) {
   window.piDesktop?.app.rendererLog(level, "renderer", message, detail).catch(() => undefined);

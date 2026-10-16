@@ -64,4 +64,18 @@ describe("sameChatMessageForRender", () => {
 		const next = message({ images: [image("a")] } as Partial<ChatMessage>);
 		expect(sameChatMessageForRender(previous, next)).toBe(true);
 	});
+
+	it("returns false when only meta changed (tool status running -> completed)", () => {
+		// 工具卡的状态/参数/详情只住在 meta 里：早前漏比较 meta，工具卡会停留在 running。
+		const previous = message({ meta: { toolName: "bash", status: "running" } } as Partial<ChatMessage>);
+		const next = message({ meta: { toolName: "bash", status: "completed" } } as Partial<ChatMessage>);
+		expect(sameChatMessageForRender(previous, next)).toBe(false);
+	});
+
+	it("returns true when meta is the same reference", () => {
+		const meta = { toolName: "bash", status: "completed" };
+		const previous = message({ meta } as Partial<ChatMessage>);
+		const next = message({ meta } as Partial<ChatMessage>);
+		expect(sameChatMessageForRender(previous, next)).toBe(true);
+	});
 });

@@ -690,9 +690,14 @@ export const UserBubble = memo(function UserBubble(props: {
 			editAreaRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
 		}
 	}, [editing]);
-	// 提取 pi 展开后的 <skill> 块：渲染为 skill 徽标，并从正文里剥除 XML
-	const { skills, text: bodyText } = extractSkillBlocks(stripAnsi(message.text));
-	const cleanText = bodyText;
+	// 提取 pi 展开后的 <skill> 块：渲染为 skill 徽标，并从正文里剥除 XML。
+	// 必须在 useMemo 内：本组件会因 agentRunning 等外部状态变化整体重渲染，
+	// 而这两步是对整条消息文本（用户可粘贴数 KB）跑正则 + 拆分，
+	// 放在渲染体里会导致历史气泡在每次状态推送时重复解析（实测占 list 渲染 90%）。
+	const { skills, cleanText } = useMemo(() => {
+		const extracted = extractSkillBlocks(stripAnsi(props.message.text));
+		return { skills: extracted.skills, cleanText: extracted.text };
+	}, [props.message.text]);
 	// 投递策略标签：steer(下次调用前插入) / followUp(停止后排队)
 	const deliveryBehavior = message.meta?.streamingBehavior as
 		| "steer"
@@ -704,6 +709,12 @@ export const UserBubble = memo(function UserBubble(props: {
 			: deliveryBehavior === "followUp"
 				? t("app.messageDeliveryFollowUp")
 				: null;
+	// chip 节点同样是"文本 → 元素树"的解析产物，随上面的 cleanText 一起缓存，
+	// 避免每次重渲染重建数组与元素（onOpenFile / Set 引用在 App 侧稳定，依赖不会误触发）。
+	const chipNodes = useMemo(
+		() => renderChipText(cleanText, props.onOpenFile, props.validCommandNames, props.validFilePaths),
+		[cleanText, props.onOpenFile, props.validCommandNames, props.validFilePaths],
+	);
 	/** 原地编辑不影响输入框；先提交给确认弹窗。 */
 	const handleSaveEdit = () => {
 		if (props.onEditMessage && editText.trim()) {
@@ -738,6 +749,8 @@ export const UserBubble = memo(function UserBubble(props: {
 							src={`data:${img.mimeType};base64,${img.data}`}
 							alt={t("app.imageAlt", { index: index + 1 })}
 							className="user-turn-attachment"
+							loading="lazy"
+							decoding="async"
 							onClick={() => props.onPreviewImage(img)}
 						/>
 					))}
@@ -745,9 +758,7 @@ export const UserBubble = memo(function UserBubble(props: {
 			)}
 			{cleanText && !editing && (
 				<div className="user-turn-bubble">
-					<div className="user-turn-text">
-						{renderChipText(cleanText, props.onOpenFile, props.validCommandNames, props.validFilePaths)}
-					</div>
+					<div className="user-turn-text">{chipNodes}</div>
 				</div>
 			)}
 			{editing && (
