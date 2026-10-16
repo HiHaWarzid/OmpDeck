@@ -29,6 +29,7 @@ import {
 	type ProcessLease,
 } from "./agentProcessSlot";
 import type { PiRpcClient, RpcResponse } from "./PiRpcClient";
+import { classifyPiFailure, requestPiCommand } from "./piRpcCompat";
 import type { PiProcessDiagnostics } from "./PiProcess";
 import { formatBashToolMessage } from "./bashResult";
 import { extractMessageText } from "./messageContent";
@@ -409,15 +410,30 @@ export class AgentManager {
 			type: "get_messages",
 		});
 
-		let entriesPromise: Promise<any> | undefined;
+		let entriesPromise: Promise<RpcResponse | undefined> | undefined;
 		if (!skipEntries) {
 			entriesPromise = runtime.slot.process.client.request({
 				type: "get_entries",
-			}, 15_000).catch(() => {
-				// get_entries 失败时不阻塞消息加载；编辑/删除走 fallback（_piDeckMsgSeq 计数）
-				void this.appLogger?.warn("agent", "Failed to get_entries for entryId mapping", { agentId });
-				return undefined;
-			});
+			}, 15_000)
+				.then((result) => {
+					if (!result.success) {
+						// 大会话 get_entries 会撞 RPC 传输上限：entryId 映射降级为 _piDeckMsgSeq 计数，
+						// 编辑/删除仍可用但定位精度下降。必须留下分类日志，否则「编辑点错行」无从追查。
+						void this.appLogger?.warn("agent", "Failed to get_entries for entryId mapping", {
+							agentId,
+							kind: classifyPiFailure(result),
+							error: result.error,
+						});
+					}
+					return result;
+				})
+				.catch((error) => {
+					void this.appLogger?.warn("agent", "get_entries request failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return undefined;
+				});
 		}
 
 		const [response, entriesResult] = await Promise.all([
@@ -427,12 +443,16 @@ export class AgentManager {
 		const t1 = Date.now();
 
 		let rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+		const failureKind = response.success ? undefined : classifyPiFailure(response);
 
-		// 兜底：get_messages 成功但返回空数组时，若会话文件确实存在且有内容，
-		// 说明 pi 进程 resume 会话时未完整加载（如同一会话被并发打开、或文件尚在写入），
-		// 直接回退到文件直读，避免历史消息在 UI 中空白。
-		// 仅对带 sessionPath 的历史加载生效；全新会话（无 sessionPath）空消息是合法状态。
-		if (rawMessages.length === 0 && skipEntries && runtime.tab.sessionPath) {
+		// 兜底：get_messages 失败（大会话撞 RPC 传输上限最常见）时任何加载都回退文件直读；
+		// 「成功但为空」仍只对历史加载（skipEntries）生效——编辑/删除后的刷新如果被 pi 返回空，
+		// 读文件可能把已删内容又读回来，不值得为一个旧疑点换这个风险。
+		// 旧实现完全不处理失败分支，于是 get_messages 失败的大会话一律渲染成「没有消息」
+		// ——用户侧表现为「打开会话空白 + 无法编辑」（实测 10/15-10/16 反复出现）。
+		// 全新会话（无 sessionPath）空消息仍是合法状态，不走兜底。
+		const rpcUnusable = failureKind !== undefined || (rawMessages.length === 0 && skipEntries);
+		if (rpcUnusable && runtime.tab.sessionPath) {
 			const sessionHostPath = this.toSessionHostPath(runtime.tab.sessionPath);
 			try {
 				if (existsSync(sessionHostPath) && statSync(sessionHostPath).size > 0) {
@@ -440,22 +460,32 @@ export class AgentManager {
 						runtime.tab.sessionPath,
 						AgentManager.MAX_HISTORY_LOAD_TURNS,
 					).catch(() => undefined);
-					if (fileFallback) {
-						const fallbackMessages =
-							(fileFallback.data as { messages?: unknown[] } | undefined)?.messages ?? [];
-						if (fallbackMessages.length > 0) {
-							rawMessages = fallbackMessages;
-							void this.appLogger?.warn("agent", "get_messages returned empty; fell back to session file read", {
-								agentId,
-								sessionPath: runtime.tab.sessionPath,
-								fileMessages: fallbackMessages.length,
-							});
-						}
+					const fallbackMessages =
+						(fileFallback?.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+					if (fallbackMessages.length > 0) {
+						rawMessages = fallbackMessages;
+						void this.appLogger?.warn("agent", "get_messages unusable; fell back to session file read", {
+							agentId,
+							sessionPath: runtime.tab.sessionPath,
+							failureKind,
+							fileMessages: fallbackMessages.length,
+						});
 					}
 				}
 			} catch {
 				// 文件不可读时维持 RPC 结果，不阻断加载
 			}
+		}
+
+		if (!response.success) {
+			// 失败绝不能静默：记录错误分类 + 文件兜底是否救回，否则「会话空白」在日志里无锚点。
+			void this.appLogger?.warn("agent", "get_messages failed", {
+				agentId,
+				kind: failureKind,
+				error: response.error,
+				recoveredFromFile: rawMessages.length > 0,
+				messageCount: rawMessages.length,
+			});
 		}
 
 		// 解析 entryId 列表（需要先于 convertAgentMessages，用于把消息关联到 pi 的会话分支）。
@@ -506,7 +536,10 @@ export class AgentManager {
 				});
 
 				const last = archiveData.compactions[archiveData.compactions.length - 1];
-				const archivedMessages = archiveData.archivedMessagesByCompactionId.get(last.id) ?? [];
+				// 归档消息不随基线下发：它可能是整个压缩前历史（MB 级），每次状态推送
+				// 结构化克隆整份会直接顶爆渲染进程（实测 render-process-gone reason=oom）。
+				// 只带 compactionId + 条数，展开压缩卡片时按需经 readArchivedMessages 取回。
+				const archivedMessageCount = (archiveData.archivedMessagesByCompactionId.get(last.id) ?? []).length;
 
 				if (!rpcAlreadyHasSummary) {
 					// RPC 未返回摘要 → 我们自己创建压缩卡片
@@ -519,16 +552,19 @@ export class AgentManager {
 							compactionCount: archiveData.compactions.length,
 							firstKeptEntryId: last.firstKeptEntryId,
 							tokensBefore: last.tokensBefore,
-							archivedMessages,
+							archivedMessageCount,
 						},
 					};
 				} else {
-					// RPC 已返回摘要 → 找到它并注入 archivedMessages（pi 的摘要不带归档消息）
+					// RPC 已返回摘要 → 给它补上归档索引（pi 的摘要不带归档消息）
 					for (const msg of trimmed) {
 						const m = msg as Record<string, unknown>;
 						if (m.role === "compactionSummary") {
-							m.meta = (m.meta as Record<string, unknown> | null) ?? {};
-							(m.meta as Record<string, unknown>).archivedMessages = archivedMessages;
+							m.meta = {
+								...((m.meta as Record<string, unknown> | null) ?? {}),
+								compactionId: last.id || null,
+								archivedMessageCount,
+							};
 							break;
 						}
 					}
@@ -562,9 +598,9 @@ export class AgentManager {
 			runtime.transcript.messages,
 			options?.preserveMessagesAfter,
 		);
-		runtime.transcript.messages = nextMessages;
-		// 整组重建：下一次 flush 必须是全量基线（渲染层整体替换），不能用增量合并。
-		this.markAllMessagesDirty(runtime);
+		// 走 replaceMessages（内含容量裁剪 + 整组重建标记）：旧实现直接赋值 + markAllMessagesDirty，
+		// 历史加载这条路径完全绕过 8MB 驻留预算，大会话 resume 时内存直接压到渲染/主进程上限（实测 OOM）。
+		replaceMessages(runtime.transcript, nextMessages);
 		this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
 		return nextMessages;
@@ -2174,6 +2210,23 @@ export class AgentManager {
 	}
 
 	/**
+	 * 按需读取某次压缩归档的消息（压缩卡片展开时调用）。
+	 *
+	 * 归档是已写入文件的不可变历史，compactionId 不会复用，因此直接按 id 取；
+	 * 取不到必须抛错——静默返回空数组会让渲染层显示「0 条归档」，用户以为历史丢了。
+	 * 顺带刷新 tab.compactionCount：只读会话（未跑过 loadMessages）时它可能还没填。
+	 */
+	async readArchivedMessages(agentId: string, compactionId: string): Promise<{ messages: ChatMessage[] }> {
+		const runtime = this.requireRuntime(agentId);
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) throw new Error("Session file unavailable for archive read");
+		const archiveData = await this.sessionJsonl.parseArchives(sessionPath, agentId);
+		const messages = archiveData.archivedMessagesByCompactionId.get(compactionId);
+		if (!messages) throw new Error(`Archived messages not found: ${compactionId}`);
+		return { messages };
+	}
+
+	/**
 	 * 同文件重发：截断该用户消息及其所有后代（assistant/tool 等），再返回可重新 prompt 的原文。
 	 * 不调用 fork，因此不会生成新的会话文件。
 	 *
@@ -2451,12 +2504,17 @@ export class AgentManager {
 	}
 
 	/**
-	 * 对未打开的历史会话执行官方 clone。
-	 * clone 会复制 active branch 到新 session；随后读取 get_state 拿到新 sessionFile 供历史列表刷新。
+	 * 对未打开的历史会话执行官方 clone（pi 18.10 起为 fork，不带 entryId）。
+	 * fork 会复制 active branch 到新 session；随后读取 get_state 拿到新 sessionFile 供历史列表刷新。
 	 */
 	async cloneSessionFile(projectId: string, sessionPath: string) {
 		return this.withTemporarySession(projectId, sessionPath, async (child) => {
-			const response = await child.client.request({ type: "clone" }, 120_000);
+			const { response, command } = await requestPiCommand(child.client, "fork", {
+				timeoutMs: 120_000,
+			});
+			if (!response.success) {
+				throw new Error(`复制会话失败（${command}）：${response.error ?? "未知错误"}`);
+			}
 			const state = await child.client.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout);
 			return {
 				...((response.data as object | undefined) ?? {}),
@@ -2493,9 +2551,15 @@ export class AgentManager {
 
 	async getForkMessages(agentId: string): Promise<ForkMessage[]> {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request({
-			type: "get_fork_messages",
-		});
+		const { response, command } = await requestPiCommand(
+			runtime.slot.process.client,
+			"get_branch_messages",
+		);
+		if (!response.success) {
+			// 失败不能再当空列表：渲染层会据此判断「这句能不能 fork」，静默变空会让
+			// 用户点 fork 后只看到「找不到对应消息」的误导提示。
+			throw new Error(`读取可分叉消息失败（${command}）：${response.error ?? "未知错误"}`);
+		}
 		return (
 			(response.data as { messages?: ForkMessage[] } | undefined)?.messages ?? []
 		);
@@ -2503,17 +2567,29 @@ export class AgentManager {
 
 	async forkSession(agentId: string, entryId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "fork", entryId },
-			120_000,
-		);
+		const { response, command } = await requestPiCommand(runtime.slot.process.client, "fork", {
+			params: { entryId },
+			timeoutMs: 120_000,
+		});
+		// 旧实现不看 success 就刷新状态：pi 拒绝（如旧版 pi 没有 fork/clone）时，渲染层
+		// 拿到 undefined 会按「已分叉」继续（预填输入框 + 提示完成），制造假成功。
+		// cancelled 属于业务结果（会话忙被拒），照常回传，由渲染层用 i18n 文案提示。
+		if (!response.success) {
+			throw new Error(`分叉会话失败（${command}）：${response.error ?? "未知错误"}`);
+		}
 		await this.refreshRuntimeAfterSessionReplacement(agentId);
 		return response.data;
 	}
 
 	async cloneSession(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request({ type: "clone" }, 120_000);
+		// clone 在 pi 18.10 起改名 fork（不带 entryId = 复制整个会话）。
+		const { response, command } = await requestPiCommand(runtime.slot.process.client, "fork", {
+			timeoutMs: 120_000,
+		});
+		if (!response.success) {
+			throw new Error(`复制会话失败（${command}）：${response.error ?? "未知错误"}`);
+		}
 		await this.refreshRuntimeAfterSessionReplacement(agentId);
 		return response.data;
 	}
@@ -2540,14 +2616,37 @@ export class AgentManager {
 		this.emitState();
 	}
 
+	/**
+	 * 读 pi 的斜线命令目录（新名 get_available_commands，旧版 pi 自动回退 get_commands）。
+	 *
+	 * 失败必须可见：旧实现把失败静默折成 []，于是「/」面板只剩本地注册的 handful 命令，
+	 * 日志里连一条 warn 都没有（实测用户侧 10/13-10/16 一直如此）。这里记命令名 + pi 原始 error。
+	 */
+	private async readPiSlashCommands(
+		runtime: AgentRuntime,
+		agentId: string,
+		timeoutMs?: number,
+	): Promise<unknown[]> {
+		const { response, command } = await requestPiCommand(
+			runtime.slot.process.client,
+			"get_available_commands",
+			{ timeoutMs },
+		);
+		if (!response.success) {
+			void this.appLogger?.warn("agent", "Failed to read pi slash commands", {
+				agentId,
+				command,
+				kind: classifyPiFailure(response),
+				error: response.error,
+			});
+			return [];
+		}
+		return (response.data as { commands?: unknown[] } | undefined)?.commands ?? [];
+	}
+
 	async getCommands(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request({
-			type: "get_commands",
-		});
-		return (
-			(response.data as { commands?: unknown[] } | undefined)?.commands ?? []
-		);
+		return this.readPiSlashCommands(runtime, agentId);
 	}
 
 	private async promptMatchesRegisteredExtensionCommand(runtime: AgentRuntime, message: string): Promise<boolean> {
@@ -2557,10 +2656,7 @@ export class AgentManager {
 		const commandName = trimmed.slice(1).split(/\s+/, 1)[0];
 		if (!commandName) return false;
 
-		const response = await runtime.slot.process.client
-			.request({ type: "get_commands" }, 10_000)
-			.catch(() => undefined);
-		const commands = (response?.data as { commands?: unknown[] } | undefined)?.commands ?? [];
+		const commands = await this.readPiSlashCommands(runtime, runtime.tab.id, 10_000).catch(() => []);
 		return commands.some((command) => {
 			if (!command || typeof command !== "object") return false;
 			const typed = command as { name?: unknown; source?: unknown };

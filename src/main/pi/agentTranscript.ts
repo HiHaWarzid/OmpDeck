@@ -63,6 +63,11 @@ export type TranscriptBudgetTrim = {
 	estimatedBytes: number;
 	/** 触发裁剪的预算上限。 */
 	limitBytes: number;
+	/**
+	 * 尾部窗口本身已超预算（单条巨型消息）：此时不裁，只登记一条诊断。
+	 * 裁到空会让时间线整体消失，比超预算更糟；有了这条日志才能解释内存为何仍高。
+	 */
+	overBudget?: boolean;
 };
 
 export type AgentTranscriptState = {
@@ -184,15 +189,18 @@ export function markAllMessagesDirty(state: AgentTranscriptState): void {
 }
 
 /**
- * 写入后按预算裁剪窗口（三个写入收口统一调用）。
+ * 写入后按预算裁剪窗口（各写入收口统一调用）。
  *
  * 只裁头部，最近的消息永远保留——正在流式更新的 assistant 消息、工具结果卡都在尾部。
  * 丢弃的消息 id 要同步清理 toolMessageIds / retryStatusMessageId：迟到的事件若找不到
  * 目标会重新 push 一张卡，同一轮回答/同一次重试就变成两条。
+ *
+ * force=true 用于整表替换（历史加载/会话切换）：新基线可能一次性带来整个大会话，
+ * 不能等攒够 32 条新消息才校验，否则内存峰值就发生在加载那一刻。
  */
-function enforceTranscriptBudget(state: AgentTranscriptState): void {
+function enforceTranscriptBudget(state: AgentTranscriptState, force = false): void {
 	const messages = state.messages;
-	if (messages.length - state.budgetCheckedLength < TRANSCRIPT_BUDGET_CHECK_STEP) return;
+	if (!force && messages.length - state.budgetCheckedLength < TRANSCRIPT_BUDGET_CHECK_STEP) return;
 	state.budgetCheckedLength = messages.length;
 	let total = 0;
 	for (const message of messages) total += estimateMessageBytes(message);
@@ -213,8 +221,17 @@ function enforceTranscriptBudget(state: AgentTranscriptState): void {
 		if (activeIndex !== -1 && activeIndex < keepFrom) keepFrom = activeIndex;
 	}
 	// 头部为空说明尾部本身已超水位（单条巨型消息）：不裁，至少留一条消息做基线，
-	// 与 getMessages「基线绝不被裁空」的约定一致。
-	if (keepFrom <= 0) return;
+	// 与 getMessages「基线绝不被裁空」的约定一致；但要留一条诊断，否则内存高得没有解释。
+	if (keepFrom <= 0) {
+		state.pendingBudgetTrim = {
+			droppedMessages: 0,
+			keptMessages: messages.length,
+			estimatedBytes: total,
+			limitBytes: MAX_TRANSCRIPT_BYTES,
+			overBudget: true,
+		};
+		return;
+	}
 
 	const keptMessages = messages.slice(keepFrom);
 	const keptBytes = keptMessages.reduce((sum, message) => sum + estimateMessageBytes(message), 0);
@@ -246,12 +263,20 @@ export function takeDirtySlice(state: AgentTranscriptState): { replaceFrom: numb
 	return { replaceFrom, messages: messages.slice(replaceFrom) };
 }
 
-/** 整表替换（历史加载 / 会话切换）：新基线 + 全量推送。 */
+/**
+ * 整表替换（历史加载 / 会话切换）：新基线 + 全量推送 + 立即按预算收口。
+ *
+ * 保留 activeAssistantMessageId / toolMessageIds：历史加载的后台回写会走
+ * preserveMessagesAfter 把加载期间新增的流式回答接回尾部，清空映射会让随后到达的
+ * text_delta / tool_execution_end 找不到目标而重新 push 一份（同一轮回答分裂成两个气泡）。
+ * 目标消息确实不存在时，upsertAssistantMessage 会按原 id 在尾部补建，行为不变。
+ */
 export function replaceMessages(state: AgentTranscriptState, messages: ChatMessage[]): void {
 	state.messages = messages;
-	state.activeAssistantMessageId = undefined;
-	state.toolMessageIds.clear();
 	markAllMessagesDirty(state);
+	// 历史加载可能一次性带进整个大会话：必须立刻校验，否则 8MB 预算对「resume 大历史」
+	// 这条最容易 OOM 的路径完全不生效（旧实现直接赋值 messages，绕过所有裁剪收口）。
+	enforceTranscriptBudget(state, true);
 }
 
 /**

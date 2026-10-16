@@ -3,7 +3,7 @@
  *
  * 从 index.ts 的 registerIpc() 迁移而来（含原内联的 piExecInstall/piCheckNpm）。
  * 返回 HandlerMap 由 registerIpcHandlers 统一注册（通道名/协议取自通道表）。
- * cachedListModels / cachedListModelsPending 为 handler 级缓存，生命周期与注册一致。
+ * cachedListModels / cachedListModelsPending / cachedModelListCommand 为 handler 级缓存，生命周期与注册一致。
  */
 import { app } from "electron";
 import { execFile } from "node:child_process";
@@ -13,40 +13,16 @@ import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
 import type { AvailableModel, NpmAvailabilityResult, PiInstallExecResult } from "../../shared/types";
 import { PiLocator } from "../pi/PiLocator";
+import {
+	detectModelListCommand,
+	parseLegacyModelTable,
+	parseModelsJson,
+	type ModelListCommand,
+} from "../pi/piModels";
 import type { ExtensionManager } from "../extensions/ExtensionManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AppLogger } from "../logging/AppLogger";
 import type { ConfigManager } from "../config/ConfigManager";
-
-/**
- * 解析 pi --list-models 表格输出为 AvailableModel[]。
- * 表格格式：provider  model  context  max-out  thinking  images
- */
-function parsePiListModels(stdout: string): Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> {
-	const lines = stdout.split(/\r?\n/).filter(Boolean);
-	if (lines.length < 2) return [];
-	// 跳过表头
-	const dataLines = lines.slice(1);
-	const models: Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> = [];
-	for (const line of dataLines) {
-		// 列1: provider, 列2: model, 列6: thinking (yes/no), 列7: images (yes/no)
-		const parts = line.trim().split(/\s+/);
-		if (parts.length < 3) continue;
-		const provider = parts[0];
-		const modelId = parts[1];
-		// thinking 和 images 在倒数第二列和最后一列
-		const thinking = parts[parts.length - 2]?.toLowerCase() === "yes";
-		const images = parts[parts.length - 1]?.toLowerCase() === "yes";
-		models.push({
-			provider,
-			id: modelId,
-			name: `${provider}/${modelId}`,
-			thinking,
-			supportsImages: images,
-		});
-	}
-	return models;
-}
 
 /** 智能查找 wsl.exe：优先绝对路径（含 32-bit Sysnative 绕过），全部不存在时回退到 PATH */
 const wslExeResolved = (() => {
@@ -79,10 +55,11 @@ type PiHandlerMaps = {
 export function registerPiHandlers(deps: PiHandlerDeps): PiHandlerMaps {
 	const { piLocator, settingsStore, extensionManager, appLogger, configManager } = deps;
 
-	// 从 pi --list-models 获取可用模型列表（无需启动 agent）
-	// 全局缓存：首次运行后复用，避免每次打开选择器都 fork 子进程
+	// 模型目录：命令形态（`models --json` / 旧 `--list-models`）按 pi 版本探测一次并长期缓存，
+	// 目录内容首次拉取后缓存，避免每次打开选择器都 fork 子进程。
 	let cachedListModels: AvailableModel[] | null = null;
 	let cachedListModelsPending: Promise<AvailableModel[]> | null = null;
+	let cachedModelListCommand: ModelListCommand | undefined;
 
 	return {
 		pi: {
@@ -308,33 +285,65 @@ export function registerPiHandlers(deps: PiHandlerDeps): PiHandlerMaps {
 
 					cachedListModelsPending = (async () => {
 						const settings = settingsStore.get();
-						const command = piLocator.resolveCommand(
-							settings.customPiPath,
-							settings.wslEnabled,
-							settings.wslDistro,
-							settings.wslUser,
-						);
-						const invocation = piLocator.createInvocation(command, ["--list-models"]);
-												const result = await new Promise<{ stdout: string }>((resolve, reject) => {
-							execFile(invocation.command, invocation.args, {
-								env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
-								shell: invocation.shell,
-								windowsHide: true,
-								timeout: 15_000,
-								encoding: "utf8",
-								windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-							}, (error, stdout, stderr) => {
-								if (error) {
-									const message = (stderr || error.message).slice(0, 300);
-									reject(new Error(message));
-								} else {
-									resolve({ stdout });
-								}
+						const runPi = (args: string[], timeoutMs: number) => {
+							const command = piLocator.resolveCommand(
+								settings.customPiPath,
+								settings.wslEnabled,
+								settings.wslDistro,
+								settings.wslUser,
+							);
+							const invocation = piLocator.createInvocation(command, args);
+							return new Promise<{ stdout: string }>((resolve, reject) => {
+								execFile(invocation.command, invocation.args, {
+									env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
+									shell: invocation.shell,
+									windowsHide: true,
+									timeout: timeoutMs,
+									encoding: "utf8",
+									windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+								}, (error, stdout, stderr) => {
+									if (error) {
+										reject(new Error((stderr || error.message).slice(0, 300)));
+									} else {
+										resolve({ stdout });
+									}
+								});
 							});
-						});
-						const models = await configManager.filterConfiguredModels(parsePiListModels(result.stdout));
-						cachedListModels = models;
-						return models;
+						};
+
+						// 先探测命令形态（读 --help，不可能挂起）：新版 pi 把未知参数 `--list-models`
+						// 当交互式启动处理，直接跑会在 15s 后被 timeout 杀掉并静默降级成空列表。
+						if (!cachedModelListCommand) {
+							const help = await runPi(["--help"], 20_000);
+							cachedModelListCommand = detectModelListCommand(help.stdout);
+							if (!cachedModelListCommand) {
+								void appLogger.warn("pi", "pi help exposes no model list command", {
+									helpHead: help.stdout.slice(0, 200),
+								});
+								return [];
+							}
+							void appLogger.info("pi", "pi model list command detected", {
+								mode: cachedModelListCommand.mode,
+								args: cachedModelListCommand.args.join(" "),
+							});
+						}
+
+						// 目录刷新可能走网络（实测冷启动 11s），超时给足；结果只取一次，之后走内存缓存。
+						const result = await runPi(cachedModelListCommand.args, 60_000);
+						const models =
+							cachedModelListCommand.mode === "json"
+								? parseModelsJson(result.stdout)
+								: parseLegacyModelTable(result.stdout);
+						if (models.length === 0) {
+							void appLogger.warn("pi", "pi model list returned no parsable entries", {
+								mode: cachedModelListCommand.mode,
+								stdoutBytes: result.stdout.length,
+								stdoutHead: result.stdout.slice(0, 200),
+							});
+							return [];
+						}
+						cachedListModels = await configManager.filterConfiguredModels(models);
+						return cachedListModels;
 					})();
 					const models = await cachedListModelsPending;
 					return models;

@@ -44,17 +44,40 @@ describe("agent transcript", () => {
 		expect(takeDirtySlice(s)).toMatchObject({ replaceFrom: 1, messages: [target] });
 	});
 
-	it("replaceMessages forces a full baseline push and drops the active assistant id", () => {
+	it("replaceMessages forces a full baseline push without dropping in-flight tracking", () => {
 		const s = createTranscriptState();
 		beginAssistantMessage(s);
-		expect(s.activeAssistantMessageId).toBeDefined();
+		const activeId = s.activeAssistantMessageId;
+		expect(activeId).toBeDefined();
 
 		const history = [{ id: "h1", agentId: AGENT, role: "user", text: "old", timestamp: 1 }] as ChatMessage[];
 		replaceMessages(s, history);
 
 		expect(s.messages).toBe(history);
-		expect(s.activeAssistantMessageId).toBeUndefined();
 		expect(takeDirtySlice(s).replaceFrom).toBe(0);
+		// 加载期间正在流式的回答会在 merge 阶段被接回尾部，映射必须保留：
+		// 清空会让随后的 text_delta 找不到目标，把同一轮回答变成两个气泡。
+		expect(s.activeAssistantMessageId).toBe(activeId);
+	});
+
+	it("replaceMessages enforces the memory budget immediately (resume of a huge session)", () => {
+		const s = createTranscriptState();
+		// 单条消息约 1MB（text 按 UTF-16 计 2 字节/字符），20 条即 20MB，远超 8MB 预算。
+		const history = Array.from({ length: 20 }, (_, index) => ({
+			id: `h${index}`,
+			agentId: AGENT,
+			role: "user",
+			text: "x".repeat(512 * 1024),
+			timestamp: index,
+		})) as ChatMessage[];
+
+		replaceMessages(s, history);
+
+		// 裁到 70% 水位以下，且最近的消息必须留着（正在看的就是尾部）。
+		expect(s.messages.length).toBeLessThan(history.length);
+		expect(s.messages.at(-1)?.id).toBe("h19");
+		expect(s.pendingBudgetTrim).toMatchObject({ limitBytes: MAX_TRANSCRIPT_BYTES });
+		expect(s.pendingBudgetTrim?.droppedMessages).toBeGreaterThan(0);
 	});
 
 	it("streaming deltas accumulate; text_end recalibrates instead of doubling the text", () => {

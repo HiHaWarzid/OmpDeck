@@ -108,6 +108,12 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				}
 				return agentManager.readMessageFullText(agentId, messageId, entryId as string | undefined);
 			},
+			readArchivedMessages: async (_event, agentId, compactionId) => {
+				// 入参校验在边界（渲染层数据不可信）
+				if (typeof agentId !== "string" || !agentId.trim()) throw new Error("Invalid agentId");
+				if (typeof compactionId !== "string" || !compactionId.trim()) throw new Error("Invalid compactionId");
+				return agentManager.readArchivedMessages(agentId, compactionId);
+			},
 		},
 
 		// ── Codex / Claude / OpenCode 会话导入 ──

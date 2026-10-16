@@ -6,10 +6,10 @@ import { ArrowLeft, Edit3, Maximize, Minimize2, SquareSplitHorizontal, X, Eye, F
 import { setupMonaco } from "../../utils/monacoSetup";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import rehypeKatex from "rehype-katex";
 import { defaultUrlTransform } from "react-markdown";
 
 import { isBinaryExtension } from "../../utils/isTextFile";
+import { KATEX_REHYPE_PLUGIN } from "../../utils/markdownKatex";
 
 let monacoSetupOnce = false;
 function ensureMonaco() {
@@ -386,7 +386,7 @@ export function FileDiffViewer(props: {
 							<div className="file-diff-preview">
 								<ReactMarkdown
 									remarkPlugins={[remarkGfm]}
-									rehypePlugins={[rehypeKatex]}
+									rehypePlugins={[KATEX_REHYPE_PLUGIN]}
 									urlTransform={defaultUrlTransform}
 								>
 									{content}

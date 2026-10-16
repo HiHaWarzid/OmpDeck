@@ -223,6 +223,7 @@ import { UpdateManager } from "./update/UpdateManager";
 import { LinkOpener } from "./links/LinkOpener";
 import { TrayManager } from "./tray/TrayManager";
 import { RpcLogger } from "./logging/RpcLogger";
+import { RendererConsoleLimiter, type RendererConsoleEvent } from "./logging/rendererConsoleLimiter";
 import { resolveWslEnvironment } from "./wsl/WslEnvironment";
 import type { WslEnvironment } from "./wsl/WslPaths";
 import {
@@ -259,10 +260,42 @@ const RENDERER_CONSOLE_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }
 	{ pattern: /Should have a queue\. You are likely calling Hooks conditionally/, reason: "hmr-transient" },
 	{ pattern: /React has detected a change in the order of Hooks/, reason: "hmr-transient" },
 ];
-/** console 错误聚合限流：同类错误窗口内只落盘首条 + 计数，第三条起再记一次 repeated。 */
-const RENDERER_CONSOLE_AGGREGATE_WINDOW_MS = 60_000;
-const RENDERER_CONSOLE_AGGREGATE_MAX = 3;
-const rendererConsoleRate = new Map<string, { count: number; lastAt: number }>();
+/** console 错误聚合限流：key 归一化 + 同 key 聚合 + 窗口内总量上限，见 logging/rendererConsoleLimiter.ts。 */
+const rendererConsoleLimiter = new RendererConsoleLimiter();
+
+/**
+ * 把限流器处置翻译成 appLogger 调用：entry / repeated 保留原有 detail 字段风格
+ * （level / message / line / sourceId），超总量上限的窗口只落一条 suppressed 汇总。
+ */
+function logRendererConsoleEvents(events: RendererConsoleEvent[]): void {
+	for (const rendererEvent of events) {
+		if (rendererEvent.type === "entry") {
+			void appLogger.warn("app", "Main window renderer console error", {
+				level: rendererEvent.entry.level,
+				message: rendererEvent.entry.message,
+				line: rendererEvent.entry.line,
+				sourceId: rendererEvent.entry.sourceId,
+			});
+			continue;
+		}
+		if (rendererEvent.type === "repeated") {
+			void appLogger.warn("app", "Main window renderer console error (repeated)", {
+				level: rendererEvent.entry.level,
+				message: rendererEvent.entry.message,
+				line: rendererEvent.entry.line,
+				sourceId: rendererEvent.entry.sourceId,
+				repeated: rendererEvent.repeated,
+			});
+			continue;
+		}
+		void appLogger.warn("app", "Main window renderer console errors suppressed", {
+			suppressed: rendererEvent.suppressed,
+			total: rendererEvent.total,
+			windowMs: rendererEvent.windowMs,
+		});
+	}
+}
+
 let projectStore: ProjectStore;
 let fileSystemService: FileSystemService;
 let sessionScanner: SessionScanner;
@@ -817,40 +850,16 @@ async function createWindow() {
 				);
 				if (noise) return;
 			}
-			// 同类错误聚合限流：同一错误反复出现时只记录首条与计数，
-			// 第三条起再记一条 repeated 标记，避免日志被同一错误刷屏。
-			const key = `${event.level}:${message.slice(0, 120)}`;
-			const now = Date.now();
-			const agg = rendererConsoleRate.get(key);
-			if (agg && now - agg.lastAt < RENDERER_CONSOLE_AGGREGATE_WINDOW_MS) {
-				agg.count += 1;
-				agg.lastAt = now;
-				if (agg.count === RENDERER_CONSOLE_AGGREGATE_MAX) {
-					void appLogger.warn("app", "Main window renderer console error (repeated)", {
-						level: event.level,
-						message,
-						line: event.lineNumber,
-						sourceId: event.sourceId,
-						repeated: agg.count,
-					});
-				}
-				return;
-			}
-			// 新错误或窗口过期：重置计数并落盘；map 过大时顺带清理过期条目。
-			if (rendererConsoleRate.size > 200) {
-				for (const [k, v] of rendererConsoleRate) {
-					if (now - v.lastAt >= RENDERER_CONSOLE_AGGREGATE_WINDOW_MS) {
-						rendererConsoleRate.delete(k);
-					}
-				}
-			}
-			rendererConsoleRate.set(key, { count: 1, lastAt: now });
-			void appLogger.warn("app", "Main window renderer console error", {
-				level: event.level,
-				message,
-				line: event.lineNumber,
-				sourceId: event.sourceId,
-			});
+			// 同类错误聚合 + 窗口内总量上限统一由 RendererConsoleLimiter 处理
+			// （key 归一化把 KaTeX `Unicode text character "X"` 这类只差一个字符的告警聚到同一 key）。
+			logRendererConsoleEvents(
+				rendererConsoleLimiter.record({
+					level: event.level,
+					message,
+					line: event.lineNumber,
+					sourceId: event.sourceId,
+				}),
+			);
 		},
 	);
 

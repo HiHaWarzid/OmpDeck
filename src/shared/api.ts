@@ -192,6 +192,12 @@ export interface SessionsApi {
 	 */
 	readChatMessages: (filePath: string, maxBytes?: number) => Promise<{ messages: ChatMessage[]; truncated: boolean }>;
 	readMessageFullText: (agentId: string, messageId: string, entryId?: string) => Promise<{ text: string }>;
+	/**
+	 * 压缩归档消息（按需）：压缩前的历史只保留「条数」随基线推送，
+	 * 展开压缩卡片时才按 compactionId 取回内容——归档可达整个压缩前历史（MB 级），
+	 * 随每次状态推送结构化克隆会直接顶爆渲染进程内存。
+	 */
+	readArchivedMessages: (agentId: string, compactionId: string) => Promise<{ messages: ChatMessage[] }>;
 }
 
 export interface CodexSessionsApi {

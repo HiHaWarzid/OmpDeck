@@ -3132,6 +3132,20 @@ body.is-terminal-resizing {
   /* 视觉间隔由 border-top 承担 */
 }
 
+/* 归档区状态行：加载中 / 读取失败（失败必须可见，附重试按钮） */
+.compaction-card-archive-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+}
+
+.compaction-card-archive-status--error {
+  color: var(--color-danger);
+}
+
 /* ── 归档消息列表 ── */
 .archived-message-list {
   display: flex;

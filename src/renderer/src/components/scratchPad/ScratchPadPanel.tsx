@@ -1,14 +1,14 @@
 import { memo, useCallback, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { Download, Eye, FilePlus, PanelRightOpen, Pencil, Trash2 } from "lucide-react";
-import type { Plugin } from "unified";
+import type { Plugin, PluggableList } from "unified";
 import type { Root, Element, Text } from "hast";
 import type { DraftMeta } from "../../../../shared/types";
 import { t } from "../../i18n";
+import { KATEX_REHYPE_PLUGIN } from "../../utils/markdownKatex";
 import { IconButton } from "../ui/IconButton";
 
 type Mode = "edit" | "preview";
@@ -147,6 +147,10 @@ const rehypeHighlightMark: Plugin<[], Root> = () => {
 		walker(tree.children);
 	};
 };
+
+// 草稿预览的 rehype 插件链：KaTeX 严格度与助手正文共用同一份选项（见 utils/markdownKatex.ts），
+// `$中文，文本$` 这类中文/全角标点不再逐字符触发 strict 告警；数组提升为模块常量以保持引用稳定。
+const PREVIEW_REHYPE_PLUGINS: PluggableList = [KATEX_REHYPE_PLUGIN, rehypeHighlightMark];
 
 /* 草稿列表项组件 */
 const DraftItem = memo(function DraftItem({
@@ -304,7 +308,7 @@ export const ScratchPadPanel = memo(function ScratchPadPanel(props: ScratchPadPa
 								<div className="scratch-pad-md">
 									<ReactMarkdown
 										remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-										rehypePlugins={[rehypeKatex, rehypeHighlightMark]}
+										rehypePlugins={PREVIEW_REHYPE_PLUGINS}
 										components={{
 											/* GFM task list：用 AST 节点行号直接定位源码行，避免 render-order 计数器漂移 */
 											li: ({ node, className, children, ...liProps }) => {

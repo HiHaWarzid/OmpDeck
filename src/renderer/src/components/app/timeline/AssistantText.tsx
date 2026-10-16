@@ -12,7 +12,6 @@ import {
 } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import katex from "katex";
-import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
@@ -22,6 +21,8 @@ import { t } from "../../../i18n";
 import { showNotice } from "../../../utils/notice";
 import { writeClipboard } from "../../../utils/clipboard";
 import { filePathFromHref, stripFileLocation, toInternalFileHref } from "../../../utils/fileLinks";
+import { KATEX_OPTIONS, KATEX_REHYPE_PLUGIN } from "../../../utils/markdownKatex";
+import type { PluggableList } from "unified";
 import type { ImageContent } from "../../../../../shared/types";
 import { stripAnsi, stripThinkingTags } from "../format";
 
@@ -107,7 +108,9 @@ const remarkLinkifyPaths = () => {
 // ReactMarkdown 对 plugins 数组做引用对比；每次渲染新建数组会触发整条 markdown 重新解析。
 // 完整渲染管线常量：引用稳定，避免每次渲染重新初始化插件链。
 const FULL_REMARK_PLUGINS = [remarkGfm, remarkMath, remarkLinkifyPaths];
-const FULL_REHYPE_PLUGINS = [rehypeKatex];
+// KaTeX 严格度与 LatexBlock / 草稿预览共用同一份选项（见 utils/markdownKatex.ts）：
+// 模型输出里的中文、全角标点常被 $...$ 包住，默认 strict:"warn" 会逐字符刷屏告警。
+const FULL_REHYPE_PLUGINS: PluggableList = [KATEX_REHYPE_PLUGIN];
 /** 助手正文：扁平 markdown 渲染，无气泡包裹，全宽排版，支持内嵌图片。
  *  路径链接化用 remark 插件在 mdast 层处理（见底部 remarkLinkifyPaths），不再前置改写原始字符串。 */
 /** 表格容器：与 code-block-wrap 保持相同的宽度与圆角，内部 <table> 仍负责横向滚动。 */
@@ -192,12 +195,11 @@ function LatexBlock(props: { source: string }) {
 	const rendered = useMemo(() => {
 		if (!source) return { html: "", error: null as string | null };
 		try {
-			// displayMode + throwOnError:false：多行方程块也能尽量渲染；错误以 katex-error span 呈现。
+			// displayMode + 共享 KATEX_OPTIONS（strict:"ignore" / throwOnError:false / trust:false）：
+			// 多行方程块也能尽量渲染，中文与全角标点不再逐字符告警；真实错误以 katex-error span 呈现。
 			const html = katex.renderToString(source, {
 				displayMode: true,
-				throwOnError: false,
-				strict: "ignore",
-				trust: false,
+				...KATEX_OPTIONS,
 			});
 			return { html, error: null as string | null };
 		} catch (err) {

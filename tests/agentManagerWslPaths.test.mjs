@@ -35,11 +35,30 @@ function loadAgentManager() {
 		unlink: [],
 		writeFile: [],
 	};
+	// 会话文件内容：默认桩（header + 一条 user 消息），压缩相关用例整份替换。
+	// 尾窗读取会丢弃窗口内第一个换行之前的片段（那可能是被窗口切开的残行），
+	// 所以桩文件不能只有一行，否则消息行会被当成残行丢掉。
+	const sessionLines = [
+		JSON.stringify({ type: "session", id: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+		JSON.stringify({
+			id: "entry-user",
+			type: "message",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "hello" },
+		}),
+		"",
+	];
+	const setSessionLines = (lines) => {
+		sessionLines.length = 0;
+		sessionLines.push(...lines);
+	};
 	const fsPromises = {
 		copyFile: async (...args) => { calls.copyFile.push(args); },
 		readFile: async (...args) => {
 			calls.readFile.push(args);
-			return `${JSON.stringify({ id: "entry-user", type: "message", message: { role: "user", content: "hello" } })}\n`;
+			// 与生产同形：首行 header + 消息行。
+			return sessionLines.join("\n");
 		},
 		// sessionEntries 的读取管线先 stat 取指纹再决定读多少；桩文件内容固定，
 		// size 用与 fsPromises.open 同一份内容的字节数，保证指纹/尾窗计算一致。
@@ -55,9 +74,11 @@ function loadAgentManager() {
 		writeFile: async (...args) => { calls.writeFile.push(args); },
 	};
 	const fsSync = {
+		// 会话文件视为存在（loadMessages 的「RPC 失败/为空 → 文件直读兜底」要先过存在性判断），
+		// 其余路径维持 false，保持既有用例对「不存在即不读」的隐含假设。
 		existsSync: (filePath) => {
 			calls.existsSync.push(filePath);
-			return false;
+			return typeof filePath === "string" && filePath.endsWith(".jsonl");
 		},
 		readdirSync: (dir) => {
 			calls.readdirSync.push(dir);
@@ -157,6 +178,8 @@ function loadAgentManager() {
 	// AgentManager 引入 ../perf（src/main/perf.ts，纯诊断模块，无内部依赖）；
 	// 测试文件自身的 require 会把 "../perf" 解析到仓库根目录，必须显式注入。
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
+	// 跨 pi 版本的 RPC 命令名兼容层（新名优先 / 旧名兜底，仅类型导入无运行时依赖）。
+	registry["./piRpcCompat"] = loadModule("src/main/pi/piRpcCompat.ts", "piRpcCompat.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {
@@ -165,6 +188,7 @@ function loadAgentManager() {
 		agentRunState,
 		agentTranscript,
 		calls,
+		setSessionLines,
 		wslPaths,
 	};
 }
@@ -324,4 +348,177 @@ test("uses host paths for trust resource checks and Linux paths for trust keys",
 	} finally {
 		rmSync(trustDir, { recursive: true, force: true });
 	}
+});
+
+/**
+ * 构造 AgentManager 期望的运行时形状（与生产 createAgentRuntime 同形）：
+ * loadMessages / fork / clone 只碰 slot.client、tab 与 transcript/run 状态，其余字段照
+ * 既有 WSL 用例补齐即可。
+ */
+function createRuntimeFixture({ agentProcessSlot, agentTranscript, agentRunState, client, tab }) {
+	return {
+		slot: new agentProcessSlot.AgentProcessSlot({ client }),
+		tab: { id: "agent", projectId: "project", title: "Agent", status: "idle", createdAt: 1, ...tab },
+		transcript: agentTranscript.createTranscriptState(),
+		run: agentRunState.createRunState(),
+		toolStateSequence: 0,
+		activeToolCalls: new Map(),
+		toolExecuting: null,
+		pendingUIRequests: new Map(),
+		rpcLogging: false,
+		compacting: false,
+		rpcCompacting: false,
+		modelRefreshing: false,
+		userInitiatedStop: false,
+		autoRestartAttempted: false,
+	};
+}
+
+test("loadMessages falls back to the session file when get_messages fails", async () => {
+	const { AgentManager, agentProcessSlot, agentTranscript, agentRunState } = loadAgentManager();
+	const manager = createManager(AgentManager);
+	const requests = [];
+	manager.agents.set(
+		"agent",
+		createRuntimeFixture({
+			agentProcessSlot,
+			agentTranscript,
+			agentRunState,
+			// 大会话撞 RPC 传输上限的典型形状：命令本身被识别，但返回 success=false。
+			client: {
+				request: async (request) => {
+					requests.push(request);
+					if (request.type === "get_messages" || request.type === "get_entries") {
+						return {
+							type: "response",
+							command: request.type,
+							success: false,
+							error: "Response exceeds transport limit (max 8388608 bytes)",
+						};
+					}
+					return { type: "response", command: request.type, success: true, data: {} };
+				},
+			},
+			tab: { sessionPath: "C:\\sessions\\session.jsonl" },
+		}),
+	);
+
+	const messages = await manager.loadMessages("agent");
+
+	assert.equal(requests.some((request) => request.type === "get_messages"), true);
+	// 文件桩里有一条 user 消息：RPC 失败后必须回退读文件，而不是渲染成空会话。
+	assert.equal(messages.length > 0, true);
+	assert.equal(messages.some((message) => String(message.text ?? "").includes("hello")), true);
+});
+
+test("compacted session ships an archive index, not the archived messages", async () => {
+	const { AgentManager, agentProcessSlot, agentTranscript, agentRunState, setSessionLines } = loadAgentManager();
+	// 会话链：u1 <- a1 <- comp1(firstKeptEntryId=u1)；a1 属于 comp1 的归档段。
+	setSessionLines([
+		JSON.stringify({ type: "session", id: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+		JSON.stringify({ id: "u1", parentId: null, type: "message", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "q1" } }),
+		JSON.stringify({ id: "a1", parentId: "u1", type: "message", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "r1" }] } }),
+		JSON.stringify({ id: "comp1", parentId: "a1", type: "compaction", summary: "摘要", firstKeptEntryId: "u1", tokensBefore: 1000, timestamp: "2026-01-01T00:00:03.000Z" }),
+		"",
+	]);
+	const manager = createManager(AgentManager);
+	manager.agents.set(
+		"agent",
+		createRuntimeFixture({
+			agentProcessSlot,
+			agentTranscript,
+			agentRunState,
+			client: {
+				request: async (request) => ({
+					type: "response",
+					command: request.type,
+					success: false,
+					error: "Response exceeds transport limit (max 8388608 bytes)",
+				}),
+			},
+			tab: { sessionPath: "C:\\sessions\\session.jsonl" },
+		}),
+	);
+
+	const messages = await manager.loadMessages("agent");
+	const summaryCard = messages.find((message) => message.meta?.type === "compaction");
+	assert.ok(summaryCard, "压缩会话必须补出压缩摘要卡片");
+	// 关键契约：归档正文不随基线下发（MB 级结构化克隆会顶爆渲染进程），只给索引。
+	assert.equal(summaryCard.meta.compactionId, "comp1");
+	assert.equal(summaryCard.meta.archivedMessageCount, 1);
+	assert.equal("archivedMessages" in summaryCard.meta, false);
+	// 保留的消息仍在时间线上
+	assert.equal(messages.some((message) => String(message.text ?? "").includes("q1")), true);
+
+	// 展开时按需取回归档正文
+	const { messages: archived } = await manager.readArchivedMessages("agent", "comp1");
+	assert.equal(archived.length, 1);
+	// 归档段是 a1（assistant），保留段是 u1（user）：长度 + 角色足以区分「取回归档」
+	// 与「把整条分支又返回一遍」。（该用例的 messageContent 是桩，文本提取不可断言）
+	assert.equal(archived[0].role, "assistant");
+	// 取不到必须抛错，不能静默返回空数组（否则 UI 显示「0 条归档」，用户以为历史丢了）
+	await assert.rejects(() => manager.readArchivedMessages("agent", "missing-compaction"));
+});
+
+test("cloneSession prefers the new fork command and falls back to the legacy clone", async () => {
+	const { AgentManager, agentProcessSlot, agentTranscript, agentRunState } = loadAgentManager();
+	const requests = [];
+	const manager = createManager(AgentManager);
+	manager.agents.set(
+		"agent",
+		createRuntimeFixture({
+			agentProcessSlot,
+			agentTranscript,
+			agentRunState,
+			client: {
+				request: async (request) => {
+					requests.push(request);
+					if (request.type === "fork") {
+						return {
+							type: "response",
+							command: "fork",
+							success: true,
+							data: { cancelled: false, sessionPath: "C:\\sessions\\copy.jsonl" },
+						};
+					}
+					return { type: "response", command: request.type, success: false, error: `Unknown command: ${request.type}` };
+				},
+			},
+			tab: {},
+		}),
+	);
+	manager.refreshRuntimeAfterSessionReplacement = async () => {};
+
+	const result = await manager.cloneSession("agent");
+
+	assert.deepEqual(requests.map((request) => request.type), ["fork"]);
+	assert.equal(result.sessionPath, "C:\\sessions\\copy.jsonl");
+
+	// 旧版 pi：fork 回 "Unknown command: fork" → 才退到 clone，且报错只能是 clone 的。
+	const legacyManager = createManager(AgentManager);
+	const legacyRequests = [];
+	legacyManager.agents.set(
+		"agent",
+		createRuntimeFixture({
+			agentProcessSlot,
+			agentTranscript,
+			agentRunState,
+			client: {
+				request: async (request) => {
+					legacyRequests.push(request);
+					if (request.type === "clone") {
+						return { type: "response", command: "clone", success: true, data: { cancelled: false } };
+					}
+					return { type: "response", command: request.type, success: false, error: `Unknown command: ${request.type}` };
+				},
+			},
+			tab: {},
+		}),
+	);
+	legacyManager.refreshRuntimeAfterSessionReplacement = async () => {};
+
+	const legacyResult = await legacyManager.cloneSession("agent");
+
+	assert.deepEqual(legacyRequests.map((request) => request.type), ["fork", "clone"]);
+	assert.equal(legacyResult.cancelled, false);
 });

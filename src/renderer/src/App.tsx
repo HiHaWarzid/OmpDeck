@@ -3800,14 +3800,19 @@ export function App() {
     projectId = sessionsProjectId ?? activeProjectId,
   ) {
     if (!projectId) return;
-    const result = await api.sessions.copy(projectId, filePath);
-    if (result.cancelled) {
-      showToast(t("app.sessionCopyCancelled"));
-      return;
+    try {
+      const result = await api.sessions.copy(projectId, filePath);
+      if (result.cancelled) {
+        showToast(t("app.sessionCopyCancelled"));
+        return;
+      }
+      showToast(t("app.sessionCopied"));
+      await refreshSessions(projectId, true);
+      await refreshProjectSessions(projectId);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      showToast(t("app.sessionCopyFailed", { error: translateAgentErrorMessage(msg) }), 5000);
     }
-    showToast(t("app.sessionCopied"));
-    await refreshSessions(projectId, true);
-    await refreshProjectSessions(projectId);
   }
 
   async function exportHistorySession(session: SessionSummary) {
@@ -3839,6 +3844,11 @@ export function App() {
       await refreshRuntimeState(agentId);
       await refreshSessions(activeProjectId, true);
       if (activeProjectId) await refreshProjectSessions(activeProjectId);
+    } catch (error) {
+      // 主进程现在会把 pi 的失败（命令不兼容/会话忙）抛过来：必须提示，否则用户只看到
+      // 菜单转一圈然后什么都没有（旧实现把失败当成功，直接提示「已复制」）。
+      const msg = error instanceof Error ? error.message : String(error);
+      showToast(t("app.sessionCopyFailed", { error: translateAgentErrorMessage(msg) }), 5000);
     } finally {
       setAgentActionLoading(null);
       setAgentMenu(null);

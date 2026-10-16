@@ -136,6 +136,8 @@ const previewOverrides: NamespaceOverrides = {
 		readChatMessages: async () => ({ messages: [], truncated: false }),
 		// 预览模式无主进程：完整输出按需读取直接返回空文本
 		readMessageFullText: async () => ({ text: "" }),
+		// 预览模式无主进程：压缩归档按需读取返回空段（真实链路读的是会话 jsonl 的归档区间）
+		readArchivedMessages: async () => ({ messages: [] }),
 	},
 	codexSessions: {
 		scan: async () => [],

@@ -184,6 +184,15 @@ export function convertAgentMessages(
 						...(isCompaction && typedMeta?.compactionCount != null
 							? { compactionCount: typedMeta.compactionCount }
 							: {}),
+						// 归档索引：实时会话只带 compactionId + 条数（归档正文按需经
+						// sessions:read-archived-messages 取回，随基线下发会顶爆渲染进程内存）；
+						// 文件直读路径（查看器）仍会带 archivedMessages 正文，这里原样透传。
+						...(isCompaction && typeof typedMeta?.compactionId === "string"
+							? { compactionId: typedMeta.compactionId }
+							: {}),
+						...(isCompaction && typeof typedMeta?.archivedMessageCount === "number"
+							? { archivedMessageCount: typedMeta.archivedMessageCount }
+							: {}),
 						...(typedMeta?.archivedMessages != null
 							? { archivedMessages: typedMeta.archivedMessages }
 							: {}),

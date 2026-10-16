@@ -143,6 +143,24 @@ test("convertAgentMessages handles compactionSummary", () => {
 	assert.equal(result[0]!.meta!.type, "compaction");
 });
 
+test("compaction card meta keeps the archive index but never synthesizes archive bodies", () => {
+	// 实时链路的压缩卡片只允许携带 compactionId + 条数：正文按需经 IPC 取回。
+	// 转换层是白名单拷贝（漏一个字段 = 卡片悄悄失去展开能力），这里钉住索引字段。
+	const raw = [
+		{
+			role: "compactionSummary",
+			summary: "摘要",
+			timestamp: 1000,
+			meta: { compactionId: "comp1", archivedMessageCount: 7, tokensBefore: 1000, compactionCount: 2 },
+		},
+	];
+	const [card] = convertAgentMessages("agent-1", raw, undefined, false);
+	assert.equal(card!.meta!.compactionId, "comp1");
+	assert.equal(card!.meta!.archivedMessageCount, 7);
+	assert.equal(card!.meta!.compactionCount, 2);
+	assert.equal("archivedMessages" in card!.meta!, false);
+});
+
 test("convertAgentMessages aborted flag nullifies askCard answer", () => {
 	const raw = [
 		{

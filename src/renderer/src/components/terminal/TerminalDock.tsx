@@ -14,6 +14,7 @@ import { ChevronDown, ChevronUp, MoreHorizontal, Plus, X } from "lucide-react";
 import type { PiDesktopApi } from "../../../../shared/api";
 import type { TerminalTab } from "../../../../shared/types";
 import { t } from "../../i18n";
+import { appendScrollback } from "./scrollbackBuffer";
 
 const TERMINAL_THEMES = {
 	"pi-soft": {
@@ -176,7 +177,12 @@ export function TerminalDock(props: {
 				buffersRef.current = nextTabs.reduce<Record<string, string>>(
 					(current, tab) => ({
 						...current,
-						[tab.id]: tab.buffer ?? current[tab.id] ?? "",
+						// 主进程回放缓冲也可能很大（切回会话时一次性送来），同样要过一遍有界截断
+						[tab.id]: appendScrollback(
+							"",
+							tab.buffer ?? current[tab.id] ?? "",
+							t("terminal.scrollbackTruncated"),
+						),
 					}),
 					{ ...buffersRef.current },
 				);
@@ -221,10 +227,21 @@ export function TerminalDock(props: {
 		};
 	}, [props.terminal, open, contentReady]);
 
+	/**
+	 * 每个 tab 回放缓冲的唯一写入入口：追加 + 有界尾部截断（规则见 scrollbackBuffer.ts）。
+	 * 初始回放、onData、onExit 都经此处，避免任何一处退回无上限字符串拼接（那正是 OOM 的成因）。
+	 */
+	function pushScrollback(tabId: string, chunk: string) {
+		buffersRef.current[tabId] = appendScrollback(
+			buffersRef.current[tabId] ?? "",
+			chunk,
+			t("terminal.scrollbackTruncated"),
+		);
+	}
+
 	useEffect(() => {
 		const offData = props.terminal.onData((payload) => {
-			buffersRef.current[payload.tabId] =
-				(buffersRef.current[payload.tabId] ?? "") + payload.data;
+			pushScrollback(payload.tabId, payload.data);
 			if (payload.tabId === activeTabIdRef.current) {
 				xtermRef.current?.write(payload.data);
 			}
@@ -238,8 +255,7 @@ export function TerminalDock(props: {
 				),
 			);
 			const exitText = `\r\n[process exited${payload.exitCode != null ? ` with code ${payload.exitCode}` : ""}]\r\n`;
-			buffersRef.current[payload.tabId] =
-				(buffersRef.current[payload.tabId] ?? "") + exitText;
+			pushScrollback(payload.tabId, exitText);
 			if (payload.tabId === activeTabIdRef.current) xtermRef.current?.write(exitText);
 		});
 		return () => {

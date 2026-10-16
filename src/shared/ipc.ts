@@ -181,6 +181,7 @@ export const ipcTable = {
 		readSessionMeta: { channel: "sessions:read-meta", kind: "invoke" },
 		readChatMessages: { channel: "sessions:read-chat-messages", kind: "invoke" },
 		readMessageFullText: { channel: "sessions:read-message-full-text", kind: "invoke" },
+		readArchivedMessages: { channel: "sessions:read-archived-messages", kind: "invoke" },
 	},
 	codexSessions: {
 		scan: { channel: "codex-sessions:scan", kind: "invoke" },
