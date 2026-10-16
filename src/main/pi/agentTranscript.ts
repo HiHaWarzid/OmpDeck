@@ -6,6 +6,9 @@ import { formatToolDetail } from "./messageTimeline";
 import { buildAskCard, extractAskQuestionDetails } from "./askQuestionCard";
 import {
 	MAX_TOOL_RESULT_CHARS,
+	NESTED_META_BYTES_KEYS,
+	TEXTUAL_META_BYTES_KEYS,
+	compactJsonLength,
 	estimateMessageBytes,
 	extractThinking,
 	extractToolResultText,
@@ -33,6 +36,14 @@ import {
 
 /** 工具完整结果文本的内存缓存上限：超出按插入序淘汰最旧一条。 */
 const TOOL_FULL_TEXT_LRU_MAX = 200;
+
+/**
+ * 工具完整结果文本的字节上限（UTF-16 估算）。
+ *
+ * 条数上限挡不住内存：一次 `cat` 大文件就能产出 MB 级完整结果，200 条合计可到 GB。
+ * 与 transcript 预算同量级即可——这些文本只服务「展开完整结果」，超出后按最旧优先淘汰。
+ */
+const TOOL_FULL_TEXT_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
  * transcript 驻留预算（估算字节，度量口径见 estimateMessageBytes）。
@@ -68,6 +79,8 @@ export type TranscriptBudgetTrim = {
 	 * 裁到空会让时间线整体消失，比超预算更糟；有了这条日志才能解释内存为何仍高。
 	 */
 	overBudget?: boolean;
+	/** 本次为压回预算而删掉的 meta 重字段个数（工具详情文本/嵌套详情/压缩归档正文）。 */
+	degradedMetaFields?: number;
 };
 
 export type AgentTranscriptState = {
@@ -200,11 +213,40 @@ export function markAllMessagesDirty(state: AgentTranscriptState): void {
  */
 function enforceTranscriptBudget(state: AgentTranscriptState, force = false): void {
 	const messages = state.messages;
-	if (!force && messages.length - state.budgetCheckedLength < TRANSCRIPT_BUDGET_CHECK_STEP) return;
+	const pending = messages.length - state.budgetCheckedLength;
+	// 单条超大消息（巨型工具结果）不能等攒够 32 条新消息才校验：它自己就可能超过
+	// 整个预算，等下去只是先驻留、先被渲染层克隆一份。尾部单条超过水位的 1/4 时立即校验。
+	const tailBytes = messages.length > 0 ? estimateMessageBytes(messages[messages.length - 1]) : 0;
+	if (!force && pending < TRANSCRIPT_BUDGET_CHECK_STEP && tailBytes <= MAX_TRANSCRIPT_BYTES / 4) return;
 	state.budgetCheckedLength = messages.length;
 	let total = 0;
 	for (const message of messages) total += estimateMessageBytes(message);
 	if (total <= MAX_TRANSCRIPT_BYTES) return;
+
+	// 超预算先降级可再取回的重 meta（工具详情文本 / 嵌套详情 / 压缩归档正文），绝不整条丢消息，
+	// 再按水位裁剪：降级后的估算决定裁剪线，避免「为几条详情丢掉整段对话」。
+	// 旧实现在尾部窗口自身超水位时直接整条保留并登记 overBudget，大会话因此长期超预算驻留。
+	const degradation = degradeHeavyMetaPayloads(messages, total);
+	const degradedFields = degradation.degradedFields;
+	if (degradedFields > 0) {
+		// 逐字段字节口径与 estimateMessageBytes 完全相同（同 compactJsonLength*2 / length*2），
+		// 直接扣减即可，不必为降级再扫一遍整个窗口（80MB 级 meta 上一次扫描约 300ms）。
+		total -= degradation.freedBytes;
+		if (total <= MAX_TRANSCRIPT_BYTES) {
+			// 消息对象本身没换（只删了 meta 字段），但渲染层握着降级前的副本，
+			// 必须全量重推一次，否则主进程省下的内存在渲染层照旧。
+			markAllMessagesDirty(state);
+			state.budgetCheckedLength = messages.length;
+			state.pendingBudgetTrim = {
+				droppedMessages: 0,
+				keptMessages: messages.length,
+				estimatedBytes: total,
+				limitBytes: MAX_TRANSCRIPT_BYTES,
+				degradedMetaFields: degradedFields,
+			};
+			return;
+		}
+	}
 
 	const target = MAX_TRANSCRIPT_BYTES * TRANSCRIPT_TRIM_WATERMARK;
 	let keepFrom = messages.length;
@@ -220,7 +262,7 @@ function enforceTranscriptBudget(state: AgentTranscriptState, force = false): vo
 		const activeIndex = messages.findIndex((message) => message.id === activeId);
 		if (activeIndex !== -1 && activeIndex < keepFrom) keepFrom = activeIndex;
 	}
-	// 头部为空说明尾部本身已超水位（单条巨型消息）：不裁，至少留一条消息做基线，
+	// 头部为空说明尾部本身已超水位（单条巨型消息）且降级也不够：不裁，至少留一条消息做基线，
 	// 与 getMessages「基线绝不被裁空」的约定一致；但要留一条诊断，否则内存高得没有解释。
 	if (keepFrom <= 0) {
 		state.pendingBudgetTrim = {
@@ -229,6 +271,7 @@ function enforceTranscriptBudget(state: AgentTranscriptState, force = false): vo
 			estimatedBytes: total,
 			limitBytes: MAX_TRANSCRIPT_BYTES,
 			overBudget: true,
+			...(degradedFields > 0 ? { degradedMetaFields: degradedFields } : {}),
 		};
 		return;
 	}
@@ -251,7 +294,65 @@ function enforceTranscriptBudget(state: AgentTranscriptState, force = false): vo
 		keptMessages: keptMessages.length,
 		estimatedBytes: keptBytes,
 		limitBytes: MAX_TRANSCRIPT_BYTES,
+		...(degradedFields > 0 ? { degradedMetaFields: degradedFields } : {}),
 	};
+}
+
+/**
+ * 允许降级删除的嵌套 meta。
+ *
+ * 类型上限定为 NESTED_META_BYTES_KEYS 的子集：降级只作用于「已被计价」的字段，
+ * 否则预算账对不上（删掉的字节数扣减会大于实际计价）。
+ * 不含 _askCard：提问卡片是用户作答的入口，删掉就等于「问题没法回答」——
+ * 宁可留着它让内存略超预算（只计价不降级），也不能让用户卡在那里。
+ */
+const DEGRADABLE_META_NESTED_KEYS: readonly (typeof NESTED_META_BYTES_KEYS)[number][] = [
+	"details",
+	"archivedMessages",
+];
+
+/**
+ * 超预算时删掉 meta 里的重字段，绝不整条丢消息。
+ *
+ * 为什么需要：transcript 预算保护的是「消息总驻留」，但这些 meta 字段与时间线语义无关——
+ * details / archivedMessages 是未截断的嵌套结构（工具卡详情、压缩归档正文），
+ * detailText / result / args 各 ≤8K 字符的详情文本。它们超预算时先删它们，
+ * 消息本体（text/thinking/顺序/entryId）一律保留，用户看到的对话结构不受影响。
+ * 删够超出的字节数即止（从大到小），尽量少丢。
+ */
+function degradeHeavyMetaPayloads(
+	messages: ChatMessage[],
+	total: number,
+): { freedBytes: number; degradedFields: number } {
+	const excess = total - MAX_TRANSCRIPT_BYTES;
+	if (excess <= 0) return { freedBytes: 0, degradedFields: 0 };
+	const candidates: Array<{ meta: Record<string, unknown>; key: string; bytes: number }> = [];
+	for (const message of messages) {
+		const meta = message.meta as Record<string, unknown> | undefined;
+		if (!meta) continue;
+		for (const key of DEGRADABLE_META_NESTED_KEYS) {
+			const value = meta[key];
+			if (value === undefined || value === null) continue;
+			candidates.push({ meta, key, bytes: compactJsonLength(value) * 2 });
+		}
+		for (const key of TEXTUAL_META_BYTES_KEYS) {
+			const value = meta[key];
+			if (typeof value !== "string" || value.length === 0) continue;
+			candidates.push({ meta, key, bytes: value.length * 2 });
+		}
+	}
+	if (candidates.length === 0) return { freedBytes: 0, degradedFields: 0 };
+	candidates.sort((a, b) => b.bytes - a.bytes);
+	let freed = 0;
+	let degraded = 0;
+	for (const candidate of candidates) {
+		if (freed >= excess) break;
+		if (candidate.meta[candidate.key] === undefined) continue;
+		delete candidate.meta[candidate.key];
+		freed += candidate.bytes;
+		degraded += 1;
+	}
+	return { freedBytes: freed, degradedFields: degraded };
 }
 
 /** 取走本轮增量：replaceFrom 起为变更内容；replaceFrom === 0 表示全量基线。 */
@@ -486,6 +587,16 @@ export function cacheFullText(state: AgentTranscriptState, messageId: string, fu
 	if (state.fullTextByMessageId.size > TOOL_FULL_TEXT_LRU_MAX) {
 		const oldest = state.fullTextByMessageId.keys().next().value;
 		if (oldest !== undefined) state.fullTextByMessageId.delete(oldest);
+	}
+	// 条数上限不封内存：200 条各数 MB 的完整结果仍是 GB 级驻留，必须再卡字节上限。
+	// 淘汰顺序同样是插入序（最旧先走），但至少留一条：否则刚展开的那条会立刻被自己挤掉。
+	let total = 0;
+	for (const text of state.fullTextByMessageId.values()) total += text.length * 2;
+	while (total > TOOL_FULL_TEXT_MAX_BYTES && state.fullTextByMessageId.size > 1) {
+		const oldest = state.fullTextByMessageId.keys().next().value;
+		if (oldest === undefined) break;
+		total -= (state.fullTextByMessageId.get(oldest)?.length ?? 0) * 2;
+		state.fullTextByMessageId.delete(oldest);
 	}
 }
 

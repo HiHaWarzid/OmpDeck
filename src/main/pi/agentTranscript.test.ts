@@ -5,6 +5,7 @@ import {
 	appendMessage,
 	appendThinkingDelta,
 	beginAssistantMessage,
+	cacheFullText,
 	clearThinkingBuffer,
 	createTranscriptState,
 	endThinking,
@@ -17,6 +18,7 @@ import {
 	upsertAssistantMessage,
 	upsertToolMessage,
 } from "./agentTranscript";
+import { estimateMessageBytes } from "./messageTextUtils";
 
 const AGENT = "a1";
 
@@ -196,6 +198,20 @@ describe("agent transcript", () => {
 		expect(fullTextOf(s, s.messages[209].id)).toBeDefined();
 	});
 
+	it("full-text cache 的字节上限按最旧优先淘汰，且至少保留最新一条", () => {
+		const s = createTranscriptState();
+		// 每条 3M 字符 ≈ 6MB 估算，两条即超 8MB 字节上限（条数上限 200 远未触及）
+		for (const id of ["m0", "m1"]) cacheFullText(s, id, "z".repeat(3 * 1024 * 1024));
+
+		expect(s.fullTextByMessageId.size).toBe(1);
+		expect(fullTextOf(s, "m0")).toBeUndefined();
+		expect(fullTextOf(s, "m1")).toBeDefined();
+
+		// 单条自身超上限也必须留着：否则刚点开「完整结果」就被自己挤掉
+		cacheFullText(s, "m2", "y".repeat(16 * 1024 * 1024));
+		expect(fullTextOf(s, "m2")).toBeDefined();
+	});
+
 	it("resetTranscriptRun clears every per-run field, so the next run starts clean", () => {
 		const s = createTranscriptState();
 		beginAssistantMessage(s);
@@ -281,5 +297,49 @@ describe("agent transcript 容量预算", () => {
 		expect(s.messages).not.toContain(toolMessage);
 		expect(s.toolMessageIds.size).toBe(0);
 		expect(s.retryStatusMessageId).toBeUndefined();
+	});
+
+	it("meta 撑爆预算时降级重字段而不是丢消息，并全量重推让渲染层同步", () => {
+		const s = createTranscriptState();
+		// 4 条消息的嵌套 details 各约 3MB（单靠 meta 就超过 8MB 预算）
+		const history = Array.from({ length: 4 }, (_, index) => ({
+			id: `h${index}`,
+			agentId: AGENT,
+			role: "tool",
+			text: `✓ tool ${index}`,
+			timestamp: index,
+			meta: {
+				details: { phases: [{ todos: [{ content: "x".repeat(3 * 1024 * 1024) }] }] },
+				detailText: "d".repeat(10_000),
+				_askCard: { questions: [{ question: "continue?" }] },
+			},
+		})) as ChatMessage[];
+
+		replaceMessages(s, history);
+
+		const metas = s.messages.map((message) => message.meta as Record<string, unknown>);
+		// 一条都不丢：降级只删 meta 重字段，对话结构（消息本体与顺序）保持完整
+		expect(s.messages.map((message) => message.id)).toEqual(["h0", "h1", "h2", "h3"]);
+		expect(metas.some((meta) => meta.details === undefined)).toBe(true);
+		expect(s.messages.reduce((sum, message) => sum + estimateMessageBytes(message), 0)).toBeLessThanOrEqual(
+			MAX_TRANSCRIPT_BYTES,
+		);
+		// 提问卡片是作答入口，不参与降级；否则用户面对的问题无法回答
+		expect(metas.every((meta) => meta._askCard !== undefined)).toBe(true);
+		expect(s.pendingBudgetTrim?.droppedMessages).toBe(0);
+		expect(s.pendingBudgetTrim?.degradedMetaFields).toBeGreaterThan(0);
+		// 渲染层还握着降级前的副本：必须全量基线重推，否则主进程省下的内存在渲染层照旧
+		expect(takeDirtySlice(s).replaceFrom).toBe(0);
+	});
+
+	it("单条巨型消息立即触发校验，不必等攒够 32 条新消息", () => {
+		const s = createTranscriptState();
+		// 10MB 正文（> 预算水位的 1/4），且 meta 无可降级字段
+		appendMessage(s, { agentId: AGENT, role: "assistant", text: "x".repeat(5 * 1024 * 1024), now: 0 });
+
+		// 只有 1 条消息也必须已经校验过：否则这条先驻留、先被渲染层克隆一份
+		expect(s.pendingBudgetTrim?.overBudget).toBe(true);
+		expect(s.pendingBudgetTrim?.keptMessages).toBe(1);
+		expect(s.pendingBudgetTrim?.estimatedBytes).toBeGreaterThan(MAX_TRANSCRIPT_BYTES);
 	});
 });

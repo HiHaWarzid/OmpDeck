@@ -451,6 +451,12 @@ export class AgentManager {
 		// 旧实现完全不处理失败分支，于是 get_messages 失败的大会话一律渲染成「没有消息」
 		// ——用户侧表现为「打开会话空白 + 无法编辑」（实测 10/15-10/16 反复出现）。
 		// 全新会话（无 sessionPath）空消息仍是合法状态，不走兜底。
+		//
+		// 为什么不改走 pi 的 get_messages_page 分页：cursor 里编码的是从最旧一条算起的 offset，
+		// 只能向前翻，取尾部窗口仍要翻完整份大会话；而 pi 在会话变动期间直接拒绝分页
+		// （session_busy/stale_cursor），恰是大会话最容易命中的时刻。文件直读只需尾部窗口
+		// （MAX_HISTORY_LOAD_TURNS 轮），且 entryId 映射两条路都拿不到（get_entries 同样撞
+		// 传输上限，pi 没有它的分页变体），所以以文件直读为准。
 		const rpcUnusable = failureKind !== undefined || (rawMessages.length === 0 && skipEntries);
 		if (rpcUnusable && runtime.tab.sessionPath) {
 			const sessionHostPath = this.toSessionHostPath(runtime.tab.sessionPath);
@@ -4308,11 +4314,12 @@ export class AgentManager {
 			sent: messages.length,
 			total: runtime.transcript.messages.length,
 		});
-		// 容量裁剪是静默丢最旧消息，必须留一条日志，否则用户无法解释「历史消息为什么少了」。
+		// 容量裁剪是静默丢最旧消息、降级是静默删 meta 重字段，必须留一条日志，
+		// 否则用户无法解释「历史消息为什么少了」/「工具详情为什么打不开了」。
 		const trim = runtime.transcript.pendingBudgetTrim;
 		if (trim) {
 			runtime.transcript.pendingBudgetTrim = undefined;
-			void this.appLogger?.warn("agent", "Transcript window trimmed to memory budget", {
+			void this.appLogger?.warn("agent", "Transcript over memory budget (trim and/or meta degradation)", {
 				agentId: runtime.tab.id,
 				...trim,
 			});

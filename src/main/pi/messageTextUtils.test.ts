@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../../shared/types";
-import { MAX_TOOL_RESULT_CHARS, estimateMessageBytes } from "./messageTextUtils";
+import { MAX_TOOL_RESULT_CHARS, compactJsonLength, estimateMessageBytes } from "./messageTextUtils";
 
 /**
  * 容量预算的度量口径。旧实现只算 text/thinking/images，于是每条最多 8K 字符的
@@ -54,5 +54,22 @@ describe("estimateMessageBytes", () => {
 		};
 
 		expect(estimateMessageBytes(withDetails)).toBeGreaterThan(estimateMessageBytes(plain) + 100_000);
+	});
+
+	it("嵌套详情按紧凑序列化计价，不被 pretty 缩进虚增", () => {
+		const details = { phases: Array.from({ length: 500 }, (_, index) => ({ index, content: "x".repeat(50) })) };
+		const message: ChatMessage = {
+			id: "m",
+			agentId: "a",
+			role: "tool",
+			text: "✓ read",
+			timestamp: 0,
+			meta: { details },
+		};
+
+		const bytes = estimateMessageBytes(message);
+		// 口径不得低于紧凑体积（否则预算漏计），也不得按 2 空格缩进的 pretty 体积虚增
+		expect(bytes).toBeGreaterThanOrEqual(compactJsonLength(details) * 2);
+		expect(bytes).toBeLessThan(JSON.stringify(details, null, 2).length * 2);
 	});
 });

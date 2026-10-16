@@ -93,8 +93,27 @@ export function extractToolResultText(result: unknown): string {
 		.join("\n");
 }
 
+/** meta 中被截断过的长文本字段：按字符串长度累加即可（不走序列化）。 */
+export const TEXTUAL_META_BYTES_KEYS = ["detailText", "result", "args"] as const;
 /** meta 中未截断的嵌套结构：值本身可能很大，只能在存在时序列化估算（绝大多数消息没有）。 */
-const NESTED_META_BYTES_KEYS = ["details", "archivedMessages", "_askCard"] as const;
+export const NESTED_META_BYTES_KEYS = ["details", "archivedMessages", "_askCard"] as const;
+
+/**
+ * 紧凑序列化的字符数（估算专用）。
+ *
+ * 只求量级，不构造 pretty 字符串：safeJson 走 `null, 2`（给 UI 展示用），
+ * 拿它估算同一份 details 会把口径放大 20% 以上，还白分配一份大字符串。
+ * 预算度量的是跨进程结构化克隆的对象体积，紧凑形式更贴近。
+ */
+export function compactJsonLength(value: unknown): number {
+	try {
+		const serialized = JSON.stringify(value);
+		// JSON.stringify(undefined/function/symbol) 返回 undefined，归一为 0 长度。
+		return serialized === undefined ? 0 : serialized.length;
+	} catch {
+		return String(value).length;
+	}
+}
 
 /**
  * 估算单条消息的驻留 / IPC 体积（字节），作为 transcript 容量预算的度量口径。
@@ -111,14 +130,14 @@ export function estimateMessageBytes(message: ChatMessage): number {
 	const meta = message.meta;
 	if (!meta) return bytes;
 	// 已被 truncateForDetail 截断的字段直接按长度累加，不触发序列化。
-	for (const key of ["detailText", "result", "args"] as const) {
+	for (const key of TEXTUAL_META_BYTES_KEYS) {
 		const value = meta[key];
 		if (typeof value === "string") bytes += value.length * 2;
 	}
 	for (const key of NESTED_META_BYTES_KEYS) {
 		const value = meta[key];
 		if (value === undefined || value === null) continue;
-		bytes += safeJson(value).length * 2;
+		bytes += compactJsonLength(value) * 2;
 	}
 	return bytes;
 }
