@@ -9,7 +9,8 @@ import { installDevPerformanceTrackGuard } from "./utils/devPerformanceTrackGuar
 import "./styles.css";
 import "./file-icons.css";
 
-// React dev 构建每次渲染都会写 performance.measure 条目且无人清理，长时间运行会持续吃内存。
+// React dev 构建会在 commit 阶段把变化过的 props 明细克隆进 performance.measure 的 detail：
+// 长时间运行会累积内存，并在堆紧张时抛 DataCloneError 打断提交（此后窗口不再响应）。
 installDevPerformanceTrackGuard();
 
 function writeStartupLog(level: AppLogLevel, message: string, detail?: unknown) {
