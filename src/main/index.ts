@@ -377,8 +377,36 @@ function mainWindowNeedsRecovery(window: BrowserWindow): boolean {
 	return mainFrameLoadFailed;
 }
 
+/**
+ * 卡死现场的主进程侧证据：渲染进程的驻留内存与 CPU。
+ * 只在主进程能看到（渲染层此时已经不响应 IPC，拿不到它的自述），
+ * 用于区分「内存压力/GC 抖动」和「纯 CPU 长任务」。
+ */
+function describeRendererProcessMetrics(window: BrowserWindow): Record<string, unknown> {
+	try {
+		const pid = window.webContents.getOSProcessId();
+		const metric = app.getAppMetrics().find((item) => item.pid === pid);
+		if (!metric) return { pid };
+		return {
+			pid,
+			workingSetMB: Math.round(metric.memory.workingSetSize / 1024),
+			peakWorkingSetMB: Math.round(metric.memory.peakWorkingSetSize / 1024),
+			cpuPercent: metric.cpu.percentCPUUsage,
+		};
+	} catch (error) {
+		return { metricsError: error instanceof Error ? error.message : String(error) };
+	}
+}
+
 /** 最近窗口内的自动恢复时间戳：只在主进程内存里，重启应用即清零。 */
 let rendererRecoveryAttempts: number[] = [];
+
+/**
+ * 渲染进程持续无响应多久后按「软崩溃」处理。
+ * 取 60s：既要避开「忙但还能用」的瞬时卡顿（那种情况下 Electron 不会报 unresponsive），
+ * 又要保证真卡死时用户不用再等十几分钟、更不用杀应用重启。
+ */
+const RENDERER_UNRESPONSIVE_RECOVERY_MS = 60_000;
 
 /**
  * 渲染进程崩溃后的自愈：判定（是否还值得重载）在 rendererRecovery.decideRendererRecovery，
@@ -414,18 +442,18 @@ async function promptRendererRecoveryExhausted(window: BrowserWindow): Promise<v
 	const useChinese = language === "zh-CN" || (language === "system" && app.getLocale().toLowerCase().startsWith("zh"));
 	const text = useChinese
 		? {
-				title: "界面连续崩溃",
-				message: "界面进程多次意外退出，已停止自动恢复。",
+				title: "界面反复不可用",
+				message: "界面多次崩溃或失去响应，已停止自动恢复。",
 				detail:
-					"会话与 Agent 仍在后台运行。可以再次尝试恢复界面；若仍然崩溃，请重启应用，并考虑清理超长会话的上下文。",
+					"会话与 Agent 仍在后台运行。可以再次尝试恢复界面；若仍然反复出现，请重启应用，并考虑清理超长会话的上下文。",
 				reload: "重新恢复界面",
 				quit: "退出应用",
 			}
 		: {
-				title: "Interface crashed repeatedly",
-				message: "The interface process exited unexpectedly several times; automatic recovery stopped.",
+				title: "Interface keeps failing",
+				message: "The interface crashed or stopped responding several times; automatic recovery stopped.",
 				detail:
-					"Sessions and agents keep running in the background. You can try restoring the interface again; if it keeps crashing, restart the app and consider clearing an over-long session context.",
+					"Sessions and agents keep running in the background. You can try restoring the interface again; if it keeps failing, restart the app and consider clearing an over-long session context.",
 				reload: "Restore interface",
 				quit: "Quit app",
 			};
@@ -807,6 +835,45 @@ async function createWindow() {
 			}
 		},
 	);
+	// 渲染进程「卡住而不崩」：主线程被长任务占死时 Electron 收不到任何 IPC，
+	// 用户感知是整个窗口点不动；而这种情况不会触发 render-process-gone，
+	// 崩溃自愈那条路径（重载 + 限流 + 超限询问）完全覆盖不到。
+	// 这里把持续无响应按「软崩溃」处理：先记证据，超时后强制结束渲染进程，
+	// 交给 handleRendererProcessGone 走同一套恢复策略。
+	let rendererUnresponsiveSince = 0;
+	let rendererUnresponsiveTimer: NodeJS.Timeout | null = null;
+	const clearRendererUnresponsiveWatch = () => {
+		if (!rendererUnresponsiveTimer) return;
+		clearTimeout(rendererUnresponsiveTimer);
+		rendererUnresponsiveTimer = null;
+	};
+	createdWindow.on("unresponsive", () => {
+		// 事件可能重复触发，只在首次进入无响应态时建立计时。
+		if (rendererUnresponsiveSince) return;
+		rendererUnresponsiveSince = Date.now();
+		void appLogger.warn("app", "Main window renderer unresponsive", {
+			recoveryTimeoutMs: RENDERER_UNRESPONSIVE_RECOVERY_MS,
+			...describeRendererProcessMetrics(createdWindow),
+		});
+		rendererUnresponsiveTimer = setTimeout(() => {
+			rendererUnresponsiveTimer = null;
+			// 计时期间用户关窗/渲染进程已崩溃：交给既有路径，不重复处理。
+			if (createdWindow.isDestroyed() || createdWindow.webContents.isCrashed()) return;
+			void appLogger.error("app", "Renderer unresponsive, forcing recovery", {
+				blockedMs: Date.now() - rendererUnresponsiveSince,
+				...describeRendererProcessMetrics(createdWindow),
+			});
+			createdWindow.webContents.forcefullyCrashRenderer();
+		}, RENDERER_UNRESPONSIVE_RECOVERY_MS);
+	});
+	createdWindow.on("responsive", () => {
+		if (!rendererUnresponsiveSince) return;
+		void appLogger.warn("app", "Main window renderer responsive again", {
+			blockedMs: Date.now() - rendererUnresponsiveSince,
+		});
+		rendererUnresponsiveSince = 0;
+		clearRendererUnresponsiveWatch();
+	});
 	mainWindow.webContents.on("render-process-gone", (_event, details) => {
 		const level: AppLogLevel = details.reason === "clean-exit" ? "info" : "error";
 		void appLogger.log(level, "app", "Main window renderer process gone", {
@@ -814,6 +881,9 @@ async function createWindow() {
 			platform: process.platform,
 			arch: process.arch,
 		});
+		// 进程已经没了，无响应计时器不再有意义（强杀自愈就是从这里继续的）。
+		rendererUnresponsiveSince = 0;
+		clearRendererUnresponsiveWatch();
 		// clean-exit 是正常离开（关窗/退出），窗口已销毁时也无处可恢复。
 		if (details.reason === "clean-exit" || createdWindow.isDestroyed()) return;
 		handleRendererProcessGone(createdWindow, details);

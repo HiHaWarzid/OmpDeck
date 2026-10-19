@@ -9,6 +9,13 @@ const ENABLED =
 	typeof window !== "undefined" &&
 	window.piDesktop?.perf?.enabled === true;
 
+/**
+ * 采样上限：一次长流式可跑几十分钟（60fps → 十万级采样），
+ * 既有无谓的内存占用，也让 `Math.max(...frameTimes)` 触到 V8 的参数上限而抛 RangeError。
+ * 帧率是「当下流畅度」指标，保留最近若干帧即可；超限后丢弃前一半（均摊 O(1)）。
+ */
+const MAX_SAMPLES = 20_000;
+
 let rafId = 0;
 let lastFrame = 0;
 let frameTimes: number[] = [];
@@ -27,6 +34,7 @@ export function startFrameSampling(): void {
 	const tick = (now: number) => {
 		if (!active) return;
 		frameTimes.push(now - lastFrame);
+		if (frameTimes.length >= MAX_SAMPLES) frameTimes = frameTimes.slice(MAX_SAMPLES / 2);
 		lastFrame = now;
 		rafId = requestAnimationFrame(tick);
 	};
@@ -42,10 +50,15 @@ export function stopFrameSampling(): void {
 	const sorted = [...frameTimes].sort((a, b) => a - b);
 	const p50 = sorted[Math.min(sorted.length - 1, Math.floor(0.5 * sorted.length))];
 	const p95 = sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))];
-	const dropped = frameTimes.filter((t) => t > 50).length;
+	let dropped = 0;
+	let max = 0;
+	for (const t of frameTimes) {
+		if (t > max) max = t;
+		if (t > 50) dropped += 1;
+	}
 	const fps = Math.round(1000 / p95);
 	console.log(
 		`[perf] renderer frames: n=${frameTimes.length} p50=${p50.toFixed(1)}ms ` +
-			`p95=${p95.toFixed(1)}ms (≈${fps}fps) max=${Math.max(...frameTimes).toFixed(1)}ms dropped>50ms=${dropped}`,
+			`p95=${p95.toFixed(1)}ms (≈${fps}fps) max=${max.toFixed(1)}ms dropped>50ms=${dropped}`,
 	);
 }

@@ -1,5 +1,5 @@
 import { app } from "electron";
-import { appendFile, mkdir, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { createGzip, createGunzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
@@ -10,6 +10,8 @@ const MAX_LIVE = 200;
 const MAX_DATA_BYTES = 2_048;
 /** 日志文件保留天数，超过自动删除 */
 const RETENTION_DAYS = 30;
+/** getFromFile 单文件尾部读取上限：查询只要最近 limit 条，不必整读 30MB+ 文件 */
+const GET_TAIL_BYTES = 4 * 1024 * 1024;
 
 function formatDate(value: Date) {
   const year = value.getFullYear();
@@ -31,8 +33,7 @@ export interface RpcLogEntry {
  * RPC 日志服务。
  * - 按 Agent 分文件：userData/logs/rpc/rpc-<agentId>-YYYY-MM-DD.jsonl
  * - 写入时截断大 data（超过 2KB 脱敏保存），大幅减少文件体积
- * - 次日自动 gzip 前一天文件，进一步压缩历史日志
- * - 超过 30 天自动清理
+ * - 首次写入前 + 每次跨日：把非当日文件 gzip，并清理超过 30 天的文件
  * - 保持小型环形缓冲区（200 条）供实时展示
  */
 export class RpcLogger {
@@ -41,6 +42,8 @@ export class RpcLogger {
   private live: RpcLogEntry[] = [];
   /** 最近写入的日期，用于触发跨日 gzip */
   private lastWriteDate = "";
+  /** 首次写入前执行的目录收尾（补压缩遗留日志 + 清过期文件），只调度一次 */
+  private sweepPromise: Promise<void> | undefined;
   private writeQueue: Promise<void> = Promise.resolve();
 
   /** 写入一条 RPC 日志，同时追加到文件与环形缓冲区 */
@@ -50,6 +53,7 @@ export class RpcLogger {
       this.live.splice(0, this.live.length - MAX_LIVE + 1);
     }
     this.live.push(entry);
+    this.ensureInitialized();
 
     // 异步写入文件，串行化避免并发写冲突
     this.writeQueue = this.writeQueue
@@ -67,8 +71,11 @@ export class RpcLogger {
   /**
    * 从文件读取日志。
    * 按 agentId 和日期范围过滤，倒序返回最近 limit 条。
-   * 只读取未压缩的 .jsonl 文件（当天和近期尚未 gzip 的），
-   * 跨日文件已被 gzip，不影响最近 7 天查询。
+   * 只读取未压缩的 .jsonl 文件（当天和近期尚未 gzip 的），跨日文件已被 gzip，不影响最近 7 天查询。
+   *
+   * 只读每个文件的尾部字节：查询只要最近 limit 条，而单份文件可达 37MB（8.7 万行），
+   * 整读 + `split` + `push(...arr)` 会让主进程瞬时多出两份 37MB 字符串和 8.7 万元素数组
+   * （spread 传参还有 V8 参数上限 RangeError 的风险）。
    */
   async getFromFile(options?: {
     agentId?: string;
@@ -79,16 +86,26 @@ export class RpcLogger {
     const limit = Math.max(1, Math.min(options?.limit ?? 5000, 10000));
     const days = Math.max(1, options?.days ?? 7);
 
+    // 按文件内日期倒序取最近 days 个日期；原来按文件名排序等于先按 agentId 排，取到的不是最近几天。
     const files = this.listFiles(options?.agentId, ".jsonl")
-      .sort()
-      .reverse()
-      .slice(0, days);
+      .map((name) => ({ name, date: name.match(/-(\d{4}-\d{2}-\d{2})\.jsonl$/)?.[1] ?? "" }))
+      .filter((item) => item.date)
+      .sort((a, b) =>
+        a.date === b.date ? b.name.localeCompare(a.name) : a.date < b.date ? 1 : -1,
+      );
+    const recentDates = [...new Set(files.map((item) => item.date))].slice(0, days);
 
     const lines: string[] = [];
-    for (const file of files) {
-      const raw = await readFile(join(this.dir, file), "utf8").catch(() => "");
-      const fileLines = raw.split(/\r?\n/).filter(Boolean);
-      lines.push(...fileLines.reverse());
+    for (const date of recentDates) {
+      for (const file of files) {
+        if (file.date !== date) continue;
+        const raw = await this.readTail(join(this.dir, file.name));
+        const fileLines = raw.split(/\r?\n/).filter(Boolean);
+        for (let i = fileLines.length - 1; i >= 0 && lines.length < limit; i -= 1) {
+          lines.push(fileLines[i]);
+        }
+        if (lines.length >= limit) break;
+      }
       if (lines.length >= limit) break;
     }
 
@@ -99,6 +116,28 @@ export class RpcLogger {
         catch { return null; }
       })
       .filter((e): e is RpcLogEntry => Boolean(e));
+  }
+
+  /** 读取文件尾部最多 GET_TAIL_BYTES 字节；从中间截断时丢掉不完整的首行。 */
+  private async readTail(filePath: string): Promise<string> {
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(filePath, "r");
+      const { size } = await handle.stat();
+      const start = Math.max(0, size - GET_TAIL_BYTES);
+      const length = size - start;
+      if (length <= 0) return "";
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      const text = buffer.toString("utf8");
+      if (start === 0) return text;
+      const firstNewline = text.indexOf("\n");
+      return firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+    } catch {
+      return "";
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   }
 
   /** 获取 RPC 日志文件总大小（字节），可选按 agentId 过滤，含 gzip 文件 */
@@ -190,30 +229,54 @@ export class RpcLogger {
 
   // ── 写入 ──
 
+  /**
+   * 目录级收尾：补压缩历史遗留的未压缩 .jsonl + 清理过期文件。
+   *
+   * 为什么不能只在跨日分支里做：原来的跨日 gzip 依赖 `lastWriteDate`（本次运行首次写的日期），
+   * 进程重启后它等于当天日期，昨天的文件永远不会被压缩；清理还被 `Math.random() < 0.01`
+   * 概率门控，可能整天不触发。实测 2026-10-16：目录里 33 个历史 .jsonl 未压缩，共 428MB
+   * （gz 只有 102MB），整个 rpc 目录 837MB。改为「首次写入前 + 每次跨日」确定性执行，
+   * 两个触发点都幂等（已压缩文件不在 .jsonl 列表里）。
+   */
+  private async initialize(): Promise<void> {
+    const today = formatDate(new Date());
+    const stale = this.listFiles(undefined, ".jsonl").filter(
+      (file) => !file.includes(`-${today}.jsonl`),
+    );
+    for (const file of stale) {
+      await this.gzipFile(join(this.dir, file)).catch(() => undefined);
+    }
+    await this.cleanOldFiles().catch(() => undefined);
+  }
+
+  /** 首次写入前调度一次收尾，之后不再重复调度。 */
+  private ensureInitialized(): void {
+    if (!this.sweepPromise) this.scheduleSweep();
+  }
+
+  /**
+   * 后台执行收尾，不阻塞写入链。
+   * 首次升级启动可能要压缩 400MB+ 遗留日志（十几秒 IO）；写入链是内存里的 promise 队列，
+   * 没有理由陪它一起等——压不动也只是占用磁盘，不影响正确性。
+   */
+  private scheduleSweep(): Promise<void> {
+    this.sweepPromise = this.initialize().catch(() => undefined);
+    return this.sweepPromise;
+  }
+
   private async writeEntry(entry: RpcLogEntry) {
     await mkdir(this.dir, { recursive: true });
     const safeAgentId = this.sanitizeAgentId(entry.agentId);
     const dateStr = formatDate(new Date(entry.time));
     const filePath = join(this.dir, `rpc-${safeAgentId}-${dateStr}.jsonl`);
 
-    // 跨日 gzip：如果上次写入是昨天，把昨天的文件 gzip
-    if (this.lastWriteDate && this.lastWriteDate !== dateStr) {
-      const oldFiles = this.listFiles(undefined, ".jsonl")
-        .filter((f) => f.includes(`-${this.lastWriteDate}.jsonl`) && !f.endsWith(".gz"));
-      for (const oldFile of oldFiles) {
-        await this.gzipFile(join(this.dir, oldFile)).catch(() => undefined);
-      }
-    }
+    // 跨日：把此前所有非当日的 .jsonl 补压缩（含本次运行开始前就遗留的），顺带清过期文件。
+    if (this.lastWriteDate && this.lastWriteDate !== dateStr) this.scheduleSweep();
     this.lastWriteDate = dateStr;
 
     // 截断大 data：将 entry 的 data 字段截断后写入，避免文件快速膨胀
     const safeEntry = this.truncateData(entry);
     await appendFile(filePath, `${JSON.stringify(safeEntry)}\n`, "utf8");
-
-    // 定期清理旧文件（每 100 次写触发一次）
-    if (Math.random() < 0.01) {
-      await this.cleanOldFiles().catch(() => undefined);
-    }
   }
 
   /** 截断 data 字段：JSON 序列化超过 MAX_DATA_BYTES 时替换为脱敏摘要。 */

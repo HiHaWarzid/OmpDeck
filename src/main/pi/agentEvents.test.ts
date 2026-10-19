@@ -522,4 +522,22 @@ test("isRpcLogWorthy: send 方向与阶段/响应事件全记，流式增量跳�
 		}),
 		false,
 	);
+	// toolcall_delta：与文本增量同为每块一条（实测占单 agent 单日日志 83%），默认不落盘
+	assert.equal(
+		isRpcLogWorthy({
+			direction: "recv",
+			data: { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } },
+		}),
+		false,
+	);
+	// 工具输出分片：默认不落盘；调用起止事件仍照常记录（顺序/耗时/成败可还原）
+	assert.equal(
+		isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_update" } }),
+		false,
+	);
+	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_stream_update" } }), false);
+	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_start" } }), true);
+	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_end" } }), true);
+	// send 方向不受上述过滤影响（用户主动命令全记）
+	assert.equal(isRpcLogWorthy({ direction: "send", data: { type: "tool_execution_update" } }), true);
 });

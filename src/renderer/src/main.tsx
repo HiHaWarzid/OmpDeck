@@ -6,12 +6,19 @@ import { AppErrorBoundary } from "./components/ui/AppErrorBoundary";
 import { t } from "./i18n";
 import { showNotice } from "./utils/notice";
 import { installDevPerformanceTrackGuard } from "./utils/devPerformanceTrackGuard";
+import { installRendererHangWatchdog } from "./utils/rendererHangWatchdog";
 import "./styles.css";
 import "./file-icons.css";
 
 // React dev 构建会在 commit 阶段把变化过的 props 明细克隆进 performance.measure 的 detail：
 // 长时间运行会累积内存，并在堆紧张时抛 DataCloneError 打断提交（此后窗口不再响应）。
 installDevPerformanceTrackGuard();
+
+// 卡死看门狗：渲染层冻结时写不了任何东西，只能靠事发时自动落盘的证据定位
+// （长任务时长、帧间隔、DOM 节点数、堆占用）。日志用独立 scope 便于在应用日志里筛。
+installRendererHangWatchdog((level, message, detail) => {
+  window.piDesktop?.app.rendererLog(level, "renderer-watchdog", message, detail).catch(() => undefined);
+});
 
 function writeStartupLog(level: AppLogLevel, message: string, detail?: unknown) {
   window.piDesktop?.app.rendererLog(level, "renderer", message, detail).catch(() => undefined);
