@@ -74,4 +74,35 @@ describe("installRendererHangWatchdog 帧心跳", () => {
 		// 安装日志属于正常输出，这里只关心没有卡死记录。
 		expect(entries.filter((entry) => entry.message === "Renderer frame stalled")).toEqual([]);
 	});
+
+	it("从隐藏恢复可见时，隐藏期间的间隔不算卡死", async () => {
+		const clock = stubClock(1_000);
+		const entries: LogEntry[] = [];
+		let visibility: DocumentVisibilityState = "visible";
+		Object.defineProperty(document, "visibilityState", {
+			configurable: true,
+			get: () => visibility,
+		});
+		const dispose = installRendererHangWatchdog((level, message, detail) => {
+			entries.push({ level, message, detail });
+		});
+		await nextFrame();
+
+		// 窗口被切走/息屏：浏览器停帧，恢复后首帧的间隔等于整段隐藏时长。
+		visibility = "hidden";
+		document.dispatchEvent(new Event("visibilitychange"));
+		clock.advance(120_000);
+		visibility = "visible";
+		document.dispatchEvent(new Event("visibilitychange"));
+		await nextFrame();
+
+		// 恢复后紧接着的一次真实停顿仍然要报告，证明跳过标记只吞掉恢复后的首帧。
+		clock.advance(4_000);
+		await nextFrame();
+		dispose();
+
+		const stalled = entries.filter((entry) => entry.message === "Renderer frame stalled");
+		expect(stalled).toHaveLength(1);
+		expect(stalled[0].detail?.blockedMs).toBe(4_000);
+	});
 });

@@ -204,13 +204,33 @@ export function installRendererHangWatchdog(sink: RendererHangLoggerSink): () =>
   // 3) rAF 心跳：观察「帧间隔」，也就是主线程连续阻塞的时长。
   let disposed = false;
   let lastFrameAt = performance.now();
+  /**
+   * 隐藏 → 可见的跳变会制造一个等于「整段隐藏时长」的帧间隔：窗口被切走、锁屏、
+   * 息屏时浏览器停帧，恢复后第一帧算出的 now - lastFrameAt 就是隐藏时长，而这一刻
+   * visibilityState 已经回到 visible。只按「出帧时刻是否可见」判定会把这整段误报成
+   * 主线程卡死（10-20 日志里 5s~253s 的 frame stalled 全是这种假阳性：同时间段
+   * longtask 一条没有、RPC 一直在流、窗口回来立刻恢复响应）。
+   * 因此可见性恢复时重置计时起点，并吞掉恢复后的首个间隔；真正的阻塞开始于可见期间，
+   * 不受影响。
+   */
+  let resumedFromHidden = false;
+  const handleVisibilityChange = () => {
+    if (document.visibilityState !== "visible") return;
+    resumedFromHidden = true;
+    lastFrameAt = performance.now();
+  };
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  disposers.push(() => document.removeEventListener("visibilitychange", handleVisibilityChange));
+
   const tick = () => {
     if (disposed) return;
     const now = performance.now();
     const gap = now - lastFrameAt;
     lastFrameAt = now;
+    const afterHidden = resumedFromHidden;
+    resumedFromHidden = false;
     // 隐藏/最小化窗口时浏览器本来就不出帧，此时的大间隔不代表卡死。
-    if (gap >= FRAME_STALL_MS && document.visibilityState === "visible") {
+    if (gap >= FRAME_STALL_MS && document.visibilityState === "visible" && !afterHidden) {
       log("warn", "Renderer frame stalled", {
         blockedMs: Math.round(gap),
         ...snapshot(),
