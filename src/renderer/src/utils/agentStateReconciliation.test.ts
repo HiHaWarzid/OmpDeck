@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { reconcileAgentState } from "./agentStateReconciliation";
+import { reconcileAgentState, sameAgentTabList } from "./agentStateReconciliation";
 import type { AgentTab } from "../../../shared/types";
 import type { PendingAgentTab } from "../agentListDisplay";
 
@@ -117,4 +117,31 @@ test("activeProjectIds 仅含真实 agent 的 project", () => {
     undefined,
   );
   assert.deepEqual([...result.activeProjectIds].sort(), ["p1", "p3"]);
+});
+
+/**
+ * sameAgentTabList 是 setAgents 的内容守卫：工具的每 50ms 全量推送若内容未变必须
+ * 判定为「无变化」，否则新数组会击穿 App 的派生链、让侧栏每 50ms 重渲染一次。
+ * 反向要求同样重要：任一可见字段变化都必须判定为「有变化」，否则 UI 会吞掉状态更新。
+ */
+test("sameAgentTabList：内容全等时无变化", () => {
+  const previous = [realAgent("a1"), realAgent("a2", "p2")];
+  const next = previous.map((agent) => ({ ...agent }));
+  assert.equal(sameAgentTabList(previous, next), true);
+});
+
+test("sameAgentTabList：状态 / 标题 / 压缩次数变化都判定为有变化", () => {
+  const previous = [realAgent("a1")];
+  assert.equal(sameAgentTabList(previous, [{ ...previous[0], status: "running" }]), false);
+  assert.equal(sameAgentTabList(previous, [{ ...previous[0], title: "改名" }]), false);
+  assert.equal(sameAgentTabList(previous, [{ ...previous[0], compactionCount: 1 }]), false);
+  assert.equal(sameAgentTabList(previous, [{ ...previous[0], lastError: "boom" }]), false);
+});
+
+test("sameAgentTabList：增删条目与可选字段出现/消失都判定为有变化", () => {
+  const previous = [realAgent("a1")];
+  assert.equal(sameAgentTabList(previous, [...previous, realAgent("a2")]), false);
+  assert.equal(sameAgentTabList(previous, []), false);
+  // sessionId 之前不存在、现在有值：键集合变化也必须触发更新
+  assert.equal(sameAgentTabList(previous, [{ ...previous[0], sessionId: "sess-1" } as AgentTab]), false);
 });

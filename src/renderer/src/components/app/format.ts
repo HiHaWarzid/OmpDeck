@@ -33,7 +33,8 @@ export function formatTime(timestamp: number) {
 }
 /** 去除 pi 输出中的 ANSI 终端转义码,避免在 React UI 中显示原始 \e[38;5;109m 等文本 */
 export function stripAnsi(text: string): string {
-	return text.replace(ANSI_RE, "");
+	// 与 AppUtils.stripAnsi 同一策略：无转义码时原样返回，省掉整串分配。
+	return text.includes("\x1b") ? text.replace(ANSI_RE, "") : text;
 }
 /** 去除文本中的 <thinking> 标签 */
 export function stripThinkingTags(text: string): string {

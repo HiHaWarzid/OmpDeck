@@ -1,4 +1,4 @@
-import React from "react";
+import React, { Profiler } from "react";
 import ReactDOM from "react-dom/client";
 import type { AppLogLevel } from "@shared/types";
 import { App } from "./App";
@@ -7,12 +7,29 @@ import { t } from "./i18n";
 import { showNotice } from "./utils/notice";
 import { installDevPerformanceTrackGuard } from "./utils/devPerformanceTrackGuard";
 import { installRendererHangWatchdog } from "./utils/rendererHangWatchdog";
+import {
+  isPerfEnabled,
+  recordCommitRender,
+  startRenderCensus,
+} from "./utils/perfStats";
 import "./styles.css";
 import "./file-icons.css";
 
 // React dev 构建会在 commit 阶段把变化过的 props 明细克隆进 performance.measure 的 detail：
 // 长时间运行会累积内存，并在堆紧张时抛 DataCloneError 打断提交（此后窗口不再响应）。
 installDevPerformanceTrackGuard();
+
+// 组件渲染普查：只在 PIDECK_PERF=1 时开启（默认零开销）。
+// 卡死现场只有「帧率掉了」这种结果指标，无法回答「谁在每 50ms 重渲染、花了多少毫秒」；
+// 该普查读 React dev 构建写出的组件级 user-timing，能直接给出
+// 「组件 → 渲染次数 / 累计耗时 / 单次最大耗时」，是判断主线程是否被渲染打满的证据。
+if (isPerfEnabled()) {
+	startRenderCensus((message, detail) => {
+		window.piDesktop?.app
+			.rendererLog("info", "render-census", message, detail)
+			.catch(() => undefined);
+	});
+}
 
 // 卡死看门狗：渲染层冻结时写不了任何东西，只能靠事发时自动落盘的证据定位
 // （长任务时长、帧间隔、DOM 节点数、堆占用）。日志用独立 scope 便于在应用日志里筛。
@@ -79,9 +96,23 @@ if (!rootElement) {
 
 ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <AppErrorBoundary>
-      <App />
-    </AppErrorBoundary>
+    {/* 普查开启时才挂 Profiler（commit 级耗时）；默认不挂，避免额外开销 */}
+    {isPerfEnabled() ? (
+      <Profiler
+        id="app"
+        onRender={(_id, _phase, actualDuration) =>
+          recordCommitRender(actualDuration)
+        }
+      >
+        <AppErrorBoundary>
+          <App />
+        </AppErrorBoundary>
+      </Profiler>
+    ) : (
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>
+    )}
   </React.StrictMode>,
 );
 

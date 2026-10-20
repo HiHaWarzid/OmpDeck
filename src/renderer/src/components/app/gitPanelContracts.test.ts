@@ -36,6 +36,7 @@ const GIT_I18N_KEYS = [
 	"git.smartCommitNever",
 	"git.openFileDiff",
 	"git.openWorkspaceDiff",
+	"git.loadMoreCount",
 	"git.discardConfirmMessage",
 	"git.discardUntrackedConfirmMessage",
 ] as const;

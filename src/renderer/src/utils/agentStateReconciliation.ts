@@ -63,3 +63,31 @@ export function reconcileAgentState(
 		activeProjectIds: new Set(nextAgents.map((agent) => agent.projectId)),
 	};
 }
+
+/**
+ * 两次 agents:state 推送的列表内容是否一致（UI 可见字段全等）。
+ *
+ * 主进程在工具回合里每 50ms 推一次全量 agent 列表，内容多数时候没变。渲染层若无条件
+ * `setAgents(next)`，新数组会击穿 App 的整条派生链（displayAgents → activeAgent →
+ * 项目投影 → SidebarTree），让侧栏子树每 50ms 整棵重渲染一次——这是流式期间根组件
+ * 被反复唤醒的主因之一。这里按字段比较，内容相同就沿用旧数组：引用稳定即所有
+ * 下游 useMemo/memo 全部命中。
+ *
+ * 用「键集合 + 逐键比较」而不是写死字段名：AgentTab 以后新增字段不需要改这里，
+ * 不会因为漏比较而吞掉更新；新字段若为对象（引用每次不同）则退化成「总是不等」，
+ * 也就是今天的行为，不会更差。
+ */
+export function sameAgentTabList(previous: AgentTab[], next: AgentTab[]): boolean {
+	if (previous === next) return true;
+	if (previous.length !== next.length) return false;
+	for (let i = 0; i < next.length; i += 1) {
+		const before = previous[i] as unknown as Record<string, unknown>;
+		const after = next[i] as unknown as Record<string, unknown>;
+		const beforeKeys = Object.keys(before);
+		if (beforeKeys.length !== Object.keys(after).length) return false;
+		for (const key of beforeKeys) {
+			if (before[key] !== after[key]) return false;
+		}
+	}
+	return true;
+}

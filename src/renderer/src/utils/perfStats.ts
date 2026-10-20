@@ -25,6 +25,107 @@ export function isPerfEnabled(): boolean {
 	return ENABLED;
 }
 
+/**
+ * 组件渲染普查（与帧率采样同源开关）：卡死现场只有「帧率掉了」这种结果指标，
+ * 无法回答「是谁在每 50ms 重渲染、花了多少毫秒」，只能靠临时插桩复现。
+ *
+ * React dev 构建对每一次渲染（含 props 未变的 memo 未命中）都会写一条以
+ * U+200B 开头的 performance.measure，因此这里只读性能条目、不改组件即可拿到
+ * 「组件 → 渲染次数 / 累计耗时 / 单次最大耗时」。总耗时占比即渲染层主线程占用率，
+ * 是判断热路径是否被压满、以及验证优化是否生效的直接证据（零侵入，不需改组件）。
+ */
+const CENSUS_WINDOW_MS = 5_000;
+const CENSUS_TOP = 8;
+const CENSUS_SLOW_MS = 16;
+
+/**
+ * 提交级统计：React 只对挂载了 `<Profiler>` 的子树写组件级 user-timing，
+ * 且根组件自身可能不带条目（实测 App 不在条目里），因此子树的总渲染耗时
+ * 只能靠 Profiler.onRender 的回调累计。commit 次数 = 整棵会话树的渲染频率
+ * （流式期间每 50ms 一批 delta 就会推一次），treeMs 占比即渲染占用率。
+ */
+let commitCount = 0;
+let commitMs = 0;
+
+export function recordCommitRender(durationMs: number): void {
+	commitCount += 1;
+	commitMs += durationMs;
+}
+
+/** 汇总一次窗口：返回停止函数（幂等；调用后不再写日志）。 */
+export function startRenderCensus(
+	log: (message: string, detail: unknown) => void,
+): () => void {
+	type Stat = { count: number; total: number; max: number; slow: number };
+	let stopped = false;
+	let lastFlush = performance.now();
+	const acc = new Map<string, Stat>();
+
+	const flush = () => {
+		const now = performance.now();
+		const windowMs = now - lastFlush;
+		lastFlush = now;
+		// React 的组件条目名 = U+200B + 组件名；其他 measure（含我们自己的探针）不统计。
+		for (const entry of performance.getEntriesByType("measure")) {
+			if (entry.name.charCodeAt(0) !== 0x200b) continue;
+			const name = entry.name.slice(1);
+			const stat = acc.get(name) ?? { count: 0, total: 0, max: 0, slow: 0 };
+			stat.count += 1;
+			stat.total += entry.duration;
+			if (entry.duration > stat.max) stat.max = entry.duration;
+			if (entry.duration >= CENSUS_SLOW_MS) stat.slow += 1;
+			acc.set(name, stat);
+		}
+		// 已汇总的条目全部丢弃，避免长会话把 performance 环形缓冲写满。
+		performance.clearMeasures();
+		if (acc.size === 0) return;
+		const stats = [...acc.entries()];
+		acc.clear();
+		let renders = 0;
+		let busyMs = 0;
+		let slow = 0;
+		for (const [, s] of stats) {
+			renders += s.count;
+			busyMs += s.total;
+			slow += s.slow;
+		}
+		const round = (n: number) => Math.round(n * 10) / 10;
+		const top = (list: typeof stats) =>
+			list.slice(0, CENSUS_TOP).map(([name, s]) => ({
+				name,
+				count: s.count,
+				totalMs: round(s.total),
+				maxMs: round(s.max),
+				slow: s.slow,
+			}));
+		log("render census", {
+			windowMs: Math.round(windowMs),
+			renders,
+			commits: commitCount,
+			treeMs: round(commitMs),
+			treeBusyRatio: Math.round((commitMs / windowMs) * 100) / 100,
+			busyRatio: Math.round((busyMs / windowMs) * 100) / 100,
+			slowRenders: slow,
+			byCost: top([...stats].sort((a, b) => b[1].total - a[1].total)),
+			byCount: top([...stats].sort((a, b) => b[1].count - a[1].count)),
+		});
+		commitCount = 0;
+		commitMs = 0;
+	};
+
+	const timer = setInterval(() => {
+		if (stopped) return;
+		flush();
+	}, CENSUS_WINDOW_MS);
+
+	return () => {
+		if (stopped) return;
+		stopped = true;
+		clearInterval(timer);
+		flush();
+	};
+}
+
 /** 开始采样：流式开始时调用（幂等，重复调用无副作用）。 */
 export function startFrameSampling(): void {
 	if (!ENABLED || active) return;

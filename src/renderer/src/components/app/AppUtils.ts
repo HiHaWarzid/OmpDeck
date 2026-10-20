@@ -13,7 +13,9 @@ import { formatFilePathRef } from "./RichInput";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 
 export function stripAnsi(text: string): string {
-	return text.replace(ANSI_RE, "");
+	// 绝大多数消息文本不含转义码；先做一次 O(n) 扫描，命中则原样返回同一字符串对象，
+	// 省掉 replace 的整串分配（20Hz 流式重算整窗消息文本时就是这条路径）。
+	return text.includes("\x1b") ? text.replace(ANSI_RE, "") : text;
 }
 
 export function stripThinkingTags(text: string): string {

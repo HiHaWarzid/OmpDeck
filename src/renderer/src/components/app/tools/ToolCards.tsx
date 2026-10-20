@@ -279,6 +279,44 @@ function getToolExitCode(message: ChatMessage) {
 	}
 	return undefined;
 }
+/**
+ * 工具卡片的 memo 判据：只比消息引用与默认展开态。
+ *
+ * onDiffFile 不参与比较（与 AssistantText/TurnRow 的比较器同一约定）：它由 App 以稳定引用
+ * 传入，行为与单条消息无关。若把回调算进判据，App 每渲染一次、每一张卡片都要重跑
+ * 工具名/参数推导、状态解析与正则可视化——实测流式期间每 5s 近千次 ToolCard 渲染，
+ * 内容大的工具输出（读大文件）时每次渲染都是毫秒级。
+ */
+function sameToolCardProps(
+	previous: { message: ChatMessage; defaultOpen?: boolean },
+	next: { message: ChatMessage; defaultOpen?: boolean },
+): boolean {
+	return previous.message === next.message && previous.defaultOpen === next.defaultOpen;
+}
+
+/**
+ * 工具组判据：id 相同且成员消息逐个引用相同就跳过。
+ *
+ * groupToolMessages 每批 delta 都重建 ToolGroupItem 与 messages 数组（新容器、旧元素），
+ * 只比容器引用会恒不相等；逐元素比较才能让未变化的卡片真正跳过——组内只有正在流式输出的
+ * 那一张需要重渲染。
+ */
+function sameToolGroupProps(
+	previous: { group: ToolGroupItem },
+	next: { group: ToolGroupItem },
+): boolean {
+	if (previous.group === next.group) return true;
+	if (previous.group.id !== next.group.id) return false;
+	const before = previous.group.messages;
+	const after = next.group.messages;
+	if (before === after) return true;
+	if (before.length !== after.length) return false;
+	for (let index = 0; index < after.length; index += 1) {
+		if (before[index] !== after[index]) return false;
+	}
+	return true;
+}
+
 export const ToolCard = memo(function ToolCard(props: {
 	message: ChatMessage;
 	defaultOpen?: boolean;
@@ -599,19 +637,22 @@ const statusLabel =
 			)}
 		</section>
 	);
-});
+}, sameToolCardProps);
 /** 工具组直接平铺为工具列表；每个 ToolCard 自己默认折叠，避免外层再占一行。 */
-export const ToolGroupCard = memo(function ToolGroupCard(props: {
-	group: ToolGroupItem;
-	onDiffFile?: DiffFileHandler;
-}) {
-	return (
-		<section className="tool-group-card flat" data-message-id={props.group.id}>
-			<div className="tool-group-card-list">
-				{props.group.messages.map((message) => (
-					<ToolCard key={message.id} message={message} onDiffFile={props.onDiffFile} />
-				))}
-			</div>
-		</section>
-	);
-});
+export const ToolGroupCard = memo(
+	function ToolGroupCard(props: {
+		group: ToolGroupItem;
+		onDiffFile?: DiffFileHandler;
+	}) {
+		return (
+			<section className="tool-group-card flat" data-message-id={props.group.id}>
+				<div className="tool-group-card-list">
+					{props.group.messages.map((message) => (
+						<ToolCard key={message.id} message={message} onDiffFile={props.onDiffFile} />
+					))}
+				</div>
+			</section>
+		);
+	},
+	sameToolGroupProps,
+);

@@ -126,7 +126,7 @@ import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
 import { useSessionImport } from "./hooks/useSessionImport";
-import { reconcileAgentState } from "./utils/agentStateReconciliation";
+import { reconcileAgentState, sameAgentTabList } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
 import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState } from "./workspace/agentRuntime";
@@ -324,6 +324,15 @@ const AGENT_CREATE_TIMEOUT_MS = 60_000;
 // useMessagePagination 与 renderedRuns 的记忆化依赖 messages 的引用相等，
 // 每次渲染新建 [] 会让这些派生全部失效；冻结防止任何路径写坏这份共享默认值。
 const EMPTY_MESSAGES: ChatMessage[] = Object.freeze([]) as unknown as ChatMessage[];
+
+// 共享空分支信息：GitPanel / composer 分支栏都读这份默认值，且 GitPanel 的 memo 判据
+// 比较 initialBranchInfo 的引用——若这里每次渲染新建对象，面板的 memo 会永久失效，
+// 于是每次 App 重渲染（流式期间每秒十余次）都要重渲染整棵数千行的资源列表，
+// 直接把渲染线程打满（实测 85 秒 100% 占用，界面完全点不动）。冻结防止共享默认值被写坏。
+const EMPTY_BRANCH_INFO: GitBranchInfo = Object.freeze({
+	current: null,
+	branches: Object.freeze([]) as unknown as string[],
+}) as GitBranchInfo;
 
 
 function isAbsoluteFilePath(path: string) {
@@ -2369,7 +2378,10 @@ export function App() {
       if (remainingPendingAgents.length !== pendingAgentsRef.current.length) {
         updatePendingAgents(() => remainingPendingAgents);
       }
-      setAgents(nextAgents);
+      // 内容相同则沿用旧数组：工具回合里 agents:state 每 50ms 推一次全量列表，
+      // 无条件 setAgents 会用新引用击穿 displayAgents → 侧栏投影的整条派生链，
+      // 让近千行侧栏子树跟着 20Hz 重渲染（见 sameAgentTabList 注释）。
+      setAgents((current) => (sameAgentTabList(current, nextAgents) ? current : nextAgents));
       setActiveAgentId(nextActiveAgentId);
       // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
       // terminalDock/drawerPinned/promptHistory/queueFlush）
@@ -3730,6 +3742,27 @@ export function App() {
     setDrawer(null);
     openEditorTab(path, "diff", resolvedOriginal, resolvedModified);
   }
+
+  // 传给 memo 化子树的回调必须引用恒定：AssistantText/TurnRow/MessageListContent/ToolCard 的
+  // memo 比较器按仓库约定不比较回调（回调行为与单条消息无关），所以只要引用变了，整窗消息
+  // 与工具卡片就会跟着 App 一起重渲染。上面这些 handler 是函数声明（每次渲染重建，且闭包
+  // 依赖 activeAgent/flatFiles/modifiedFiles 等），这里用 latest-ref 适配器把引用固定下来：
+  // 调用始终走最新实现（不会读到陈旧闭包），引用恒定则子树 memo 真正生效。
+  const latestHandlersRef = useRef({ openFilePath, diffFilePath, viewFilePath });
+  latestHandlersRef.current = { openFilePath, diffFilePath, viewFilePath };
+  const stableOpenFilePath = useCallback(
+    (path: string) => latestHandlersRef.current.openFilePath(path),
+    [],
+  );
+  const stableDiffFilePath = useCallback(
+    (path: string, originalContent?: string, content?: string) =>
+      latestHandlersRef.current.diffFilePath(path, originalContent, content),
+    [],
+  );
+  const stableViewFilePath = useCallback(
+    (path: string) => latestHandlersRef.current.viewFilePath(path),
+    [],
+  );
 
   async function openWorkspaceFileDiff(group: GitResourceGroupType, path: string) {
     if (!activeProjectId) return;
@@ -5884,8 +5917,8 @@ export function App() {
 
   /** 当前项目分支信息（统一 store 的读取视图）：composer 分支展示 / GitPanel 首帧种子 / 切换守卫共用。 */
   const activeGitInfo: GitBranchInfo = activeProjectId
-    ? (branchInfoByProject[activeProjectId] ?? { current: null, branches: [] })
-    : { current: null, branches: [] };
+    ? (branchInfoByProject[activeProjectId] ?? EMPTY_BRANCH_INFO)
+    : EMPTY_BRANCH_INFO;
 
   async function switchBranch(branch: string): Promise<GitBranchInfo | void> {
     if (!activeProjectId || !branch || branch === activeGitInfo.current) return;
@@ -5930,6 +5963,39 @@ export function App() {
       setSwitchingBranch(null);
     }
   }
+
+  // 传给 memo 化 GitPanel 的回调同样必须引用恒定（理由见 latestHandlersRef 注释）：
+  // 面板内是数千行资源列表，回调引用一变整块列表就会重渲染。
+  const latestGitHandlersRef = useRef({
+    openCommitFileDiff,
+    openWorkspaceFileDiff,
+    switchBranch,
+    createBranch,
+  });
+  latestGitHandlersRef.current = {
+    openCommitFileDiff,
+    openWorkspaceFileDiff,
+    switchBranch,
+    createBranch,
+  };
+  const stableOpenCommitFileDiff = useCallback(
+    (commit: CommitEntry, file: GitChangedFile) =>
+      latestGitHandlersRef.current.openCommitFileDiff(commit, file),
+    [],
+  );
+  const stableOpenWorkspaceFileDiff = useCallback(
+    (group: GitResourceGroupType, path: string) =>
+      latestGitHandlersRef.current.openWorkspaceFileDiff(group, path),
+    [],
+  );
+  const stableSwitchBranch = useCallback(
+    (branch: string) => latestGitHandlersRef.current.switchBranch(branch),
+    [],
+  );
+  const stableCreateBranch = useCallback(
+    (branchName: string) => latestGitHandlersRef.current.createBranch(branchName),
+    [],
+  );
 
   /** 创建新的 git worktree 工作区 */
   async function createWorktree(projectId: string, branchName: string) {
@@ -6631,8 +6697,8 @@ export function App() {
               validCommandNames={validCommandNames}
               validFilePaths={validFilePaths}
               onPreviewImage={setPreviewImage}
-              onOpenFile={openFilePath}
-              onDiffFile={diffFilePath}
+              onOpenFile={stableOpenFilePath}
+              onDiffFile={stableDiffFilePath}
               onEditMessage={editMessage}
               onDeleteMessage={deleteMessage}
               onForkMessage={forkFromUserMessage}
@@ -7739,11 +7805,11 @@ export function App() {
                         projectId={activeProjectId}
                         projectRoot={activeProject?.path}
                         git={api.git}
-                        onOpenCommitFileDiff={openCommitFileDiff}
-                        onOpenWorkspaceFileDiff={openWorkspaceFileDiff}
+                        onOpenCommitFileDiff={stableOpenCommitFileDiff}
+                        onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
                         initialBranchInfo={activeGitInfo}
-                        onSwitchBranch={switchBranch}
-                        onCreateBranch={createBranch}
+                        onSwitchBranch={stableSwitchBranch}
+                        onCreateBranch={stableCreateBranch}
                       />
                     </div>
                     {gitDrawerDiff && gitDrawerDiff.projectId === activeProjectId && gitDiffDisplayMode === "drawer" && (
@@ -7824,8 +7890,8 @@ export function App() {
                           const p = projects.find((p) => p.id === activeProjectId);
                           if (p) void api.files.open(p.path);
                         }}
-                        onViewFile={viewFilePath}
-                        onOpenFile={openFilePath}
+                        onViewFile={stableViewFilePath}
+                        onOpenFile={stableOpenFilePath}
                         onDropFiles={(targetDir, fileList) => {
                           const paths: string[] = [];
                           for (let i = 0; i < fileList.length; i++) {

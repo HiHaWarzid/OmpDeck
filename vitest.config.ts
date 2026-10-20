@@ -1,6 +1,15 @@
 import { defineConfig } from "vitest/config";
+import { resolve } from "node:path";
 
 export default defineConfig({
+  resolve: {
+    // 与 electron.vite.config.ts 的 renderer alias 保持一致：否则引用 @renderer/@shared
+    // 的渲染层模块（组件、工具）无法在单测里导入，只能靠源码正则断言间接覆盖。
+    alias: {
+      "@renderer": resolve("src/renderer/src"),
+      "@shared": resolve("src/shared"),
+    },
+  },
   test: {
     environment: "node",
     // 只收集 src 下的 TS 单测；tests/*.test.mjs 是 node:test 源码审查套件，

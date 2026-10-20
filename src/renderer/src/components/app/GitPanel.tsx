@@ -1,5 +1,6 @@
 import {
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -28,6 +29,12 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { ConfirmDialog } from "./menus/ContextMenus";
 import { showNotice } from "../../utils/notice";
+import { sameResourceGroups } from "../../utils/gitResourceGroups";
+import {
+	FILE_TREE_PAGE_SIZE,
+	buildFileTreeView,
+	groupGitResourcesByDir,
+} from "../../utils/gitFileTree";
 import type { PiDesktopApi } from "../../../../shared/api";
 import type {
   BranchDiffResult,
@@ -36,6 +43,7 @@ import type {
   GitBranchInfo,
   GitChangedFile,
   GitFileStatus,
+  GitResource,
   GitResourceGroupType,
   GitResourceGroups,
 } from "../../../../shared/types";
@@ -106,6 +114,11 @@ const EMPTY_GROUPS: GitResourceGroups = {
   workingTree: [],
   untracked: [],
 };
+/** 共享空分支信息：state 默认值/错误回退必须是稳定引用，否则每次落存都换新对象。 */
+const EMPTY_BRANCH_INFO: GitBranchInfo = Object.freeze({
+  current: null,
+  branches: Object.freeze([]) as unknown as string[],
+}) as GitBranchInfo;
 const GRAPH_COLORS = [
   "var(--git-graph-lane-1)",
   "var(--git-graph-lane-2)",
@@ -310,74 +323,59 @@ function shortenDir(dir: string): string {
   return parts.map((p) => p.charAt(0) || "").join("/");
 }
 
-/** 按目录分组 Git 资源，返回 { dir -> resources[] } 映射 */
-function groupByDir(
-	resources: import("../../../../shared/types").GitResource[],
-	/** 项目根目录，传入后目录名显示为相对路径而非绝对路径 */
-	rootPath?: string,
-): Map<string, import("../../../../shared/types").GitResource[]> {
-	const dirs = new Map<string, import("../../../../shared/types").GitResource[]>();
-	for (const r of resources) {
-		// 将绝对路径转为相对路径，使目录分组显示简洁的相对路径而非长绝对路径
-		let p = r.path;
-		if (rootPath) {
-			const normalizedRoot = rootPath.replace(/[\\]+/g, "/").replace(/\/+$/, "");
-			const normalizedPath = p.replace(/[\\]+/g, "/");
-			if (normalizedPath.startsWith(normalizedRoot + "/")) {
-				p = normalizedPath.slice(normalizedRoot.length + 1);
-			} else if (normalizedPath === normalizedRoot) {
-				p = "";
-			}
-		}
-		const parts = p.split(/[/\\]/);
-		const dir = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
-		if (!dirs.has(dir)) dirs.set(dir, []);
-		dirs.get(dir)!.push(r);
-	}
-	return dirs;
-}
-
 /** 收集变更列表中可折叠的目录键（单根无目录头时返回空） */
 function getCollapsibleChangeDirs(
 	resources: import("../../../../shared/types").GitResource[],
 	projectRoot?: string,
 ): string[] {
-	const byDir = groupByDir(resources, projectRoot);
-	const dirs = [...byDir.keys()];
+	const dirs = [...groupGitResourcesByDir(resources, projectRoot).keys()];
 	// 与 FileTree 一致：仅一个根目录时不显示目录头，也就没有可折叠项
 	if (dirs.length === 1 && dirs[0] === "") return [];
 	return dirs;
 }
 
-/** 按目录树渲染文件列表 */
+/**
+ * 按目录树渲染文件列表。
+ *
+ * 行数受 FILE_TREE_PAGE_SIZE 限制：大仓库（实测 3389 条变更）全量渲染会产生
+ * 4 万+ DOM 节点，单次按键的提交+布局要 1.1 秒以上。分页后首屏固定为 200 行，
+ * 其余通过「加载更多」按需追加，目录折叠不消耗预算（用户主动隐藏的行不该占额度）。
+ */
 function FileTree(props: {
-	resources: import("../../../../shared/types").GitResource[];
-	groupType: import("../../../../shared/types").GitResourceGroupType;
+	resources: GitResource[];
+	groupType: GitResourceGroupType;
 	stageFile?: (path: string) => void;
 	unstageFile?: (path: string) => void;
 	discardFile?: (path: string, group: "workingTree" | "untracked") => void;
 	mutating: boolean;
-	onOpenWorkspaceFileDiff: (group: import("../../../../shared/types").GitResourceGroupType, path: string) => void;
+	onOpenWorkspaceFileDiff: (group: GitResourceGroupType, path: string) => void;
 	/** 项目根目录路径，用于显示相对路径 */
 	projectRoot?: string;
 	/** 受控：已折叠目录集合（与父级「收起/展开全部」共享） */
 	collapsedDirs: Set<string>;
 	onToggleDir: (dir: string) => void;
 }) {
-	const byDir = groupByDir(props.resources, props.projectRoot);
-	// 按目录名排序，根目录排最前
-	const dirs = [...byDir.keys()].sort((a, b) => {
-		if (a === "") return -1;
-		if (b === "") return 1;
-		return a.localeCompare(b);
-	});
+	const [limit, setLimit] = useState(FILE_TREE_PAGE_SIZE);
+	// 切项目时回到首屏行数：上一项目展开的页数对新仓库没有意义，且会让大仓库首帧重新变慢。
+	useEffect(() => {
+		setLimit(FILE_TREE_PAGE_SIZE);
+	}, [props.projectRoot]);
+	const view = useMemo(
+		() =>
+			buildFileTreeView(
+				props.resources,
+				props.projectRoot,
+				props.collapsedDirs,
+				limit,
+			),
+		[props.resources, props.projectRoot, props.collapsedDirs, limit],
+	);
 
 	return (
 		<>
-		{dirs.map((dir) => {
-			const resources = byDir.get(dir)!;
+		{view.sections.map(({ dir, resources, total }) => {
 			// 单目录且无嵌套时不显示目录头
-			const isSingleRoot = dirs.length === 1 && dir === "";
+			const isSingleRoot = view.singleRoot && dir === "";
 			return (
 				<Fragment key={dir || "root"}>
 					{!isSingleRoot && (
@@ -392,10 +390,11 @@ function FileTree(props: {
 							<span className="git-tree-directory-name" title={dir || "/"}>
 								{shortenDir(dir) || "/"}
 							</span>
-							<span className="git-tree-directory-count">{resources.length}</span>
+							{/* 徽标始终显示目录全量，而不是本页渲染的行数 */}
+							<span className="git-tree-directory-count">{total}</span>
 						</div>
 					)}
-					{(!props.collapsedDirs.has(dir) || isSingleRoot) && resources.map((r) => {
+					{resources.map((r) => {
 						const actions: Array<{
 							label: string;
 							kind: "stage" | "unstage" | "discard";
@@ -431,6 +430,15 @@ function FileTree(props: {
 				</Fragment>
 			);
 		})}
+		{view.hidden > 0 && (
+			<button
+				type="button"
+				className="git-load-more-btn"
+				onClick={() => setLimit((current) => current + FILE_TREE_PAGE_SIZE)}
+			>
+				{t("git.loadMoreCount", { count: view.hidden })}
+			</button>
+		)}
 		</>
 	);
 }
@@ -861,7 +869,27 @@ function PaneSash(props: {
   );
 }
 
-export function GitPanel(props: GitPanelProps) {
+/**
+ * 面板 memo 判据：只比数据入参（项目、根目录、git 门面、初始分支信息），
+ * 四个回调按仓库约定不参与比较——App 侧用 latest-ref 适配器传入，引用恒定、行为始终最新。
+ *
+ * 为什么必须 memo：变更列表按目录树一次渲染全部条目（大仓库实测 3000+ 行，单次面板渲染
+ * 200ms 以上）。若面板跟着 App 一起重渲染（流式期间每 50ms 一批 delta、以及各种状态推送），
+ * 就是「数千行 × 每秒数十次」——实测把渲染线程连续打满 85 秒（100% 占用），
+ * 用户侧表现就是整个界面点不动，只能重启。
+ */
+function sameGitPanelProps(previous: GitPanelProps, next: GitPanelProps): boolean {
+  return (
+    previous.projectId === next.projectId &&
+    previous.projectRoot === next.projectRoot &&
+    previous.git === next.git &&
+    previous.initialBranchInfo === next.initialBranchInfo
+  );
+}
+
+export const GitPanel = memo(GitPanelImpl, sameGitPanelProps);
+
+function GitPanelImpl(props: GitPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const projectIdRef = useRef(props.projectId);
   projectIdRef.current = props.projectId;
@@ -906,7 +934,7 @@ export function GitPanel(props: GitPanelProps) {
   /** 分支列表自持状态：面板打开时以 initialBranchInfo 作首帧，随后自拉取/自刷新，
    *  不再依赖 App 逐帧透传 branches/currentBranch props。 */
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo>(
-    props.initialBranchInfo ?? { current: null, branches: [] },
+    props.initialBranchInfo ?? EMPTY_BRANCH_INFO,
   );
 
   /**
@@ -927,14 +955,14 @@ export function GitPanel(props: GitPanelProps) {
       );
     } catch {
       if (projectId === projectIdRef.current) {
-        setBranchInfo({ current: null, branches: [] });
+        setBranchInfo(EMPTY_BRANCH_INFO);
       }
     }
   }, [props.git, props.projectId]);
 
   // 项目切换/面板挂载：以 App 统一 store 的最新值作首帧并立即拉取一次权威数据。
   useEffect(() => {
-    setBranchInfo(props.initialBranchInfo ?? { current: null, branches: [] });
+    setBranchInfo(props.initialBranchInfo ?? EMPTY_BRANCH_INFO);
     void refreshBranches();
     // initialBranchInfo 只在项目切换时作为种子使用，后续同步由 refreshBranches 自持，
     // 故不列入依赖，避免 App store 每次变化都重复拉取。
@@ -1055,7 +1083,11 @@ export function GitPanel(props: GitPanelProps) {
           request === statusRequestRef.current &&
           projectId === projectIdRef.current
         ) {
-          setGroups(next);
+          // 静默轮询每 5 秒一次；工作区没变时必须保留旧引用，否则整棵资源树
+          // （大仓库数千行）会跟着无意义地重渲染一次，白占主线程。
+          setGroups((current) =>
+            sameResourceGroups(current, next) ? current : next,
+          );
           // 状态成功即证明 git 可用且目录是仓库：两个提示位必须随之清零。
           // 此前只有 notAGitRepo 会在切项目/init 后被重置，gitNotInstalled 一旦置位
           // 就永久停留，用户重装 git 或切到正常项目后仍看到「未安装」引导。
