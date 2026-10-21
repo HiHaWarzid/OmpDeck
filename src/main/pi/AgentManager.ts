@@ -348,6 +348,17 @@ export class AgentManager {
 	}
 
 	/**
+	 * 查找当前占用指定会话文件的 Agent。
+	 * 重命名必须区分：活跃会话走 RPC（由 omp 写原生标题并维护内存状态），
+	 * 已关闭的历史会话才直接改文件，避免桌面端与运行中的 omp 各写一份标题。
+	 */
+	getAgentBySessionPath(sessionPath: string) {
+		const sessionKey = this.normalizeSessionPathForCompare(sessionPath);
+		if (!sessionKey) return undefined;
+		return this.findRuntimeBySessionKey(sessionKey)?.tab;
+	}
+
+	/**
 	 * 判断指定项目是否仍有运行中的 Agent（pi 子进程未退出）。
 	 * 用于删除项目前拦截，避免删除后 pi 进程悬挂后台继续占用资源。
 	 */

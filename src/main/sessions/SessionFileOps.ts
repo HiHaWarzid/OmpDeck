@@ -18,7 +18,7 @@ import { isJsonRecord, readEntries, type ReadEntriesOptions, type SessionEntries
  *     访问器每次操作时读取当前适配器，避免持有过期实例。
  *
  * 读取半部分（解码/逐行解析/字节预算）委托给 sessionEntries 的单一实现；
- * 写入半部分（session_info 追加、回收站回退删除、modifyLines 写回）留在本模块。
+ * 写入半部分（原生标题槽/title_change、回收站回退删除、modifyLines 写回）留在本模块。
  *
  * 依赖方向：不依赖 SessionScanner、不依赖 AgentManager/RPC；
  * 可在无 WSL 环境下用 stub 适配器测试。
@@ -56,6 +56,55 @@ function normalize(path: string) {
 }
 
 /**
+ * omp 会话标题槽固定宽度（字节，含换行）。
+ *
+ * omp 把首行标题做成定长槽位，重命名时原地覆盖这一行而不是追加历史；
+ * 尺寸必须与 @oh-my-pi/pi-coding-agent 的 SESSION_TITLE_SLOT_BYTES 一致，
+ * 否则 omp 读取时会认为标题行损坏并退回 session 头/首条消息。
+ */
+const SESSION_TITLE_SLOT_BYTES = 256;
+const TITLE_SLOT_TYPE = "title";
+const TITLE_CHANGE_TYPE = "title_change";
+
+/**
+ * 生成 omp 原生定长标题槽：key 顺序与 omp serializeTitleSlot 保持一致，
+ * 标题按码点二分截断到能放进 256 UTF-8 字节，剩余空间用空格填在 pad 里。
+ * 返回文本以换行结尾，可直接作为 JSONL 的第一行。
+ */
+function serializeTitleSlot(title: string, updatedAt: string): string {
+  const buildLine = (value: string, pad: string) =>
+    `${JSON.stringify({
+      type: TITLE_SLOT_TYPE,
+      v: 1,
+      title: value,
+      source: "user",
+      updatedAt,
+      pad,
+    })}\n`;
+
+  // omp 用 [...title] 按码点截断；必须同样处理，避免把代理对劈成半个字符。
+  const codePoints = [...title];
+  let low = 0;
+  let high = codePoints.length;
+  let fitted = "";
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const candidate = codePoints.slice(0, middle).join("");
+    if (Buffer.byteLength(buildLine(candidate, ""), "utf8") <= SESSION_TITLE_SLOT_BYTES) {
+      fitted = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  const withoutPad = buildLine(fitted, "");
+  const padBytes = SESSION_TITLE_SLOT_BYTES - Buffer.byteLength(withoutPad, "utf8");
+  if (padBytes < 0) throw new Error("Session title slot metadata exceeds fixed slot size");
+  return buildLine(fitted, " ".repeat(padBytes));
+}
+
+/**
  * 会话读取硬上限（字节）。
  *
  * readMessages / readSessionMeta 会把整份 JSONL 解析成对象数组，再随 IPC 结构化克隆
@@ -75,68 +124,100 @@ export class SessionFileOps {
   // ── 会话操作：rename / delete / copy / exportHtml / readMessages ─
 
   /**
-   * 重命名会话：按 pi 原生格式在 JSONL 末尾追加 session_info 记录。
+   * 重命名会话：写 omp 原生标题（首行定长 title 槽 + 末尾 title_change 记录）。
    *
-   * pi 要求会话文件首条可解析记录必须是 type:"session"（buildSessionInfo 中
-   * 否则直接返回 null），旧版在文件头前置 {"sessionName":...} 会让 pi 完全无法
-   * 加载该会话（/resume 中也不可见，见 #114）。pi 原生 /rename 的做法是末尾追加
-   * {type:"session_info", id, parentId, timestamp, name}，读取时取最后一条。
+   * 历史教训：旧实现追加 pi 的 {type:"session_info"}，omp 不认这条记录，
+   * 列表即时刷新只是读到了旧格式；重启/换读 omp 原生标题后就“失效”了。
+   * omp 的权威标题在首行 title 槽（重命名时原地覆盖），同时追加 title_change
+   * 让查看器/会话树看到变更；两者缺一不可。
    *
-   * 顺带剔除旧版应用写入的 sessionName 私有行，修复已被破坏的会话文件。
-   * 支持 WSL 路径。
+   * 顺带剔除旧版应用写入的 sessionName 私有行和 session_info 旧记录，
+   * 迁移已被旧格式改写的会话。支持 WSL 路径。
    */
   async rename(filePath: string, newName: string): Promise<void> {
     const raw = await this.deps.getAdapter().read(filePath);
-    const output = this.appendSessionInfoLine(raw, newName);
+    const output = this.rewriteTitle(raw, newName);
     await this.deps.getAdapter().write(filePath, output);
   }
 
   /**
-   * 在 JSONL 文本末尾追加 pi 原生 session_info 记录，返回新文本。
+   * 把 JSONL 文本改写成 omp 原生标题布局，返回新文本。
    *
-   * id/parentId 规则与 pi SessionManager 一致：id 为文件内不冲突的 8 位十六进制，
-   * parentId 指向追加前最后一条带 id 的记录（没有则 null，由 pi 视为新根）。
-   * 会话树靠 parentId 串联，指向最后一片叶子可保持链条完整。
-   *
-   * 同时剔除旧版应用的 {"sessionName":...} 私有行（无 type 字段）：pi 无法识别，
-   * 位于文件头时会破坏首行校验导致整个会话无法加载（#114 的存量受损文件）。
+   * 标题槽必须位于第一行（omp 只读首行），所以这里不是简单追加：
+   *   1. 丢掉旧版私有 sessionName 行与 session_info 行；
+   *   2. 找到已有 title 槽就原地替换，没有就插到文件最前面；
+   *   3. 若存在 session 头，同步 title/titleSource，兼容只读头部的旧查看器；
+   *   4. 末尾追加 title_change，parentId 指向最后一条带 id 的记录。
    */
-  private appendSessionInfoLine(raw: string, name: string): string {
-    // 与 pi appendSessionInfo 相同的清洗规则：换行折叠为空格，避免破坏 JSONL 行结构。
+  private rewriteTitle(raw: string, name: string): string {
+    // 与 omp 相同的清洗规则：换行折叠为空格，避免破坏 JSONL 行结构。
     const sanitized = name.replace(/[\r\n]+/g, " ").trim();
+    const now = new Date().toISOString();
     const ids = new Set<string>();
     let lastId: string | null = null;
+    let titleSlot: string | null = null;
     const keptLines: string[] = [];
-    for (const line of raw.split(/\r?\n/)) {
+
+    for (const line of raw.replace(/^\uFEFF/, "").split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      let isLegacyNameLine = false;
+
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(trimmed);
-        // 判定旧版私有格式：带 sessionName 且无 type；pi 原生记录一律有 type。
-        isLegacyNameLine =
-          typeof parsed.sessionName === "string" && typeof parsed.type !== "string";
-        if (!isLegacyNameLine && typeof parsed.id === "string" && parsed.id) {
-          ids.add(parsed.id);
-          lastId = parsed.id;
-        }
+        parsed = JSON.parse(trimmed);
       } catch {
         // 不可解析的行原样保留，不做破坏性清理
+        keptLines.push(trimmed);
+        continue;
       }
-      if (!isLegacyNameLine) keptLines.push(trimmed);
+      if (!isJsonRecord(parsed)) {
+        keptLines.push(trimmed);
+        continue;
+      }
+
+      const type = typeof parsed.type === "string" ? parsed.type : undefined;
+      // 旧版应用私有格式：带 sessionName 且无 type（会破坏 pi 首行校验）。
+      if (!type && typeof parsed.sessionName === "string") continue;
+      // omp 不认 session_info；旧的桌面端重命名记录在迁移时清掉。
+      if (type === "session_info") continue;
+      // 定长标题槽只允许一个，统一放到第一行。
+      if (type === TITLE_SLOT_TYPE) {
+        if (!titleSlot) titleSlot = serializeTitleSlot(sanitized, now);
+        continue;
+      }
+      // 同步会话头标题：部分读取路径在没有标题槽时依赖这里。
+      if (type === "session") {
+        parsed.title = sanitized;
+        parsed.titleSource = "user";
+        parsed.titleUpdatedAt = now;
+        keptLines.push(JSON.stringify(parsed));
+      } else {
+        keptLines.push(trimmed);
+      }
+
+      if (typeof parsed.id === "string" && parsed.id) {
+        ids.add(parsed.id);
+        lastId = parsed.id;
+      }
     }
-    // 与 pi generateId 一致：randomUUID 前 8 位，冲突时重试
-    let id = randomUUID().slice(0, 8);
-    while (ids.has(id)) id = randomUUID().slice(0, 8);
-    const entry = {
-      type: "session_info",
-      id,
-      parentId: lastId,
-      timestamp: new Date().toISOString(),
-      name: sanitized,
-    };
-    keptLines.push(JSON.stringify(entry));
-    return `${keptLines.join("\n")}\n`;
+
+    // 标题槽固定第一行；没有就新建。
+    const outputLines = [titleSlot ?? serializeTitleSlot(sanitized, now), ...keptLines];
+
+    // 会话树 id 为 8 位十六进制；与已有 id 冲突时重试。
+    let id = randomUUID().slice(-8);
+    while (ids.has(id)) id = randomUUID().slice(-8);
+    outputLines.push(
+      JSON.stringify({
+        type: TITLE_CHANGE_TYPE,
+        id,
+        parentId: lastId,
+        timestamp: now,
+        title: sanitized,
+        source: "user",
+      }),
+    );
+    return `${outputLines.join("\n")}\n`;
   }
 
   /**

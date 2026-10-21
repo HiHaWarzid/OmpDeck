@@ -1564,6 +1564,12 @@ export function App() {
    * 用触发功能）时复位（见 handleComposerKeyDown）。
    */
   const suggestionsDismissedRef = useRef(false);
+  /**
+   * 「↓ + Enter」排队到下一轮的按键状态：Enter 的 KeyboardEvent 不会携带
+   * 另一个键是否按住，只能自己记录 ArrowDown 的按下/抬起。失焦时复位，
+   * 避免切走再回来时误判为组合键。
+   */
+  const arrowDownHeldRef = useRef(false);
   const projectDragPreventClickRef = useRef(false);
 
   // ===== 飞书桥接 =====
@@ -2676,6 +2682,23 @@ export function App() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [scratchPadToggle, scratchPadClose, scratchPadIsOpen]);
+
+  // ArrowDown 只用于判定「↓ + Enter」组合键，不拦截事件本身；
+  // 在 window 上监听 keyup/blur，保证输入框失焦或按键在别处释放时状态不会卡住。
+  useEffect(() => {
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "ArrowDown") arrowDownHeldRef.current = false;
+    };
+    const handleBlur = () => {
+      arrowDownHeldRef.current = false;
+    };
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
 
   // 桌面宠物点击跳转：主进程通知激活某 Agent，切到对应 project + agent tab
   useEffect(() => {
@@ -4801,6 +4824,16 @@ export function App() {
   function handleComposerKeyDown(
     event: React.KeyboardEvent<HTMLDivElement>,
   ) {
+    if (
+      event.key === "ArrowDown" &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !(event.nativeEvent as KeyboardEvent).isComposing
+    ) {
+      arrowDownHeldRef.current = true;
+    }
     // ESC 关闭后 suppressed：用户再次按下 @/& 触发键 = 明确开始一条新查询，
     // 复位 dismissed，让本次输入的面板正常弹出。
     // IME 合成中（key 为 Process/Dead）与普通字符编辑不算；只认触发键本身。
@@ -4940,6 +4973,24 @@ export function App() {
         // 置 dismissed 抑制后续打字弹回（见 onChange）。
         dismissSuggestions();
       }
+    }
+    // 「↓ + Enter」：跳过 steer，直接把这条消息排到下一轮。
+    // 放在建议面板/历史导航分支之后，避免抢占它们对 Enter/ArrowDown 的语义。
+    if (
+      event.key === "Enter" &&
+      arrowDownHeldRef.current &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !(event.nativeEvent as KeyboardEvent).isComposing &&
+      event.keyCode !== 229
+    ) {
+      event.preventDefault();
+      // 连按 Enter 时 keyup 还没到达：立刻清掉，防止重复排队。
+      arrowDownHeldRef.current = false;
+      void sendPromptAsFollowUp();
+      return;
     }
     const enterIntent = getComposerEnterIntent(event, settings.sendShortcut);
     if (enterIntent === "send") {
@@ -6773,7 +6824,13 @@ export function App() {
               // 与 scroll-to-bottom-btn 同一锚点：由 composer 实际高度 + 终端高度决定 bottom。
               style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
             >
-              <Button buttonSize="sm" variant="secondary" onClick={scrollToBottom} title={t("app.jumpToNewest")}>
+              <Button
+                buttonSize="sm"
+                variant="secondary"
+                className="timeline-newer-btn"
+                onClick={scrollToBottom}
+                title={t("app.jumpToNewest")}
+              >
                 <ChevronDown size={14} aria-hidden="true" />
                 {t("app.newerMessagesHint", { count: messagesBelowWindow })}
               </Button>

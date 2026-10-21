@@ -51,8 +51,19 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				}
 			},
 			rename: async (_event, filePath: string, newName: string) => {
-				await sessionFileOps.rename(filePath, newName);
-				void appLogger.info("session", "Session renamed", { filePath, newName });
+				// 活跃会话必须走 RPC：omp 自己写 title 槽/title_change 并更新内存标题；
+				// 直接改文件会让运行中的进程之后用旧标题覆盖，重启后标题就“丢”了。
+				const activeAgent = agentManager.getAgentBySessionPath(filePath);
+				if (activeAgent) {
+					await agentManager.rename(activeAgent.id, newName);
+				} else {
+					await sessionFileOps.rename(filePath, newName);
+				}
+				void appLogger.info("session", "Session renamed", {
+					filePath,
+					newName,
+					activeAgentId: activeAgent?.id,
+				});
 			},
 			copy: (_event, projectId: string, filePath: string) =>
 				agentManager.cloneSessionFile(projectId, filePath),

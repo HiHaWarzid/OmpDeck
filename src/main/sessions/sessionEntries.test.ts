@@ -134,6 +134,57 @@ test("带 BOM 的会话文件在扫描/文件操作/sessionJsonl 三条路径上
   assert.equal(summaries[0].preview, (await fileOps.readMessages(sessionPath))[0].content);
 });
 
+test("重命名写入 omp 原生标题槽 + title_change，重启扫描仍生效", async () => {
+  const home = await createHome();
+  const entries = [
+    { type: "session", version: 3, id: "sess-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: "D:\\proj" },
+    // 旧桌面端写入的重命名记录：迁移时应清掉，避免 omp 读到不认识的格式。
+    { type: "session_info", id: "old-name-1", parentId: "sess-1", timestamp: "2026-01-01T00:00:00.500Z", name: "旧名字" },
+    { type: "message", id: "msg-1", parentId: "old-name-1", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "rename me" } },
+  ];
+  const raw = `\uFEFF${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+  const filePath = await writeSessionFile(home, "rename.jsonl", raw);
+  const fileOps = makeFileOps(home);
+
+  await fileOps.rename(filePath, "第一版标题");
+
+  const first = await readEntries(nodeEntriesIo, filePath);
+  const lines = first.entries.map((entry) => entry as Record<string, unknown>);
+  // 首行必须是 omp 定长 256 字节标题槽（含换行），且位于 session 头之前。
+  const firstLine = first.raw.split("\n")[0];
+  assert.equal(Buffer.byteLength(`${firstLine}\n`, "utf8"), 256);
+  assert.equal(lines[0].type, "title");
+  assert.equal(lines[0].title, "第一版标题");
+  assert.equal(lines[0].source, "user");
+  assert.equal(lines[1].type, "session");
+  assert.equal(lines[1].title, "第一版标题");
+  // 旧 session_info 被迁移清理，原有消息保留。
+  assert.equal(lines.some((entry) => entry.type === "session_info"), false);
+  assert.equal(lines.some((entry) => entry.type === "message"), true);
+  // 末尾追加 title_change，parentId 指向重命名前最后一条带 id 的记录。
+  const last = lines[lines.length - 1];
+  assert.equal(last.type, "title_change");
+  assert.equal(last.title, "第一版标题");
+  assert.equal(last.parentId, "msg-1");
+  assert.match(String(last.id), /^[0-9a-f]{8}$/);
+
+  // 重启等价于新 Scanner：原生标题必须直接成为会话列表名字。
+  const scanner = new SessionScanner();
+  assert.equal((await scanner.list())[0].name, "第一版标题");
+  await scanner.close();
+
+  // 第二次重命名覆盖标题槽而不是再插一行；超长标题按 UTF-8 字节截断后仍保持 256。
+  await fileOps.rename(filePath, `很长标题${"汉".repeat(200)}`);
+  const second = await readEntries(nodeEntriesIo, filePath);
+  const secondLines = second.entries.map((entry) => entry as Record<string, unknown>);
+  assert.equal(secondLines.filter((entry) => entry.type === "title").length, 1);
+  assert.equal(
+    Buffer.byteLength(`${second.raw.split("\n")[0]}\n`, "utf8"),
+    256,
+  );
+  assert.equal(secondLines[secondLines.length - 1].title, `很长标题${"汉".repeat(200)}`);
+});
+
 test("UTF-16 会话文件在三条路径上一致判定为不可读", async () => {
   const home = await createHome();
   // UTF-16LE 按 utf8 解码后满是 NUL：不是合法 JSONL，必须三处一致地隐藏/返回空，

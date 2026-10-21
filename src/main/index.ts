@@ -33,8 +33,11 @@ import {
 } from "./rendererRecovery";
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
-// 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
+// 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题。
+// Windows 额外用多尺寸 ICO：Electron 文档明确建议任务栏/窗口图标使用 ICO，
+// 只用 PNG 时开发态（electron.exe）可能继续显示 Electron 默认图标。
 import iconPath from "../../build/icon.png?asset";
+import windowsIconPath from "../../build/icon.ico?asset";
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -77,6 +80,13 @@ if (!app.isPackaged) {
 			console.error("[OmpDeck] 历史数据迁移失败，请手动从 pi-desktop-dev 恢复:", error);
 		}
 	}
+}
+
+// Windows 任务栏/通知按 AppUserModelID 归组并绑定应用图标。
+// 不设置时开发态会沿用 electron.exe 的默认 Electron 图标；必须与 electron-builder
+// 的 appId 保持一致，否则打包版与开发态会被系统视为两个不同的应用。
+if (process.platform === "win32") {
+	app.setAppUserModelId("com.hihawarzid.omp-deck");
 }
 
 // 三个 pre-ready 偏好（宠物、Chromium 沙箱、单实例）都取自同一份 settings.json：
@@ -749,7 +759,7 @@ async function createWindow() {
 		minWidth: 880,
 		minHeight: 640,
 		title: "",
-		icon: iconPath,
+		icon: process.platform === "win32" ? windowsIconPath : iconPath,
 		frame: windowOptions.frame,
 		titleBarStyle: windowOptions.titleBarStyle,
 		...(windowOptions.trafficLightPosition ? { trafficLightPosition: windowOptions.trafficLightPosition } : {}),

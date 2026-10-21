@@ -20,7 +20,7 @@ export interface QueuedPromptSnapshot {
 export type QueuedPromptMap = Record<string, QueuedPromptSnapshot[]>;
 
 /** 单会话待发送队列上限；超出时拒绝入队，保留输入框内容。 */
-export const QUEUED_PROMPT_LIMIT = 10;
+export const QUEUED_PROMPT_LIMIT = 20;
 /** 队列面板默认最多展示的行数，超出以 +N 提示。 */
 export const QUEUED_PROMPT_VISIBLE = 3;
 

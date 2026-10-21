@@ -705,8 +705,9 @@ export class SessionScanner {
 
   /**
    * 快速校验文件是否为 Pi Agent 会话 JSONL（非备份/导出/重命名残留）。
-   * 真实会话的首行通常是 `type: session`；兼容旧版应用重命名后前置的 sessionName 元数据，
-   * 但要求随后仍出现 type 字段，不能只凭任意 JSON 对象误判为父会话。
+   * 真实会话的首行通常是 omp 的 `type: "title"` 定长标题槽（旧会话为 `type: "session"`）；
+   * 兼容旧版应用重命名后前置的 sessionName 元数据，但要求随后仍出现 type 字段，
+   * 不能只凭任意 JSON 对象误判为父会话。
    */
   private async isSessionFile(filePath: string, signal?: AbortSignal): Promise<boolean> {
     try {
@@ -773,6 +774,11 @@ export class SessionScanner {
     let codexAgentNickname: string | undefined;
     let codexSourcePath: string | undefined;
     let latestSessionInfoName: string | undefined;
+    /** omp 原生标题：首行定长 title 槽 + 末尾 title_change（重命名记录）。 */
+    let titleSlotName: string | undefined;
+    let latestTitleChangeName: string | undefined;
+    /** 会话头里的 title/titleSource：没有 title 槽的旧文件仍可读到。 */
+    let sessionHeaderTitle: string | undefined;
     let forkParentSession: string | undefined;
     let hasSubagentChildMarker = false;
 
@@ -789,7 +795,16 @@ export class SessionScanner {
         // Forked sessions may contain an older copied name; only the latest marker is authoritative.
         latestSessionInfoName = this.optionalString(entry.name ?? data?.name);
       }
+      // omp 原生标题：title 槽在首行原地更新，title_change 是追加式变更记录；
+      // 后者可能比槽位更新（例如槽位写入失败），因此读标题时优先取最后一条。
+      if (entryType === "title") {
+        titleSlotName = this.optionalString(entry.title) ?? titleSlotName;
+      }
+      if (entryType === "title_change") {
+        latestTitleChangeName = this.optionalString(entry.title) ?? latestTitleChangeName;
+      }
       if (entryType === "session") {
+        sessionHeaderTitle ||= this.optionalString(entry.title);
         forkParentSession ||= this.optionalString(entry.parentSession ?? header?.parentSession);
       }
       // 检测显式子会话标记：支持任何 "*.child-session" 格式，
@@ -846,10 +861,15 @@ export class SessionScanner {
     //   弱信号（1分）：子会话命名模式、parentSession header 引用
     //   置信度阈值：≥ SUBAGENT_CONFIDENCE_THRESHOLD 判定为子会话
     const pathInferredParent = await this.inferParentSessionFromPath(filePath, signal);
+    // 会话名优先级：title_change（最新重命名）> title 槽 > 会话头标题 > 旧版 session_info。
+    // 旧桌面端只写 session_info，保留在末尾兜底，保证已有会话不丢名字。
+    const explicitSessionName =
+      latestTitleChangeName || titleSlotName || sessionHeaderTitle || latestSessionInfoName;
+
     const confidenceScore = scoreSubagentConfidence({
       pathInferred: Boolean(pathInferredParent),
       customMarker: hasSubagentChildMarker,
-      sessionName: latestSessionInfoName,
+      sessionName: explicitSessionName,
       parentSessionRef: forkParentSession,
     });
 
@@ -889,15 +909,14 @@ export class SessionScanner {
       }
     }
 
-    // 会话名优先级与 pi getSessionName 一致：最后一条 session_info 为准；
-    // 旧版应用的 sessionName 私有行及其他字段仅作降级回退。
-    let inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
+    // 显式标题优先；旧版应用的 sessionName 私有行及其他字段仅作降级回退。
+    let inferredName = this.cleanTitle(explicitSessionName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
 
     // omp/pi 子代理会话常没有显式标题（title 为空），且首条消息都是 task 工具的固定前缀
     // （"Complete the assignment below, thoroughly: ..."），此时名字会退化成同一条截断文本，
     // 展开后整组子会话无法区分。子会话布局下文件名即代理标签（如 AgentManagerApi），
     // 无显式标题时用文件名作为名字；session.jsonl 这类通用名无区分度，仍保持消息回退。
-    if (parentSessionPath && !latestSessionInfoName && !name) {
+    if (parentSessionPath && !explicitSessionName && !name) {
       const fileLabel = basename(filePath).replace(/\.jsonl$/i, "");
       if (fileLabel && fileLabel !== "session") {
         inferredName = this.cleanTitle(fileLabel) ?? inferredName;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { QueuedPromptSnapshot } from "./queuedPromptQueue";
+import { QUEUED_PROMPT_LIMIT, type QueuedPromptSnapshot } from "./queuedPromptQueue";
 import { createQueuedPromptStore } from "./queuedPromptStore";
 
 function makePrompt(id: string, overrides: Partial<QueuedPromptSnapshot> = {}): QueuedPromptSnapshot {
@@ -295,7 +295,7 @@ describe("createQueuedPromptStore", () => {
   });
 
   it("enqueue：limit 缺省时沿用 QUEUED_PROMPT_LIMIT 语义（超量拒绝）", () => {
-    const full: QueuedPromptSnapshot[] = Array.from({ length: 10 }, (_, i) =>
+    const full: QueuedPromptSnapshot[] = Array.from({ length: QUEUED_PROMPT_LIMIT }, (_, i) =>
       makePrompt(`p${i}`),
     );
     let calls = 0;
