@@ -79,7 +79,6 @@ import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
 import { Button } from "./components/ui/Button";
-import { pickTimelineAnchorIndex } from "./utils/timelineAnchor";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
@@ -127,7 +126,6 @@ import {
   terminalOwnerKey,
   type TerminalDockStateByOwner,
 } from "./terminalDockState";
-import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
@@ -157,7 +155,6 @@ import { SessionsDrawer } from "./components/app/drawers/SessionsDrawer";
 import {
   AgentStatusIndicator,
   BrandLockup,
-  EmptyState,
   ProjectAvatar,
 } from "./components/app/brand/Brand";
 import { EnvironmentDialog } from "./components/app/modals/EnvironmentDialog";
@@ -178,13 +175,11 @@ import {
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
 } from "./components/app/widgets/widgetKeys";
-import { MultiSelectModal } from "./components/app/modals/MultiSelectModal";
 import { WorktreeCreateDialog } from "./components/app/modals/WorktreeCreateDialog";
-import { stripMarkdown } from "./components/app/format";
-import type { DrawerPanel, SessionModifiedFile, WidgetLine } from "./components/app/types";
+import type { DrawerPanel, WidgetLine } from "./components/app/types";
 import { GitPanel } from "./components/app/GitPanel";
 import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
-import { MessageListContent } from "./components/app/MessageListContent";
+import { ConversationOutlineHost, ConversationPane, type ConversationPaneHandle } from "./components/app/ConversationPane";
 import { SidebarTree } from "./components/app/sidebar/SidebarTree";
 import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
 import {
@@ -192,21 +187,15 @@ import {
   SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
-import { buildStreamState } from "./components/app/streamStateSelector";
 import {
-  groupToolMessages,
-  getMultiSelectImageCaptureIds,
   applySuggestion,
-  buildOutline,
+  buildModifiedFiles,
   buildSuggestionItems,
   detectTrigger,
   displayPath,
   flattenFiles,
   matches,
   mergeCommands,
-  getToolFilePath,
-  getToolNewContent,
-  getToolChangedLineCount,
   countTextLines,
   type MessageItem,
 } from "./components/app/AppUtils";
@@ -325,11 +314,6 @@ const COMPOSER_MIN_TIMELINE_HEIGHT = 160;
 const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
-// 共享空数组：无焦点 agent / 条目尚未 join 时的消息默认值。必须是稳定引用——
-// useMessagePagination 与 renderedRuns 的记忆化依赖 messages 的引用相等，
-// 每次渲染新建 [] 会让这些派生全部失效；冻结防止任何路径写坏这份共享默认值。
-const EMPTY_MESSAGES: ChatMessage[] = Object.freeze([]) as unknown as ChatMessage[];
-
 // 共享空分支信息：GitPanel / composer 分支栏都读这份默认值，且 GitPanel 的 memo 判据
 // 比较 initialBranchInfo 的引用——若这里每次渲染新建对象，面板的 memo 会永久失效，
 // 于是每次 App 重渲染（流式期间每秒十余次）都要重渲染整棵数千行的资源列表，
@@ -597,15 +581,10 @@ export function App() {
   const activeWorkspaceComposer = useWorkspaceSlice(activeAgentId, "composer");
   const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
   const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
-  // 当前会话的消息与运行态：根只订阅「当前 agent」这两条切片。
-  // 迁出根 state 的意义在后台 agent——原来 messagesByAgent / runtimeStateByAgent 是
-  // 整张 record 落在根 state 上，任何 agent 的 50ms 消息增量、≤150ms 工具循环都
-  // 唤醒整个 App（9k 行组件体 + 内联侧栏）。现在后台条目的变化只唤醒订阅它的叶子。
-  // 当前会话仍会重渲染根：分页窗口（useMessagePagination）、renderedRuns、流式
-  // 滚动等派生链都在根上，本批次不动这条链（行为与迁移前一致）。
-  const activeTranscript = useWorkspaceSlice(activeAgentId, "transcript");
-  const activeMessages = activeTranscript?.messages ?? EMPTY_MESSAGES;
+  // 当前会话的运行态：根仍需它驱动输入框/忙碌态；消息本身由 ConversationPane 订阅，
+  // transcript 的 50ms 流式增量不再唤醒 9k 行的 App 根。
   const agentRuntimeState = useWorkspaceSlice(activeAgentId, "runtime");
+  const conversationRef = useRef<ConversationPaneHandle>(null);
   // Extension widget（批次 5d）：按 agent 隔离的 setWidget 内容。键 = 条目键，
   // agent 离场即随条目 dispose；后台 agent 推 widget 只唤醒它自己的订阅者。
   const activeExtensionWidgets = useWorkspaceSlice(activeAgentId, "extensionWidgets");
@@ -773,8 +752,6 @@ export function App() {
   const prevIsAgentBusyRef = useRef(false);
   const activeQueuedPrompts = activeAgentId ? (queuedPrompts[activeAgentId] ?? []) : [];
 
-  /** 当前 agent 流式思考的实时文本,agent_end 时清空 */
-  const [multiSelectOpen, setMultiSelectOpen] = useState(false);
   const [sessionRefPickerOpen, setSessionRefPickerOpen] = useState(false);
   const [sessionRefPickerTarget, setSessionRefPickerTarget] = useState<SessionSummary | null>(null);
   /** & 会话引用选择缓存：key = chip raw（如 "&My Session"），value = 选中的消息列表 */
@@ -1020,9 +997,6 @@ export function App() {
     (url: string) => api.app.openExternal(url),
     [],
   );
-  const handleEnterMultiSelect = useCallback(() => {
-    setMultiSelectOpen(true);
-  }, []);
   /** AskQuestionCard 应答回调（从时间线内联箭头提为稳定回调）。
    *  cancelled 通过 sendUiResponse 正常发送；select/input/editor：cancelled 或 value:null → undefined/null。
    *  原生 confirm：pi 会把 cancelled 解析成 false（与「否」同值）；ask_question 扩展已把 confirm
@@ -1357,20 +1331,6 @@ export function App() {
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(false);
   const [_debugOpen, _setDebugOpen] = useState(false);
-  /** 是否自动滚动到最新消息 */
-  const [autoScroll, setAutoScroll] = useState(true);
-  /** 用 ref 同步 autoScroll，供 ResizeObserver 回调读取最新值，避免响应式时序间隙导致滚动抢跑。 */
-  const autoScrollRef = useRef(true);
-  autoScrollRef.current = autoScroll;
-  /** 标记当前滚动是否由程序触发（ResizeObserver / scrollToBottom 等），
-   *  用于在 scroll 事件中区分用户手动滚动，防止竞态误关 autoScroll。 */
-  const programmaticScrollRef = useRef(false);
-  /** 是否显示"移动到最新"按钮 */
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
-  /** 会话定位跳转到尚未加载的旧消息时，先扩展分页再在 effect 中滚动定位；此状态保存待跳转的消息 id。 */
-  const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
-  /** 加载更多历史消息前的滚动锚点（窗口首条消息的 id + 视口坐标），用于渲染后按元素位移恢复滚动位置。 */
-  const loadMoreAnchorRef = useRef<{ id: string; top: number } | null>(null);
 
   const [settings, setSettings] = useState<AppSettings>({
     useNativeTitleBar: true,
@@ -1553,7 +1513,6 @@ export function App() {
   const [composerChrome, setComposerChrome] = useState(0);
   const composerRef = useRef<HTMLElement | null>(null);
   const queuedTrackRef = useRef<HTMLDivElement | null>(null);
-  const timelineRef = useRef<HTMLElement | null>(null);
   const composerBoxRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
   // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
@@ -1821,105 +1780,6 @@ export function App() {
     recompute();
     return sessionWorkspaceStore.subscribeSliceChange("runtime", recompute);
   }, [activeProjectId, displayAgents]);
-  // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
-  // 窗口上限（默认 200 条）在 hook 内：超过后从顶部上收，避免长会话把上千条消息全量渲染进 DOM。
-  const {
-    visibleMessages: paginatedMessages,
-    hasMore: hasMoreMessages,
-    messagesAbove: messagesAboveWindow,
-    messagesBelow: messagesBelowWindow,
-    loadMore: loadMoreMessages,
-    loadUntilIncluded: loadMessagesUntilIncluded,
-    jumpToLatest: jumpMessagesToLatest,
-    isLoading: isLoadingMoreMessages,
-  } = useMessagePagination({
-    messages: activeMessages,
-    initialPageSize: 50,
-    pageSize: 50,
-    enabled: activeMessages.length > 50,
-    resetKey: activeAgentId ?? undefined,
-    // 贴底跟随：autoScroll=false（用户在看历史）时冻结窗口，新消息不再塞进 DOM 顶走阅读位置。
-    followTail: autoScroll,
-  });
-
-  /** 最后一条用户消息的 id，用于决定重发按钮只在最新消息上显示。 */
-  /**
-   * 将分页消息按 agent run 分组，用于 TurnRow 渲染。
-   * 用户/错误/系统消息保持独立条目，assistant + tool 消息聚合为 agnet-run。
-   */
-  const renderedRuns = useMemo(
-    () => groupToolMessages(paginatedMessages),
-    [paginatedMessages],
-  );
-
-  // 多选分享：图片只克隆已勾选的可见消息，避免截到整屏会话或被滚动容器裁掉。
-  const handleMultiSelectCopy = useCallback(async (selectedIds: Set<string>, kind: "text" | "markdown" | "image") => {
-    if (kind === "image") {
-      try {
-        const { toBlob: toBlobImg } = await import("html-to-image");
-        const source = document.querySelector(".message-list") as HTMLElement | null;
-        if (!source) return;
-
-        const captureIds = getMultiSelectImageCaptureIds(renderedRuns, selectedIds);
-        const clone = source.cloneNode(true) as HTMLElement;
-        for (const item of Array.from(clone.children)) {
-          if (!(item instanceof HTMLElement)) continue;
-          const id = item.dataset.messageId;
-          if (!id || !captureIds.has(id)) item.remove();
-        }
-        clone.classList.add("multi-select-image-export");
-        clone.style.width = `${Math.max(source.clientWidth, source.scrollWidth)}px`;
-        clone.style.padding = "24px";
-        clone.style.background = getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || "#fff";
-        document.body.appendChild(clone);
-        let blob: Blob | null = null;
-        try {
-          blob = await toBlobImg(clone, {
-            pixelRatio: Math.min(2, window.devicePixelRatio || 1),
-            backgroundColor: getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || undefined,
-            filter: (node) =>
-              !(node instanceof HTMLElement) ||
-              (!node.classList.contains("turn-row-actions") &&
-                !node.classList.contains("user-turn-actions") &&
-                !node.classList.contains("copy-menu-popover")),
-          });
-        } finally {
-          clone.remove();
-        }
-        if (blob) {
-          await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-          showToast(t("copy.asImageCopied"));
-        }
-      } catch {
-        showToast(t("copy.failed"));
-      }
-      setMultiSelectOpen(false);
-      return;
-    }
-
-    const selected = activeMessages
-      .filter((m) => selectedIds.has(m.id))
-      .sort((a, b) => a.timestamp - b.timestamp);
-    if (selected.length === 0) return;
-
-    const separator = "\n\n---\n\n";
-    const content = kind === "text"
-      ? selected.map((m) => {
-          let text = m.text;
-          text = text.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
-          text = text.replace(/<thinking>[\s\S]*?<\/thinking>/g, "");
-          text = text.replace(/<skill\s+name="[^"]*"[^>]*>[\s\S]*?<\/skill>/gi, "");
-          return stripMarkdown(text);
-        }).join(separator)
-      : selected.map((m) => m.text).join(separator);
-
-    await writeClipboard(content);
-    showToast(kind === "text" ? t("copy.asTextCopied") : t("copy.asMarkdownCopied"));
-    setMultiSelectOpen(false);
-  }, [activeMessages, renderedRuns]);
-
-
-
   // 从 activeUiRequest 提取正在进行的交互式请求（select/confirm/input/editor/batch_ask）
   // 这是 ask_question 在 pi RPC 模式下的表现方式：pi 通过 extension_ui_request 将
   // 等待用户回答的对话框发送到桌面端，包含 requestId、title、options 等完整信息。
@@ -1940,27 +1800,6 @@ export function App() {
     document.body.classList.toggle("ask-bar-active", showAskDialog);
     return () => document.body.classList.remove("ask-bar-active");
   }, [showAskDialog]);
-
-  const isAwaitingAssistant = Boolean(
-    activeAgent &&
-    !cancellingUi &&
-    isAgentStreaming(activeAgent, activeRuntimeState) &&
-    activeMessages.at(-1)?.role !== "assistant",
-  );
-  /** 正在流式追加的最后一条 assistant 消息的 id（agent 处于运行/流式状态时才有值）。
-   *  用于让对应 AssistantText 走轻量渲染路径，避免每个 token 都对不断增长的全量正文
-   *  反复运行 KaTeX 数学解析导致渲染主线程卡死；回答结束后切回完整渲染。 */
-  const streamingMessageId = useMemo(() => {
-    if (!activeAgent || !isAgentExactlyRunning(activeAgent)) return undefined;
-    if (!(activeRuntimeState?.isStreaming)) return undefined;
-    for (let i = activeMessages.length - 1; i >= 0; i--) {
-      const m = activeMessages[i];
-      if (m.role === "user") break;
-      // 跳过纯 thinking / 工具消息，定位最后一条有实际正文的 assistant 消息
-      if (m.role === "assistant" && (m.text || "").trim()) return m.id;
-    }
-    return undefined;
-  }, [activeAgent, activeRuntimeState, activeMessages]);
 
   // PIDECK_PERF=1 帧率诊断：agent 运行/流式期间采样帧间隔，结束时输出 P50/P95（验收指标）。
   const isStreamingNow = isAgentStreaming(activeAgent, activeRuntimeState);
@@ -2127,44 +1966,6 @@ export function App() {
     settings.fontFamilyMonoCustom,
   ]);
 
-  /** 当前会话中 agent 修改过的文件(从 tool 消息 meta 中提取) */
-  // 优化:只在消息数量变化时才重新计算,减少不必要的遍历
-  const modifiedFiles = useMemo(() => {
-    const byPath = new Map<string, SessionModifiedFile>();
-    for (const msg of activeMessages) {
-      if (msg.role !== "tool") continue;
-      const toolName: string | undefined = msg.meta?.toolName as
-        | string
-        | undefined;
-      const args: any = msg.meta?.args;
-      const status: string = String(msg.meta?.status ?? "done");
-      // 只收集文件写入/编辑类的工具调用，作为右侧 Files 与会话结束摘要的统一数据源。
-      if (!toolName || !/write|edit|create|patch/i.test(toolName)) continue;
-      const filePath = getToolFilePath(args);
-      if (!filePath) continue;
-      const previous = byPath.get(filePath);
-      // 同一路径再次被修改时移动到 Map 末尾，右侧修改清单才能按"最新修改"展示。
-      if (previous) byPath.delete(filePath);
-      // originalContent 不再存储到消息 meta 中（full file 会使会话体积过大）。
-      // diff 展示时使用工具参数（oldText/newText）显示变动区域。
-      byPath.set(filePath, {
-        path: filePath,
-        toolName,
-        status: status === "running" ? "running" : (previous?.status ?? status),
-        changedLines:
-          (previous?.changedLines ?? 0) +
-          getToolChangedLineCount(toolName, args),
-        originalContent: "",
-        content: getToolNewContent(toolName, args) ?? previous?.content,
-      });
-    }
-    return Array.from(byPath.values());
-  }, [activeMessages.length, activeAgentId]);
-  // 优化:轮廓项计算仅在消息数量变化时触发,减少不必要的重计算
-  const outlineItems = useMemo(
-    () => buildOutline(activeMessages),
-    [activeMessages.length, activeAgentId],
-  );
   const flatFiles = useMemo(() => flattenFiles(files), [files]);
   // 优化:建议项计算仅在必要时触发,避免每次输入都重计算导致卡顿
   // 只有当建议框打开时才计算,关闭时返回空数组
@@ -2960,70 +2761,6 @@ export function App() {
     setComposerAutoHeight((current) => Math.min(current, maxHeight));
   }, [activeAgentId, activeQueuedPrompts.length]);
 
-  function scrollToBottom() {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    // 回看历史时窗口可能冻结在旧位置，最新消息尚未渲染：先把窗口复位到尾部，再滚到底。
-    // 复位后 DOM 会变高，由 ResizeObserver(programmaticScrollRef/autoScroll) 二次校准到真正的底部。
-    jumpMessagesToLatest();
-    programmaticScrollRef.current = true;
-    timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-  }
-
-  // 给定位命中的消息元素加一个短暂的高亮动画，方便用户在长会话中快速识别跳转落点。
-  function highlightMessageElement(el: HTMLElement) {
-    el.classList.remove("message-jump-highlight");
-    // 强制 reflow 以便重复跳转同一条消息时仍能重新触发动画。
-    void el.offsetWidth;
-    el.classList.add("message-jump-highlight");
-    window.setTimeout(() => el.classList.remove("message-jump-highlight"), 2000);
-  }
-
-  // 点击“加载更多历史消息”：先记录窗口首条消息的视口位置，再触发分页加载，
-  // 渲染后的 effect 按该锚点位移补偿 scrollTop，保持视图稳定。
-  // 用元素位移而不是高度差：窗口到上限后翻页是“顶部加、底部收”，高度差 ≠ 视图位移。
-  function handleLoadMoreMessages() {
-    loadMoreAnchorRef.current = captureTimelineAnchor();
-    loadMoreMessages();
-  }
-
-  /**
-   * 记录一个"视口内的稳定行"的 id 与视口坐标，供翻页/滑窗后恢复滚动位置使用。
-   * 选取规则与原因见 `utils/timelineAnchor.ts`。
-   */
-  function captureTimelineAnchor(): { id: string; top: number } | null {
-    const timeline = timelineRef.current;
-    if (!timeline) return null;
-    const rows = Array.from(timeline.querySelectorAll<HTMLElement>("[data-message-id]")).map((row) => {
-      const rect = row.getBoundingClientRect();
-      return { id: row.dataset.messageId ?? "", rectTop: rect.top, rectBottom: rect.bottom };
-    });
-    const index = pickTimelineAnchorIndex(rows, timeline.getBoundingClientRect().top);
-    const picked = index >= 0 ? rows[index] : undefined;
-    if (!picked?.id) return null;
-    return { id: picked.id, top: picked.rectTop };
-  }
-
-  // 会话定位跳转：若目标消息已在当前分页内则直接滚动定位；
-  // 否则先扩展分页窗口把它包含进来，交给 pendingJumpId effect 在渲染后定位。
-  function handleOutlineJump(id: string) {
-    const el = document.querySelector(
-      `[data-message-id="${CSS.escape(id)}"]`,
-    ) as HTMLElement | null;
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-      highlightMessageElement(el);
-      return;
-    }
-    const index = activeMessages.findIndex((m) => m.id === id);
-    if (index < 0) return;
-    loadMessagesUntilIncluded(index);
-    setPendingJumpId(id);
-  }
-
   useEffect(() => {
     let frame = 0;
     const scheduleSync = () => {
@@ -3156,133 +2893,6 @@ export function App() {
       // 静默失败
     }
   }, [sessionSourceFilter]);
-
-  // 切换 Agent 时重置滚动状态，确保回到该 Agent 时自动滚到底部。
-  // 历史命令已由当前分支按 Agent 隔离，不恢复 dev 旧的全局 commandHistory 持久化。
-  useEffect(() => {
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-    const frame = requestAnimationFrame(() => {
-      const timeline = timelineRef.current;
-      if (timeline) {
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      }
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeAgentId]);
-
-  // 监听用户滚动,判断是否需要显示"移动到最新"按钮
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = timeline;
-      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
-
-      // 程序触发的滚动（ResizeObserver / scrollToBottom 等）只允许开启 autoScroll，
-      // 不允许关闭。防止竞态：scrollTo(bottom) 后、scroll 事件触发前，scrollHeight
-      // 可能已大幅变化（思考块折叠、代码块/工具输出出现），导致误判为"用户滚离了底部"。
-      if (programmaticScrollRef.current) {
-        programmaticScrollRef.current = false;
-        if (isAtBottom) {
-          setAutoScroll(true);
-          autoScrollRef.current = true;
-          setShowScrollToBottom(false);
-        }
-        // 非底部也不关 autoScroll — 交给后续事件重新判断。
-        return;
-      }
-
-      if (isAtBottom) {
-        setAutoScroll(true);
-        autoScrollRef.current = true;
-        setShowScrollToBottom(false);
-      } else {
-        setAutoScroll(false);
-        // 同步更新 ref，确保 ResizeObserver 回调在 React 状态更新生效前读到最新值，
-        // 避免用户已滚到上方但 DOM 增长触发的 observer 因闭包旧值抢滚动到底部。
-        autoScrollRef.current = false;
-        setShowScrollToBottom(true);
-      }
-    };
-
-    // 初始化时检查一次
-    handleScroll();
-
-    timeline.addEventListener("scroll", handleScroll);
-    return () => timeline.removeEventListener("scroll", handleScroll);
-  }, [activeAgentId]);
-
-  // 用 ResizeObserver 监控消息列表内容的 DOM 高度变化，自动滚动到底部。
-  // 流式回答时最后一条 assistant 消息原地增长但 messages.length 不变，
-  // 依赖 length 的 effect 不会及时触发；通过 ResizeObserver 准确感知容器扩张。
-  // autoScroll 在依赖中确保开关变化时重建 observer（同时触发一次初始滚动）。
-  // activeAgent?.status 让 agent 从 starting→idle/errored 时重建 observer
-  // 并触发一次滚动，解决状态切换后才出现 .message-list 时不会自动滚到底部的问题。
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    const messageList = timeline.querySelector(".message-list");
-    if (!messageList) return;
-
-    // 使用 ref 而非闭包值，防止 DOM 变化与 React 状态更新之间的时序间隙造成滚动抢跑：
-    // 用户已滚到上方（autoScroll=false），但状态更新尚未生效，observer 闭包中的 autoScroll 仍为 true。
-    // rAF 合并：流式期间内容每 50ms 增长触发一次 observer，同一帧内多次触发只执行一次
-    // scrollTo，避免每次 token 都做同步布局读取 + 滚动（虚拟显卡上这是滚动卡顿源）。
-    let scrollFrame = 0;
-    const scrollIfNeeded = () => {
-      if (scrollFrame) return;
-      scrollFrame = requestAnimationFrame(() => {
-        scrollFrame = 0;
-        if (!autoScrollRef.current) return;
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      });
-    };
-    // 重建 observer 时先主动滚一次，处理 autoScroll 从 false→true 但列表高度未变的场景。
-    scrollIfNeeded();
-
-    const resizeObserver = new ResizeObserver(scrollIfNeeded);
-    resizeObserver.observe(messageList);
-
-    return () => {
-      if (scrollFrame) cancelAnimationFrame(scrollFrame);
-      resizeObserver.disconnect();
-    };
-  }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length]);
-
-  // 加载更多历史消息/滑窗后恢复滚动位置：翻页会在窗口顶部插入内容（滑窗还会在底部收起内容），
-  // 浏览器保持 scrollTop 不变会让正在看的内容上下跳动。这里按锚点消息的视口位移做补偿，
-  // 让同一批消息停在原来的位置。用 useLayoutEffect 在绘制前同步补偿，避免中间帧抖动。
-  useLayoutEffect(() => {
-    const anchor = loadMoreAnchorRef.current;
-    if (!anchor) return;
-    loadMoreAnchorRef.current = null;
-    const el = timelineRef.current;
-    if (!el) return;
-    const target = el.querySelector(
-      `[data-message-id="${CSS.escape(anchor.id)}"]`,
-    ) as HTMLElement | null;
-    if (!target) return;
-    const delta = target.getBoundingClientRect().top - anchor.top;
-    if (delta !== 0) el.scrollTop += delta;
-  }, [paginatedMessages]);
-
-  // 会话定位跳转到尚未加载的消息时，先通过 loadMessagesUntilIncluded 扩展分页窗口；
-  // 该消息被渲染进 DOM 后，在此 effect 中真正滚动定位并短暂高亮，提示用户落点。
-  useEffect(() => {
-    if (!pendingJumpId) return;
-    const el = document.querySelector(
-      `[data-message-id="${CSS.escape(pendingJumpId)}"]`,
-    ) as HTMLElement | null;
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
-    highlightMessageElement(el);
-    setPendingJumpId(null);
-  }, [pendingJumpId, paginatedMessages.length]);
 
   // 追踪 agent 会话开始/结束时间,计算会话时长
   // 点击外部区域自动关闭会话组合下拉
@@ -3781,7 +3391,11 @@ export function App() {
   function diffFilePath(path: string, originalContent?: string, content?: string) {
     // 工具 diff 展示：write = 空白→全量内容，edit = oldText→newText（变动区域）
     // originalContent 不再存储 full file，使用工具参数中的变动文本作为对比基准。
-    const modified = modifiedFiles.find((f) => f.path === path);
+    // 按需读 transcript 快照：根不再为了这段偶发逻辑订阅消息切片。
+    const messages = activeAgentId
+      ? sessionWorkspaceStore.getSlice(activeAgentId, "transcript")?.messages ?? []
+      : [];
+    const modified = buildModifiedFiles(messages).find((f) => f.path === path);
     const resolvedOriginal = originalContent ?? modified?.originalContent ?? "";
     const resolvedModified = content ?? modified?.content ?? undefined;
     // 工具 diff 与 Git diff 共享弹窗层；打开普通 diff 时先关闭 Git 快照，避免两个 backdrop 叠加。
@@ -4059,8 +3673,7 @@ export function App() {
       setActiveProjectId(projectId);
       setActiveAgentId(existingAgent.id);
       ensureAgentMessagesLoaded(existingAgent.id);
-      setAutoScroll(true);
-      autoScrollRef.current = true;
+      conversationRef.current?.resetAndScrollToBottom();
       return;
     }
     return createAgent(projectId, session.filePath, session.name);
@@ -4257,8 +3870,7 @@ export function App() {
     if (existing) {
       setActiveProjectId(existing.projectId);
       setActiveAgentId(existing.id);
-      setAutoScroll(true);
-      autoScrollRef.current = true;
+      conversationRef.current?.resetAndScrollToBottom();
       return existing;
     }
     // 新建 agent / 从历史会话恢复：点选当下就给品牌 logo 反馈，不必等进程真正 ready。
@@ -5034,40 +4646,6 @@ export function App() {
     prevIsAgentBusyRef.current = isAgentBusy;
   }, [isAgentBusy]);
 
-  /** 流式/运行相关的时间线展示状态：App 侧聚合为单一对象传给 MessageListContent，
-   *  用 useMemo 保证只有任一输入真正变化时才重建引用——流式期间 App 每次重渲染
-   *  （~50ms delta + 侧栏等无关状态变化）不能让对象每帧新建，否则 memo 失效整树重渲染。
-   *  聚合与内容比较器同处 streamStateSelector 模块（buildStreamState /
-   *  areStreamStatesEqual），字段形状与比较逻辑不跨文件漂移。
-   *  注意：thinking 文本不在此处——它由 MessageListContent 自己订阅 thinking 切片，
-   *  否则 20Hz 思考更新会经这里把整个 App 根组件一起唤醒。 */
-  const streamState = useMemo(
-    () =>
-      buildStreamState({
-        streamingMessageId,
-        agentRunning: isAgentBusy,
-        statusRunning: isAgentExactlyRunning(activeAgent),
-        isAwaitingAssistant,
-        showThinking: settings.showThinking,
-        isExecutingTool: activeRuntimeState?.isExecutingTool,
-        isStreaming: activeRuntimeState?.isStreaming,
-        cancellingUi,
-        activeUiAskRequestId: activeUiAsk?.requestId,
-      }),
-    [
-      streamingMessageId,
-      isAgentBusy,
-      activeAgent?.status,
-      isAwaitingAssistant,
-      settings.showThinking,
-      activeAgentId,
-      activeRuntimeState?.isExecutingTool,
-      activeRuntimeState?.isStreaming,
-      cancellingUi,
-      activeUiAsk?.requestId,
-    ],
-  );
-
   /** 解析消息中的 & 会话引用，将 chip 替换为引用上下文 */
   async function resolveSessionRefs(message: string): Promise<string> {
     let resolved = message;
@@ -5230,8 +4808,7 @@ export function App() {
     // 发送前先保留快照,再立即清空 composer;运行中发送会走官方 steer 队列,
     // 由 pi runtime 保证在当前工具调用结束后、下一次 LLM 调用前注入。
     // 不论之前是否滚动回看，发新消息都强制自动滚到底，确保能看到 agent 的回答。
-    setAutoScroll(true);
-    autoScrollRef.current = true;
+    conversationRef.current?.resetAndScrollToBottom();
     // Viewer 首条是独立快照，不消费恢复期间新写入真实 Agent 的第二条草稿。
     if (!override) {
       setLivePrompt(agentId, "");
@@ -5299,13 +4876,9 @@ export function App() {
       return;
     }
     // 此时用户消息已经渲染到 DOM（状态在 await 前已提交），直接滚到底部确保用户看不到消息开头。
-    // 后续流式渲染靠 ResizeObserver（已有 useEffect）自动追踪容器高度变化持续滚动。
+    // 后续流式渲染靠 ConversationPane 的 ResizeObserver 自动追踪容器高度变化持续滚动。
     requestAnimationFrame(() => {
-      const el = timelineRef.current;
-      if (el && autoScrollRef.current) {
-        programmaticScrollRef.current = true;
-        el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
-      }
+      conversationRef.current?.scrollToBottomIfFollowing();
     });
   }
 
@@ -5329,11 +4902,7 @@ export function App() {
     // 在任何 await 之前清掉实时草稿，防止双击/Enter 连发读取同一份消息。
     stageLivePrompt(followUpAgentId);
     const images = attachedImages.length > 0 ? attachedImages : undefined;
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    programmaticScrollRef.current = true;
-    const scrollTimeline = timelineRef.current;
-    if (scrollTimeline) scrollTimeline.scrollTo({ top: scrollTimeline.scrollHeight, behavior: "instant" });
+    conversationRef.current?.resetAndScrollToBottom();
     setPrompt("");
     setAttachedImages([]);
     // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
@@ -5402,22 +4971,10 @@ export function App() {
       }
       return;
     }
-    // 用 MutationObserver 监听消息列表 DOM 变化
-
-    const scrollOnNewMessage = () => {
-      const timeline = timelineRef.current;
-      if (!timeline) return;
-      const list = timeline.querySelector(".message-list");
-      if (!list) return;
-      const observer = new MutationObserver(() => {
-        if (!autoScrollRef.current) return;
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      });
-      observer.observe(list, { childList: true, subtree: false });
-      setTimeout(() => observer.disconnect(), 8000);
-    };
-    requestAnimationFrame(scrollOnNewMessage);
+    // 用户消息提交后若仍贴底则跟随；后续增长交给 pane 的 ResizeObserver。
+    requestAnimationFrame(() => {
+      conversationRef.current?.scrollToBottomIfFollowing();
+    });
   }
 
   // 已删除内置 /goal 与 startNewGoal 实现。
@@ -6720,76 +6277,38 @@ export function App() {
           </div>
         </header>
 
-        <section className="message-timeline" ref={timelineRef}>
-          {/* 加载更多历史消息按钮：计数取"窗口上方未渲染的条数"，滑窗后仍准确。 */}
-          {hasMoreMessages && activeAgent && activeAgent.status !== "starting" && (
-            <div className="timeline-load-more">
-              <Button
-                buttonSize="sm"
-                variant="secondary"
-                onClick={handleLoadMoreMessages}
-                loading={isLoadingMoreMessages}
-              >
-                {t("app.loadMoreHistory", { count: messagesAboveWindow })}
-              </Button>
-            </div>
-          )}
+        {/* 时间线订阅/分页/滚动跟随都在 ConversationPane 内：根不再订阅 transcript，
+            流式 50ms 增量不会唤醒 9k 行的 App。 */}
+        <ConversationPane
+          ref={conversationRef}
+          activeAgentId={activeAgentId}
+          activeAgent={activeAgent}
+          activeProjectId={activeProjectId}
+          runtimeState={activeRuntimeState}
+          isAgentBusy={isAgentBusy}
+          cancellingUi={cancellingUi}
+          activeUiAskRequestId={activeUiAsk?.requestId}
+          showThinking={settings.showThinking}
+          forkingMessageId={forkingMessageId}
+          validCommandNames={validCommandNames}
+          validFilePaths={validFilePaths}
+          hasProject={Boolean(activeProjectId)}
+          terminalRowHeight={terminalRowHeight}
+          composerOffsetHeight={composerOffsetHeight}
+          onCreateAgent={() => {
+            void createAgent();
+          }}
+          onPreviewImage={setPreviewImage}
+          onOpenFile={stableOpenFilePath}
+          onDiffFile={stableDiffFilePath}
+          onEditMessage={editMessage}
+          onDeleteMessage={deleteMessage}
+          onForkMessage={forkFromUserMessage}
+          onOpenExternal={handleOpenExternal}
+          onRespondAsk={handleRespondAsk}
+        />
 
-          {/* Agent 启动时显示骨架屏；消息尚未到达时继续展示，避免闪空
-               Agent 状态已是 idle 时不再显示，即使消息还未到达，
-               避免 "正在启动 Agent" 在启动完成后仍卡住。 */}
-          {(isAgentStarting(activeAgent) || (!isAgentIdle(activeAgent) && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id))) ? (
-            <div className="history-loading">
-              <div className="history-loading-placeholder">
-                <div className="skeleton-bubble" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <div className="history-loading-placeholder">
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <div className="history-loading-placeholder">
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <span style={{ paddingTop: "16px", alignSelf: "center", fontSize: "var(--font-size-small)" }}>{t("app.agentStarting")}</span>
-            </div>
-          ) : null}
-          {!activeAgent && (
-            <EmptyState
-              hasProject={Boolean(activeProjectId)}
-              onCreate={() => createAgent()}
-            />
-          )}
-          {(activeAgent && activeAgent.status !== "starting" && activeMessages.length > 0) ? (
-            <MessageListContent
-              renderedRuns={renderedRuns}
-              streamState={streamState}
-              activeAgentId={activeAgentId}
-              forkingMessageId={forkingMessageId}
-              validCommandNames={validCommandNames}
-              validFilePaths={validFilePaths}
-              onPreviewImage={setPreviewImage}
-              onOpenFile={stableOpenFilePath}
-              onDiffFile={stableDiffFilePath}
-              onEditMessage={editMessage}
-              onDeleteMessage={deleteMessage}
-              onForkMessage={forkFromUserMessage}
-              onEnterMultiSelect={handleEnterMultiSelect}
-              onOpenExternal={handleOpenExternal}
-              onRespondAsk={handleRespondAsk}
-            />
-          ) : null}
-
-          {/* 多选分享弹框：会话树 */}
-          {multiSelectOpen && (
-            <MultiSelectModal renderedRuns={renderedRuns} onClose={() => setMultiSelectOpen(false)} onCopy={handleMultiSelectCopy} />
-          )}
-
-          {sessionRefPickerOpen && sessionRefPickerTarget && (
+        {sessionRefPickerOpen && sessionRefPickerTarget && (
             <SessionReferenceModal
               session={sessionRefPickerTarget}
               initialSelected={
@@ -6812,40 +6331,6 @@ export function App() {
               loadMessages={async (fp: string) => api.sessions.readMessages(fp)}
             />
           )}
-
-        </section>
-
-          {/* 回看历史时窗口冻结，较新的消息没有渲染进 DOM（否则每条流式增量都会顶走阅读位置）：
-              用「还有 N 条新消息」入口替代单纯的回到最新箭头，位置与箭头一致（悬浮在输入框上方，
-              不随滚动内容飘走），让用户知道下方仍在新消息并一键回到最新。 */}
-          {messagesBelowWindow > 0 ? (
-            <div
-              className="timeline-newer-strip"
-              // 与 scroll-to-bottom-btn 同一锚点：由 composer 实际高度 + 终端高度决定 bottom。
-              style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
-            >
-              <Button
-                buttonSize="sm"
-                variant="secondary"
-                className="timeline-newer-btn"
-                onClick={scrollToBottom}
-                title={t("app.jumpToNewest")}
-              >
-                <ChevronDown size={14} aria-hidden="true" />
-                {t("app.newerMessagesHint", { count: messagesBelowWindow })}
-              </Button>
-            </div>
-          ) : showScrollToBottom ? (
-            <button
-              className="scroll-to-bottom-btn"
-              // 按钮脱离滚动容器后，由 composer 实际高度 + 终端高度决定 bottom，避免输入框增高或终端打开时遮挡。
-              style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
-              onClick={scrollToBottom}
-              title={t("app.scrollToBottom")}
-            >
-              <ChevronDown size={18} />
-            </button>
-          ) : null}
 
         {activeAgent && (
         <footer ref={composerRef} className="composer">
@@ -7756,43 +7241,48 @@ export function App() {
         )}
       </main>
 
-        <ConversationOutline
-            items={outlineItems}
-            onJump={handleOutlineJump}
-            extraAction={{
-              active: scratchPad.isOpen,
-              label: t("scratchPad.openTooltip"),
-              onClick: () => scratchPad.toggle(),
-              icon: <Pencil size={17} />,
-            }}
-            terminalAction={activeTerminalOwnerKey ? {
-              active: terminalOpen,
-              label: t("app.terminal"),
-              onClick: () => {
-                setTerminalOpenForOwner(!terminalOpen);
-              },
-              icon: <Terminal size={17} />,
-            } : undefined}
-            editorsAction={{
-              active: editorsOpen,
-              label: t("app.openWithEditor"),
-              onClick: (e) => {
-                const projectPath =
-                  activeAgent?.cwd ||
-                  (activeProject && !isChatProject(activeProject)
-                    ? activeProject.path
-                    : null);
-                setEditorsTargetPath(projectPath);
-                setEditorsOpen((open) => !open);
-                const btn = (e?.currentTarget as HTMLElement)?.closest("button");
-                if (btn) {
-                  const rect = btn.getBoundingClientRect();
-                  setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
-                }
-              },
-              icon: <Code size={17} />,
-            }}
-          />
+        {/* 大纲自己订阅 transcript：消息增量不会经 App 根重算 buildOutline。 */}
+        <ConversationOutlineHost activeAgentId={activeAgentId}>
+          {(outlineItems) => (
+            <ConversationOutline
+              items={outlineItems}
+              onJump={(id) => conversationRef.current?.jumpToMessage(id)}
+              extraAction={{
+                active: scratchPad.isOpen,
+                label: t("scratchPad.openTooltip"),
+                onClick: () => scratchPad.toggle(),
+                icon: <Pencil size={17} />,
+              }}
+              terminalAction={activeTerminalOwnerKey ? {
+                active: terminalOpen,
+                label: t("app.terminal"),
+                onClick: () => {
+                  setTerminalOpenForOwner(!terminalOpen);
+                },
+                icon: <Terminal size={17} />,
+              } : undefined}
+              editorsAction={{
+                active: editorsOpen,
+                label: t("app.openWithEditor"),
+                onClick: (e) => {
+                  const projectPath =
+                    activeAgent?.cwd ||
+                    (activeProject && !isChatProject(activeProject)
+                      ? activeProject.path
+                      : null);
+                  setEditorsTargetPath(projectPath);
+                  setEditorsOpen((open) => !open);
+                  const btn = (e?.currentTarget as HTMLElement)?.closest("button");
+                  if (btn) {
+                    const rect = btn.getBoundingClientRect();
+                    setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
+                  }
+                },
+                icon: <Code size={17} />,
+              }}
+            />
+          )}
+        </ConversationOutlineHost>
 
       {/* 右侧分隔条常驻 grid 列 4，宽度由 --drawer-splitter-w 驱动（0/6px）；
           关闭/折叠时宽度 0 且 pointer-events:none，避免遮挡会话区。 */}

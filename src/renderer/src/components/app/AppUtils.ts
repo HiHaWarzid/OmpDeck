@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import type { ChatMessage, FileTreeNode, ImageContent, PiCommand } from "../../../../shared/types";
 import { computeThinkingTiming } from "../../utils/thinkingTiming";
 import { formatFilePathRef } from "./RichInput";
+import type { SessionModifiedFile } from "./types";
 
 /* ── ANSI 清理 ── */
 
@@ -907,5 +908,39 @@ export function getToolChangedLineCount(toolName: string, args: any): number {
 		return countTextLines(String(args?.content ?? args?.text ?? args?.data ?? args?.body ?? ""));
 	}
 	return 0;
+}
+
+/**
+ * 从工具消息里归并出「当前会话修改过的文件」。
+ *
+ * 之前这段推导挂在 App 根 useMemo 上，导致 transcript 每次 50ms 增量都要唤醒根组件；
+ * 现在只在真正需要（打开 diff）时按当前 transcript 快照计算一次，点击路径可接受 O(n)。
+ */
+export function buildModifiedFiles(messages: ChatMessage[]): SessionModifiedFile[] {
+	const byPath = new Map<string, SessionModifiedFile>();
+	for (const msg of messages) {
+		if (msg.role !== "tool") continue;
+		const toolName: string | undefined = msg.meta?.toolName as string | undefined;
+		const args: unknown = msg.meta?.args;
+		const status: string = String(msg.meta?.status ?? "done");
+		// 只收集文件写入/编辑类的工具调用，作为右侧 Files 与会话结束摘要的统一数据源。
+		if (!toolName || !/write|edit|create|patch/i.test(toolName)) continue;
+		const filePath = getToolFilePath(args);
+		if (!filePath) continue;
+		const previous = byPath.get(filePath);
+		// 同一路径再次被修改时移动到 Map 末尾，右侧修改清单才能按"最新修改"展示。
+		if (previous) byPath.delete(filePath);
+		// originalContent 不再存储到消息 meta 中（full file 会使会话体积过大）。
+		// diff 展示时使用工具参数（oldText/newText）显示变动区域。
+		byPath.set(filePath, {
+			path: filePath,
+			toolName,
+			status: status === "running" ? "running" : (previous?.status ?? status),
+			changedLines: (previous?.changedLines ?? 0) + getToolChangedLineCount(toolName, args),
+			originalContent: "",
+			content: getToolNewContent(toolName, args) ?? previous?.content,
+		});
+	}
+	return Array.from(byPath.values());
 }
 
