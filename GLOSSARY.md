@@ -1,4 +1,4 @@
-# OmpDeck AFK — 领域语言 (CONTEXT.md)
+# OmpDeck AFK — 领域语言 (GLOSSARY.md)
 
 > 记录 OmpDeck AFK 自动编排功能的领域术语（ubiquitous language）。
 > AFK = 应用内"挂机"模式：无值守情况下，按 GitHub 工单自动派发 pi Agent 到隔离 worktree 完成 T1 级编码任务。

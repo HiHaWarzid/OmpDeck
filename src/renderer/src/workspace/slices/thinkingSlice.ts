@@ -7,7 +7,7 @@ import type { EntryKind, WorkspaceAction } from "../sessionWorkspace";
  * - streamingThinking[agentId] / streamingThinkingRef
  * - streamingThinkingStartedAt[agentId] / streamingThinkingStartedAtRef
  * 镜像 ref 存在的根因是「挂载一次的 onThinking 监听器需要读最新缓存」——
- * store 的 dispatch 直接落进自身最新状态，镜像对随之消亡（见 CONTEXT.md
+ * store 的 dispatch 直接落进自身最新状态，镜像对随之消亡（见 GLOSSARY.md
  * SessionEntry / Slice 术语）。语义与 utils/thinkingState.reduceThinkingUpdate
  * 逐点等价（该模块随迁入删除）：
  * - 同文本 → 原引用（主进程 50ms 节流重复推送不触发订阅者）；

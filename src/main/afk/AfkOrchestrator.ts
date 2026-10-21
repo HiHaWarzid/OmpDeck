@@ -1,7 +1,7 @@
 /**
  * AFK 编排器（ADR-0001 Orchestrator 模式）：选 ticket → 建 worktree/分支 → spawn agent
  * → 监听 settled/error → 标终态 → 推分支/开 PR → 回写 issue label。
- * 领域规则见 CONTEXT.md 与 docs/adr/0001-0006；AgentManager 仅作"被调用的 spawn 工具"，
+ * 领域规则见 GLOSSARY.md 与 docs/adr/0001-0006；AgentManager 仅作"被调用的 spawn 工具"，
  * 不侵入其多 tab 状态机。判定基于 AgentManager 语义事件（settled/statusChanged），
  * 不做 addStateListener 全量快照轮询（#2 杠杆点）。
  *
@@ -237,7 +237,7 @@ export class AfkOrchestrator {
 	// ── 初始化 / 崩溃恢复 / 持久化 ──
 
 	/**
-	 * 启动初始化：加载 afk-state.json → 30 天归档滚动清理 → 崩溃恢复（CONTEXT.md Crash Recovery）：
+	 * 启动初始化：加载 afk-state.json → 30 天归档滚动清理 → 崩溃恢复（GLOSSARY.md Crash Recovery）：
 	 * - running/queued 且 agent 存活（agentManager.list() 能查到）→ 标 needs-review 等人，不判死
 	 * - running/queued 且 agent 不存在 → 强清 worktree（removeWithWip 留 WIP per ADR-0003）→ failed
 	 * - 终态任务直接进入归档（30 天滚动清理）
@@ -495,7 +495,7 @@ export class AfkOrchestrator {
 		void this.saveState();
 	}
 
-	/** Brief 原样派发（CONTEXT.md）：title 作 goal、body 作 brief 原文、workflow:* 标签作工作流提示。 */
+	/** Brief 原样派发（GLOSSARY.md）：title 作 goal、body 作 brief 原文、workflow:* 标签作工作流提示。 */
 	private buildBrief(ticket: AfkTicket, body: string): string {
 		const parts = [`# Goal\n${ticket.title}`, `# Brief\n${body}`];
 		const workflowHints = ticket.labels.filter((label) => label.startsWith("workflow:"));
@@ -558,7 +558,7 @@ export class AfkOrchestrator {
 			// 避免 ticket 滞留 ready-for-agent 被下轮 poll 循环重派
 			await this.failTask(task, `完成路径失败：${errorMessage(error)}`, { keepWorktree: false });
 		} finally {
-			// 终态后 stop agent + 关 tab 防泄漏（CONTEXT.md AfkTask Lifecycle）
+			// 终态后 stop agent + 关 tab 防泄漏（GLOSSARY.md AfkTask Lifecycle）
 			await this.agentManager.stop(agentId).catch(() => undefined);
 		}
 		void this.saveState();

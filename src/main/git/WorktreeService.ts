@@ -102,7 +102,7 @@ export class WorktreeService {
 
 	/**
 	 * AFK 专用 worktree 创建：分支 afk-{ticketId}-{slug}（- 分隔，slug 取自 issue title）。
-	 * 与 create() 不同：目录/分支碰撞时**复用**而非抛错（重跑从 [afk-wip] commit 继续，见 CONTEXT.md）。
+	 * 与 create() 不同：目录/分支碰撞时**复用**而非抛错（重跑从 [afk-wip] commit 继续，见 GLOSSARY.md）。
 	 *
 	 * 复用语义（精确）：
 	 * - git 里已有该分支的 worktree → 返回它的实际路径（可能不在目标目录）；
@@ -218,7 +218,7 @@ export class WorktreeService {
 	async removeWithWip(worktreePath: string, projectPath: string, ticketRef: number): Promise<boolean> {
 		// ADR-0003：删 worktree 前必须先把未提交改动快照成 [afk-wip] commit，留在 afk 分支供重跑复用。
 		// 工作树干净时跳过（无变更不产生 commit）；快照失败则中止删除——宁可保留 worktree
-		// 等重跑复用，也不裸删抹掉进度（崩溃/超时场景，见 CONTEXT.md Retry）。
+		// 等重跑复用，也不裸删抹掉进度（崩溃/超时场景，见 GLOSSARY.md Retry）。
 		const stdout = await this.fx.runGit(worktreePath, ["status", "--porcelain"]);
 		if (stdout.trim()) {
 			await this.fx.queue.run(worktreePath, async () => {

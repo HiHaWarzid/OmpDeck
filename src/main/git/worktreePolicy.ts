@@ -5,7 +5,7 @@ import type { WorktreeEntry } from "../../shared/types";
  * worktree 保留/复用策略（纯函数，与 WorktreeService 的 git 副作用分离）。
  *
  * 背景：AFK 无人值守，删 worktree 前必须保留 WIP（ADR-0003），碰撞必须复用而非抛错
- * （CONTEXT.md Retry）。这些"给定状态定路线"的判定是纯的，先让它们可单测；
+ * （GLOSSARY.md Retry）。这些"给定状态定路线"的判定是纯的，先让它们可单测；
  * 查状态（list/show-ref/existsSync）与执行（add/commit/remove）仍留在 service。
  */
 

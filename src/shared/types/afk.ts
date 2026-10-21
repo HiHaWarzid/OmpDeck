@@ -1,6 +1,6 @@
 /**
  * AFK（挂机编排）领域类型。
- * 术语见 CONTEXT.md：Ticket（GitHub Issue）→ AfkTask（运行时记录）→ Complete ≠ Success。
+ * 术语见 GLOSSARY.md：Ticket（GitHub Issue）→ AfkTask（运行时记录）→ Complete ≠ Success。
  */
 
 /** AFK 任务状态：queued（排队）→ running（agent 工作）→ complete/failed 终态；pr-pending/needs-review 为 complete 后的人审阶段。 */
@@ -12,7 +12,7 @@ export type AfkTaskStatus =
 	| "pr-pending"
 	| "needs-review";
 
-/** AFK 任务运行时记录（持久化于 userData/afk-state.json，见 CONTEXT.md AfkTask）。 */
+/** AFK 任务运行时记录（持久化于 userData/afk-state.json，见 GLOSSARY.md AfkTask）。 */
 export type AfkTask = {
 	/** GitHub Issue 编号（ticketRef = issue number） */
 	ticketRef: number;

@@ -4,7 +4,7 @@
 - 日期：2026-08-07
 
 ## 背景
-`complete` 只表"跑到停"，`success` 需独立 review（CONTEXT.md / ADR-0001 已立）。需决定 review 怎么落地。候选：
+`complete` 只表"跑到停"，`success` 需独立 review（GLOSSARY.md / ADR-0001 已立）。需决定 review 怎么落地。候选：
 - (a) 只重标 label 不开 PR；
 - (b) AFK 再 spawn `/skill:code-review` 自审；
 - (c) AFK 推分支 + 开 PR + 重标 `ready-for-human` + 停手；

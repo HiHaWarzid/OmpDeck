@@ -258,4 +258,4 @@ GitHub Issues（`HiHaWarzid/OmpDeck`），通过 `gh` CLI 操作。操作命令�
 
 ### Domain docs
 
-AFK 领域术语表 `CONTEXT.md` + 架构决策记录 `docs/adr/`。领域建模流程和术语维护规则见 `docs/agents/domain.md`。
+AFK 领域术语表 `GLOSSARY.md` + 架构决策记录 `docs/adr/`。领域建模流程和术语维护规则见 `docs/agents/domain.md`。

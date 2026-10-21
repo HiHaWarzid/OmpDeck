@@ -75,7 +75,7 @@ export const GhTicketSource: TicketSource = {
 	createPr,
 };
 
-/** 列出目标仓库待派发的工单（Selection 规则，CONTEXT.md）：
+/** 列出目标仓库待派发的工单（Selection 规则，GLOSSARY.md）：
  * `gh issue list --state open --label ready-for-agent`，在项目 cwd 运行。
  */
 export async function listReadyForAgent(cwd: string): Promise<AfkTicket[]> {
@@ -117,7 +117,7 @@ export async function getIssueBody(cwd: string, number: number): Promise<string>
 	return parsed.body ?? "";
 }
 
-/** 当前 gh 认证账户 login（AFK Identity = @me，CONTEXT.md；用于已认领过滤）。 */
+/** 当前 gh 认证账户 login（AFK Identity = @me，GLOSSARY.md；用于已认领过滤）。 */
 export async function getCurrentUser(cwd: string): Promise<string> {
 	const stdout = await runGh(cwd, ["api", "user", "--jq", ".login"]);
 	const login = stdout.trim();

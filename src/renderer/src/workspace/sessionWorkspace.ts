@@ -11,7 +11,7 @@ import { transcriptSlice, type TranscriptState } from "./slices/transcriptSlice"
 /**
  * 会话工作区（SessionWorkspace）——渲染层深模块核心（切片 0，纯逻辑，零 React）。
  *
- * 领域术语见 CONTEXT.md「会话工作区」节。设计定案（C+B 混合）：
+ * 领域术语见 GLOSSARY.md「会话工作区」节。设计定案（C+B 混合）：
  * - 单一 store 实例（工厂创建，默认单例由上层挂载），内部 reducer 分片；
  * - Focus：单一选中态。用户意图操作绑定焦点、不带 key；事件驱动操作带显式 key
  *   （后台 tab 也在流式，事件不能只落在焦点上）；
