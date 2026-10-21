@@ -654,6 +654,26 @@ export function App() {
   );
   const expandedSidebarProjectsRef = useRef(expandedSidebarProjects);
   expandedSidebarProjectsRef.current = expandedSidebarProjects;
+  // 冷扫描先返回部分摘要，完整扫描结束后主进程推送 sessions:changed。
+  // 用 ref 取最新 refresh 函数，避免事件监听随每次渲染重绑定。
+  const refreshProjectSessionsRef = useRef(refreshProjectSessions);
+  refreshProjectSessionsRef.current = refreshProjectSessions;
+  const sessionsByProjectRef = useRef(sessionsByProject);
+  sessionsByProjectRef.current = sessionsByProject;
+  useEffect(() => {
+    return api.sessions.onChanged(() => {
+      // 已经加载过列表的项目（侧栏/活动项目）都要补一次完整快照；
+      // 只认 expanded 会漏掉当前活动但尚未展开的项目。
+      const projectIds = new Set(Object.keys(sessionsByProjectRef.current));
+      for (const projectId of expandedSidebarProjectsRef.current) projectIds.add(projectId);
+      const active = activeProjectIdRef.current;
+      if (active) projectIds.add(active);
+      for (const projectId of projectIds) {
+        // silent：这是补全已有部分列表，不应重新显示 loading 骨架。
+        void refreshProjectSessionsRef.current(projectId, true).catch(() => undefined);
+      }
+    });
+  }, []);
   /** 已从 settings.json 合并过展开状态，避免被后续 settings 刷新覆盖用户刚点的展开 */
   const expandedSidebarFromSettingsRef = useRef(false);
   const [files, setFiles] = useState<FileTreeNode[]>([]);

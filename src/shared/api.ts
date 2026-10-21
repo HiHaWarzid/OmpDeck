@@ -197,7 +197,9 @@ export interface SessionsApi {
 	 * 展开压缩卡片时才按 compactionId 取回内容——归档可达整个压缩前历史（MB 级），
 	 * 随每次状态推送结构化克隆会直接顶爆渲染进程内存。
 	 */
-	readArchivedMessages: (agentId: string, compactionId: string) => Promise<{ messages: ChatMessage[] }>;
+	readArchivedMessages: (filePath: string, compactionId: string) => Promise<{ messages: ChatMessage[] }>;
+	/** 冷扫描部分结果返回后，完整扫描结束时触发；回调无需参数，重新 list 即可。 */
+	onChanged: (callback: () => void) => () => void;
 }
 
 export interface CodexSessionsApi {

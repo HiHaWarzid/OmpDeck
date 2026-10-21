@@ -120,6 +120,7 @@ const previewOverrides: NamespaceOverrides = {
 	},
 	sessions: {
 		list: async () => getSessions(),
+		onChanged: () => () => {},
 		copy: async (_projectId, filePath) => ({
 			cancelled: false,
 			sessionPath: `${filePath}-copy`,

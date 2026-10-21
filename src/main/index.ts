@@ -1212,7 +1212,13 @@ app.whenReady().then(async () => {
 
 	projectStore = new ProjectStore();
 	fileSystemService = new FileSystemService();
-	sessionScanner = new SessionScanner();
+	sessionScanner = new SessionScanner({
+		onScanSettled: () => {
+			if (mainWindow && !mainWindow.isDestroyed()) {
+				mainWindow.webContents.send(ipcChannels.sessionsChanged);
+			}
+		},
+	});
 	importPipeline = new ImportPipeline(join(app.getPath("home"), ".omp", "agent", "sessions"));
 	importPipeline.registerAdapter(new OpenCodeImportAdapter(join(app.getPath("home"), ".local", "share", "opencode", "opencode.db")));
 	importPipeline.registerAdapter(new ClaudeImportAdapter(join(app.getPath("home"), ".claude", "projects")));

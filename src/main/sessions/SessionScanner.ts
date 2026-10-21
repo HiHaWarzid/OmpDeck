@@ -30,13 +30,6 @@ function firstString(...values: unknown[]): string | undefined {
 /** 本地模式扫描并发度：readFile/stat 是异步 IO，32 路足够打满磁盘吞吐且不爆句柄。 */
 const SCAN_CONCURRENCY_LOCAL = 32;
 
-/**
- * 项目匹配结果缓存的 key：`文件 + 项目`。
- * 分隔符用 NUL：Windows/POSIX 路径都不允许包含它，因此不会与路径本身混淆。
- */
-function projectMatchKey(filePath: string, projectPath: string) {
-  return `${filePath}\u0000${projectPath}`;
-}
 /** WSL 模式扫描并发度：每个 stat/read 都 spawn 一个 wsl.exe（100~300ms 进程启动），
  *  8 路并发已能占满 wsl.exe 吞吐，数百文件全并发会进程句柄爆炸。 */
 const SCAN_CONCURRENCY_WSL = 8;
@@ -65,6 +58,7 @@ async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
   fn: (item: T, index: number) => Promise<R>,
+  onResult?: (result: R) => void,
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
@@ -74,11 +68,32 @@ async function mapWithConcurrency<T, R>(
     for (;;) {
       const index = next++;
       if (index >= items.length) return;
-      results[index] = await fn(items[index], index);
+      const result = await fn(items[index], index);
+      results[index] = result;
+      // 每完成一个文件就上报，供首屏渐进返回（见 SessionScanner.list 的部分结果窗口）。
+      onResult?.(result);
     }
   });
   await Promise.all(workers);
   return results;
+}
+
+/**
+ * 首次扫描在无摘要缓存时要整读全部 JSONL（实测 0.86GB 约 9.5s）。这里给调用方一个
+ * 短等待窗口：窗口内完成就返回完整结果；未完成则先返回已解析的尾部快照，完整结果
+ * 落盘后通过 sessions:changed 事件触发渲染层刷新。窗口取 1.2s——足够覆盖热缓存扫描，
+ * 又不至于让冷启动首屏等满整轮。
+ */
+const PARTIAL_SCAN_WAIT_MS = 1_200;
+
+interface ScanJob {
+  /** 完整扫描结果（含缓存命中与新解析文件），按 updatedAt 倒序。 */
+  promise: Promise<SessionSummary[]>;
+  /** 扫描过程中的已解析摘要；完成前可被读取。 */
+  partial: SessionSummary[];
+  done: boolean;
+  /** 是否已有调用方拿到过部分结果；只有这种情况才需要在完成时通知刷新。 */
+  deliveredPartial: boolean;
 }
 
 export class SessionScanner {
@@ -93,17 +108,16 @@ export class SessionScanner {
   private readonly summaryCache = new SessionSummaryCache<SessionSummary | null>();
   private summaryCacheFileSetKey = "";
   /**
-   * isSameProject 内容校验的结果缓存：key 为「文件 + 项目」，值只有布尔 + 指纹。
+   * isSameProject 内容校验的结果缓存：key 为文件路径，值是该文件对每个项目的匹配布尔。
    * 只有「父目录 cwd 会话」才需要整读内容匹配项目路径（isParentSessionForProject），
    * 这里缓存「某个项目是否在该文件里出现过」，避免重复扫描时对同一文件反复整读。
-   * 只存布尔不存全文：早期实现按文件缓存整读文本，同一文件对每个项目各存一份，
-   * 常驻内存 = O(会话数 × 项目数 × 文件体积)，随会话规模线性增长；结果缓存是每会话字节级。
+   * 内存 + 磁盘双层：否则每次冷启动首屏都要把所有 home/父目录会话整读一遍
+   * （实测 1.2s，项目嵌套时更久）。值只有布尔，不缓存全文。
    * 随 summaryCache 的 fileSetKey 变化一起修剪。
    */
-  private readonly projectMatchCache = new Map<
-    string,
-    { filePath: string; version: FileVersion; matched: boolean }
-  >();
+  private readonly projectMatchCache = new SessionSummaryCache<Record<string, boolean>>(
+    "session-project-match-cache.json",
+  );
   /**
    * isSessionFile 校验结果的指纹缓存：父会话候选文件（<stem>.jsonl）只在子会话
    * 结束时才更新，每次扫描对每个候选父做 stat + readHead(4096) 的成本可省。
@@ -144,6 +158,15 @@ export class SessionScanner {
     getDefaultSessionsRoot: () => this.defaultSessionsRoot,
   });
 
+  constructor(
+    private readonly options: {
+      /** 冷扫描完整结束后通知渲染层刷新（只在本次调用返回过部分结果时触发）。 */
+      onScanSettled?: () => void;
+      /** 测试注入用：部分结果等待窗口，默认 1.2s。 */
+      partialWaitMs?: number;
+    } = {},
+  ) {}
+
   /**
    * wsl.exe 命令与启动模式。优先绝对路径，
    * 文件不存在时回退到 shell PATH 查找。
@@ -183,6 +206,7 @@ export class SessionScanner {
     // 环境切换时只重置“本轮扫描键”，并从磁盘重新装载缓存；不要把另一环境的磁盘缓存清空。
     this.summaryCacheFileSetKey = "";
     await this.summaryCache.reloadFromDisk();
+    await this.projectMatchCache.reloadFromDisk();
   }
 
   /** 清除 WSL 配置 */
@@ -191,6 +215,7 @@ export class SessionScanner {
     this.fileAdapter = new LocalFileAdapter();
     this.summaryCacheFileSetKey = "";
     void this.summaryCache.reloadFromDisk();
+    void this.projectMatchCache.reloadFromDisk();
   }
 
   /** WSL 中 pi 默认 session 目录（基于动态获取的 home） */
@@ -211,7 +236,7 @@ export class SessionScanner {
   }
 
   /** 进行中的原始扫描（按扫描根共享）：并发 list() 合并为同一轮扫描。 */
-  private readonly listInFlightByKey = new Map<string, Promise<SessionSummary[]>>();
+  private readonly scanJobs = new Map<string, ScanJob>();
 
   async list(projectPath?: string): Promise<SessionSummary[]> {
     // 匹配用路径：WSL 模式下转 /mnt/...，与会话 JSONL 内 cwd 对齐。
@@ -226,7 +251,8 @@ export class SessionScanner {
     // 原始扫描结果与项目无关（项目归属在共享结果之上逐调用方过滤），因此快速连点、
     // 周期同步、多项目同时展开会合并为同一轮扫描：慢扫描时后到的请求直接复用
     // 进行中的结果，而不是叠加多轮全量扫描互相拖慢，最终谁也拿不到列表。
-    const summaries = await this.scanShared(scanRoots);
+    const job = this.scanShared(scanRoots);
+    const summaries = await this.awaitScan(job);
 
     if (!normalizedProjectPath) return summaries;
     // 异步 isSameProject 过滤（自定义 sessionDir 下的文件也会按 cwd/路径归属判断）
@@ -235,22 +261,83 @@ export class SessionScanner {
   }
 
   /**
+   * 等待共享扫描：热缓存通常立即完成；冷扫描超过窗口时先返回已解析的部分结果，
+   * 完整结果完成后由 onScanSettled 通知渲染层再取一次（那时已是热缓存，毫秒级）。
+   */
+  private async awaitScan(job: ScanJob): Promise<SessionSummary[]> {
+    if (!job.done) {
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), this.options.partialWaitMs ?? PARTIAL_SCAN_WAIT_MS);
+      });
+      let outcome: "done" | "timeout";
+      try {
+        outcome = await Promise.race([
+          job.promise.then(() => "done" as const),
+          timeout,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (outcome === "timeout" && !job.done && job.partial.length > 0) {
+        job.deliveredPartial = true;
+        // 部分结果按 UI 同一排序规则输出；拷贝避免调用方改动内部快照。
+        return [...job.partial].sort((a, b) => b.updatedAt - a.updatedAt);
+      }
+    }
+    return job.promise;
+  }
+
+  /**
    * 按扫描根共享进行中的原始扫描（不按项目过滤，排序已完成）。
    * 只有扫描根不同的并发调用（如不同项目配置了不同 sessionDir）才会各自扫描。
    */
-  private scanShared(scanRoots: string[]): Promise<SessionSummary[]> {
+  private scanShared(scanRoots: string[]): ScanJob {
     const key = scanRoots.map((root) => this.normalize(root)).join("\n");
-    const inFlight = this.listInFlightByKey.get(key);
+    const inFlight = this.scanJobs.get(key);
     if (inFlight) return inFlight;
+
+    const partial: SessionSummary[] = [];
+    const startedAt = Date.now();
+    let job!: ScanJob;
     // 整个 scanOnce 也纳入 watchdog：本地 fs 调用不可中断，若只依赖 signal 传递，
     // 卡在 readFile/stat 上的扫描会让共享 promise 永远 pending，后续 list() 全部挂死。
     let scan: Promise<SessionSummary[]>;
-    scan = this.withScanWatchdog("Session scan", (signal) => this.scanOnce(scanRoots, signal)).finally(() => {
+    scan = this.withScanWatchdog(
+      "Session scan",
+      (signal) => this.scanOnce(scanRoots, signal, (summary) => {
+        if (summary) partial.push(summary);
+      }),
+    ).finally(() => {
+      job.done = true;
+      if (process.env.PIDECK_PERF === "1") {
+        const elapsed = Date.now() - startedAt;
+        console.log(
+          `[perf] session scan ${elapsed}ms parsed=${partial.length} partial=${job.deliveredPartial}`,
+        );
+      }
       // 只清理自己注册的条目：期间可能有新调用注册了同 key 的新一轮扫描。
-      if (this.listInFlightByKey.get(key) === scan) this.listInFlightByKey.delete(key);
+      if (this.scanJobs.get(key) === job) this.scanJobs.delete(key);
     });
-    this.listInFlightByKey.set(key, scan);
-    return scan;
+    job = { promise: scan, partial, done: false, deliveredPartial: false };
+    this.scanJobs.set(key, job);
+    // 部分结果已经返回过，就必须在完整扫描成功后唤醒渲染层；
+    // 否则 UI 会长期停留在首屏截断的列表上。失败不通知，避免磁盘持续异常时
+    // 18s 超时 → 重扫 → 再超时的无限循环（保留部分列表，用户可手动刷新）。
+    void scan.then(
+      () => this.notifyScanSettled(job),
+      () => undefined,
+    );
+    return job;
+  }
+
+  private notifyScanSettled(job: ScanJob): void {
+    if (!job.deliveredPartial) return;
+    try {
+      this.options.onScanSettled?.();
+    } catch {
+      // 通知失败不能影响扫描结果本身。
+    }
   }
 
   /**
@@ -275,7 +362,11 @@ export class SessionScanner {
     }
   }
 
-  private async scanOnce(scanRoots: string[], signal: AbortSignal): Promise<SessionSummary[]> {
+  private async scanOnce(
+    scanRoots: string[],
+    signal: AbortSignal,
+    onResult?: (summary: SessionSummary | null) => void,
+  ): Promise<SessionSummary[]> {
     const rethrowAbort = <T>(fallback: T) => (error: unknown): T => {
       if (signal.aborted) throw signal.reason ?? error;
       return fallback;
@@ -283,6 +374,7 @@ export class SessionScanner {
 
     // 重启后先恢复磁盘摘要缓存，避免全量重读 JSONL。
     await this.summaryCache.ensureLoaded();
+    await this.projectMatchCache.ensureLoaded();
     this.activeScanRoots = scanRoots;
 
     // WSL 模式 vs 本地模式：互斥扫描，不会同时展示两个环境的会话。
@@ -292,11 +384,9 @@ export class SessionScanner {
     if (fileSetKey !== this.summaryCacheFileSetKey) {
       // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
       this.summaryCache.prune(files, this.wslConfig ? "wsl" : "local");
-      // 同步修剪项目匹配结果缓存，避免已删除会话的条目长期残留内存。
+      // 同步修剪项目匹配结果缓存，避免已删除会话的条目长期残留。
+      this.projectMatchCache.prune(files, this.wslConfig ? "wsl" : "local");
       const fileSet = new Set(files.map((f) => this.normalize(f)));
-      for (const [key, entry] of this.projectMatchCache) {
-        if (!fileSet.has(this.normalize(entry.filePath))) this.projectMatchCache.delete(key);
-      }
       // 父会话校验缓存同样只保留当前扫描集合内的条目。
       for (const key of this.sessionFileCheckCache.keys()) {
         if (!fileSet.has(this.normalize(key))) this.sessionFileCheckCache.delete(key);
@@ -315,6 +405,7 @@ export class SessionScanner {
       this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
       (file) =>
         this.readSummary(file, signal, prefetchedVersions?.get(file)).catch(rethrowAbort(null)),
+      onResult,
     );
     signal.throwIfAborted();
 
@@ -839,7 +930,10 @@ export class SessionScanner {
 
   /** 应用退出前刷盘，保证本轮扫描结果可被下次启动复用；超时即放弃，不阻塞退出。 */
   async flushSummaryCache(): Promise<void> {
-    await this.summaryCache.flushWithTimeout();
+    await Promise.all([
+      this.summaryCache.flushWithTimeout(),
+      this.projectMatchCache.flushWithTimeout(),
+    ]);
   }
 
   private optionalString(value: unknown) {
@@ -968,17 +1062,15 @@ export class SessionScanner {
     // 早期用户常在 home 目录启动 pi 再操作子项目；这类历史 session 的 cwd 是父目录，
     // 但文件内容可能明确提到当前项目。仅对父目录 session 做内容校验，避免把无关 home 会话全部展示到子项目下。
     if (!sessionProject || !projectPath.startsWith(`${sessionProject}/`)) return false;
-    const key = projectMatchKey(filePath, projectPath);
     let version: FileVersion;
     try {
       version = await this.fileAdapter.stat(filePath, signal);
     } catch {
       return false;
     }
-    const cached = this.projectMatchCache.get(key);
-    if (cached && cached.version.mtimeMs === version.mtimeMs && cached.version.size === version.size) {
-      return cached.matched;
-    }
+    const matches = this.projectMatchCache.get(filePath, version);
+    const cached = matches?.[projectPath];
+    if (cached !== undefined) return cached;
     let matched: boolean;
     try {
       // 只需要子串命中，不需要逐行 JSON.parse：直接整读原文（BOM/UTF-16 文件在扫描摘要阶段
@@ -989,7 +1081,8 @@ export class SessionScanner {
       // 读取失败（含扫描取消）：按不匹配处理但不落缓存，下次扫描重试，避免瞬时错误把会话永久隐藏。
       return false;
     }
-    this.projectMatchCache.set(key, { filePath, version, matched });
+    // 同一文件对多个项目各存一个布尔；版本未变即可跨重启复用。
+    this.projectMatchCache.set(filePath, version, { ...matches, [projectPath]: matched });
     return matched;
   }
 

@@ -182,6 +182,8 @@ export const ipcTable = {
 		readChatMessages: { channel: "sessions:read-chat-messages", kind: "invoke" },
 		readMessageFullText: { channel: "sessions:read-message-full-text", kind: "invoke" },
 		readArchivedMessages: { channel: "sessions:read-archived-messages", kind: "invoke" },
+		// 冷扫描先返回部分结果，完整扫描结束后由主进程推送一次，渲染层据此重取热缓存列表。
+		onChanged: { channel: "sessions:changed", kind: "subscribe", pushFrom: "main-index" },
 	},
 	codexSessions: {
 		scan: { channel: "codex-sessions:scan", kind: "invoke" },
