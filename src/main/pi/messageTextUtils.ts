@@ -116,6 +116,36 @@ export function compactJsonLength(value: unknown): number {
 }
 
 /**
+ * 嵌套 meta 序列化长度缓存（WeakMap 以 meta 对象为键，每个 meta 最多 3 条）。
+ *
+ * 为什么需要：details / archivedMessages / _askCard 未截断，可能是 MB 级结构；
+ * getMessages 在渲染层流式推送、Web 轮询与 transcript 预算校验中反复估算同一条
+ * 消息，每次都 JSON.stringify 这些嵌套结构是纯重复 CPU。meta 在消息更新时整体
+ * 替换、普通消息的 meta 更是终生不变，因此按对象身份缓存测得长度即可。
+ *
+ * 条目里同时记录嵌套值的引用：同一个 meta 对象上的嵌套值若被就地替换（引用不再
+ * 相等），就重算，保证返回值与不走缓存的路径完全一致。
+ * 只缓存嵌套结构长度，不缓存消息总字节 —— text/thinking 是流式增长的，必须按当前值重算。
+ */
+const nestedMetaLengthCache = new WeakMap<
+	object,
+	Map<string, { value: unknown; length: number }>
+>();
+
+function memoizedNestedMetaLength(meta: object, key: string, value: unknown): number {
+	let perMeta = nestedMetaLengthCache.get(meta);
+	if (!perMeta) {
+		perMeta = new Map();
+		nestedMetaLengthCache.set(meta, perMeta);
+	}
+	const cached = perMeta.get(key);
+	if (cached && cached.value === value) return cached.length;
+	const length = compactJsonLength(value);
+	perMeta.set(key, { value, length });
+	return length;
+}
+
+/**
  * 估算单条消息的驻留 / IPC 体积（字节），作为 transcript 容量预算的度量口径。
  *
  * 只求量级正确：文本按 UTF-16（2 字节/字符）计，图片按 base64 串长计，另加固定开销。
@@ -137,7 +167,7 @@ export function estimateMessageBytes(message: ChatMessage): number {
 	for (const key of NESTED_META_BYTES_KEYS) {
 		const value = meta[key];
 		if (value === undefined || value === null) continue;
-		bytes += compactJsonLength(value) * 2;
+		bytes += memoizedNestedMetaLength(meta, key, value) * 2;
 	}
 	return bytes;
 }

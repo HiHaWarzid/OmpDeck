@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { gunzipSync } from "node:zlib";
 import { join } from "node:path";
 import { app } from "electron";
@@ -42,6 +42,8 @@ export class XuePromptManager {
 	 * 共享一个实例没有并发问题，加载一次后所有 list/detail 直接命中。
 	 */
 	private db: SqlJsDatabase | null = null;
+	/** 懒加载就绪句柄（见 ensureLoaded）：并发查询共享同一次 WASM 初始化 + DB 读取。 */
+	private loadPromise: Promise<SqlJsDatabase> | null = null;
 
 	/**
 	 * 初始化 sql.js WASM，传入 locateFile 确保能找到 sql-wasm.wasm
@@ -93,17 +95,23 @@ export class XuePromptManager {
 	}
 
 	/**
-	 * 延迟初始化 sql.js（WASM 只需加载一次）
+	 * 延迟初始化 sql.js（WASM 只需加载一次）。
+	 *
+	 * 构造/模块导入阶段绝不触碰磁盘：数据库 4MB，readFileSync 会在主进程启动路径上
+	 * 同步阻塞；改为首个查询时异步 readFile，加载完成后所有 sql.js 查询仍是同步调用。
 	 */
 	private async getDb(): Promise<SqlJsDatabase> {
 		if (this.db) return this.db;
 		const SQL = await this.initSql();
 
-		if (!existsSync(this.dbPath)) {
-			throw new Error(`XuePrompt 数据库不存在: ${this.dbPath}`);
-		}
 		const t0 = perfStart("xueprompts:db-open");
-		const buffer = readFileSync(this.dbPath);
+		// ENOENT 归一为原来的「数据库不存在」错误；其他 I/O 错误原样抛出。
+		const buffer = await readFile(this.dbPath).catch((err: NodeJS.ErrnoException) => {
+			if (err?.code === "ENOENT") {
+				throw new Error(`XuePrompt 数据库不存在: ${this.dbPath}`);
+			}
+			throw err;
+		});
 		const db = new SQL.Database(buffer);
 		perfEnd("xueprompts:db-open", t0, { bytes: buffer.length });
 		this.db = db;
@@ -111,12 +119,42 @@ export class XuePromptManager {
 	}
 
 	/**
+	 * 就绪句柄：并发首个查询共享同一次「WASM 初始化 + DB 读取」，不重复加载。
+	 * 失败时清空句柄，下一次查询可重试（例如数据库文件稍后才就位）。
+	 */
+	private ensureLoaded(): Promise<SqlJsDatabase> {
+		if (this.db) return Promise.resolve(this.db);
+		if (!this.loadPromise) {
+			this.loadPromise = this.getDb().catch((err) => {
+				this.loadPromise = null;
+				throw err;
+			});
+		}
+		return this.loadPromise;
+	}
+
+	/**
 	 * 分页查询结果缓存：搜索/翻页的 LIKE 全表扫描 + description gunzip 是主进程
 	 * CPU 大头，同一 (category, search, page) 在 TTL 内重复查询（切分类回跳、
 	 * 防抖窗口内的重复请求）直接复用。
+	 *
+	 * 有界 LRU：搜索词每次击键都可能产生新 key，无上限会让 Map 随使用时长无限增长，
+	 * 因此按插入序（命中即移到末尾）淘汰最旧条目，上限 200 条。
 	 */
 	private readonly queryCache = new Map<string, { expiresAt: number; value: YaoPromptListResult }>();
 	private static readonly QUERY_TTL_MS = 30_000;
+	private static readonly QUERY_CACHE_MAX_ENTRIES = 200;
+
+	/** 写入查询缓存并按插入序淘汰最旧条目（容量上限见 QUERY_CACHE_MAX_ENTRIES）。 */
+	private cacheQueryResult(key: string, now: number, value: YaoPromptListResult): void {
+		this.queryCache.delete(key);
+		this.queryCache.set(key, { expiresAt: now + XuePromptManager.QUERY_TTL_MS, value });
+		while (this.queryCache.size > XuePromptManager.QUERY_CACHE_MAX_ENTRIES) {
+			const oldest = this.queryCache.keys().next();
+			if (oldest.done) break;
+			this.queryCache.delete(oldest.value);
+		}
+	}
 
 	/**
 	 * 列出分类和提示词。
@@ -133,7 +171,7 @@ export class XuePromptManager {
 		pageSize?: number;
 		onlyCategories?: boolean;
 	}): Promise<YaoPromptListResult> {
-		const db = await this.getDb();
+		const db = await this.ensureLoaded();
 		// db 是复用的只读实例（见 getDb），不能 close——close 会销毁共享连接，
 		// 下一次 list/detail 又要重建整个 WASM 数据库。
 		// 始终查询全部分类（数据量小，分类栏需要）
@@ -177,7 +215,13 @@ export class XuePromptManager {
 		const cacheKey = JSON.stringify([opts.category ?? "", opts.search ?? "", opts.page ?? 1, opts.pageSize ?? 20]);
 		const now = Date.now();
 		const cached = this.queryCache.get(cacheKey);
-		if (cached && cached.expiresAt > now) return cached.value;
+		if (cached && cached.expiresAt > now) {
+			// 命中即移到插入序末尾，淘汰顺序才是真正的 LRU（最久未用先出）。
+			this.queryCache.delete(cacheKey);
+			this.queryCache.set(cacheKey, cached);
+			return cached.value;
+		}
+		if (cached) this.queryCache.delete(cacheKey);
 
 		// 分页查询：构建 WHERE 条件
 		const conditions: string[] = [];
@@ -229,7 +273,7 @@ export class XuePromptManager {
 		}));
 
 		const result: YaoPromptListResult = { categories, prompts, repoPath: this.dbPath, total, page, pageSize };
-		this.queryCache.set(cacheKey, { expiresAt: now + XuePromptManager.QUERY_TTL_MS, value: result });
+		this.cacheQueryResult(cacheKey, now, result);
 		return result;
 	}
 
@@ -240,7 +284,7 @@ export class XuePromptManager {
 		slug: string,
 		_category: string
 	): Promise<YaoPromptDetailResult | null> {
-		const db = await this.getDb();
+		const db = await this.ensureLoaded();
 		// db 是复用的只读实例（见 getDb），不能 close。
 		const rows = db.exec(
 			"SELECT title, content, description, url FROM xueprompts WHERE slug = ?",

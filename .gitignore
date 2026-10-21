@@ -67,3 +67,6 @@ video-series/decks/assets/
 video-series/pipeline/EP0*/
 video-series/pipeline/demo/
 video-series/pipeline/*.mp4
+
+# 性能基线产物（scripts/perf）
+.perf-results/

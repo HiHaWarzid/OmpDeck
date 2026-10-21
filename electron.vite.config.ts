@@ -99,7 +99,12 @@ export default defineConfig({
             if (id.includes("/node_modules/lucide-react/")) {
               return "vendor-icons";
             }
-            if (id.includes("/node_modules/react-markdown/") || id.includes("/node_modules/remark-") || id.includes("/node_modules/rehype-") || id.includes("/node_modules/unified/") || id.includes("/node_modules/katex/") || id.includes("/node_modules/mdast-") || id.includes("/node_modules/hast-") || id.includes("/node_modules/micromark-") || id.includes("/node_modules/vfile") || id.includes("/node_modules/unist-") || id.includes("/node_modules/trough") || id.includes("/node_modules/bail") || id.includes("/node_modules/dequal") || id.includes("/node_modules/devlop") || id.includes("/node_modules/html-to-image/")) {
+            // html-to-image 被时间线静态引用（复制图片），不能并入 vendor-markdown：
+            // 否则整个 react-markdown/KaTeX 栈会被入口 chunk 静态拉回首屏。
+            if (id.includes("/node_modules/html-to-image/")) {
+              return "vendor-image";
+            }
+            if (id.includes("/node_modules/react-markdown/") || id.includes("/node_modules/remark-") || id.includes("/node_modules/rehype-") || id.includes("/node_modules/unified/") || id.includes("/node_modules/katex/") || id.includes("/node_modules/mdast-") || id.includes("/node_modules/hast-") || id.includes("/node_modules/micromark-") || id.includes("/node_modules/vfile") || id.includes("/node_modules/unist-") || id.includes("/node_modules/trough") || id.includes("/node_modules/bail") || id.includes("/node_modules/dequal") || id.includes("/node_modules/devlop")) {
               return "vendor-markdown";
             }
           },

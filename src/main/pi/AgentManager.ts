@@ -176,6 +176,13 @@ export type AgentConfigDeps = {
 /** 项目信任确认弹窗的用户选择 */
 export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
 
+/**
+ * 「IPC 基线截断」告警的最小间隔（每 agent）：getMessages 被渲染层状态拉取、
+ * Web 轮询、飞书同步高频调用（≤600ms 一次）。超过 transcript 预算的会话若每次
+ * 调用都 warn，日志会在几秒内被同一条记录刷爆，反而掩盖真正的问题。
+ */
+const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
+
 export class AgentManager {
 	/**
 	 * 所有 agent 的运行态。per-agent 状态（消息/思考/工具/闸门/flag 等）全部收拢在
@@ -358,7 +365,8 @@ export class AgentManager {
 	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
 	 */
 	getMessages(agentId: string): ChatMessage[] {
-		const messages = this.agents.get(agentId)?.transcript.messages ?? [];
+		const runtime = this.agents.get(agentId);
+		const messages = runtime?.transcript.messages ?? [];
 		// 预算与写入端 transcript 裁剪共用同一个常量（见 agentTranscript.MAX_TRANSCRIPT_BYTES）：
 		// 正常路径下写入端已把数组压回预算内，此处只在历史整段注入超过预算时兜底。
 		// 未超预算时返回原数组（保持既有引用语义）；超限时只保留尾部能装下的最近消息，
@@ -372,13 +380,21 @@ export class AgentManager {
 			start = i;
 		}
 		if (start === 0) return messages;
-		void this.appLogger?.warn("agent", "Transcript truncated for IPC baseline", {
-			agentId,
-			totalMessages: messages.length,
-			keptMessages: messages.length - start,
-			estimatedBytes: total,
-			limitBytes: MAX_TRANSCRIPT_BYTES,
-		});
+		// 超预算的会话每次 getMessages 都会走到这里；告警按 agent 限频，避免轮询把它放大成日志风暴。
+		const now = Date.now();
+		if (
+			runtime
+			&& now - (runtime.lastTranscriptTruncationWarnAt ?? 0) >= TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS
+		) {
+			runtime.lastTranscriptTruncationWarnAt = now;
+			void this.appLogger?.warn("agent", "Transcript truncated for IPC baseline", {
+				agentId,
+				totalMessages: messages.length,
+				keptMessages: messages.length - start,
+				estimatedBytes: total,
+				limitBytes: MAX_TRANSCRIPT_BYTES,
+			});
+		}
 		return messages.slice(start);
 	}
 
@@ -4438,6 +4454,8 @@ type AgentRuntime = {
 	toolExecuting: string | null;
 	/** 完整运行态推送的单调序号：渲染层据此丢弃乱序到达的旧快照（长任务后 RPC 慢更容易乱序）。 */
 	runtimeStateSeq: number;
+	/** 「IPC 基线截断」告警上次输出的时刻（毫秒）：getMessages 被高频调用，告警据此限频。 */
+	lastTranscriptTruncationWarnAt?: number;
 
 	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
 	settleCheckTimer?: NodeJS.Timeout;

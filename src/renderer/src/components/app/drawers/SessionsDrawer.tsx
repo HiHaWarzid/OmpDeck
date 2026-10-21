@@ -1,10 +1,14 @@
 /** 会话抽屉：历史会话面板（会话历史弹窗复用同一面板）。 */
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, Pin, X } from "lucide-react";
 import { getSessionTreeProjection, normalizeSessionPathForCompare } from "../../../agentListDisplay";
 import { t } from "../../../i18n";
 import { showNotice } from "../../../utils/notice";
+import { Button } from "../../ui/Button";
 import type { Project, SessionSummary } from "../../../../../shared/types";
+
+/** 首屏渲染的顶层会话数；「加载更多」每次追加同样的数量（子会话不受影响）。 */
+const SESSION_TOP_LEVEL_PAGE_SIZE = 50;
 
 /** 会话历史抽屉：自带 header（标题/pin/close），只管会话列表——文件树由 FilesDrawer 独占。 */
 export function SessionsDrawer(props: {
@@ -126,6 +130,21 @@ export function SessionsPanel(props: {
 	// 同一语义（pi 按 parentSessionPath 归一化、codex 按 codexSessionId、orphan 恢复）。
 	const tree = useMemo(() => getSessionTreeProjection(props.sessions), [props.sessions]);
 	const parentSessions = tree.topLevel;
+	/* 首屏只渲染前 50 个顶层会话：历史可能上千条，全量 map 会阻塞首帧。
+	   子会话仍按展开状态渲染，不受这个窗口限制。 */
+	const [visibleParentCount, setVisibleParentCount] = useState(SESSION_TOP_LEVEL_PAGE_SIZE);
+	const previousParentCountRef = useRef(parentSessions.length);
+	useEffect(() => {
+		const count = parentSessions.length;
+		// 刷新后列表变短（删除/过滤/切项目）时收回分页，避免保留旧窗口导致首屏重新变长；
+		// 流式更新通常不改变顶层会话数量，所以不会把用户「加载更多」的结果折叠回去。
+		if (count < previousParentCountRef.current) {
+			setVisibleParentCount(SESSION_TOP_LEVEL_PAGE_SIZE);
+		}
+		previousParentCountRef.current = count;
+	}, [parentSessions.length]);
+	const visibleParents = parentSessions.slice(0, visibleParentCount);
+	const remainingParents = parentSessions.length - visibleParents.length;
 	const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
 	const toggleParent = useCallback((filePath: string) => {
 		const key = normalizeSessionPathForCompare(filePath) ?? filePath;
@@ -152,7 +171,7 @@ export function SessionsPanel(props: {
 					<span>{t("drawer.sessionEmptyDesc")}</span>
 				</div>
 			)}
-			{parentSessions.map((session) => {
+			{visibleParents.map((session) => {
 				const children = getChildren(session.filePath);
 				const normalizedPath = normalizeSessionPathForCompare(session.filePath) ?? session.filePath;
 				const isExpanded = expandedParents.has(normalizedPath);
@@ -323,6 +342,19 @@ export function SessionsPanel(props: {
 				</div>
 				);
 			})}
+			{remainingParents > 0 && (
+				<div className="sessions-load-more">
+					<Button
+						variant="ghost"
+						buttonSize="sm"
+						onClick={() =>
+							setVisibleParentCount((count) => count + SESSION_TOP_LEVEL_PAGE_SIZE)
+						}
+					>
+						{t("drawer.loadMoreSessions", { count: remainingParents })}
+					</Button>
+				</div>
+			)}
 			{deleteConfirmSession && (() => {
 					const deleteChildren = getChildren(deleteConfirmSession.filePath);
 					return (

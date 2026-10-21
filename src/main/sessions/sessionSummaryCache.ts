@@ -36,12 +36,17 @@ interface DiskCacheFile<V> {
  *    整组子会话同名无法区分）；旧缓存里的名字不会因文件未变而重推断，必须丢弃重建。
  */
 const DISK_SCHEMA_VERSION = 3;
-const SAVE_DEBOUNCE_MS = 800;
+const SAVE_DEBOUNCE_MS = 2_000;
 
 export class SessionSummaryCache<V> {
   private readonly store = new Map<string, CacheEntry<V>>();
   private readonly filePath: string;
   private dirty = false;
+  /**
+   * dirty 代数：写盘是异步的，快照之后的 set/prune 不能被本次成功写盘清掉 dirty，
+   * 否则这些新条目要等到下一次写入才会落盘。捕获开始时的代数即可判断。
+   */
+  private dirtyGeneration = 0;
   private saveTimer: NodeJS.Timeout | null = null;
   private loadPromise: Promise<void> | null = null;
   private loaded = false;
@@ -142,9 +147,31 @@ export class SessionSummaryCache<V> {
     await this.saveToDisk();
   }
 
+  /**
+   * 带超时的刷盘：退出流程不能因为磁盘慢/被杀软锁住而无限等待。
+   * 超时后底层写入仍可能在后台完成，但调用方已解挂；缓存写丢只影响下次启动的扫描速度。
+   */
+  async flushWithTimeout(ms = 2_000): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.flush(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, ms);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private markDirty(): void {
     this.dirty = true;
-    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.dirtyGeneration += 1;
+    // 非重置式 debounce：只有第一个 dirty 调度刷盘，写盘窗口内的后续 set() 不再推迟计时。
+    // 重置式 debounce 在持续扫描（每轮都有 set/prune）时可能永远等不到 2s 静默窗口。
+    if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       void this.saveToDisk();
@@ -187,6 +214,8 @@ export class SessionSummaryCache<V> {
   }
 
   private async writeAtomic(): Promise<void> {
+    // 快照在当前 tick 内同步完成，先记下代数：写盘期间新增的 dirty 不能被本次成功清除。
+    const generationAtSnapshot = this.dirtyGeneration;
     try {
       const entries: Record<string, CacheEntry<V>> = {};
       for (const [path, entry] of this.store) {
@@ -202,7 +231,7 @@ export class SessionSummaryCache<V> {
       await writeFile(tmpPath, JSON.stringify(payload), "utf8");
       // Windows 杀软/云同步可能瞬时锁住刚写出的 tmp，rename 走退避重试避免误判失败
       await renameWithRetry(tmpPath, this.filePath);
-      this.dirty = false;
+      if (this.dirtyGeneration === generationAtSnapshot) this.dirty = false;
     } catch {
       // 写盘失败保留 dirty，下次 set/flush 再试
     }

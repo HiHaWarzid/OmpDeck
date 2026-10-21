@@ -10,6 +10,10 @@
  */
 
 import type { BrowserWindow } from "electron";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 import { ipcChannels } from "../../shared/ipc";
 import type {
 	FeishuBotConfig,
@@ -590,20 +594,18 @@ export class FeishuBridge {
 		await this.runCards.abort(binding.sessionId);
 
 		// 图片 → ImageContent (base64) + 临时文件（方便 Agent 用 bash 操作）
-		const { writeFileSync, mkdirSync } = await import("node:fs");
-		const { join } = await import("node:path");
-		const { tmpdir } = await import("node:os");
 		const imgDir = join(tmpdir(), "pi-feishu-images");
-		mkdirSync(imgDir, { recursive: true });
-		const savedImages: string[] = [];
-		const images: ImageContent[] = imageAttachments.map((att) => {
+		await mkdir(imgDir, { recursive: true });
+		// 并行落盘但按输入下标记录路径：savedImages 的顺序会写进提示文本，必须稳定。
+		const savedImages: string[] = new Array(imageAttachments.length);
+		const images: ImageContent[] = await Promise.all(imageAttachments.map(async (att, index) => {
 			const ext = att.mediaType.split("/").pop() || "png";
 			const name = `feishu-img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
 			const fp = join(imgDir, name);
-			writeFileSync(fp, att.data);
-			savedImages.push(fp);
+			await writeFile(fp, att.data);
+			savedImages[index] = fp;
 			return { type: "image" as const, data: att.data.toString("base64"), mimeType: att.mediaType };
-		});
+		}));
 		let finalText = text;
 		if (savedImages.length > 0) {
 			finalText = finalText ? `${finalText}\n\n[图片已保存到: ${savedImages.join(", ")}]` : `[图片已保存到: ${savedImages.join(", ")}]`;
@@ -837,7 +839,6 @@ export class FeishuBridge {
 
 		// 1. 尝试用 sessionPath 恢复已有会话
 		if (binding.sessionPath) {
-			const { existsSync } = await import("node:fs");
 			if (existsSync(binding.sessionPath)) {
 				try {
 					const tab = await this.agentManager.create({
@@ -1261,7 +1262,6 @@ export class FeishuBridge {
 			}
 		} else if (canSendFile) {
 			// 2. 无显式标记 → 自动检测 Agent 回答中提到的文件并发送（前 3 个）
-			const { existsSync } = await import("node:fs");
 			const pathPattern = /(?:保存到|已生成|文件在|输出到|写入|created|saved to|written to)[：:\s]*([^\s，,\n""<>]{5,200}\.(?:md|txt|csv|json|html|pdf|png|jpg|xlsx|docx|pptx|py|ts|js))/gi;
 			const autoFiles: string[] = [];
 			let m: RegExpExecArray | null;
@@ -1294,11 +1294,13 @@ export class FeishuBridge {
 	 */
 	private async sendFeishuFile(chatId: string, filePath: string, fileName?: string): Promise<string> {
 		if (!this.client) return "飞书连接未就绪";
-		const { existsSync, readFileSync } = await import("node:fs");
-		const { basename } = await import("node:path");
-		if (!existsSync(filePath)) return `文件不存在: ${filePath}`;
 		const fName = fileName || basename(filePath);
-		const fileData = readFileSync(filePath);
+		// 异步读取，避免大文件把主进程事件循环钉住；ENOENT 归一为原来的「文件不存在」返回值。
+		const fileData = await readFile(filePath).catch((err: NodeJS.ErrnoException) => {
+			if (err?.code === "ENOENT") return null;
+			throw err;
+		});
+		if (!fileData) return `文件不存在: ${filePath}`;
 		if (fileData.length > 30 * 1024 * 1024) return "文件不能超过 30MB";
 
 		try {
@@ -1388,7 +1390,7 @@ export class FeishuBridge {
 		const resp = result as Record<string, unknown>;
 		if (typeof resp?.getReadableStream === "function") { const chunks: Buffer[] = []; const readable = (resp.getReadableStream as () => NodeJS.ReadableStream)(); for await (const chunk of readable as AsyncIterable<Buffer | string>) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); } return Buffer.concat(chunks); }
 		if (typeof (result as AsyncIterable<unknown>)?.[Symbol.asyncIterator] === "function") { const chunks: Buffer[] = []; for await (const chunk of result as AsyncIterable<Buffer | string>) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); } return Buffer.concat(chunks); }
-		if (typeof resp?.writeFile === "function") { const { readFileSync, unlinkSync } = await import("node:fs"); const tmp = `/tmp/feishu-dl-${Date.now()}.tmp`; await (resp.writeFile as (p: string) => Promise<void>)(tmp); const data = readFileSync(tmp); try { unlinkSync(tmp); } catch {} return data; }
+		if (typeof resp?.writeFile === "function") { const tmp = `/tmp/feishu-dl-${Date.now()}.tmp`; await (resp.writeFile as (p: string) => Promise<void>)(tmp); const data = await readFile(tmp); try { await unlink(tmp); } catch {} return data; }
 		logErr("[飞书 Bridge] streamToBuffer 未知格式:", typeof result); throw new Error("无法读取飞书文件流");
 	}
 

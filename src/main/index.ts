@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { connect } from "node:net";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { is } from "@electron-toolkit/utils";
-import { PetSystem, type PetSystemDeps } from "./pet";
+import type { PetSystem } from "./pet";
 import {
 	applyLinuxDisplayBackendWorkaround,
 	isUsingLinuxXWaylandWorkaround,
@@ -233,9 +233,10 @@ import {
 	openProjectInEditor,
 	validateExternalEditorCommand,
 } from "./editors/EditorDetector";
-import { FeishuBridge } from "./feishu/FeishuBridge";
+import type { FeishuBridge } from "./feishu/FeishuBridge";
 import { listBots } from "./feishu/FeishuConfig";
 import { perfDump } from "./perf";
+import { startSoakRecorder } from "./perf/soak";
 
 let mainWindow: BrowserWindow | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
@@ -549,6 +550,8 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 	]);
 	const stop = () => {
 		void webServiceManager?.stop();
+		// 关闭会话目录 watcher，避免进程退出前仍持有目录句柄。
+		void sessionScanner?.close();
 		terminalManager?.closeAll();
 		void agentManager?.stopAll();
 		petSystem?.stop();
@@ -1311,6 +1314,8 @@ app.whenReady().then(async () => {
 		},
 	}));
 	await createWindow();
+	// PIDECK_PERF_SOAK=1 时长时运行采样（默认关闭，空操作）。
+	startSoakRecorder();
 	setupTray();
 
 	void runPostWindowStartupTasks().catch((error) => {
@@ -1413,7 +1418,10 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		void appLogger.warn("editor", "External editor first launch detection failed", error);
 	});
 
-	// 桌面宠物系统：新增模块，默认关闭（petEnabled=false），不触碰现有 IPC 与主窗逻辑
+	// 桌面宠物系统：新增模块，默认关闭（petEnabled=false），不触碰现有 IPC 与主窗逻辑。
+	// 动态 import：pet 模块及其依赖只在真正构造时解析，避免随主进程启动一起加载。
+	// 构造点本来就在窗口出现之后，因此加载时机变化不影响启动时序。
+	const { PetSystem } = await import("./pet");
 	petSystem = new PetSystem({
 		agentManager,
 		settingsStore,

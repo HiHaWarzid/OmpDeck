@@ -108,7 +108,9 @@ test("带 BOM 的会话文件在扫描/文件操作/sessionJsonl 三条路径上
   const fileOps = makeFileOps(home);
 
   // 1) SessionScanner（列表摘要走读取→解码→解析管线）
-  const summaries = await new SessionScanner().list();
+  const scanner = new SessionScanner();
+  const summaries = await scanner.list();
+  await scanner.close();
   assert.equal(summaries.length, 1);
   assert.equal(summaries[0].name, "BOM 会话");
   assert.equal(summaries[0].preview, "hello bom");
@@ -139,7 +141,9 @@ test("UTF-16 会话文件在三条路径上一致判定为不可读", async () =
   const sessionPath = await writeSessionFile(home, "session.jsonl", Buffer.from(BOM_RAW, "utf16le"));
   const fileOps = makeFileOps(home);
 
-  expect(await new SessionScanner().list()).toEqual([]);
+  const scanner = new SessionScanner();
+  expect(await scanner.list()).toEqual([]);
+  await scanner.close();
   expect(await fileOps.readMessages(sessionPath)).toEqual([]);
   expect(await fileOps.readSessionMeta(sessionPath)).toEqual({
     provider: undefined,
@@ -227,6 +231,7 @@ test("扫描摘要缓存随指纹失效：外部改写后列表拿到新标题",
     `${JSON.stringify({ type: "session_info", id: "s1", name: "第二版标题更长" })}\n`,
   );
   assert.equal((await scanner.list())[0].name, "第二版标题更长");
+  await scanner.close();
 });
 
 // ── 尾窗读不整文件读 ───────────────────────────────────

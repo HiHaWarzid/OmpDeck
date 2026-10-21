@@ -5,6 +5,8 @@ import type { AppLogEntry, AppLogLevel, AppLogQuery } from "../../shared/types";
 
 const MAX_LOG_FILES = 14;
 const MAX_READ_LINES = 5000;
+/** 旧日志清理间隔：目录 readdir 不必每条日志都做，5 分钟一次足够回收过期文件。 */
+const CLEANUP_INTERVAL_MS = 5 * 60_000;
 
 function formatDate(value: Date) {
 	const year = value.getFullYear();
@@ -28,6 +30,12 @@ function normalizeDetail(detail: unknown) {
 export class AppLogger {
 	private readonly dir = join(app.getPath("userData"), "logs");
 	private writeQueue: Promise<void> = Promise.resolve();
+	/** 当日日志文件路径缓存：按日期失效，避免每条日志都格式化日期 + join。 */
+	private cachedDay: { date: string; filePath: string } | null = null;
+	/** 已创建目录对应的日期；跨日才重新 mkdir。 */
+	private ensuredDay: string | null = null;
+	/** 上次清理旧文件的时间；undefined 表示本进程尚未清理（首次写入即清理）。 */
+	private lastCleanupAt: number | undefined;
 
 	log(level: AppLogLevel, scope: string, message: string, detail?: unknown) {
 		const entry: AppLogEntry = {
@@ -128,10 +136,35 @@ export class AppLogger {
 	}
 
 	private async writeEntry(entry: AppLogEntry) {
-		await mkdir(this.dir, { recursive: true });
-		await this.cleanupOldFiles();
-		const filePath = join(this.dir, `app-${formatDate(new Date(entry.time))}.log`);
+		const { date, filePath } = this.resolveDayFile(entry.time);
+		// mkdir 每进程每天只做一次：日志写入是热路径，不能每条都发起目录 syscall。
+		if (this.ensuredDay !== date) {
+			await mkdir(this.dir, { recursive: true });
+			this.ensuredDay = date;
+		}
+		this.scheduleCleanupIfDue();
 		await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
+	}
+
+	/** 解析（并缓存）某时刻对应的日志文件；日期变化时自动失效。 */
+	private resolveDayFile(time: number): { date: string; filePath: string } {
+		const date = formatDate(new Date(time));
+		const cached = this.cachedDay;
+		if (cached && cached.date === date) return cached;
+		const filePath = join(this.dir, `app-${date}.log`);
+		this.cachedDay = { date, filePath };
+		return this.cachedDay;
+	}
+
+	/**
+	 * 旧文件清理节流：首次写入（进程启动）触发一次，之后最多每 5 分钟一次。
+	 * 清理异步执行、失败静默：日志本身不能因目录整理失败而丢失。
+	 */
+	private scheduleCleanupIfDue(): void {
+		const now = Date.now();
+		if (this.lastCleanupAt !== undefined && now - this.lastCleanupAt < CLEANUP_INTERVAL_MS) return;
+		this.lastCleanupAt = now;
+		void this.cleanupOldFiles().catch(() => undefined);
 	}
 
 	private async cleanupOldFiles() {

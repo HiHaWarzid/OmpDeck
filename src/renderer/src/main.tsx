@@ -15,6 +15,9 @@ import {
 import "./styles.css";
 import "./file-icons.css";
 
+/** 模块脚本开始执行的时间；与 navigationStart 同一时钟，用于启动基线对比。 */
+const bootScriptStart = performance.now();
+
 // React dev 构建会在 commit 阶段把变化过的 props 明细克隆进 performance.measure 的 detail：
 // 长时间运行会累积内存，并在堆紧张时抛 DataCloneError 打断提交（此后窗口不再响应）。
 installDevPerformanceTrackGuard();
@@ -135,7 +138,13 @@ const MIN_BOOT_MS = 850;
 const bootMountedAt = performance.now();
 
 requestAnimationFrame(() => {
-  writeStartupLog("info", "Renderer React tree mounted");
+  // 启动基线：模块开始执行到 React 首帧 commit 完成。
+  // 只在日志里记录数字，默认无额外行为；PIDECK_PERF 汇总与 soak 脚本可直接对比。
+  writeStartupLog("info", "Renderer React tree mounted", {
+    scriptMs: Math.round(bootScriptStart),
+    mountedMs: Math.round(performance.now()),
+    bootOverlayMs: Math.round(bootMountedAt),
+  });
 
   const overlay = document.getElementById("boot-overlay");
   if (!overlay) return;

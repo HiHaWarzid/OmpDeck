@@ -15,8 +15,6 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   Settings,
   Sliders,
@@ -67,6 +65,14 @@ const TerminalDock = lazy(() =>
   import("./components/terminal/TerminalDock").then((m) => ({
     default: m.TerminalDock,
   })),
+);
+// Markdown/KaTeX 栈（react-markdown + remark + katex CSS）不应进入首屏 modulepreload：
+// 只有真正打开更新说明或会话消息时才加载。ScratchPad 同样只在草稿本打开时加载。
+const LazyMarkdownText = lazy(() =>
+  import("./components/app/timeline/MarkdownBody").then((m) => ({ default: m.MarkdownText })),
+);
+const ScratchPadPanel = lazy(() =>
+  import("./components/scratchPad/ScratchPadPanel").then((m) => ({ default: m.ScratchPadPanel })),
 );
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
@@ -137,7 +143,6 @@ import { extensionWidgetActions } from "./workspace/slices/extensionWidgetsSlice
 import { rpcLogActions } from "./workspace/slices/rpcLogSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
-import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
@@ -8895,6 +8900,7 @@ filePath={gitDrawerDiff.filePath}
       {/* Scratch Pad（草稿本）：根级渲染，避免受 chat-pane grid 影响定位 */}
       {scratchPad.isOpen || scratchPad.isClosing ? (
         <div className={`scratch-pad-overlay${scratchPad.isClosing ? " closing" : ""}`} onClick={() => scratchPad.close()}>
+          <Suspense fallback={null}>
           <ScratchPadPanel
             drafts={scratchPad.drafts}
             currentDraftPath={scratchPad.currentDraftPath}
@@ -8911,6 +8917,7 @@ filePath={gitDrawerDiff.filePath}
             onCreateDraft={scratchPad.createDraft}
             onDeleteDraft={scratchPad.deleteDraft}
           />
+          </Suspense>
         </div>
       ) : null}
 
@@ -9260,10 +9267,11 @@ function UpdateModal(props: {
             </div>
           )}
           <div className="update-notes markdown-body">
-            {/* GitHub Release notes 通常是 Markdown;这里复用聊天渲染链路支持标题、列表、链接和代码块。 */}
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {props.info.releaseNotes.trim() || t("update.noReleaseNotes")}
-            </ReactMarkdown>
+            {/* GitHub Release notes 通常是 Markdown;这里复用聊天渲染链路支持标题、列表、链接和代码块。
+                Markdown/KaTeX 栈按需加载,避免进入首屏 modulepreload。 */}
+            <Suspense fallback={null}>
+              <LazyMarkdownText text={props.info.releaseNotes.trim() || t("update.noReleaseNotes")} />
+            </Suspense>
           </div>
         </div>
         <div className="update-actions">

@@ -7,6 +7,7 @@ import type {
 	SendPromptResult,
 } from "../../shared/types";
 import { t } from "./i18n";
+import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import { createPreviewApi } from "./previewApi";
 
 type WebState = {
@@ -71,7 +72,10 @@ async function refreshState() {
 	connected = true;
 	for (const listener of stateListeners) listener(state.agents);
 	for (const [agentId, messages] of Object.entries(state.messagesByAgent)) {
-		const key = JSON.stringify(messages);
+		// 只比较流式版本（长度/末条 id/时间戳/文本长度），不序列化整份 transcript；
+		// 与 WebServiceManager 的指纹语义一致，避免 Web 模式每轮轮询在主线程
+		// 对全部消息做 JSON.stringify。
+		const key = messageStreamVersion(messages);
 		if (lastMessages.get(agentId) === key) continue;
 		lastMessages.set(agentId, key);
 		for (const listener of messageListeners) listener({ agentId, replaceFrom: 0, messages });
@@ -85,7 +89,7 @@ function ensurePolling() {
 	void refreshState().catch(() => undefined);
 	pollTimer = window.setInterval(() => {
 		void refreshState().catch(() => undefined);
-	}, 600);
+	}, 1000);
 }
 
 function subscribe<T>(set: Set<(payload: T) => void>, callback: (payload: T) => void) {

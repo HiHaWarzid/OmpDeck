@@ -3,6 +3,7 @@ import type { FileVersion } from "../fs/adapters/fileAdapter";
 import { LocalFileAdapter } from "../fs/adapters/localFileAdapter";
 import { WslFileAdapter } from "../fs/adapters/wslFileAdapter";
 import { app } from "electron";
+import { watch, type FSWatcher } from "chokidar";
 import { existsSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { dirname as posixDirname, isAbsolute as posixIsAbsolute, join as posixJoin } from "node:path/posix";
@@ -39,6 +40,20 @@ function projectMatchKey(filePath: string, projectPath: string) {
 /** WSL 模式扫描并发度：每个 stat/read 都 spawn 一个 wsl.exe（100~300ms 进程启动），
  *  8 路并发已能占满 wsl.exe 吞吐，数百文件全并发会进程句柄爆炸。 */
 const SCAN_CONCURRENCY_WSL = 8;
+
+/**
+ * watcher 索引的有效期：即使监听正常，也至少每 5 分钟重走一次整棵树。
+ * watcher 会漏事件（休眠唤醒、网络盘、句柄丢失、事件队列溢出），只靠增量索引
+ * 会让漏掉的会话永远不出现；定期全量遍历是兜底，不是性能主路径。
+ */
+const WATCHER_INDEX_TTL_MS = 5 * 60_000;
+
+/**
+ * 不再出现在扫描根列表中的 watcher 保留时长。
+ * 项目切换时常会出现 list(project) 与 list() 交替调用；立即关闭会让 watcher
+ * 反复重建。闲置一段时间后再关闭，既不抖动，也不会让监听句柄无限增长。
+ */
+const ROOT_IDLE_TTL_MS = 10 * 60_000;
 
 /**
  * 以固定并发度映射数组。
@@ -101,6 +116,22 @@ export class SessionScanner {
    * 供子会话父路径推断作为边界。
    */
   private activeScanRoots: string[] = [];
+
+  /**
+   * 每个扫描根的增量文件索引（normalizedRoot → 文件路径集合）。
+   * 首次扫描写入，之后由 chokidar 的 add/unlink 事件增删，避免每次 list() 全量 readdir。
+   */
+  private readonly rootFileIndex = new Map<string, Set<string>>();
+  /** 每个扫描根最近一次全量遍历的时间戳；缺失或超过 TTL 时重走整棵树。 */
+  private readonly rootIndexWalkedAt = new Map<string, number>();
+  /** 每个扫描根最近一次出现在扫描请求中的时间，用于闲置清理 watcher。 */
+  private readonly rootLastSeenAt = new Map<string, number>();
+  private readonly rootWatchers = new Map<string, FSWatcher>();
+  /**
+   * 扫描根并发引用计数：关闭“已不再使用的根” watcher 前需确认没有其他并发扫描
+   * 仍在使用它，否则不同项目的并发 list() 会互相关闭对方的监听。
+   */
+  private readonly rootActiveScans = new Map<string, number>();
 
   /**
    * 会话文件操作（rename/delete/readMessages/readSessionMeta/readSessionFile）。
@@ -211,7 +242,10 @@ export class SessionScanner {
     const key = scanRoots.map((root) => this.normalize(root)).join("\n");
     const inFlight = this.listInFlightByKey.get(key);
     if (inFlight) return inFlight;
-    const scan = this.scanOnce(scanRoots).finally(() => {
+    // 整个 scanOnce 也纳入 watchdog：本地 fs 调用不可中断，若只依赖 signal 传递，
+    // 卡在 readFile/stat 上的扫描会让共享 promise 永远 pending，后续 list() 全部挂死。
+    let scan: Promise<SessionSummary[]>;
+    scan = this.withScanWatchdog("Session scan", (signal) => this.scanOnce(scanRoots, signal)).finally(() => {
       // 只清理自己注册的条目：期间可能有新调用注册了同 key 的新一轮扫描。
       if (this.listInFlightByKey.get(key) === scan) this.listInFlightByKey.delete(key);
     });
@@ -219,86 +253,90 @@ export class SessionScanner {
     return scan;
   }
 
-  private async scanOnce(scanRoots: string[]): Promise<SessionSummary[]> {
-    // WSL 扫描会启动大量外部命令；整体 watchdog 必须早于 renderer 超时，
-    // 这样超时会真正终止底层 wsl.exe，而不是只释放前端锁后继续堆积扫描。
-    const controller = this.wslConfig ? new AbortController() : null;
-    const signal = controller?.signal;
-    const scanTimer = controller
-      ? setTimeout(() => controller.abort(new Error("Session scan timed out")), this.scanTimeoutMs)
-      : undefined;
-    const rethrowAbort = <T>(fallback: T) => (error: unknown): T => {
-      if (signal?.aborted) throw signal.reason ?? error;
-      return fallback;
-    };
-
+  /**
+   * 扫描 watchdog：超时同时 abort（WSL 下能真正终止 wsl.exe）并让外层 promise reject
+   * （本地模式下 fs 调用不响应 signal，只能靠 race 解挂）。
+   * 底层扫描被放弃后仍可能自行结束，Promise.race 已挂好 handler，不会产生未处理拒绝。
+   */
+  private async withScanWatchdog<T>(label: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    const timeoutError = new Error(`${label} timed out`);
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, this.scanTimeoutMs);
+    });
     try {
-      // 重启后先恢复磁盘摘要缓存，避免全量重读 JSONL。
-      await this.summaryCache.ensureLoaded();
-      this.activeScanRoots = scanRoots;
-
-      // WSL 模式 vs 本地模式：互斥扫描，不会同时展示两个环境的会话。
-      // 文件访问统一走 fileAdapter，两个环境共用同一条扫描路径。
-      const files = await this.collectFromRoots(scanRoots, signal).catch(rethrowAbort([] as string[]));
-      const fileSetKey = [...files].sort().join("\n");
-      if (fileSetKey !== this.summaryCacheFileSetKey) {
-        // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
-        this.summaryCache.prune(files, this.wslConfig ? "wsl" : "local");
-        // 同步修剪项目匹配结果缓存，避免已删除会话的条目长期残留内存。
-        const fileSet = new Set(files.map((f) => this.normalize(f)));
-        for (const [key, entry] of this.projectMatchCache) {
-          if (!fileSet.has(this.normalize(entry.filePath))) this.projectMatchCache.delete(key);
-        }
-        // 父会话校验缓存同样只保留当前扫描集合内的条目。
-        for (const key of this.sessionFileCheckCache.keys()) {
-          if (!fileSet.has(this.normalize(key))) this.sessionFileCheckCache.delete(key);
-        }
-        this.summaryCacheFileSetKey = fileSetKey;
-      }
-
-      // 指纹预取：WSL 模式下 statMany 把 N 次 wsl.exe spawn 合并为 ceil(N/100) 次，
-      // readSummary 直接消费预取结果；本地模式无 statMany，保持逐文件 stat。
-      const prefetchedVersions = this.fileAdapter.statMany
-        ? await this.fileAdapter.statMany(files, signal).catch(() => undefined)
-        : undefined;
-
-      const summaries = await mapWithConcurrency(
-        files,
-        this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
-        (file) =>
-          this.readSummary(file, signal, prefetchedVersions?.get(file)).catch(rethrowAbort(null)),
-      );
-      signal?.throwIfAborted();
-
-      return summaries
-        .filter((summary): summary is SessionSummary => Boolean(summary))
-        .sort((a, b) => b.updatedAt - a.updatedAt);
+      return await Promise.race([run(controller.signal), timeout]);
     } finally {
-      clearTimeout(scanTimer);
+      clearTimeout(timer);
     }
   }
 
+  private async scanOnce(scanRoots: string[], signal: AbortSignal): Promise<SessionSummary[]> {
+    const rethrowAbort = <T>(fallback: T) => (error: unknown): T => {
+      if (signal.aborted) throw signal.reason ?? error;
+      return fallback;
+    };
+
+    // 重启后先恢复磁盘摘要缓存，避免全量重读 JSONL。
+    await this.summaryCache.ensureLoaded();
+    this.activeScanRoots = scanRoots;
+
+    // WSL 模式 vs 本地模式：互斥扫描，不会同时展示两个环境的会话。
+    // 文件访问统一走 fileAdapter，两个环境共用同一条扫描路径。
+    const files = await this.collectFromRoots(scanRoots, signal).catch(rethrowAbort([] as string[]));
+    const fileSetKey = [...files].sort().join("\n");
+    if (fileSetKey !== this.summaryCacheFileSetKey) {
+      // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
+      this.summaryCache.prune(files, this.wslConfig ? "wsl" : "local");
+      // 同步修剪项目匹配结果缓存，避免已删除会话的条目长期残留内存。
+      const fileSet = new Set(files.map((f) => this.normalize(f)));
+      for (const [key, entry] of this.projectMatchCache) {
+        if (!fileSet.has(this.normalize(entry.filePath))) this.projectMatchCache.delete(key);
+      }
+      // 父会话校验缓存同样只保留当前扫描集合内的条目。
+      for (const key of this.sessionFileCheckCache.keys()) {
+        if (!fileSet.has(this.normalize(key))) this.sessionFileCheckCache.delete(key);
+      }
+      this.summaryCacheFileSetKey = fileSetKey;
+    }
+
+    // 指纹预取：WSL 模式下 statMany 把 N 次 wsl.exe spawn 合并为 ceil(N/100) 次，
+    // readSummary 直接消费预取结果；本地模式无 statMany，保持逐文件 stat。
+    const prefetchedVersions = this.fileAdapter.statMany
+      ? await this.fileAdapter.statMany(files, signal).catch(() => undefined)
+      : undefined;
+
+    const summaries = await mapWithConcurrency(
+      files,
+      this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
+      (file) =>
+        this.readSummary(file, signal, prefetchedVersions?.get(file)).catch(rethrowAbort(null)),
+    );
+    signal.throwIfAborted();
+
+    return summaries
+      .filter((summary): summary is SessionSummary => Boolean(summary))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
   /**
-   * 在共享扫描结果上按项目归属过滤；WSL 下同样受 watchdog 约束，
+   * 在共享扫描结果上按项目归属过滤；同样受 watchdog 约束，
    * 避免过滤阶段的文件读取（父目录会话内容校验）无界等待。
    */
   private async filterByProject(summaries: SessionSummary[], projectPath: string): Promise<boolean[]> {
-    const controller = this.wslConfig ? new AbortController() : null;
-    const signal = controller?.signal;
-    const scanTimer = controller
-      ? setTimeout(() => controller.abort(new Error("Session scan timed out")), this.scanTimeoutMs)
-      : undefined;
-    try {
+    return this.withScanWatchdog("Session filter", async (signal) => {
       const matched = await mapWithConcurrency(
         summaries,
         this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
         (summary) => this.isSameProject(summary, projectPath, signal),
       );
-      signal?.throwIfAborted();
+      signal.throwIfAborted();
       return matched;
-    } finally {
-      clearTimeout(scanTimer);
-    }
+    });
   }
 
   /**
@@ -409,16 +447,137 @@ export class SessionScanner {
   private async collectFromRoots(roots: string[], signal?: AbortSignal): Promise<string[]> {
     const all: string[] = [];
     const seen = new Set<string>();
-    for (const root of roots) {
-      const files = await this.fileAdapter.collectJsonl(root, signal).catch(() => [] as string[]);
-      for (const file of files) {
-        const key = this.normalize(file);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        all.push(file);
+    const rootKeys = roots.map((root) => this.normalize(root));
+    const now = Date.now();
+    for (const key of rootKeys) {
+      this.rootActiveScans.set(key, (this.rootActiveScans.get(key) ?? 0) + 1);
+      this.rootLastSeenAt.set(key, now);
+    }
+    try {
+      for (const root of roots) {
+        const rootKey = this.normalize(root);
+        // WSL 会话根是 Linux 路径，Windows 上的 chokidar 无法监听：保持逐次全量遍历。
+        const cachedIndex = this.wslConfig ? undefined : this.rootFileIndex.get(rootKey);
+        const lastWalkAt = this.rootIndexWalkedAt.get(rootKey) ?? 0;
+        const fresh =
+          cachedIndex !== undefined &&
+          this.rootWatchers.has(rootKey) &&
+          Date.now() - lastWalkAt < WATCHER_INDEX_TTL_MS;
+
+        let files: string[];
+        if (fresh && cachedIndex) {
+          files = [...cachedIndex];
+        } else {
+          files = await this.fileAdapter.collectJsonl(root, signal).catch(() => [] as string[]);
+          // 扫描被取消时不能把不完整结果写进索引，否则 5 分钟内的后续扫描会看到残缺列表。
+          if (signal?.aborted) throw signal.reason ?? new Error("Session scan aborted");
+          // WSL 路径无法被 chokidar 监听，索引永远无法保持新鲜，不保存以免白占内存。
+          if (!this.wslConfig) {
+            this.rootFileIndex.set(rootKey, new Set(files));
+            this.rootIndexWalkedAt.set(rootKey, Date.now());
+            this.ensureRootWatcher(rootKey, root);
+          }
+        }
+
+        for (const file of files) {
+          const key = this.normalize(file);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          all.push(file);
+        }
+      }
+      // 扫描根会随项目切换（自定义 sessionDir）而变；关闭不再被任何进行中扫描使用的根 watcher，
+      // 避免为每个打开过的项目长留监听句柄。
+      await this.pruneInactiveRootState(new Set(rootKeys));
+      return all;
+    } finally {
+      for (const key of rootKeys) {
+        const next = (this.rootActiveScans.get(key) ?? 1) - 1;
+        if (next <= 0) this.rootActiveScans.delete(key);
+        else this.rootActiveScans.set(key, next);
       }
     }
-    return all;
+  }
+
+  /**
+   * 为扫描根建立 chokidar 监听；已有监听时不重复创建。
+   * 监听不可用（不存在/权限/UNC）时静默退回全量遍历——watcher 只是加速，不能影响可用性。
+   */
+  private ensureRootWatcher(rootKey: string, root: string): void {
+    if (this.wslConfig) return;
+    if (this.rootWatchers.has(rootKey)) return;
+
+    let watcher: FSWatcher;
+    try {
+      // 不设 glob：chokidar 4 的默认行为就是递归监听整个目录，add/unlink 直接给出文件路径。
+      // persistent: false 避免监听句柄单独撑住事件循环（Electron 主进程自身有生命周期）。
+      watcher = watch(root, { ignoreInitial: true, ignorePermissionErrors: true, persistent: false });
+    } catch {
+      return;
+    }
+    this.rootWatchers.set(rootKey, watcher);
+
+    // 目录增删意味着索引可能整段漏掉：清掉遍历时间戳，下次扫描强制重走该根。
+    const markStale = () => {
+      if (this.rootWatchers.get(rootKey) !== watcher) return;
+      this.rootIndexWalkedAt.delete(rootKey);
+    };
+    watcher.on("add", (filePath) => {
+      if (this.rootWatchers.get(rootKey) !== watcher) return;
+      if (!filePath.toLowerCase().endsWith(".jsonl")) return;
+      this.rootFileIndex.get(rootKey)?.add(filePath);
+    });
+    watcher.on("unlink", (filePath) => {
+      if (this.rootWatchers.get(rootKey) !== watcher) return;
+      this.rootFileIndex.get(rootKey)?.delete(filePath);
+    });
+    watcher.on("addDir", markStale);
+    watcher.on("unlinkDir", markStale);
+    watcher.on("error", markStale);
+    // 首次遍历(fs.watch 建立 + chokidar 初始 crawl)与刚才的 walk 之间存在窗口：
+    // 期间新建的文件会被 ignoreInitial 当成初始内容吞掉。ready 后强制再走一次，
+    // 把窗口缩到「下一次轮询」，而不是等满 5 分钟 TTL。
+    watcher.on("ready", markStale);
+  }
+
+  /**
+   * 清理闲置的根状态。只有「本轮未使用 + 无并发扫描引用 + 闲置超过 ROOT_IDLE_TTL_MS」
+   * 三个条件同时满足才关闭，避免项目切换时 watcher 抖动，也避免监听句柄无限增长。
+   */
+  private async pruneInactiveRootState(activeRootKeys: Set<string>): Promise<void> {
+    const now = Date.now();
+    const isIdle = (rootKey: string) =>
+      !activeRootKeys.has(rootKey) &&
+      (this.rootActiveScans.get(rootKey) ?? 0) === 0 &&
+      now - (this.rootLastSeenAt.get(rootKey) ?? 0) >= ROOT_IDLE_TTL_MS;
+
+    const closing: Promise<void>[] = [];
+    for (const [rootKey, watcher] of [...this.rootWatchers]) {
+      if (!isIdle(rootKey)) continue;
+      this.rootWatchers.delete(rootKey);
+      closing.push(watcher.close().catch(() => undefined));
+    }
+    for (const rootKey of [...this.rootFileIndex.keys()]) {
+      if (!isIdle(rootKey)) continue;
+      this.rootFileIndex.delete(rootKey);
+      this.rootIndexWalkedAt.delete(rootKey);
+    }
+    for (const rootKey of [...this.rootLastSeenAt.keys()]) {
+      if (!isIdle(rootKey)) continue;
+      this.rootLastSeenAt.delete(rootKey);
+    }
+    await Promise.all(closing);
+  }
+
+  /** 应用退出时关闭所有会话目录监听；再次调用扫描会按需重建。 */
+  async close(): Promise<void> {
+    const watchers = [...this.rootWatchers.values()];
+    this.rootWatchers.clear();
+    this.rootFileIndex.clear();
+    this.rootIndexWalkedAt.clear();
+    this.rootLastSeenAt.clear();
+    this.rootActiveScans.clear();
+    await Promise.all(watchers.map((watcher) => watcher.close().catch(() => undefined)));
   }
 
   /**
@@ -678,9 +837,9 @@ export class SessionScanner {
     return summary;
   }
 
-  /** 应用退出前刷盘，保证本轮扫描结果可被下次启动复用。 */
+  /** 应用退出前刷盘，保证本轮扫描结果可被下次启动复用；超时即放弃，不阻塞退出。 */
   async flushSummaryCache(): Promise<void> {
-    await this.summaryCache.flush();
+    await this.summaryCache.flushWithTimeout();
   }
 
   private optionalString(value: unknown) {

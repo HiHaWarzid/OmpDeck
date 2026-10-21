@@ -30,7 +30,7 @@ export function YaoPromptTab(props: {
 	const [activeCategory, setActiveCategory] = useState<string | null>(null);
 	const [searchQuery, setSearchQuery] = useState("");
 	// 搜索防抖：每击键都触发 IPC 全表 LIKE 扫描（主进程 CPU 大头），
-	// 输入停顿 250ms 后才真正发起查询；输入框本身保持即时响应。
+	// 输入停顿 150ms 后才真正发起查询；输入框本身保持即时响应。
 	const [debouncedSearch, setDebouncedSearch] = useState("");
 	const [page, setPage] = useState(1);
 	const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
@@ -45,9 +45,9 @@ export function YaoPromptTab(props: {
 		void loadCategories();
 	}, []);
 
-	// 搜索防抖：searchQuery 变化后 250ms 无新输入才同步到查询用值
+	// 搜索防抖：searchQuery 变化后 150ms 无新输入才同步到查询用值
 	useEffect(() => {
-		const timer = setTimeout(() => setDebouncedSearch(searchQuery), 250);
+		const timer = setTimeout(() => setDebouncedSearch(searchQuery), 150);
 		return () => clearTimeout(timer);
 	}, [searchQuery]);
 

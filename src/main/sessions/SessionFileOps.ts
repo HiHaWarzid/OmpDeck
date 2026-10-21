@@ -55,6 +55,16 @@ function normalize(path: string) {
   return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
+/**
+ * 会话读取硬上限（字节）。
+ *
+ * readMessages / readSessionMeta 会把整份 JSONL 解析成对象数组，再随 IPC 结构化克隆
+ * 给渲染层。正常会话远小于这个量级；超过 64MB 说明文件已不是「消息时间线」而是
+ * 异常数据（例如单行巨型工具输出），此时既不截断也不分页，直接抛出可读错误，
+ * 让调用方看到明确失败，而不是拿到一份被静默裁剪、看起来像完整历史的列表。
+ */
+const SESSION_READ_HARD_MAX_BYTES = 64 * 1024 * 1024;
+
 export class SessionFileOps {
   private readonly deps: SessionFileOpsDeps;
 
@@ -188,7 +198,7 @@ export class SessionFileOps {
 
   /** 读取会话消息列表，支持 WSL 路径 */
   async readMessages(filePath: string): Promise<Array<{ role: string; content: string; timestamp: number }>> {
-    const file = await this.readSessionFile(filePath);
+    const file = await this.readSessionFileWithinLimit(filePath);
     if (file.unreadable) return [];
     const messages: Array<{ role: string; content: string; timestamp: number }> = [];
     for (const raw of file.entries) {
@@ -225,6 +235,22 @@ export class SessionFileOps {
   }
 
   /**
+   * readMessages / readSessionMeta 共用的硬上限守卫。
+   *
+   * 先用适配器 stat 拿大小（WSL/本地同一 seam），超过 64MB 立即抛错；
+   * 指纹顺手传给 readEntries，避免正常路径多一次 stat（I/O 次数与原来一致）。
+   */
+  private async readSessionFileWithinLimit(filePath: string): Promise<SessionEntriesFile> {
+    const fingerprint = await this.deps.getAdapter().stat(filePath);
+    if (fingerprint.size > SESSION_READ_HARD_MAX_BYTES) {
+      const sizeMb = (fingerprint.size / (1024 * 1024)).toFixed(1);
+      const limitMb = SESSION_READ_HARD_MAX_BYTES / (1024 * 1024);
+      throw new Error(`会话文件过大（${sizeMb} MB），超过 ${limitMb} MB 读取上限: ${filePath}`);
+    }
+    return this.readSessionFile(filePath, { fingerprint });
+  }
+
+  /**
    * 从会话 JSONL 文件头部读取模型和思考级别信息。
    * 取最后一条 model_change / thinking_level_change 记录作为当前值。
    */
@@ -233,7 +259,7 @@ export class SessionFileOps {
     modelId?: string;
     thinkingLevel?: string;
   }> {
-    const file = await this.readSessionFile(filePath);
+    const file = await this.readSessionFileWithinLimit(filePath);
     let provider: string | undefined;
     let modelId: string | undefined;
     let thinkingLevel: string | undefined;
