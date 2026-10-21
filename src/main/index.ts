@@ -189,6 +189,7 @@ import { PiProcess } from "./pi/PiProcess";
 import { QuickGenProcess } from "./pi/QuickGenProcess";
 import { ensureAllPiSettingsDefaults } from "./pi/PiSettingsDefaults";
 import { SessionScanner } from "./sessions/SessionScanner";
+import { createSessionParseWorker } from "./sessions/sessionWorkerFactory";
 import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
 import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
@@ -1228,6 +1229,7 @@ app.whenReady().then(async () => {
 				mainWindow.webContents.send(ipcChannels.sessionsChanged);
 			}
 		},
+		createParseWorker: createSessionParseWorker,
 	});
 	importPipeline = new ImportPipeline(join(app.getPath("home"), ".omp", "agent", "sessions"));
 	importPipeline.registerAdapter(new OpenCodeImportAdapter(join(app.getPath("home"), ".local", "share", "opencode", "opencode.db")));

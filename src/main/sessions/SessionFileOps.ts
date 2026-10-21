@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 
 import type { FileAdapter } from "../fs/adapters/fileAdapter";
 import { isJsonRecord, readEntries, type ReadEntriesOptions, type SessionEntriesFile } from "./sessionEntries";
+import { extractText } from "./sessionText";
 
 /**
  * 会话文件操作模块 —— 从 SessionScanner 中抽出的纯文件操作（rename/delete/
@@ -32,22 +33,6 @@ export interface SessionFileOpsDeps {
   localSessionsRoot: string;
   /** 当前环境默认会话根目录（WSL 时为 Linux 路径），删除安全防护用。 */
   getDefaultSessionsRoot: () => string;
-}
-
-/** 从 JSONL 消息 content 中提取纯文本（string | 块数组）。 */
-export function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map(item => {
-      if (typeof item === "string") return item;
-      if (item && typeof item === "object") {
-        const block = item as Record<string, unknown>;
-        return String(block.text ?? block.thinking ?? "");
-      }
-      return "";
-    }).filter(Boolean).join(" ");
-  }
-  return "";
 }
 
 /** 归一化路径用于比较（统一分隔符、去尾部斜杠、小写），与 SessionScanner 语义一致。 */

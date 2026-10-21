@@ -10,22 +10,13 @@ import { dirname as posixDirname, isAbsolute as posixIsAbsolute, join as posixJo
 import type { SessionSummary } from "../../shared/types";
 import { getCodexSessionThreadInfo } from "../../shared/codexSessionMeta";
 import { inferParentCandidatesFromPath, scoreSubagentConfidence, SUBAGENT_CONFIDENCE_THRESHOLD } from "./subagentParentInference";
-import { SessionFileOps, extractText } from "./SessionFileOps";
+import type { Worker } from "node:worker_threads";
+import { SessionFileOps } from "./SessionFileOps";
 import { isJsonRecord, parseSessionText, readEntries } from "./sessionEntries";
+import { extractSessionSummaryFacts, type SessionSummaryFacts } from "./sessionSummaryFacts";
+import { SessionParsePool } from "./sessionParsePool";
 import { toWslLinuxPath, type WslEnvironment } from "../wsl/WslPaths";
 import { SessionSummaryCache } from "./sessionSummaryCache";
-
-/**
- * 取候选字段中第一个非空字符串。
- * JSONL 行是外部持久化数据，字段类型不可信：早先把行当 any 处理时，非字符串的
- * name/cwd 会被塞进 string 变量，并在后续 cleanTitle/normalize 的 .replace 上抛错。
- */
-function firstString(...values: unknown[]): string | undefined {
-  for (const value of values) {
-    if (typeof value === "string" && value) return value;
-  }
-  return undefined;
-}
 
 /** 本地模式扫描并发度：readFile/stat 是异步 IO，32 路足够打满磁盘吞吐且不爆句柄。 */
 const SCAN_CONCURRENCY_LOCAL = 32;
@@ -86,6 +77,12 @@ async function mapWithConcurrency<T, R>(
  */
 const PARTIAL_SCAN_WAIT_MS = 1_200;
 
+/**
+ * 小文件不值得付 worker 启动/消息往返成本；主线程解析几十 KB JSONL 只需微秒级。
+ * 阈值按单文件指纹大小判断，大会话（历史/工具输出密集）才进入 worker 池。
+ */
+const PARSE_WORKER_MIN_BYTES = 256 * 1024;
+
 interface ScanJob {
   /** 完整扫描结果（含缓存命中与新解析文件），按 updatedAt 倒序。 */
   promise: Promise<SessionSummary[]>;
@@ -105,6 +102,8 @@ export class SessionScanner {
   private fileAdapter: FileAdapter = new LocalFileAdapter();
   /** 比 renderer watchdog 更短，确保超时前先终止实际扫描，避免后台请求堆积。 */
   private scanTimeoutMs = 18_000;
+  /** 摘要解析 worker 池；未注入工厂时为 null（测试或纯 Node 环境走主线程）。 */
+  private readonly parsePool: SessionParsePool | null;
   private readonly summaryCache = new SessionSummaryCache<SessionSummary | null>();
   private summaryCacheFileSetKey = "";
   /**
@@ -164,8 +163,19 @@ export class SessionScanner {
       onScanSettled?: () => void;
       /** 测试注入用：部分结果等待窗口，默认 1.2s。 */
       partialWaitMs?: number;
+      /** 生产注入：创建摘要解析 worker；缺省时在调用线程解析（测试/无 worker 环境）。 */
+      createParseWorker?: () => Worker;
+      /** 摘要解析 worker 数，默认 2。 */
+      parseWorkerCount?: number;
     } = {},
-  ) {}
+  ) {
+    this.parsePool = options.createParseWorker
+      ? new SessionParsePool({
+          createWorker: options.createParseWorker,
+          size: options.parseWorkerCount,
+        })
+      : null;
+  }
 
   /**
    * wsl.exe 命令与启动模式。优先绝对路径，
@@ -668,7 +678,10 @@ export class SessionScanner {
     this.rootIndexWalkedAt.clear();
     this.rootLastSeenAt.clear();
     this.rootActiveScans.clear();
-    await Promise.all(watchers.map((watcher) => watcher.close().catch(() => undefined)));
+    await Promise.all([
+      ...watchers.map((watcher) => watcher.close().catch(() => undefined)),
+      this.parsePool?.dispose() ?? Promise.resolve(),
+    ]);
   }
 
   /**
@@ -747,108 +760,52 @@ export class SessionScanner {
     const cached = this.summaryCache.get(filePath, version);
     if (cached !== undefined) return cached;
 
+    const facts = await this.readSummaryFacts(filePath, version, isWsl, signal);
+    return this.buildSummaryFromFacts(filePath, version, isWsl, facts, signal);
+  }
+
+  /**
+   * 读取 → 解码 → 逐行解析。
+   *
+   * 本地文件交给 worker 池，主进程只接收摘要事实；WSL 路径必须经 wsl.exe 适配器，
+   * 无法在普通 worker 中复用，保留主线程读取。worker 不可用/崩溃时回退主线程，
+   * 功能正确性优先于性能。
+   */
+  private async readSummaryFacts(
+    filePath: string,
+    version: FileVersion,
+    isWsl: boolean,
+    signal?: AbortSignal,
+  ): Promise<SessionSummaryFacts> {
+    if (this.parsePool && !isWsl && version.size >= PARSE_WORKER_MIN_BYTES) {
+      try {
+        return await this.parsePool.parse(filePath, signal);
+      } catch (error) {
+        // 扫描取消不是解析失败，直接向上抛出，避免无意义的整文件重读。
+        if (signal?.aborted) throw error;
+      }
+    }
+
     // 读取 → 解码 → 逐行解析由 sessionEntries 独占（BOM/UTF-16 守卫的唯一实现）；
     // 复用已取到的指纹，避免同一次扫描对同一文件重复 stat。
     const file = await readEntries(this.fileAdapter, filePath, { fingerprint: version, signal });
-    // 不可读（UTF-16/二进制）与空文件同等处理：隐藏，而不是显示成"空会话"的幽灵条目。
-    if (file.unreadable || !file.raw.trim()) {
-      this.summaryCache.set(filePath, version, null);
-      return null;
-    }
+    return extractSessionSummaryFacts({
+      entries: file.entries,
+      malformedLines: file.malformedLines,
+      unreadable: file.unreadable,
+      raw: file.raw,
+    });
+  }
 
-    let name: string | undefined;
-    let projectPath: string | undefined;
-    let preview = "空会话";
-    let firstUserText = "";
-    let firstAssistantText = "";
-    let messageCount = 0;
-    /** 可解析行与损坏行计数：全部损坏时隐藏会话，部分损坏时标记 degraded。 */
-    const parsedLines = file.entries.length;
-    const skippedLines = file.malformedLines;
-    /** 会话来源：扫描前几行检测导入标记 */
-    let source: SessionSummary["source"] = "pi";
-    let codexSessionId: string | undefined;
-    let codexThreadSource: SessionSummary["codexThreadSource"];
-    let codexParentThreadId: string | undefined;
-    let codexAgentRole: string | undefined;
-    let codexAgentNickname: string | undefined;
-    let codexSourcePath: string | undefined;
-    let latestSessionInfoName: string | undefined;
-    /** omp 原生标题：首行定长 title 槽 + 末尾 title_change（重命名记录）。 */
-    let titleSlotName: string | undefined;
-    let latestTitleChangeName: string | undefined;
-    /** 会话头里的 title/titleSource：没有 title 槽的旧文件仍可读到。 */
-    let sessionHeaderTitle: string | undefined;
-    let forkParentSession: string | undefined;
-    let hasSubagentChildMarker = false;
-
-    for (const parsedEntry of file.entries) {
-      // JSONL 行可能是合法 JSON 但非对象（null/字符串/数字），访问属性前先判空，避免 TypeError。
-      if (!isJsonRecord(parsedEntry)) continue;
-      const entry = parsedEntry;
-      const data = isJsonRecord(entry.data) ? entry.data : undefined;
-      const header = isJsonRecord(entry.header) ? entry.header : undefined;
-      const sessionRecord = isJsonRecord(entry.session) ? entry.session : undefined;
-      const nestedSession = data && isJsonRecord(data.session) ? data.session : undefined;
-      const entryType = typeof entry.type === "string" ? entry.type : undefined;
-      if (entryType === "session_info") {
-        // Forked sessions may contain an older copied name; only the latest marker is authoritative.
-        latestSessionInfoName = this.optionalString(entry.name ?? data?.name);
-      }
-      // omp 原生标题：title 槽在首行原地更新，title_change 是追加式变更记录；
-      // 后者可能比槽位更新（例如槽位写入失败），因此读标题时优先取最后一条。
-      if (entryType === "title") {
-        titleSlotName = this.optionalString(entry.title) ?? titleSlotName;
-      }
-      if (entryType === "title_change") {
-        latestTitleChangeName = this.optionalString(entry.title) ?? latestTitleChangeName;
-      }
-      if (entryType === "session") {
-        sessionHeaderTitle ||= this.optionalString(entry.title);
-        forkParentSession ||= this.optionalString(entry.parentSession ?? header?.parentSession);
-      }
-      // 检测显式子会话标记：支持任何 "*.child-session" 格式，
-      // 不仅限于 pi-subagents，未来其他扩展也可沿用此约定。
-      if (entryType === "custom" && typeof entry.customType === "string" && entry.customType.endsWith(".child-session")) {
-        hasSubagentChildMarker = true;
-      }
-      // 扫描前几行的非消息条目，检测导入来源标记
-      if (source === "pi") {
-        if (entryType === "codex_import") {
-          source = "codex";
-          codexSessionId = this.optionalString(entry.codexSessionId);
-          codexSourcePath = this.optionalString(entry.sourcePath);
-          codexThreadSource = entry.threadSource === "subagent" ? "subagent" : "user";
-          codexParentThreadId = this.optionalString(entry.parentThreadId);
-          codexAgentRole = this.optionalString(entry.agentRole);
-          codexAgentNickname = this.optionalString(entry.agentNickname);
-        }
-        else if (entryType === "claude_import") source = "claude";
-        else if (entryType === "opencode_import") source = "opencode";
-      }
-
-      name ||= firstString(entry.sessionName, entry.name, data?.name, header?.name, sessionRecord?.name);
-      projectPath ||= firstString(
-        entry.cwd,
-        entry.projectPath,
-        header?.cwd,
-        data?.cwd,
-        sessionRecord?.cwd,
-        nestedSession?.cwd,
-      );
-
-      const message = entry.message ?? data?.message ?? entry;
-      if (isJsonRecord(message) && message.role) {
-        messageCount += 1;
-        const text = extractText(message.content).trim();
-        if (text && preview === "空会话") preview = text;
-        if (text && message.role === "user" && !firstUserText) firstUserText = text;
-        if (text && message.role === "assistant" && !firstAssistantText) firstAssistantText = text;
-      }
-    }
-
-    // 全部行都无法解析（损坏文件/二进制残留）：不显示成"空会话"幽灵条目，与无法读取的文件同等处理。
-    if (parsedLines === 0) {
+  private async buildSummaryFromFacts(
+    filePath: string,
+    version: FileVersion,
+    isWsl: boolean,
+    facts: SessionSummaryFacts,
+    signal?: AbortSignal,
+  ): Promise<SessionSummary | null> {
+    // 不可读（UTF-16/二进制）、空文件、全部行损坏：隐藏，而不是显示成"空会话"的幽灵条目。
+    if (facts.unreadable || facts.rawEmpty || facts.parsedLines === 0) {
       this.summaryCache.set(filePath, version, null);
       return null;
     }
@@ -864,27 +821,27 @@ export class SessionScanner {
     // 会话名优先级：title_change（最新重命名）> title 槽 > 会话头标题 > 旧版 session_info。
     // 旧桌面端只写 session_info，保留在末尾兜底，保证已有会话不丢名字。
     const explicitSessionName =
-      latestTitleChangeName || titleSlotName || sessionHeaderTitle || latestSessionInfoName;
+      facts.latestTitleChangeName || facts.titleSlotName || facts.sessionHeaderTitle || facts.latestSessionInfoName;
 
     const confidenceScore = scoreSubagentConfidence({
       pathInferred: Boolean(pathInferredParent),
-      customMarker: hasSubagentChildMarker,
+      customMarker: facts.hasSubagentChildMarker,
       sessionName: explicitSessionName,
-      parentSessionRef: forkParentSession,
+      parentSessionRef: facts.forkParentSession,
     });
 
     let parentSessionPath: string | undefined;
-    if (source === "pi" && confidenceScore >= SUBAGENT_CONFIDENCE_THRESHOLD) {
+    if (facts.source === "pi" && confidenceScore >= SUBAGENT_CONFIDENCE_THRESHOLD) {
       // 优先复用上面已完成的路径推断，避免重复遍历文件系统/WSL。
       parentSessionPath = pathInferredParent;
       // 路径推断失败时，尝试使用 forkParentSession header 引用的父路径
-      if (!parentSessionPath && forkParentSession) {
-        const normalizedForkParent = forkParentSession.replace(/\\/g, "/");
+      if (!parentSessionPath && facts.forkParentSession) {
+        const normalizedForkParent = facts.forkParentSession.replace(/\\/g, "/");
         const resolved = isWsl
           ? posixJoin(posixDirname(filePath), normalizedForkParent)
           // forkParentSession 可能来自 fork header 的绝对 Windows 路径；
           // path.join 在 Windows 上不会以盘符根路径重置，需用 resolve。
-          : resolve(dirname(filePath), forkParentSession);
+          : resolve(dirname(filePath), facts.forkParentSession);
         const normalizedResolved = this.normalize(resolved);
         const normalizedSessionsRoot = this.normalize(this.findSessionsRootForFile(filePath));
         // header 来自外部 JSONL；仅允许引用当前 sessions 根目录内的现有文件，避免路径穿越或误挂载。
@@ -894,29 +851,28 @@ export class SessionScanner {
         const resolvedExists = isInsideSessionsRoot && (await this.fileAdapter.exists(resolved, signal));
         if (resolvedExists) {
           parentSessionPath = resolved;
-        } else {
         }
       }
     }
 
-    if (source === "codex" && codexSourcePath && !codexParentThreadId) {
-      const fallbackInfo = await this.readCodexThreadInfo(codexSourcePath);
+    if (facts.source === "codex" && facts.codexSourcePath && !facts.codexParentThreadId) {
+      const fallbackInfo = await this.readCodexThreadInfo(facts.codexSourcePath);
       if (fallbackInfo) {
-        codexThreadSource = fallbackInfo.threadSource;
-        codexParentThreadId = fallbackInfo.parentThreadId;
-        codexAgentRole = fallbackInfo.agentRole;
-        codexAgentNickname = fallbackInfo.agentNickname;
+        facts.codexThreadSource = fallbackInfo.threadSource;
+        facts.codexParentThreadId = fallbackInfo.parentThreadId;
+        facts.codexAgentRole = fallbackInfo.agentRole;
+        facts.codexAgentNickname = fallbackInfo.agentNickname;
       }
     }
 
     // 显式标题优先；旧版应用的 sessionName 私有行及其他字段仅作降级回退。
-    let inferredName = this.cleanTitle(explicitSessionName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
+    let inferredName = this.cleanTitle(explicitSessionName) || this.cleanTitle(facts.name) || this.cleanTitle(facts.firstUserText) || this.cleanTitle(facts.firstAssistantText) || "Untitled";
 
     // omp/pi 子代理会话常没有显式标题（title 为空），且首条消息都是 task 工具的固定前缀
     // （"Complete the assignment below, thoroughly: ..."），此时名字会退化成同一条截断文本，
     // 展开后整组子会话无法区分。子会话布局下文件名即代理标签（如 AgentManagerApi），
     // 无显式标题时用文件名作为名字；session.jsonl 这类通用名无区分度，仍保持消息回退。
-    if (parentSessionPath && !explicitSessionName && !name) {
+    if (parentSessionPath && !explicitSessionName && !facts.name) {
       const fileLabel = basename(filePath).replace(/\.jsonl$/i, "");
       if (fileLabel && fileLabel !== "session") {
         inferredName = this.cleanTitle(fileLabel) ?? inferredName;
@@ -926,22 +882,22 @@ export class SessionScanner {
     const summary: SessionSummary = {
       id: filePath,
       filePath,
-      projectPath: projectPath ? this.normalize(projectPath) : this.inferProjectPathFromFile(filePath),
+      projectPath: facts.projectPath ? this.normalize(facts.projectPath) : this.inferProjectPathFromFile(filePath),
       name: inferredName,
-      preview: preview.slice(0, 160),
+      preview: facts.preview.slice(0, 160),
       updatedAt: version.mtimeMs,
-      messageCount,
-      source,
-      codexSessionId,
-      codexThreadSource,
-      codexParentThreadId,
-      codexAgentRole,
-      codexAgentNickname,
+      messageCount: facts.messageCount,
+      source: facts.source,
+      codexSessionId: facts.codexSessionId,
+      codexThreadSource: facts.codexThreadSource,
+      codexParentThreadId: facts.codexParentThreadId,
+      codexAgentRole: facts.codexAgentRole,
+      codexAgentNickname: facts.codexAgentNickname,
       parentSessionPath,
       // 标记 WSL 来源，供 rename/delete/copy/readMessages 等操作识别
       wsl: isWsl || undefined,
       // 部分行损坏时标记 degraded，供 UI 提示 messageCount/预览可能不完整。
-      degraded: skippedLines > 0 ? true : undefined,
+      degraded: facts.malformedLines > 0 ? true : undefined,
     };
     this.summaryCache.set(filePath, version, summary);
     return summary;
@@ -953,10 +909,6 @@ export class SessionScanner {
       this.summaryCache.flushWithTimeout(),
       this.projectMatchCache.flushWithTimeout(),
     ]);
-  }
-
-  private optionalString(value: unknown) {
-    return typeof value === "string" && value.trim() ? value.trim() : undefined;
   }
 
   private async readCodexThreadInfo(sourcePath: string) {

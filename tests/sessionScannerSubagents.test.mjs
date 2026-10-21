@@ -77,9 +77,21 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 	// extractText 为共享纯函数，一并来自该模块。
 	// 读取半部分收敛到 sessionEntries，两个模块都依赖它：vm 沙箱不解析 .ts 扩展引入，需显式注入。
 	const sessionEntries = loadTranspiledModule("src/main/sessions/sessionEntries.ts");
+	const sessionText = loadTranspiledModule("src/main/sessions/sessionText.ts");
+	const sessionSummaryFacts = loadTranspiledModule(
+		"src/main/sessions/sessionSummaryFacts.ts",
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
+	);
+	const sessionParsePool = loadTranspiledModule("src/main/sessions/sessionParsePool.ts");
 	const sessionFileOps = loadTranspiledModule(
 		"src/main/sessions/SessionFileOps.ts",
-		new Map([["./sessionEntries", sessionEntries]]),
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
 	);
 	const sandbox = {
 		AbortController,
@@ -87,6 +99,7 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 		Buffer,
 		clearTimeout,
 		exports: {},
+		process,
 		setTimeout,
 		require: (id) => {
 			if (id === "electron") {
@@ -106,6 +119,8 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 			if (id === "./subagentParentInference") return subagentParentInference;
 			if (id === "./SessionFileOps") return sessionFileOps;
 			if (id === "./sessionEntries") return sessionEntries;
+			if (id === "./sessionSummaryFacts") return sessionSummaryFacts;
+			if (id === "./sessionParsePool") return sessionParsePool;
 			if (id === "node:fs") return { ...require(id), ...fsOverrides };
 			if (id === "node:fs/promises") return { ...require(id), ...fsPromisesOverrides };
 			return require(id);
@@ -118,6 +133,15 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 function writeSession(filePath, entries) {
 	mkdirSync(dirname(filePath), { recursive: true });
 	writeFileSync(filePath, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+}
+
+/** 测试统一关闭 scanner：chokidar 监听会让 Node 测试进程在用例结束后仍无法退出。 */
+async function listAndClose(scanner, projectPath) {
+	try {
+		return await scanner.list(projectPath);
+	} finally {
+		await scanner.close();
+	}
 }
 
 function session(name, cwd) {
@@ -174,6 +198,7 @@ test("aborts a hung WSL scan before the renderer watchdog and allows a clean ret
 		await assert.rejects(scanner.list());
 		assert.equal((await scanner.list()).length, 0);
 		assert.equal(attempts, 2);
+		await scanner.close();
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
@@ -206,7 +231,7 @@ test("hides persisted pi-subagents runs without deleting them or unrelated neste
 		writeSession(reviewerFile, session("subagent-reviewer-run-abc-1", projectPath));
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectPath);
+		const summaries = await listAndClose(new SessionScanner(), projectPath);
 		const visiblePaths = new Set(summaries.map(summary => summary.filePath));
 
 		assert.equal(visiblePaths.has(parentFile), true);
@@ -272,7 +297,7 @@ test("groups WSL child sessions with POSIX parent paths", async () => {
 		// 避免 resolveScanRoots 走真实 wsl.exe 探测自定义 sessionDir
 		scanner.fileAdapter.existsDir = async () => false;
 
-		const summaries = await scanner.list(selectedProjectPath);
+		const summaries = await listAndClose(scanner, selectedProjectPath);
 		assert.equal(summaries.length, 4);
 		assert.equal(summaries.find((item) => item.filePath === childFile)?.parentSessionPath, parentFile);
 		assert.equal(summaries.find((item) => item.filePath === forkChildFile)?.parentSessionPath, forkParentFile);
@@ -303,7 +328,7 @@ test("uses a valid renamed parent session and ignores false-positive path owners
 		writeSession(lookalikeFile, session("Path lookalike", projectPath));
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectPath);
+		const summaries = await listAndClose(new SessionScanner(), projectPath);
 		assert.equal(summaries.find((item) => item.filePath === childFile)?.parentSessionPath, parentFile);
 		assert.equal(summaries.find((item) => item.filePath === lookalikeFile)?.parentSessionPath, undefined);
 	} finally {
@@ -350,7 +375,7 @@ test("handles orphan, fork, rename and imported-session compatibility without fa
 		]);
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectPath);
+		const summaries = await listAndClose(new SessionScanner(), projectPath);
 		const visiblePaths = new Set(summaries.map(summary => summary.filePath));
 
 		// 子会话包含在摘要列表中，但标记了 parentSessionPath
@@ -393,7 +418,7 @@ test("resolves fork child with absolute Windows parent path via parentSession he
 		]);
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectPath);
+		const summaries = await listAndClose(new SessionScanner(), projectPath);
 		assert.equal(summaries.length, 2);
 		const forkSummary = summaries.find(s => s.filePath === forkChildFile);
 		assert.equal(forkSummary.parentSessionPath, parentFile);
@@ -435,7 +460,7 @@ test("reads project sessionDir from .omp/settings.json and lists local sessions"
 		writeSession(legacySession, session("Legacy global session", projectRoot));
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectRoot);
+		const summaries = await listAndClose(new SessionScanner(), projectRoot);
 		const paths = new Set(summaries.map((item) => item.filePath));
 
 		assert.equal(paths.has(localSession), true);
@@ -464,7 +489,7 @@ test("falls back to global sessionDir when project settings omit it", async () =
 		writeSession(localSession, session("From global sessionDir", projectRoot));
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectRoot);
+		const summaries = await listAndClose(new SessionScanner(), projectRoot);
 		assert.equal(summaries.some((item) => item.filePath === localSession), true);
 	} finally {
 		rmSync(home, { recursive: true, force: true });

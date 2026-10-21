@@ -13,6 +13,10 @@ function loadBrowserApiModule() {
     exports: {},
     require: (specifier) => {
       if (specifier === "./i18n") return { t: (key) => key };
+      // browserApi 只用版本号判断是否需要丢弃过期全量结果；这些用例不涉及流合并。
+      if (specifier === "../../shared/messageStreamVersion") {
+        return { messageStreamVersion: () => 0 };
+      }
       if (specifier === "./previewApi") {
         return {
           createPreviewApi: () => ({

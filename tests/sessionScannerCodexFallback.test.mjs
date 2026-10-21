@@ -74,9 +74,21 @@ function loadSessionScanner(homePath) {
 	// 读取半部分（解码/逐行解析/字节预算）收敛到 sessionEntries，两个模块都依赖它：
 	// vm 沙箱不解析 .ts 扩展引入，需显式注入同一份加载结果。
 	const sessionEntries = loadTranspiledModule("src/main/sessions/sessionEntries.ts");
+	const sessionText = loadTranspiledModule("src/main/sessions/sessionText.ts");
+	const sessionSummaryFacts = loadTranspiledModule(
+		"src/main/sessions/sessionSummaryFacts.ts",
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
+	);
+	const sessionParsePool = loadTranspiledModule("src/main/sessions/sessionParsePool.ts");
 	const sessionFileOps = loadTranspiledModule(
 		"src/main/sessions/SessionFileOps.ts",
-		new Map([["./sessionEntries", sessionEntries]]),
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
 	);
 	const sandbox = {
 		AbortController,
@@ -84,6 +96,7 @@ function loadSessionScanner(homePath) {
 		Buffer,
 		clearTimeout,
 		exports: {},
+		process,
 		setTimeout,
 		require: (id) => {
 			if (id === "electron") {
@@ -98,6 +111,8 @@ function loadSessionScanner(homePath) {
 			if (id === "./subagentParentInference") return subagentParentInference;
 			if (id === "./SessionFileOps") return sessionFileOps;
 			if (id === "./sessionEntries") return sessionEntries;
+			if (id === "./sessionSummaryFacts") return sessionSummaryFacts;
+			if (id === "./sessionParsePool") return sessionParsePool;
 			return require(id);
 		},
 	};
@@ -155,13 +170,16 @@ test("backfills Codex subagent metadata for sessions imported before grouping fi
 		);
 
 		const { SessionScanner } = loadSessionScanner(home);
-		const summaries = await new SessionScanner().list(projectPath);
+		const scanner = new SessionScanner();
+		const summaries = await scanner.list(projectPath);
 
 		assert.equal(summaries.length, 1);
 		assert.equal(summaries[0].codexThreadSource, "subagent");
 		assert.equal(summaries[0].codexParentThreadId, "parent-thread");
 		assert.equal(summaries[0].codexAgentRole, "worker");
 		assert.equal(summaries[0].codexAgentNickname, "Darwin");
+		// 关闭 chokidar 监听，避免测试进程被后台初始扫描拖住。
+		await scanner.close();
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}

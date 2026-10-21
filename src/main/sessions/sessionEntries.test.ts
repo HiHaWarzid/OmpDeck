@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 
 import type { ChatMessage } from "../../shared/types";
@@ -21,8 +23,10 @@ import { LocalFileAdapter } from "../fs/adapters/localFileAdapter";
 import { SessionJsonl } from "../pi/sessionJsonl";
 import { SessionFileOps } from "./SessionFileOps";
 import { SessionScanner } from "./SessionScanner";
+import { extractSessionSummaryFacts } from "./sessionSummaryFacts";
 import {
   nodeEntriesIo,
+  parseSessionText,
   readEntries,
   readTailEntries,
   type SessionEntriesIo,
@@ -322,3 +326,120 @@ test("尾窗读只读窗口字节，不整文件读", async () => {
   await readEntries(whole.io as SessionEntriesIo, filePath);
   assert.equal(whole.bytesRead(), size);
 });
+
+// ── 摘要事实提取与 worker 路径 ─────────────────────────
+
+test("摘要事实提取保留标题优先级、来源标记与损坏行计数", () => {
+  const entries = [
+    { type: "session", title: "header-title", cwd: "D:\\proj", parentSession: "parent.jsonl" },
+    { type: "title", title: "slot-title" },
+    { type: "title_change", title: "renamed-title" },
+    { type: "session_info", name: "old-name" },
+    { type: "custom", customType: "pi.child-session" },
+    {
+      type: "codex_import",
+      codexSessionId: "codex-1",
+      sourcePath: "C:\\codex\\thread.jsonl",
+      threadSource: "subagent",
+      parentThreadId: "parent-1",
+      agentRole: "reviewer",
+      agentNickname: "Rex",
+    },
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "  hello  " }] } },
+    { type: "message", message: { role: "assistant", content: "world" } },
+  ];
+  const parsed = parseSessionText(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n{broken`);
+  const facts = extractSessionSummaryFacts({
+    entries: parsed.entries,
+    malformedLines: parsed.malformedLines,
+    unreadable: parsed.unreadable,
+    raw: parsed.text,
+  });
+
+  expect(facts.source).toBe("codex");
+  expect(facts.codexSessionId).toBe("codex-1");
+  expect(facts.codexThreadSource).toBe("subagent");
+  expect(facts.codexParentThreadId).toBe("parent-1");
+  expect(facts.codexAgentRole).toBe("reviewer");
+  expect(facts.codexAgentNickname).toBe("Rex");
+  expect(facts.codexSourcePath).toBe("C:\\codex\\thread.jsonl");
+  expect(facts.projectPath).toBe("D:\\proj");
+  expect(facts.forkParentSession).toBe("parent.jsonl");
+  expect(facts.hasSubagentChildMarker).toBe(true);
+  expect(facts.latestTitleChangeName).toBe("renamed-title");
+  expect(facts.titleSlotName).toBe("slot-title");
+  expect(facts.sessionHeaderTitle).toBe("header-title");
+  expect(facts.latestSessionInfoName).toBe("old-name");
+  expect(facts.preview).toBe("hello");
+  expect(facts.messageCount).toBe(2);
+  expect(facts.malformedLines).toBe(1);
+  expect(facts.rawEmpty).toBe(false);
+});
+
+test("worker 解析路径与主线程路径产出相同摘要", async () => {
+  const home = await createHome();
+  // 摘要解析只对 >=256KB 的文件启用 worker；夹具必须跨过阈值才会真正走 worker 池。
+  const largeEntries = [
+    ...BOM_ENTRIES,
+    { type: "custom", customType: "fixture.padding", payload: "x".repeat(300 * 1024) },
+  ];
+  await writeSessionFile(
+    home,
+    "session.jsonl",
+    `\uFEFF${largeEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+  );
+
+  const direct = new SessionScanner();
+  const directSummaries = await direct.list();
+  await direct.close();
+
+  const viaWorker = new SessionScanner({
+    createParseWorker: () => new FakeParseWorker() as unknown as Worker,
+    parseWorkerCount: 1,
+  });
+  const workerSummaries = await viaWorker.list();
+  await viaWorker.close();
+
+  expect(workerSummaries).toEqual(directSummaries);
+  expect(workerSummaries).toHaveLength(1);
+  expect(workerSummaries[0]).toMatchObject({
+    name: "BOM 会话",
+    preview: "hello bom",
+    messageCount: 1,
+    projectPath: "d:/proj",
+  });
+});
+
+/** 用同步实现替代真实 worker，验证 SessionParsePool 的消息契约与扫描集成。 */
+class FakeParseWorker extends EventEmitter {
+  unref(): void {}
+
+  terminate(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  postMessage(request: { id: number; filePath: string }): void {
+    void (async () => {
+      try {
+        const raw = await nodeEntriesIo.read(request.filePath);
+        const parsed = parseSessionText(raw);
+        this.emit("message", {
+          id: request.id,
+          ok: true,
+          facts: extractSessionSummaryFacts({
+            entries: parsed.entries,
+            malformedLines: parsed.malformedLines,
+            unreadable: parsed.unreadable,
+            raw: parsed.text,
+          }),
+        });
+      } catch (error) {
+        this.emit("message", {
+          id: request.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+  }
+}
