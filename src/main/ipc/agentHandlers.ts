@@ -24,7 +24,7 @@ interface AgentHandlerDeps {
 	appLogger: AppLogger;
 	getFeishuBridge: () => FeishuBridge | null;
 	getMainWindow: () => BrowserWindow | null;
-	/** 与应用窗口/托盘一致的通知图标；缺省时系统会回退 Electron 默认图标。 */
+	/** Toast 正文图像；Windows 左上角应用图标来自 AUMID 快捷方式。 */
 	notificationIcon?: NativeImage;
 }
 

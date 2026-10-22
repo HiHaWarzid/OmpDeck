@@ -320,7 +320,7 @@ export class AgentManager {
 		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
 		/** 生产注入归档解析 worker；测试缺省时在主线程解析。 */
 		createArchiveWorker?: () => Worker,
-		/** 系统通知图标；Windows 未注册 AUMID 时避免回退 Electron 默认图标。 */
+		/** Toast 正文图像；Windows 左上角应用图标来自 AUMID 快捷方式。 */
 		private readonly notificationIcon?: NativeImage,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;

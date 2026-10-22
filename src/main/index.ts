@@ -35,16 +35,24 @@ import {
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题。
-// Windows 额外用多尺寸 ICO：Electron 文档明确建议任务栏/窗口图标使用 ICO，
-// 只用 PNG 时开发态（electron.exe）可能继续显示 Electron 默认图标。
+// Windows 额外用多尺寸 ICO：任务栏/窗口图标优先使用 ICO。
+// 但 AUMID 未注册开始菜单快捷方式时，Windows 会忽略窗口图标，仍需
+// windowsAppIdentity.ts 补建快捷方式。
 import iconPath from "../../build/icon.png?asset";
 import windowsIconPath from "../../build/icon.ico?asset";
+import {
+	WINDOWS_APP_USER_MODEL_ID,
+	ensureWindowsAppUserModelShortcut,
+} from "./windowsAppIdentity";
 
 /**
- * 系统通知图标与窗口/托盘同源。Windows 开发态未注册开始菜单 AUMID 时，
- * 不给 Notification 传图标会让通知中心回退到 electron.exe 的默认图标。
+ * 系统通知正文图标与窗口/托盘同源。Windows 用多尺寸 ICO，避免通知正文图像发糊；
+ * 通知左上角的应用图标由 AUMID 对应的开始菜单快捷方式决定，见
+ * windowsAppIdentity.ts。
  */
-const notificationIcon = nativeImage.createFromPath(iconPath);
+const notificationIcon = nativeImage.createFromPath(
+	process.platform === "win32" ? windowsIconPath : iconPath,
+);
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -90,10 +98,11 @@ if (!app.isPackaged) {
 }
 
 // Windows 任务栏/通知按 AppUserModelID 归组并绑定应用图标。
-// 不设置时开发态会沿用 electron.exe 的默认 Electron 图标；必须与 electron-builder
-// 的 appId 保持一致，否则打包版与开发态会被系统视为两个不同的应用。
+// 注册表里没有对应 AUMID 的开始菜单快捷方式时，Windows 会忽略 BrowserWindow.icon，
+// 任务栏和 Toast 左上角都回退成 electron.exe 的默认图标；快捷方式由
+// ensureWindowsAppUserModelShortcut() 在 ready 后补齐。
 if (process.platform === "win32") {
-	app.setAppUserModelId("com.hihawarzid.omp-deck");
+	app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
 }
 
 // 三个 pre-ready 偏好（宠物、Chromium 沙箱、单实例）都取自同一份 settings.json：
@@ -1246,6 +1255,18 @@ app.whenReady().then(async () => {
 	importPipeline.registerAdapter(new CodexImportAdapter(join(app.getPath("home"), ".codex", "sessions")));
 	settingsStore = new SettingsStore();
 	appLogger = new AppLogger();
+	// 与设置加载/IPC 注册并行：只在首次或版本/路径变化时真正拉起 PowerShell，
+	// 后续启动命中 marker 直接返回，不拖慢首帧。
+	const windowsAppIdentityReady = ensureWindowsAppUserModelShortcut({
+		isPackaged: app.isPackaged,
+		execPath: process.execPath,
+		appPath: app.getAppPath(),
+		appVersion: app.getVersion(),
+		appDataDir: app.getPath("appData"),
+		userDataDir: app.getPath("userData"),
+		iconPath: windowsIconPath,
+		portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE,
+	});
 	rpcLogger = new RpcLogger();
 	updateManager = new UpdateManager({ appLogger, getMainWindow: () => mainWindow });
 	linkOpener = new LinkOpener({ getMainWindow: () => mainWindow, getSettings: () => settingsStore.get() });
@@ -1344,6 +1365,17 @@ app.whenReady().then(async () => {
 			feishuBridge = bridge;
 		},
 	}));
+	// 任务栏/Toast 的图标解析发生在窗口创建时，必须先把开始菜单快捷方式补好。
+	const windowsAppIdentity = await windowsAppIdentityReady;
+	if (windowsAppIdentity.status === "registered") {
+		void appLogger.info("app", "Registered Windows AppUserModelID shortcut", {
+			shortcutPath: windowsAppIdentity.shortcutPath,
+		});
+	} else if (windowsAppIdentity.status === "failed") {
+		void appLogger.warn("app", "Failed to register Windows AppUserModelID shortcut", {
+			error: windowsAppIdentity.error,
+		});
+	}
 	await createWindow();
 	// PIDECK_PERF_SOAK=1 时长时运行采样（默认关闭，空操作）。
 	startSoakRecorder();
