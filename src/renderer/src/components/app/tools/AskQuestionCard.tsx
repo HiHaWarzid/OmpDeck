@@ -556,10 +556,20 @@ export const NativeAskInlineBar = memo(function NativeAskInlineBar(props: {
 	);
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const [submitted, setSubmitted] = useState(false);
+	// 选项预览跟随当前题目的推荐项/悬停项；切题时回到推荐项，避免显示上一题的预览。
+	const [previewIndex, setPreviewIndex] = useState<number | null>(null);
 
 	const total = props.questions.length;
 	const currentQuestion = props.questions[Math.min(currentIndex, Math.max(total - 1, 0))];
 	const currentDraft = drafts[Math.min(currentIndex, Math.max(total - 1, 0))];
+
+	// 切题后默认预览推荐项；没有推荐项时不主动展示预览，避免凭空挤占高度。
+	useEffect(() => {
+		setPreviewIndex(currentQuestion?.recommended ?? null);
+	}, [currentQuestion?.id, currentQuestion?.recommended]);
+	const previewOption =
+		previewIndex !== null ? currentQuestion?.options[previewIndex] : undefined;
+	const previewText = previewOption?.preview?.trim();
 
 	const isAnswered = (draft: NativeAskDraft) =>
 		draft.none || draft.touched || draft.selected.length > 0 || draft.custom.trim().length > 0;
@@ -726,6 +736,8 @@ export const NativeAskInlineBar = memo(function NativeAskInlineBar(props: {
 									aria-selected={selected}
 									className={`ask-inline-bar-option ask-native-option${selected ? " selected" : ""}`}
 									onClick={() => selectOption(option.label)}
+									onMouseEnter={() => setPreviewIndex(optionIndex)}
+									onFocus={() => setPreviewIndex(optionIndex)}
 									disabled={submitted}
 								>
 									<span className="ask-inline-bar-option-marker">{option.label}</span>
@@ -738,6 +750,17 @@ export const NativeAskInlineBar = memo(function NativeAskInlineBar(props: {
 								</button>
 							);
 						})}
+					</div>
+				) : null}
+
+				{/* omp ask 的 option.preview：TUI 里用于并排/侧栏展示详细方案，桌面端放在选项下方滚动预览。 */}
+				{previewText ? (
+					<div className="ask-native-preview" aria-live="polite">
+						<div className="ask-native-preview-label">
+							{t("ask.nativePreview")}
+							{previewOption?.label ? ` · ${previewOption.label}` : ""}
+						</div>
+						<pre className="ask-native-preview-body">{previewText}</pre>
 					</div>
 				) : null}
 

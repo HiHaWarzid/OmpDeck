@@ -54,8 +54,11 @@ function buildOmpSingleAsk(details: Record<string, unknown>): Record<string, unk
 		type: details.multi === true ? "multi" : "select",
 		options: details.options,
 		answer: answerValue,
-		answered: !timedOut && answerValue !== null,
+		// 超时自动选择也是 pi 实际采用的答案，必须展示；timedOut 单独标记来源，
+		// 避免 UI 把答案误判为「未回答」。
+		answered: answerValue !== null,
 		answerLabel: answerValue != null ? answerValue : undefined,
+		timedOut,
 	};
 }
 
@@ -85,6 +88,7 @@ function buildOmpBatchAsk(results: unknown[]): Record<string, unknown> {
 			id,
 			value,
 			...(value != null ? { label: value } : {}),
+			...(r.timedOut === true ? { timedOut: true } : {}),
 		});
 	}
 	return { questions, answers, cancelled: false };
@@ -194,6 +198,7 @@ export function buildAskCard(
 				answerLabel: cancelled ? undefined : (a as Record<string, unknown>)?.label ?? (hasAnswer ? String(value) : undefined),
 				options: q?.options,
 				wasCustom: (a as Record<string, unknown>)?.wasCustom === true,
+				timedOut: !cancelled && (a as Record<string, unknown>)?.timedOut === true,
 			};
 		});
 		// 无 questions 但有 answers（如旧版会话）：把 answers 直接当 items
@@ -210,6 +215,7 @@ export function buildAskCard(
 					answerLabel: cancelled ? undefined : a?.label ?? (hasAnswer ? String(value) : undefined),
 					options: undefined,
 					wasCustom: a?.wasCustom === true,
+					timedOut: !cancelled && a?.timedOut === true,
 				});
 			}
 		}
@@ -223,6 +229,7 @@ export function buildAskCard(
 			answerLabel: first?.answerLabel,
 			options: undefined,
 			cancelled,
+			timedOut: items.some((item: { timedOut: boolean }) => item.timedOut),
 			items,
 		};
 	}
@@ -242,6 +249,7 @@ export function buildAskCard(
 			answer: aborted ? null : askDetails.answer,
 			answerLabel: aborted ? undefined : (askDetails.answerLabel as string | undefined) ?? (hasAnswer ? String(rawAnswer) : undefined),
 			options: askDetails.options,
+			timedOut: !aborted && askDetails.timedOut === true,
 		};
 	}
 	return undefined;

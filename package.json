@@ -197,6 +197,7 @@
     "remark-highlight-mark": "^1.4.0",
     "remark-math": "^6.0.0",
     "remove-markdown": "^0.6.4",
+    "resedit": "^1.7.2",
     "sharp": "^0.35.3",
     "sonner": "^2.0.7",
     "tailwindcss": "^4.3.3",

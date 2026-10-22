@@ -289,12 +289,12 @@ export class AgentManager {
 	 */
 	private readonly emptyResponseTimeoutMs: number;
 	/**
-	 * 会话结束通知延迟窗口。pi 的 session_settled 之后仍可能紧接着到达最终
-	 * message 渲染/收尾事件（用户感知为"对话还没结束"），所以不立即弹窗；
-	 * 回调在窗口结束时复查本地忙碌信号（流式消息/工具/压缩/待回答 UI），
+	 * 会话结束通知的静默窗口。pi 的 session_settled 之后仍可能紧接着到达最终
+	 * message 渲染/收尾事件（用户感知为"对话还没结束"），所以不立即弹窗：
+	 * 回调要求最后一次工作事件距今满 2.5s，仍在流式/工具/压缩/待回答时重新计时，
 	 * 新 run 开始则直接撤销定时器。
 	 */
-	private static readonly SESSION_END_NOTIFY_DELAY_MS = 1_500;
+	private static readonly SESSION_END_NOTIFY_DELAY_MS = 2_500;
 	private readonly sessionEndNotifyTimers = new Map<string, NodeJS.Timeout>();
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
@@ -320,7 +320,7 @@ export class AgentManager {
 		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
 		/** 生产注入归档解析 worker；测试缺省时在主线程解析。 */
 		createArchiveWorker?: () => Worker,
-		/** Toast 正文图像；Windows 左上角应用图标来自 AUMID 快捷方式。 */
+		/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
 		private readonly notificationIcon?: NativeImage,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
@@ -3172,6 +3172,11 @@ export class AgentManager {
 		// 事件流活性戳：静默兜底（forceIdleOnDeadSilence）据此判断 pi 是否真的什么都不做了。
 		// 必须在任何提前 return 之前刷新——流式增量、被封印丢弃的 delta 同样是活性证据。
 		runtime.lastPiEventAt = Date.now();
+		// 会话结束通知的静默窗口只看用户可感知的工作事件；session_info 是标题等
+		// 元数据，不能因为它刷新时间戳而让「已完成」通知一直不弹。
+		if (typed.type !== "session_info_changed" && typed.type !== "session_info_update") {
+			runtime.lastWorkEventAt = runtime.lastPiEventAt;
+		}
 
 		// 扩展/RPC 调用 setSessionName 后 Pi 发 session_info_changed（旧 pi）/ session_info_update（omp）事件；
 		// 同步到 tab.title，使侧边栏与手动 rename 路径看到同一标题。
@@ -4252,7 +4257,11 @@ export class AgentManager {
 	 * 复查状态与本地忙碌信号，只有真正空闲才弹；新 run 的 agent_start 会直接撤销
 	 * 定时器。点击通知会聚焦主窗口并切到该 Agent。
 	 */
-	private scheduleSessionEndNotification(runtime: AgentRuntime, agentId: string) {
+	private scheduleSessionEndNotification(
+		runtime: AgentRuntime,
+		agentId: string,
+		delayMs: number = AgentManager.SESSION_END_NOTIFY_DELAY_MS,
+	) {
 		// settingsStore 在单测里可能只是空桩；通知失败不应影响 settle 收口。
 		let enabled = false;
 		try {
@@ -4268,9 +4277,8 @@ export class AgentManager {
 			// 已被 stop/restart 摘除的 runtime 不再通知。
 			if (this.agents.get(agentId) !== runtime) return;
 			if (runtime.tab.status !== "idle" || runtime.run.recentlyAborted) return;
-			// 延迟窗口内若又长出流式消息/工具/压缩/待回答 UI，说明这一轮并没有真的结束。
-			// 只认这些本地忙碌信号，不用 lastPiEventAt：settle 后的标题更新等元数据事件
-			// 也会刷新时间戳，按时间戳判断会误吞正常通知。
+			// 窗口结束时若仍在流式消息/工具/压缩/待回答 UI，说明这一轮并没有真的结束；
+			// 重新等一个窗口，而不是直接放弃——否则收尾事件晚到时会永远收不到通知。
 			if (
 				runtime.transcript.activeAssistantMessageId ||
 				runtime.activeToolCalls.size > 0 ||
@@ -4279,6 +4287,15 @@ export class AgentManager {
 				runtime.compacting ||
 				runtime.rpcCompacting
 			) {
+				this.scheduleSessionEndNotification(runtime, agentId);
+				return;
+			}
+			// settled 到最终消息之间可能还有一段事件空档：以最后一次工作事件为准补足
+			// 静默窗口，避免通知比用户看到的最后一段输出早几秒。
+			const quietFor = Date.now() - (runtime.lastWorkEventAt ?? runtime.lastPiEventAt ?? 0);
+			const remaining = AgentManager.SESSION_END_NOTIFY_DELAY_MS - quietFor;
+			if (remaining > 0) {
+				this.scheduleSessionEndNotification(runtime, agentId, remaining);
 				return;
 			}
 			showAppNotification({
@@ -4287,7 +4304,7 @@ export class AgentManager {
 				agentId,
 				getWindow: this.getWindow,
 			});
-		}, AgentManager.SESSION_END_NOTIFY_DELAY_MS);
+		}, delayMs);
 		timer.unref?.();
 		this.sessionEndNotifyTimers.set(agentId, timer);
 	}
@@ -4598,6 +4615,12 @@ type AgentRuntime = {
 	 * 只由 handlePiEvent 刷新——get_state 是我们主动发的请求，其响应不算事件流活性。
 	 */
 	lastPiEventAt?: number;
+	/**
+	 * 最近一次「用户可感知的工作事件」时刻：消息增量/工具/压缩/UI 请求等。
+	 * 会话结束通知用它做静默窗口判定；session_info 等元数据事件不刷新，
+	 * 避免标题更新把通知无限推迟。
+	 */
+	lastWorkEventAt?: number;
 	/** abort 后等 pi 确认的兜底定时器（见 scheduleAbortSettledFallback） */
 	abortSettledFallbackTimer?: NodeJS.Timeout;
 

@@ -6,6 +6,7 @@
  */
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { ensureDevElectronExecutable } = require("./devElectronIdentity");
 
 const ELECTRON_VITE_BIN = path.join(__dirname, "..", "node_modules", "electron-vite", "bin", "electron-vite.js");
 const STALE_ELECTRON_VITE_ENV_KEYS = [
@@ -95,9 +96,14 @@ function runDev() {
 			// 忽略失败，仅影响中文显示
 		}
 	}
+	const env = createDevEnvironment();
+	// electron-vite 读取 ELECTRON_EXEC_PATH；createDevEnvironment 会清掉从外部继承的
+	// 旧值，这里再注入本次生成的品牌化开发 exe。
+	const devExecutable = ensureDevElectronExecutable();
+	if (devExecutable) env.ELECTRON_EXEC_PATH = devExecutable;
 	const child = spawn(invocation.command, invocation.args, {
 		stdio: "inherit",
-		env: createDevEnvironment(),
+		env,
 	});
 	child.on("exit", (code, signal) => {
 		if (signal) {

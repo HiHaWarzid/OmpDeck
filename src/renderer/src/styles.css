@@ -6759,6 +6759,13 @@ body.ask-bar-active .ask-inline-bar--timeline {
   color: var(--color-text-tertiary);
   font-weight: 500;
 }
+.ask-question-card-batch-auto {
+  margin-left: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-weight: 500;
+  white-space: nowrap;
+}
 
 /* ask_question 内联栏 - 输入框上方；普通 ask 与 Plan 下一步共用紧凑高度 */
 .ask-inline-bar {
@@ -7661,6 +7668,31 @@ body.ask-bar-active .ask-inline-bar--timeline {
   font-size: var(--font-size-micro);
   font-weight: 400;
   line-height: var(--line-height-caption);
+}
+.ask-native-preview {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-muted);
+  max-height: 160px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.ask-native-preview-label {
+  margin-bottom: var(--space-1);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+}
+.ask-native-preview-body {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-micro);
+  line-height: var(--line-height-caption);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .ask-native-multi-hint {
   margin-left: var(--space-2);

@@ -24,7 +24,7 @@ interface AgentHandlerDeps {
 	appLogger: AppLogger;
 	getFeishuBridge: () => FeishuBridge | null;
 	getMainWindow: () => BrowserWindow | null;
-	/** Toast 正文图像；Windows 左上角应用图标来自 AUMID 快捷方式。 */
+	/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
 	notificationIcon?: NativeImage;
 }
 
@@ -44,7 +44,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 	return {
 		agents: {
 			notifyAsk: async (_event, title: unknown, body: unknown, agentId: unknown) => {
-				// 渲染层判定「非活动 agent 收到 ask 请求且设置开启」后请求主进程发系统通知；
+				// 渲染层判定「后台 agent 提问，或窗口未聚焦时收到 ask 且设置开启」后请求发系统通知；
 				// 点击通知聚焦主窗口并切到发起提问的 Agent，用户可直接作答。
 				if (typeof title !== "string" || typeof body !== "string") return;
 				showAppNotification({

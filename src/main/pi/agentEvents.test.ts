@@ -52,6 +52,8 @@ type TestRuntime = {
 	settleCheckTimer?: NodeJS.Timeout;
 	/** 最近一次 pi 事件时刻：静默兜底按它计算事件流静默时长 */
 	lastPiEventAt?: number;
+	/** 最近一次工作事件时刻：会话结束通知按它计算静默窗口 */
+	lastWorkEventAt?: number;
 	pendingUIRequests: Map<string, { method: string; title: string }>;
 	rpcLogging: boolean;
 	compacting: boolean;
@@ -641,7 +643,7 @@ test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () =>
 	);
 });
 
-test("会话结束通知延迟 1.5s，期间重新开跑则取消", () => {
+test("会话结束通知在 2.5s 静默窗口后触发，期间重新开跑则取消", () => {
 	vi.useFakeTimers();
 	const manager = new AgentManager(
 		() => undefined,
@@ -662,7 +664,7 @@ test("会话结束通知延迟 1.5s，期间重新开跑则取消", () => {
 	notify.mockClear();
 
 	inner.handlePiEvent("a1", { type: "session_settled" });
-	vi.advanceTimersByTime(1_499);
+	vi.advanceTimersByTime(2_499);
 	assert.equal(notify.mock.calls.length, 0);
 
 	// 新一轮 run 已开始：旧通知必须撤销，不能提示"已完成"。
@@ -672,7 +674,69 @@ test("会话结束通知延迟 1.5s，期间重新开跑则取消", () => {
 
 	inner.handlePiEvent("a1", { type: "agent_end" });
 	inner.handlePiEvent("a1", { type: "session_settled" });
-	vi.advanceTimersByTime(1_500);
+	vi.advanceTimersByTime(2_500);
+	assert.equal(notify.mock.calls.length, 1);
+	vi.useRealTimers();
+});
+
+test("会话结束通知的静默窗口不被标题等元数据事件刷新", () => {
+	vi.useFakeTimers();
+	const manager = new AgentManager(
+		() => undefined,
+		() => null,
+		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
+		{} as unknown as AgentConfigDeps,
+		undefined,
+		undefined,
+	);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+		sendRaw: () => undefined,
+	});
+	inner.agents.set("a1", runtime);
+	inner.addMessage(runtime, "assistant", "已完成");
+	const notify = vi.mocked(showAppNotification);
+	notify.mockClear();
+
+	inner.handlePiEvent("a1", { type: "session_settled" });
+	vi.advanceTimersByTime(2_000);
+	// 标题更新只刷新 lastPiEventAt，不应把通知再推迟 2.5s。
+	inner.handlePiEvent("a1", { type: "session_info_update", name: "新标题" });
+	vi.advanceTimersByTime(499);
+	assert.equal(notify.mock.calls.length, 0);
+	vi.advanceTimersByTime(1);
+	assert.equal(notify.mock.calls.length, 1);
+	vi.useRealTimers();
+});
+
+test("窗口结束时仍在执行工具则不弹通知，等收尾后重新计时", () => {
+	vi.useFakeTimers();
+	const manager = new AgentManager(
+		() => undefined,
+		() => null,
+		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
+		{} as unknown as AgentConfigDeps,
+		undefined,
+		undefined,
+	);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+		sendRaw: () => undefined,
+	});
+	inner.agents.set("a1", runtime);
+	inner.addMessage(runtime, "assistant", "已完成");
+	const notify = vi.mocked(showAppNotification);
+	notify.mockClear();
+
+	inner.handlePiEvent("a1", { type: "session_settled" });
+	runtime.activeToolCalls.set("tool-1", "read");
+	vi.advanceTimersByTime(2_500);
+	assert.equal(notify.mock.calls.length, 0);
+
+	runtime.activeToolCalls.clear();
+	vi.advanceTimersByTime(2_500);
 	assert.equal(notify.mock.calls.length, 1);
 	vi.useRealTimers();
 });

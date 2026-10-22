@@ -5,8 +5,11 @@ import { dirname, join } from "node:path";
 import { afterEach, test } from "vitest";
 
 import {
+	WINDOWS_APP_USER_MODEL_ID,
+	WINDOWS_DEV_APP_USER_MODEL_ID,
 	buildWindowsShortcutScript,
 	ensureWindowsAppUserModelShortcut,
+	resolveWindowsAppUserModelId,
 	resolveWindowsShortcutSpec,
 } from "./windowsAppIdentity";
 
@@ -47,6 +50,8 @@ test("安装版快捷方式直接指向 exe，图标取 exe 内嵌资源", () =>
 	assert.equal(spec.workingDirectory, root);
 	assert.equal(spec.iconLocation, `${input.execPath},0`);
 	assert.equal(spec.updateTarget, true);
+	assert.equal(spec.appId, WINDOWS_APP_USER_MODEL_ID);
+	assert.equal(resolveWindowsAppUserModelId(true), WINDOWS_APP_USER_MODEL_ID);
 });
 
 test("开发态快捷方式带项目路径参数，图标取构建产物 ICO", () => {
@@ -58,6 +63,9 @@ test("开发态快捷方式带项目路径参数，图标取构建产物 ICO", (
 	assert.equal(spec.arguments, `"${input.appPath}"`);
 	assert.equal(spec.workingDirectory, input.appPath);
 	assert.equal(spec.iconLocation, `${input.iconPath},0`);
+	assert.equal(spec.appId, WINDOWS_DEV_APP_USER_MODEL_ID);
+	assert.match(spec.shortcutPath, /OmpDeck Dev\.lnk$/);
+	assert.equal(resolveWindowsAppUserModelId(false), WINDOWS_DEV_APP_USER_MODEL_ID);
 });
 
 test("便携版用用户双击的原始 exe，而不是解压后的临时进程", () => {
@@ -69,10 +77,10 @@ test("便携版用用户双击的原始 exe，而不是解压后的临时进程"
 	assert.equal(spec.target, portable);
 	assert.equal(spec.arguments, "");
 	assert.equal(spec.workingDirectory, root);
-	assert.equal(spec.iconLocation, `${input.execPath},0`);
+	assert.equal(spec.iconLocation, `${portable},0`);
 });
 
-test("已有快捷方式时开发态/便携版不篡改目标或图标，只补 AUMID", () => {
+test("开发态可修正独立快捷方式，便携版不篡改已有快捷方式", () => {
 	const root = makeTempDir();
 	const devInput = { ...baseInput(root), isPackaged: false };
 	const first = resolveWindowsShortcutSpec(devInput);
@@ -80,8 +88,8 @@ test("已有快捷方式时开发态/便携版不篡改目标或图标，只补 
 	writeFileSync(first.shortcutPath, "");
 
 	const devSpec = resolveWindowsShortcutSpec(devInput);
-	assert.equal(devSpec.updateTarget, false);
-	assert.equal(devSpec.updateIcon, false);
+	assert.equal(devSpec.updateTarget, true);
+	assert.equal(devSpec.updateIcon, true);
 	const portableSpec = resolveWindowsShortcutSpec({
 		...devInput,
 		portableExecutableFile: join(root, "portable.exe"),

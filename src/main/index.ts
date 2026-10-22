@@ -41,9 +41,14 @@ import type { StartupWindowMode } from "../shared/types";
 import iconPath from "../../build/icon.png?asset";
 import windowsIconPath from "../../build/icon.ico?asset";
 import {
-	WINDOWS_APP_USER_MODEL_ID,
 	ensureWindowsAppUserModelShortcut,
+	resolveWindowsAppUserModelId,
 } from "./windowsAppIdentity";
+
+const windowsShortcutIconPath =
+	!app.isPackaged && existsSync(join(app.getAppPath(), "build", "icon.ico"))
+		? join(app.getAppPath(), "build", "icon.ico")
+		: windowsIconPath;
 
 /**
  * 系统通知正文图标与窗口/托盘同源。Windows 用多尺寸 ICO，避免通知正文图像发糊；
@@ -102,7 +107,7 @@ if (!app.isPackaged) {
 // 任务栏和 Toast 左上角都回退成 electron.exe 的默认图标；快捷方式由
 // ensureWindowsAppUserModelShortcut() 在 ready 后补齐。
 if (process.platform === "win32") {
-	app.setAppUserModelId(WINDOWS_APP_USER_MODEL_ID);
+	app.setAppUserModelId(resolveWindowsAppUserModelId(app.isPackaged));
 }
 
 // 三个 pre-ready 偏好（宠物、Chromium 沙箱、单实例）都取自同一份 settings.json：
@@ -1264,7 +1269,7 @@ app.whenReady().then(async () => {
 		appVersion: app.getVersion(),
 		appDataDir: app.getPath("appData"),
 		userDataDir: app.getPath("userData"),
-		iconPath: windowsIconPath,
+		iconPath: windowsShortcutIconPath,
 		portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE,
 	});
 	rpcLogger = new RpcLogger();

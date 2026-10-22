@@ -363,6 +363,7 @@ export const ToolCard = memo(function ToolCard(props: {
 				answerLabel?: string;
 				options?: unknown[];
 				cancelled?: boolean;
+				timedOut?: boolean;
 				items?: Array<{
 					id?: string;
 					question?: string;
@@ -372,6 +373,7 @@ export const ToolCard = memo(function ToolCard(props: {
 					answerLabel?: string;
 					options?: unknown[];
 					wasCustom?: boolean;
+					timedOut?: boolean;
 				}>;
 		  }
 		| undefined;
@@ -503,6 +505,7 @@ const statusLabel =
 												question: item.question || item.id,
 												answered: Boolean(item.answered),
 												answerText: formatAskAnswerText(item.answer, item.answerLabel),
+												timedOut: item.timedOut === true,
 										  }))
 										: [
 												{
@@ -514,6 +517,7 @@ const statusLabel =
 														askCard.answer,
 														askCard.answerLabel,
 													),
+													timedOut: askCard.timedOut === true,
 												},
 										  ];
 								const isSingleSelect =
@@ -545,6 +549,14 @@ const statusLabel =
 																title={row.answerText}
 															>
 																{row.answerText}
+																{row.timedOut ? (
+																	<span
+																		className="ask-question-card-batch-auto"
+																		title={t("ask.timedOut")}
+																	>
+																		{t("ask.autoSelected")}
+																	</span>
+																) : null}
 															</span>
 														) : (
 															<span className="ask-question-card-batch-a ask-question-card-batch-a--muted">

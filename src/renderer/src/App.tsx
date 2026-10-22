@@ -1401,7 +1401,14 @@ export function App() {
     piRpcNoSkills: false,
     afk: { enabled: false, targetProjectIds: [], pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
   });
-  /* settingsNotice 已改用 showToast (app-notice) 实现 */
+  // 事件订阅在挂载时建立，闭包不能直接读 settings（会永久停留在首帧默认值）；
+  // 通知开关需要实时值，因此镜像到 ref。
+  const settingsRef = useRef(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+  // 后台 ask 通知去重：同一 requestId 只弹一次（扩展可能重发同一请求）。
+  const notifiedAskRequestIdsRef = useRef<Set<string>>(new Set());
   const [piProxyNotice, setPiProxyNotice] = useState("");
   const [piProxyNoticeTone, setPiProxyNoticeTone] = useState<
     "info" | "success" | "error"
@@ -2345,6 +2352,33 @@ export function App() {
         return;
       }
 
+      // completed 事件到达时释放去重记录，同一 requestId 若被重发仍可再次提醒。
+      if (request.completed) {
+        notifiedAskRequestIdsRef.current.delete(request.requestId);
+      } else if (
+        (request.agentId !== activeAgentIdRef.current || !document.hasFocus()) &&
+        settingsRef.current.enableNotifications &&
+        (request.method === "select" ||
+          request.method === "confirm" ||
+          request.method === "input" ||
+          request.method === "editor" ||
+          request.method === "batch_ask" ||
+          request.method === "ask") &&
+        !notifiedAskRequestIdsRef.current.has(request.requestId)
+      ) {
+        // 通知是副作用，必须放在 setState updater 外：updater 可能重放，
+        // 会造成同一提问弹两次系统通知。
+        notifiedAskRequestIdsRef.current.add(request.requestId);
+        const askTitle = typeof request.title === "string" && request.title.trim()
+          ? request.title
+          : t("app.askPendingTitle");
+        void api.agents.notifyAsk(
+          t("app.askNotificationTitle", { app: "OmpDeck" }),
+          t("app.askNotificationBody", { title: askTitle }),
+          request.agentId,
+        );
+      }
+
       setActiveUiRequest((current) => {
         // completed 事件：只删对应 requestId；其它 pending 请求保留。
         if (request.completed) {
@@ -2353,28 +2387,6 @@ export function App() {
           delete next[request.requestId];
           if (Object.keys(next).length === 0) return null;
           return next;
-        }
-
-        // 非活动 Agent 收到对话类 ask 请求时发系统通知（每 requestId 一次，completed 不重复）：
-        // 用户在别的会话工作时，后台 agent 的提问不应被错过。设置关闭或聚焦时不打扰。
-        if (
-          request.agentId !== activeAgentIdRef.current &&
-          settings.enableNotifications &&
-          (request.method === "select" ||
-            request.method === "confirm" ||
-            request.method === "input" ||
-            request.method === "editor" ||
-            request.method === "batch_ask" ||
-            request.method === "ask")
-        ) {
-          const askTitle = typeof request.title === "string" && request.title.trim()
-            ? request.title
-            : t("app.askPendingTitle");
-          void api.agents.notifyAsk(
-            t("app.askNotificationTitle", { app: "OmpDeck" }),
-            t("app.askNotificationBody", { title: askTitle }),
-            request.agentId,
-          );
         }
 
         /*

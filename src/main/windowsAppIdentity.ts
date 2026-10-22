@@ -11,15 +11,25 @@
  * 避免开发版/便携版把已安装应用的快捷方式劫持走。
  */
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
 export const WINDOWS_APP_USER_MODEL_ID = "com.hihawarzid.omp-deck";
-const SHORTCUT_NAME = "OmpDeck.lnk";
+/**
+ * 开发态使用独立 AUMID/快捷方式，避免 `npm run dev` 改写已安装版本的身份；
+ * 也让 Windows 不会把开发进程与正式版缓存成同一个任务栏/通知条目。
+ */
+export const WINDOWS_DEV_APP_USER_MODEL_ID = "com.hihawarzid.omp-deck.dev";
+const PACKAGED_SHORTCUT_NAME = "OmpDeck.lnk";
+const DEV_SHORTCUT_NAME = "OmpDeck Dev.lnk";
 const IDENTITY_SCHEMA = 1;
+
+export function resolveWindowsAppUserModelId(isPackaged: boolean): string {
+	return isPackaged ? WINDOWS_APP_USER_MODEL_ID : WINDOWS_DEV_APP_USER_MODEL_ID;
+}
 
 export type WindowsAppIdentityInput = {
 	isPackaged: boolean;
@@ -65,29 +75,32 @@ export function resolveWindowsShortcutSpec(
 	const target = isPortable
 		? (input.portableExecutableFile as string)
 		: input.execPath;
+	const appId = resolveWindowsAppUserModelId(input.isPackaged);
 	const shortcutPath = join(
 		input.appDataDir,
 		"Microsoft",
 		"Windows",
 		"Start Menu",
 		"Programs",
-		SHORTCUT_NAME,
+		input.isPackaged ? PACKAGED_SHORTCUT_NAME : DEV_SHORTCUT_NAME,
 	);
-	// 开发态（electron.exe + 项目目录）需要参数；安装版/便携版直接启动 exe。
+	// 开发态（品牌化 OmpDeck.exe + 项目目录）需要参数；安装版/便携版直接启动 exe。
 	const launchArguments = input.isPackaged
 		? ""
 		: `"${input.appPath}"`;
 	const shortcutExists = existsSync(shortcutPath);
-	// 已有快捷方式可能是安装器建的：开发版/便携版只补 AUMID，不改目标或图标。
-	// 安装版则允许修正旧的安装路径和图标。
-	const ownsShortcut = !shortcutExists || (input.isPackaged && !isPortable);
+	// 开发态用独立快捷方式，可放心修正目标；安装版允许修复旧安装路径。
+	// 便携版只在没有快捷方式时创建，避免劫持已安装版本。
+	const ownsShortcut = isPortable ? !shortcutExists : true;
 	return {
 		shortcutPath,
 		target,
 		arguments: launchArguments,
 		workingDirectory: input.isPackaged ? dirname(target) : input.appPath,
-		iconLocation: `${input.isPackaged ? input.execPath : input.iconPath},0`,
-		appId: WINDOWS_APP_USER_MODEL_ID,
+		// 便携版必须指向未改名的原始 exe；input.execPath 是临时 electron.exe 副本，
+		// 用它当图标会显示 Electron 默认图标，且副本退出后可能被清理。
+		iconLocation: `${input.isPackaged ? target : input.iconPath},0`,
+		appId,
 		updateTarget: ownsShortcut,
 		updateIcon: ownsShortcut,
 	};
@@ -184,7 +197,8 @@ export function buildWindowsShortcutScript(spec: WindowsShortcutSpec): string {
 		"$ws = New-Object -ComObject WScript.Shell",
 		"$sc = $ws.CreateShortcut($lnkPath)",
 		"$changed = $false",
-		// 安装器建的快捷方式：开发版/便携版只补 AUMID，不改 TargetPath 或图标。
+		// 安装器建的快捷方式：便携版只补 AUMID，不改 TargetPath 或图标；
+		// 开发版使用独立快捷方式，允许修正 TargetPath 与图标。
 		"if ($updateTarget) {",
 		"  if ($sc.TargetPath -ne $target) { $sc.TargetPath = $target; $changed = $true }",
 		"  if ($sc.Arguments -ne $arguments) { $sc.Arguments = $arguments; $changed = $true }",
@@ -213,6 +227,70 @@ function isSameSpec(marker: IdentityMarker | null, spec: WindowsShortcutSpec, ap
 	return JSON.stringify(marker.spec) === JSON.stringify(markerSpec);
 }
 
+async function readWindowsShortcutTarget(shortcutPath: string): Promise<string | null> {
+	try {
+		const script = [
+			"$ErrorActionPreference = 'Stop'",
+			`$lnkPath = ${psQuote(shortcutPath)}`,
+			"$ws = New-Object -ComObject WScript.Shell",
+			"$ws.CreateShortcut($lnkPath).TargetPath",
+		].join("\n");
+		const encoded = Buffer.from(script, "utf16le").toString("base64");
+		const { stdout } = await execFileAsync(
+			"powershell.exe",
+			["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+			{ windowsHide: true, timeout: 5_000 },
+		);
+		return stdout.trim() || null;
+	} catch {
+		return null;
+	}
+}
+
+/** 开发态 Electron 二进制位于 node_modules/electron/dist；正式安装不会在这个目录。 */
+function isDevElectronTarget(target: string): boolean {
+	return /[\\/]node_modules[\\/]electron[\\/]dist[\\/](?:electron|OmpDeck)\.exe$/i.test(target);
+}
+
+/**
+ * 旧版本开发态曾用正式版 AUMID 抢建 `OmpDeck.lnk`。升级到独立开发快捷方式后清理它。
+ *
+ * 不能只看 marker：新开发快捷方式注册后会覆盖同一个 marker，旧路径的证明就丢了；
+ * 因此优先以快捷方式实际 TargetPath 判定。只有 target 明确位于 electron/dist 时
+ * 才删除，避免误删安装器创建的正式版快捷方式。
+ */
+async function removeLegacyDevShortcut(
+	input: WindowsAppIdentityInput,
+	marker: IdentityMarker | null,
+): Promise<void> {
+	if (input.isPackaged) return;
+	const legacyPath = join(
+		input.appDataDir,
+		"Microsoft",
+		"Windows",
+		"Start Menu",
+		"Programs",
+		PACKAGED_SHORTCUT_NAME,
+	);
+	// 绝大多数机器没有旧快捷方式：直接返回，避免每次启动都拉起 PowerShell。
+	if (!existsSync(legacyPath)) return;
+	const actualTarget = await readWindowsShortcutTarget(legacyPath);
+	if (!actualTarget || !isDevElectronTarget(actualTarget)) return;
+
+	// marker 仍指向旧快捷方式时，必须确认磁盘上的 target 没被安装器替换过。
+	const markerOwnsLegacy =
+		marker?.spec.shortcutPath === legacyPath &&
+		marker.spec.appId === WINDOWS_APP_USER_MODEL_ID;
+	if (markerOwnsLegacy && actualTarget.toLowerCase() !== marker.spec.target.toLowerCase()) {
+		return;
+	}
+	try {
+		rmSync(legacyPath, { force: true });
+	} catch {
+		// 快捷方式可能被 Explorer 占用；下次启动再试，不影响当前身份注册。
+	}
+}
+
 /**
  * 幂等地补齐开始菜单快捷方式。首次运行会启动一次 PowerShell；之后通过 marker
  * 跳过，不进入启动关键路径的重复开销。
@@ -227,6 +305,7 @@ export async function ensureWindowsAppUserModelShortcut(
 	const spec = resolveWindowsShortcutSpec(input);
 	const markerPath = join(input.userDataDir, "windows-app-identity.json");
 	const marker = readMarker(markerPath);
+	await removeLegacyDevShortcut(input, marker);
 	if (existsSync(spec.shortcutPath) && isSameSpec(marker, spec, input.appVersion)) {
 		return { status: "skipped", reason: "already-registered" };
 	}
