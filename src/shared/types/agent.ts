@@ -92,6 +92,35 @@ export type AgentUiBatchQuestion = {
 };
 
 /**
+ * omp 原生 ask 对话框选项：label 是回传给 pi 的精确值，description/preview 仅用于展示。
+ * 与 batch_ask（扩展把 JSON 塞进 input title）不同，这套结构来自 pi 的 `method: "ask"` 协议。
+ */
+export type AgentUiAskOption = {
+	label: string;
+	description?: string;
+	preview?: string;
+};
+
+/** omp 原生 ask 协议的单个问题（method 为 ask）。 */
+export type AgentUiAskQuestion = {
+	id: string;
+	question: string;
+	header?: string;
+	options: AgentUiAskOption[];
+	/** true 时允许勾选多个选项；false/省略为单选。 */
+	multi?: boolean;
+	/** 推荐选项下标；pi 超时会自动选择它。 */
+	recommended?: number;
+};
+
+/** omp ask 的回答项，必须与请求中的 questions 顺序、id 一一对应。 */
+export type AgentUiAskAnswer = {
+	id: string;
+	selectedOptions: string[];
+	customInput?: string;
+};
+
+/**
  * Agent 扩展 UI 请求（ctx.ui.select/confirm/input/editor/notify/setWidget）。
  * 主进程 AgentManager 发出、preload 原样透传、渲染层渲染卡片——三侧共用同一类型，
  * 避免各自内联声明导致字段漂移（历史教训：batchQuestions/widgetLines 曾只存在于渲染层）。
@@ -109,6 +138,10 @@ export type AgentUiRequest = {
 	batchQuestions?: AgentUiBatchQuestion[];
 	/** 批量是否强制 Submit 审阅 tab */
 	batchReview?: boolean;
+	/** omp 原生 ask（method === "ask"）的问题列表；与 batch_ask 的扩展 envelope 不同。 */
+	askQuestions?: AgentUiAskQuestion[];
+	/** pi 侧超时（毫秒）：超时后自动选择 recommended，桌面端仅用于提示。 */
+	timeout?: number;
 	completed?: boolean;
 	value?: string;
 	cancelled?: boolean;

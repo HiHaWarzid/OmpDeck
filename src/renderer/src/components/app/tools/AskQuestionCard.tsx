@@ -4,7 +4,11 @@ import { getComposerEnterIntent } from "../../../composerBehavior";
 import { AlertTriangle, Check, ClipboardList, MessageCircle, X } from "lucide-react";
 import { t } from "../../../i18n";
 import { showNotice } from "../../../utils/notice";
-import type { ChatMessage } from "../../../../../shared/types";
+import type {
+	AgentUiAskAnswer,
+	AgentUiAskQuestion,
+	ChatMessage,
+} from "../../../../../shared/types";
 
 /**
  * 内联提问卡片：渲染 Extension UI 请求（select/confirm/input/editor）作为 system 消息。
@@ -520,6 +524,286 @@ export const BatchAskInlineBar = memo(function BatchAskInlineBar(props: {
 				) : (
 					<div className="ask-inline-bar-question">{t("ask.cancelled")}</div>
 				)}
+			</div>
+		</div>
+	);
+});
+
+type NativeAskDraft = {
+	selected: string[];
+	custom: string;
+	/** 多选题目显式选择「一个都不选」：与「还没答」区分。 */
+	none: boolean;
+	/** 用户是否动过本题；多选清空后仍视为已答（空选择是合法回答）。 */
+	touched: boolean;
+};
+
+/**
+ * omp 原生 ask 内联问答条（method: "ask"）。
+ *
+ * 与 batch_ask 的区别：问题/选项/推荐项/多选都是 pi 的结构化字段，回答必须走
+ * `answers` 数组（按问题 id 一一对应），不能降级成 select/input。单选一题时点选项
+ * 直接提交（对齐 TUI 的即时选择）；多题时单选项自动跳到下一道未答题，最后统一提交。
+ */
+export const NativeAskInlineBar = memo(function NativeAskInlineBar(props: {
+	questions: AgentUiAskQuestion[];
+	timeout?: number;
+	onSubmit: (answers: AgentUiAskAnswer[]) => void;
+	onCancel: () => void;
+}) {
+	const [drafts, setDrafts] = useState<NativeAskDraft[]>(() =>
+		props.questions.map(() => ({ selected: [], custom: "", none: false, touched: false })),
+	);
+	const [currentIndex, setCurrentIndex] = useState(0);
+	const [submitted, setSubmitted] = useState(false);
+
+	const total = props.questions.length;
+	const currentQuestion = props.questions[Math.min(currentIndex, Math.max(total - 1, 0))];
+	const currentDraft = drafts[Math.min(currentIndex, Math.max(total - 1, 0))];
+
+	const isAnswered = (draft: NativeAskDraft) =>
+		draft.none || draft.touched || draft.selected.length > 0 || draft.custom.trim().length > 0;
+	const allAnswered = drafts.length === total && drafts.every(isAnswered);
+	const answeredCount = drafts.filter(isAnswered).length;
+
+	const buildAnswers = (from: NativeAskDraft[]): AgentUiAskAnswer[] =>
+		props.questions.map((question, index) => {
+			const draft = from[index];
+			const customInput = draft.custom.trim();
+			return {
+				id: question.id,
+				selectedOptions: draft.none ? [] : draft.selected,
+				...(customInput ? { customInput } : {}),
+			};
+		});
+
+	const submit = (from: NativeAskDraft[]) => {
+		if (submitted) return;
+		if (!from.every(isAnswered)) return;
+		setSubmitted(true);
+		props.onSubmit(buildAnswers(from));
+	};
+
+	/** 多选题/多题流程：跳到下一道未答题（没有则停在最后一题等待手动提交）。 */
+	const advance = (from: NativeAskDraft[], fromIndex: number) => {
+		for (let offset = 1; offset <= total; offset += 1) {
+			const index = (fromIndex + offset) % total;
+			if (!isAnswered(from[index])) {
+				setCurrentIndex(index);
+				return;
+			}
+		}
+		if (fromIndex < total - 1) setCurrentIndex(fromIndex + 1);
+	};
+
+	if (!currentQuestion || !currentDraft) return null;
+
+	const selectOption = (label: string) => {
+		const next = drafts.slice();
+		const current = next[currentIndex];
+		if (currentQuestion.multi) {
+			const selected = current.selected.includes(label)
+				? current.selected.filter((value) => value !== label)
+				: [...current.selected, label];
+			next[currentIndex] = { ...current, selected, none: false, touched: true };
+			setDrafts(next);
+			return;
+		}
+		next[currentIndex] = {
+			selected: [label],
+			custom: "",
+			none: false,
+			touched: true,
+		};
+		setDrafts(next);
+		if (total === 1) {
+			submit(next);
+			return;
+		}
+		advance(next, currentIndex);
+	};
+
+	const updateCustom = (value: string) => {
+		const next = drafts.slice();
+		const current = next[currentIndex];
+		next[currentIndex] = {
+			...current,
+			custom: value,
+			// 单选与自定义互斥（pi 的解析器只接受二者之一）；多选允许选项+补充文本。
+			selected: currentQuestion.multi ? current.selected : [],
+			none: false,
+			touched: value.trim().length > 0 || current.selected.length > 0,
+		};
+		setDrafts(next);
+	};
+
+	const submitCustom = () => {
+		if (!currentDraft.custom.trim()) return;
+		if (total === 1) {
+			submit(drafts);
+			return;
+		}
+		advance(drafts, currentIndex);
+	};
+
+	const chooseNone = () => {
+		const next = drafts.slice();
+		next[currentIndex] = { selected: [], custom: "", none: true, touched: true };
+		setDrafts(next);
+		if (total === 1) submit(next);
+	};
+
+	return (
+		<div className="ask-inline-bar ask-inline-bar--native" aria-label={t("ask.nativeTitle")}>
+			<div className="ask-inline-bar-header">
+				<MessageCircle size={14} aria-hidden="true" />
+				<span>{t("ask.nativeTitle")}</span>
+				{total > 1 ? (
+					<span className="ask-inline-bar-batch-progress">
+						{t("ask.batchProgress", { done: String(answeredCount), total: String(total) })}
+					</span>
+				) : null}
+				<span className="ask-inline-bar-cancel-hint">{t("ask.cancelBatchHint")}</span>
+				<button
+					className="ask-inline-bar-close"
+					title={t("common.close")}
+					onClick={props.onCancel}
+					disabled={submitted}
+				>
+					<X size={14} aria-hidden="true" />
+				</button>
+			</div>
+
+			{total > 1 ? (
+				<div className="ask-batch-tabs" role="tablist" aria-label={t("ask.nativeTitle")}>
+					{props.questions.map((question, index) => (
+						<button
+							key={question.id}
+							type="button"
+							role="tab"
+							aria-selected={index === currentIndex}
+							className={[
+								"ask-batch-tab",
+								index === currentIndex ? "active" : "",
+								isAnswered(drafts[index]) ? "answered" : "",
+							]
+								.filter(Boolean)
+								.join(" ")}
+							onClick={() => setCurrentIndex(index)}
+						>
+							{index + 1}. {question.header || question.question}
+						</button>
+					))}
+				</div>
+			) : null}
+
+			<div className="ask-inline-bar-question">
+				{currentQuestion.header ? (
+					<span className="ask-batch-question-num">{currentQuestion.header}</span>
+				) : null}
+				{currentQuestion.question}
+				{currentQuestion.multi ? (
+					<span className="ask-native-multi-hint">{t("ask.nativeMultiHint")}</span>
+				) : null}
+			</div>
+
+			<div className="ask-inline-bar-body">
+				{currentQuestion.options.length > 0 ? (
+					<div
+						className="ask-inline-bar-options ask-native-options"
+						role="listbox"
+						aria-multiselectable={currentQuestion.multi || undefined}
+						aria-label={currentQuestion.question}
+					>
+						{currentQuestion.options.map((option, optionIndex) => {
+							const selected = currentDraft.selected.includes(option.label);
+							const recommended = currentQuestion.recommended === optionIndex;
+							return (
+								<button
+									key={`${option.label}-${optionIndex}`}
+									type="button"
+									role="option"
+									aria-selected={selected}
+									className={`ask-inline-bar-option ask-native-option${selected ? " selected" : ""}`}
+									onClick={() => selectOption(option.label)}
+									disabled={submitted}
+								>
+									<span className="ask-inline-bar-option-marker">{option.label}</span>
+									{recommended ? (
+										<span className="ask-native-option-badge">{t("ask.nativeRecommended")}</span>
+									) : null}
+									{option.description ? (
+										<span className="ask-native-option-desc">{option.description}</span>
+									) : null}
+								</button>
+							);
+						})}
+					</div>
+				) : null}
+
+				<div className="ask-native-custom">
+					<textarea
+						className="ask-batch-textarea ask-native-custom-field"
+						value={currentDraft.custom}
+						placeholder={t("ask.nativeCustomPlaceholder")}
+						rows={2}
+						disabled={submitted}
+						onChange={(event) => updateCustom(event.target.value)}
+					/>
+					{currentDraft.custom.trim() ? (
+						<button
+							type="button"
+							className="ask-batch-nav-btn primary"
+							onClick={submitCustom}
+							disabled={submitted}
+						>
+							{t("ask.nativeCustomSubmit")}
+						</button>
+					) : null}
+					{currentQuestion.multi ? (
+						<button
+							type="button"
+							className="ask-batch-nav-btn"
+							onClick={chooseNone}
+							disabled={submitted}
+						>
+							{t("ask.nativePickNone")}
+						</button>
+					) : null}
+				</div>
+
+				{props.timeout && props.timeout > 0 ? (
+					<div className="ask-native-timeout-hint">{t("ask.nativeTimeoutHint")}</div>
+				) : null}
+			</div>
+
+			<div className="ask-batch-nav">
+				{total > 1 && currentIndex > 0 ? (
+					<button
+						className="ask-batch-nav-btn"
+						onClick={() => setCurrentIndex(currentIndex - 1)}
+						disabled={submitted}
+					>
+						{t("ask.batchPrev")}
+					</button>
+				) : null}
+				<div className="ask-batch-nav-spacer" />
+				{total > 1 && currentIndex < total - 1 ? (
+					<button
+						className="ask-batch-nav-btn primary"
+						onClick={() => setCurrentIndex(currentIndex + 1)}
+						disabled={submitted}
+					>
+						{t("ask.batchNext")}
+					</button>
+				) : null}
+				<button
+					className="ask-batch-submit-all-btn"
+					onClick={() => submit(drafts)}
+					disabled={submitted || !allAnswered}
+				>
+					{t("ask.nativeSubmitAnswers")}
+				</button>
 			</div>
 		</div>
 	);

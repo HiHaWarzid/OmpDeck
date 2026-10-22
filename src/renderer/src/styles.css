@@ -7626,6 +7626,64 @@ body.ask-bar-active .ask-inline-bar--timeline {
   outline-offset: 2px;
 }
 
+/* -- omp 原生 ask（method: "ask"）：结构化选项 + answers 数组 -- */
+.ask-inline-bar--native {
+  /* 多题/带说明的选项比 batch 更高，单独放宽上限 */
+  --ask-inline-max-height: min(360px, 46vh);
+}
+.ask-native-options {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+.ask-native-option {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: 100%;
+}
+.ask-native-option .ask-inline-bar-option-marker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.ask-native-option-badge {
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.ask-native-option-desc {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-weight: 400;
+  line-height: var(--line-height-caption);
+}
+.ask-native-multi-hint {
+  margin-left: var(--space-2);
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  font-weight: 400;
+}
+.ask-native-custom {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-end;
+  margin-top: 6px;
+}
+.ask-native-custom-field {
+  flex: 1 1 auto;
+  min-height: 48px;
+}
+.ask-native-timeout-hint {
+  margin-top: 4px;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+}
+
 /* 📱 手机竖屏自适应 */
 @media (max-width: 480px) {
   .ask-batch-tab-label {

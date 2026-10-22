@@ -268,6 +268,11 @@ export class PiProcess extends EventEmitter {
 
     this.rpc = new PiRpcClient(this.proc.stdin, this.proc.stdout);
 
+    // 显式启用 omp 原生 ask 对话框（ctx.ui.askDialog）。旧版 pi 没有该命令会返回
+    // unknown command，此时 ask 工具自动回退到 select，由现有 UI 兜底；因此这里
+    // 不等待响应、失败也不影响启动。命令先于用户 prompt 写入 stdin，顺序有保证。
+    void this.rpc.request({ type: "set_ask_dialog", enabled: true }, 10_000).catch(() => undefined);
+
     this.rpc.on("event", event => this.emit("event", event));
     this.rpc.on("protocol-error", line => this.emit("protocol-error", line));
     // 转发 RPC 日志到 AgentManager，用于前端调试面板展示

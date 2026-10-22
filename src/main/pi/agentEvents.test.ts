@@ -8,6 +8,7 @@ import type {
 	ChatMessage,
 } from "../../shared/types";
 import { AgentManager, isRpcLogWorthy } from "./AgentManager";
+import { showAppNotification } from "../notifications";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, RUN_SILENCE_FORCE_IDLE_MS, type AgentRunState } from "./agentRunState";
@@ -15,6 +16,11 @@ import { AGENT_SETTLED_TIMEOUT_MS } from "./settleReducer";
 import type { AgentConfigDeps } from "./AgentManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AppLogger } from "../logging/AppLogger";
+
+vi.mock("../notifications", () => ({
+	showAppNotification: vi.fn(),
+	focusMainWindow: vi.fn(),
+}));
 
 // electron 在 vitest（node 环境）下不可用；AgentManager 及其依赖只在构造/方法调用时
 // 触碰 electron API，本测试不触发任何 UI/通知路径，提供最小桩即可。
@@ -33,6 +39,7 @@ type TestRuntime = {
 		process: {
 			client: {
 				request: (req: unknown, timeoutMs?: number) => Promise<unknown>;
+				sendRaw?: (payload: Record<string, unknown>) => void;
 			};
 		};
 	};
@@ -117,6 +124,8 @@ type ManagerInternals = {
 	emitStateNow(): void;
 	addMessage(runtime: TestRuntime, role: string, text: string): void;
 	handlePiEvent(agentId: string, event: unknown): void;
+	handleUIRequest(runtime: TestRuntime, event: Record<string, unknown>): void;
+	emit: (channel: string, payload: unknown) => void;
 	markIdleIfPiReportsNoWork(agentId: string): Promise<void>;
 	emitRuntimeState(agentId: string): Promise<void>;
 };
@@ -540,4 +549,162 @@ test("isRpcLogWorthy: send 方向与阶段/响应事件全记，流式增量跳�
 	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_end" } }), true);
 	// send 方向不受上述过滤影响（用户主动命令全记）
 	assert.equal(isRpcLogWorthy({ direction: "send", data: { type: "tool_execution_update" } }), true);
+});
+
+// ── omp 原生 ask（method: "ask"）协议适配 ──────────────────
+
+test("native ask 转发结构化问题，回答走 answers 数组", () => {
+	const manager = makeManager();
+	const emitted: Array<{ channel: string; payload: any }> = [];
+	const sent: Array<Record<string, unknown>> = [];
+	const inner = internals(manager);
+	inner.emit = (channel, payload) => emitted.push({ channel, payload });
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true }),
+		sendRaw: (payload) => sent.push(payload),
+	});
+	inner.agents.set("a1", runtime);
+
+	inner.handleUIRequest(runtime, {
+		type: "extension_ui_request",
+		id: "r1",
+		method: "ask",
+		timeout: 60_000,
+		questions: [
+			{
+				id: "q1",
+				header: "范围",
+				question: "先改哪一块？",
+				recommended: 1,
+				options: [
+					{ label: "主进程", description: "IPC 与进程管理" },
+					{ label: "渲染层" },
+				],
+			},
+		],
+	});
+
+	const ask = emitted.find((item) => item.payload?.requestId === "r1");
+	assert.equal(ask?.payload.method, "ask");
+	assert.equal(ask?.payload.askQuestions[0].id, "q1");
+	assert.equal(ask?.payload.askQuestions[0].options[0].description, "IPC 与进程管理");
+	assert.equal(ask?.payload.askQuestions[0].recommended, 1);
+	assert.equal(ask?.payload.timeout, 60_000);
+	assert.equal(runtime.pendingUIRequests.get("r1")?.method, "ask");
+
+	manager.sendUIResponse("a1", "r1", {
+		answers: [{ id: "q1", selectedOptions: ["渲染层"] }],
+	});
+
+	assert.deepEqual(sent[0], {
+		type: "extension_ui_response",
+		id: "r1",
+		answers: [{ id: "q1", selectedOptions: ["渲染层"] }],
+	});
+	assert.equal(runtime.pendingUIRequests.size, 0);
+});
+
+test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () => {
+	const manager = makeManager();
+	const emitted: Array<{ channel: string; payload: any }> = [];
+	const inner = internals(manager);
+	inner.emit = (channel, payload) => emitted.push({ channel, payload });
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true }),
+		sendRaw: () => undefined,
+	});
+	inner.agents.set("a1", runtime);
+
+	inner.handleUIRequest(runtime, {
+		type: "extension_ui_request",
+		id: "r2",
+		method: "ask",
+		questions: [{ id: "q1", question: "继续？", options: ["是", "否"] }],
+	});
+	assert.equal(runtime.pendingUIRequests.size, 1);
+
+	inner.handleUIRequest(runtime, {
+		type: "extension_ui_request",
+		id: "cancel-1",
+		method: "cancel",
+		targetId: "r2",
+	});
+
+	assert.equal(runtime.pendingUIRequests.size, 0);
+	assert.ok(
+		emitted.some(
+			(item) =>
+				item.payload?.requestId === "r2" &&
+				item.payload?.completed === true &&
+				item.payload?.cancelled === true,
+		),
+	);
+});
+
+test("会话结束通知延迟 1.5s，期间重新开跑则取消", () => {
+	vi.useFakeTimers();
+	const manager = new AgentManager(
+		() => undefined,
+		() => null,
+		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
+		{} as unknown as AgentConfigDeps,
+		undefined,
+		undefined,
+	);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+		sendRaw: () => undefined,
+	});
+	inner.agents.set("a1", runtime);
+	inner.addMessage(runtime, "assistant", "已完成");
+	const notify = vi.mocked(showAppNotification);
+	notify.mockClear();
+
+	inner.handlePiEvent("a1", { type: "session_settled" });
+	vi.advanceTimersByTime(1_499);
+	assert.equal(notify.mock.calls.length, 0);
+
+	// 新一轮 run 已开始：旧通知必须撤销，不能提示"已完成"。
+	inner.handlePiEvent("a1", { type: "agent_start" });
+	vi.advanceTimersByTime(5_000);
+	assert.equal(notify.mock.calls.length, 0);
+
+	inner.handlePiEvent("a1", { type: "agent_end" });
+	inner.handlePiEvent("a1", { type: "session_settled" });
+	vi.advanceTimersByTime(1_500);
+	assert.equal(notify.mock.calls.length, 1);
+	vi.useRealTimers();
+});
+
+test("native ask 载荷有坏题时整体取消，避免 answers 与问题错位", () => {
+	const manager = makeManager();
+	const emitted: Array<{ channel: string; payload: any }> = [];
+	const sent: Array<Record<string, unknown>> = [];
+	const inner = internals(manager);
+	inner.emit = (channel, payload) => emitted.push({ channel, payload });
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true }),
+		sendRaw: (payload) => sent.push(payload),
+	});
+	inner.agents.set("a1", runtime);
+
+	inner.handleUIRequest(runtime, {
+		type: "extension_ui_request",
+		id: "r3",
+		method: "ask",
+		questions: [{ id: "q1", question: "正常" }, { id: "q2" }],
+	});
+
+	assert.deepEqual(sent[0], {
+		type: "extension_ui_response",
+		id: "r3",
+		cancelled: true,
+	});
+	assert.equal(runtime.pendingUIRequests.size, 0);
+	assert.ok(
+		!emitted.some(
+			(item) => item.payload?.requestId === "r3" && item.payload?.method === "ask",
+		),
+	);
 });

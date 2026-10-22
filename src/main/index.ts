@@ -4,6 +4,7 @@ import {
 	BrowserWindow,
 	dialog,
 	ipcMain,
+	nativeImage,
 	nativeTheme,
 	net,
 } from "electron";
@@ -38,6 +39,12 @@ import type { StartupWindowMode } from "../shared/types";
 // 只用 PNG 时开发态（electron.exe）可能继续显示 Electron 默认图标。
 import iconPath from "../../build/icon.png?asset";
 import windowsIconPath from "../../build/icon.ico?asset";
+
+/**
+ * 系统通知图标与窗口/托盘同源。Windows 开发态未注册开始菜单 AUMID 时，
+ * 不给 Notification 传图标会让通知中心回退到 electron.exe 的默认图标。
+ */
+const notificationIcon = nativeImage.createFromPath(iconPath);
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -1150,6 +1157,7 @@ function registerIpc() {
 			appLogger,
 			getFeishuBridge: () => feishuBridge,
 			getMainWindow: () => mainWindow,
+			notificationIcon,
 		}),
 		registerAppHandlers({
 			appLogger,
@@ -1279,6 +1287,7 @@ app.whenReady().then(async () => {
 		undefined,
 		undefined,
 		createSessionArchiveWorker,
+		notificationIcon,
 	);
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),

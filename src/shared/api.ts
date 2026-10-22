@@ -12,6 +12,7 @@ import type {
 	AgentMessagesDelta,
 	AgentRuntimeState,
 	AgentTab,
+	AgentUiAskAnswer,
 	AgentUiRequest,
 	AfkState,
 	AfkTask,
@@ -514,11 +515,11 @@ export interface AgentsApi {
 	onRpcLog: (callback: (payload: { agentId: string; direction: string; summary: string; data: unknown }) => void) => () => void;
 	onRuntimeState: (callback: (payload: { agentId: string; state: AgentRuntimeState }) => void) => () => void;
 	/** 向 Agent 发送扩展 UI 响应（用户回答了 select/confirm/input/editor 对话框） */
-	sendUiResponse: (agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => Promise<void>;
-	/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor） */
+	sendUiResponse: (agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) => Promise<void>;
+	/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor/ask） */
 	onUiRequest: (callback: (request: AgentUiRequest) => void) => () => void;
-	/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关） */
-	notifyAsk: (title: string, body: string) => Promise<void>;
+	/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关）；点击通知聚焦该 Agent */
+	notifyAsk: (title: string, body: string, agentId?: string) => Promise<void>;
 	/** 监听项目信任确认请求（主进程在启动 Agent 前对含 .pi 资源的项目发起） */
 	onTrustRequest: (callback: (request: { requestId: string; cwd: string; projectName: string }) => void) => () => void;
 	/** 回传用户对项目信任确认弹窗的选择（trust-remember/trust-session/deny） */

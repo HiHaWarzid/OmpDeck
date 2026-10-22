@@ -6,16 +6,17 @@
  * 用于飞书会话镜像、文件转发和流式卡片控制。
  * agentsStop / agentsRestart 调用 terminalManager.closeAgent 清理终端会话。
  */
-import { Notification, type BrowserWindow } from "electron";
+import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentUiAskAnswer, CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
 import type { FeishuBridge } from "../feishu/FeishuBridge";
 import { wantsFeishuDoc, wrapHostInstruction } from "../feishu/docActions";
 import { resolveFeishuFileSendIntent } from "../feishu/fileIntent";
+import { showAppNotification } from "../notifications";
 
 interface AgentHandlerDeps {
 	agentManager: AgentManager;
@@ -23,6 +24,8 @@ interface AgentHandlerDeps {
 	appLogger: AppLogger;
 	getFeishuBridge: () => FeishuBridge | null;
 	getMainWindow: () => BrowserWindow | null;
+	/** 与应用窗口/托盘一致的通知图标；缺省时系统会回退 Electron 默认图标。 */
+	notificationIcon?: NativeImage;
 }
 
 type AgentHandlerMaps = {
@@ -36,28 +39,21 @@ type AgentHandlerMaps = {
 };
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps {
-	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow } = deps;
+	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow, notificationIcon } = deps;
 
 	return {
 		agents: {
-			notifyAsk: async (_event, title: unknown, body: unknown) => {
+			notifyAsk: async (_event, title: unknown, body: unknown, agentId: unknown) => {
 				// 渲染层判定「非活动 agent 收到 ask 请求且设置开启」后请求主进程发系统通知；
-				// 点击通知聚焦主窗口（询问卡片已渲染在会话流中，用户聚焦后可直接作答）。
+				// 点击通知聚焦主窗口并切到发起提问的 Agent，用户可直接作答。
 				if (typeof title !== "string" || typeof body !== "string") return;
-				if (!Notification.isSupported()) return;
-				const notification = new Notification({
+				showAppNotification({
 					title: title || "OmpDeck",
 					body,
-					silent: false,
+					icon: notificationIcon,
+					agentId: typeof agentId === "string" ? agentId : undefined,
+					getWindow: getMainWindow,
 				});
-				notification.on("click", () => {
-					const win = getMainWindow();
-					if (!win || win.isDestroyed()) return;
-					if (win.isMinimized()) win.restore();
-					if (!win.isVisible()) win.show();
-					win.focus();
-				});
-				notification.show();
 			},
 			list: async () => agentManager.list(),
 			getMessages: async (_event, agentId: string) =>
@@ -282,7 +278,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				}
 			},
 			/** 用户通过 UI 响应了扩展的 ask_question 请求，转发给 AgentManager 发送 extension_ui_response */
-			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
+			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) => {
 				await agentManager.sendUIResponse(agentId, requestId, response);
 			},
 			/** 回传项目信任确认弹窗的用户选择，唤醒等待中的 Agent 创建流程（TrustStore.decide 的 ask 适配器）。 */

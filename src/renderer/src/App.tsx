@@ -164,7 +164,7 @@ import {
 } from "./components/app/composer/ComposerPickers";
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
-import { BatchAskInlineBar } from "./components/app/tools/AskQuestionCard";
+import { BatchAskInlineBar, NativeAskInlineBar } from "./components/app/tools/AskQuestionCard";
 import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
 import {
   MERGED_TASK_WIDGET_KEY,
@@ -1794,7 +1794,7 @@ export function App() {
       (req) =>
         !req.completed &&
         req.agentId === activeAgentId &&
-        ["select", "confirm", "input", "editor", "batch_ask"].includes(req.method),
+        ["select", "confirm", "input", "editor", "batch_ask", "ask"].includes(req.method),
     );
   }, [activeUiRequest, activeAgentId]);
   // dialog 显示条件：仅当有活跃的交互式 UI 请求时
@@ -2364,7 +2364,8 @@ export function App() {
             request.method === "confirm" ||
             request.method === "input" ||
             request.method === "editor" ||
-            request.method === "batch_ask")
+            request.method === "batch_ask" ||
+            request.method === "ask")
         ) {
           const askTitle = typeof request.title === "string" && request.title.trim()
             ? request.title
@@ -2372,6 +2373,7 @@ export function App() {
           void api.agents.notifyAsk(
             t("app.askNotificationTitle", { app: "OmpDeck" }),
             t("app.askNotificationBody", { title: askTitle }),
+            request.agentId,
           );
         }
 
@@ -6638,9 +6640,41 @@ export function App() {
               </div>
             </div>
           )}
+          {/* omp 原生 ask：结构化问题 + answers 数组，工作区常驻内联条 */}
+          {showAskDialog && activeUiAsk && activeUiAsk.method === "ask" && (
+            <NativeAskInlineBar
+              key={activeUiAsk.requestId}
+              questions={activeUiAsk.askQuestions ?? []}
+              timeout={activeUiAsk.timeout}
+              onCancel={() => {
+                if (!activeUiAsk.requestId || !activeAgentId) return;
+                showToast(t("ask.cancelBatchHint"));
+                setActiveUiRequest((current) => {
+                  if (!current) return null;
+                  const next = { ...current };
+                  delete next[activeUiAsk.requestId];
+                  if (Object.keys(next).length === 0) return null;
+                  return next;
+                });
+                api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
+              }}
+              onSubmit={(answers) => {
+                if (!activeUiAsk.requestId || !activeAgentId) return;
+                setActiveUiRequest((current) => {
+                  if (!current) return null;
+                  const next = { ...current };
+                  delete next[activeUiAsk.requestId];
+                  if (Object.keys(next).length === 0) return null;
+                  return next;
+                });
+                api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { answers });
+              }}
+            />
+          )}
           {/* 批量 ask（batch_ask）：Tab 标签页问卷 */}
           {showAskDialog && activeUiAsk && activeUiAsk.method === "batch_ask" && (
             <BatchAskInlineBar
+              key={activeUiAsk.requestId}
               uiRequest={activeUiAsk}
               activeAgentId={activeAgentId}
               onCancel={() => {
@@ -6672,7 +6706,7 @@ export function App() {
             />
           )}
           {/* 传统单问（select/confirm/input/editor） */}
-          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && (() => {
+          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && activeUiAsk.method !== "ask" && (() => {
             // Plan 结束后的「下一步」选单：关闭=退出计划模式，绝不是「默认第一项」。
             // 扩展用标题前缀 [PI_DECK_PLAN_NEXT] 标记；选项用「标题|说明」编码，桌面端拆主副文案。
             const PLAN_NEXT_MARKER = "[PI_DECK_PLAN_NEXT]";

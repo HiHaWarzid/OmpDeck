@@ -1,4 +1,4 @@
-import { app, type BrowserWindow, Notification } from "electron";
+import type { BrowserWindow, NativeImage } from "electron";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import type { Worker } from "node:worker_threads";
@@ -11,6 +11,9 @@ import type {
 	AgentRuntimeState,
 	AgentStatus,
 	AgentTab,
+	AgentUiAskAnswer,
+	AgentUiAskOption,
+	AgentUiAskQuestion,
 	AvailableModel,
 	ChatMessage,
 	CreateAgentInput,
@@ -45,6 +48,7 @@ import { perfEnd, perfStart } from "../perf";
 import {
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
+import { showAppNotification } from "../notifications";
 import {
 	estimateMessageBytes,
 	extractImages,
@@ -284,6 +288,14 @@ export class AgentManager {
 	 * 注入更小值以避免 30s 真实等待。
 	 */
 	private readonly emptyResponseTimeoutMs: number;
+	/**
+	 * 会话结束通知延迟窗口。pi 的 session_settled 之后仍可能紧接着到达最终
+	 * message 渲染/收尾事件（用户感知为"对话还没结束"），所以不立即弹窗；
+	 * 回调在窗口结束时复查本地忙碌信号（流式消息/工具/压缩/待回答 UI），
+	 * 新 run 开始则直接撤销定时器。
+	 */
+	private static readonly SESSION_END_NOTIFY_DELAY_MS = 1_500;
+	private readonly sessionEndNotifyTimers = new Map<string, NodeJS.Timeout>();
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -308,6 +320,8 @@ export class AgentManager {
 		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
 		/** 生产注入归档解析 worker；测试缺省时在主线程解析。 */
 		createArchiveWorker?: () => Worker,
+		/** 系统通知图标；Windows 未注册 AUMID 时避免回退 Electron 默认图标。 */
+		private readonly notificationIcon?: NativeImage,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
 		this.sessionJsonl = new SessionJsonl({
@@ -1326,6 +1340,8 @@ export class AgentManager {
 
 	async abort(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
+		// 用户主动停止的会话不应再弹"已完成"。
+		this.cancelSessionEndNotification(agentId);
 
 		// pi 在等待 extension_ui_response 时（如 ask_question），不发 abort 也能处理，
 		// 但必须解除 pending 请求的阻塞，否则 pi 不会继续读取 stdin 中的后续命令。
@@ -1335,11 +1351,13 @@ export class AgentManager {
 		const pending = runtime.pendingUIRequests;
 		if (pending.size > 0) {
 			runtime.run.abortedDuringAsk = true;
-			for (const [requestId] of pending) {
+			for (const [requestId, info] of pending) {
+				// 原生 ask 的解析器只认 cancelled；发 value:null 会落进
+				// "must carry N answers" 分支触发 ToolAbortError。旧 select 仍用 value:null。
 				runtime.slot.process.client.sendRaw({
 					type: "extension_ui_response",
 					id: requestId,
-					value: null,
+					...(info.method === "ask" ? { cancelled: true } : { value: null }),
 				});
 			}
 		}
@@ -1372,6 +1390,13 @@ export class AgentManager {
 					messages.splice(idx, 1);
 					this.markMessagesDirty(runtime, idx);
 				}
+				// 让渲染层立刻收起内联问答条；不能等 pi 回 cancelled（abort 路径不一定回）。
+				this.emit(ipcChannels.agentsUiRequest, {
+					agentId,
+					requestId,
+					completed: true,
+					cancelled: true,
+				});
 			}
 			pending.clear();
 		}
@@ -2805,8 +2830,9 @@ export class AgentManager {
 		this.agents.delete(agentId);
 		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
-		// agent 退役时清空响应兜底定时器，避免退役后兜底误打到空 runtime。
+		// agent 退役时清空响应兜底/结束通知定时器，避免退役后回调误打到空 runtime。
 		this.clearEmptyResponseTimer(runtime);
+		this.cancelSessionEndNotification(agentId);
 		this.retiringProcesses.add(child);
 		this.emitState();
 		return child;
@@ -3162,6 +3188,8 @@ export class AgentManager {
 		}
 
 		if (typed.type === "agent_start") {
+			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知。
+			this.cancelSessionEndNotification(agentId);
 			// 流式生命信号：上游 provider 已开始跑 run，空响应兜底不再需要。
 			this.clearEmptyResponseTimer(runtime);
 			// agent_start 表示一轮新的 agent run 开始：
@@ -3405,7 +3433,7 @@ export class AgentManager {
 				const messages = runtime.transcript.messages;
 				const lastMessage = messages[messages.length - 1];
 				if (lastMessage?.role === "assistant" && !settledAfterAbort) {
-					this.notifySessionEnd(runtime.tab.title);
+					this.scheduleSessionEndNotification(runtime, agentId);
 				}
 			}
 		}
@@ -3513,6 +3541,33 @@ export class AgentManager {
 		const agentId = runtime.tab.id;
 		const method = String(typed.method ?? "");
 		const requestId = String(typed.id ?? "");
+		// pi 在 abort/超时后发 method:"cancel" + targetId 关闭已结算的对话框。
+		// 必须按 targetId 清理，否则桌面端会留下一个永远不会被回答的问答条。
+		if (method === "cancel") {
+			const targetId = String(typed.targetId ?? "");
+			if (!targetId) return;
+			runtime.pendingUIRequests.delete(targetId);
+			const messages = runtime.transcript.messages;
+			const idx = messages.findIndex(
+				(msg) =>
+					msg.role === "system" &&
+					msg.meta?.type === "askQuestion" &&
+					(msg.meta as Record<string, unknown>).uiRequest &&
+					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === targetId,
+			);
+			if (idx !== -1) {
+				messages.splice(idx, 1);
+				this.markMessagesDirty(runtime, idx);
+				this.scheduleMessageEmit(runtime, false);
+			}
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: targetId,
+				completed: true,
+				cancelled: true,
+			});
+			return;
+		}
 		// pi RPC 协议将 setWidget / dialog 字段放在顶层，不嵌套 params
 		if (method === "notify") {
 			this.emit(ipcChannels.agentsUiRequest, {
@@ -3552,6 +3607,36 @@ export class AgentManager {
 		}
 		// 其他非对话 UI 方法暂不占用桌面 UI 空间。
 		if (["setStatus", "setTitle"].includes(method)) return;
+
+		// omp 原生 ask（ctx.ui.askDialog）：questions 是结构化数组，不是扩展 envelope。
+		// 它只能通过 ask 协议回答（answers 数组），不能降级成 select/input。
+		if (method === "ask") {
+			const questions = normalizeAskQuestions(typed.questions);
+			if (questions.length === 0) {
+				// 没有可回答的问题就立即取消，避免 pi 侧一直等待。
+				this.sendUIResponse(agentId, requestId, { cancelled: true });
+				return;
+			}
+			const title =
+				questions.length === 1
+					? questions[0].question
+					: `提问（${questions.length} 题）`;
+			runtime.pendingUIRequests.set(requestId, { method, title });
+			// 原生 ask 由渲染层的常驻内联问答条承载，不插入时间线 system 卡片，
+			// 避免与工具调用卡片重复展示同一个问题。
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method: "ask",
+				title,
+				askQuestions: questions,
+				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+			});
+			// 超时/abort 由 pi 主动发 method:"cancel" 关闭，桌面端不再自建超时，
+			// 避免两端计时竞争导致问答条提前消失。
+			return;
+		}
+
 		if (!["select", "confirm", "input", "editor"].includes(method)) return;
 
 		// select 无选项时自动取消，不等用户响应
@@ -3603,7 +3688,7 @@ export class AgentManager {
 	 * 发送 Extension UI 响应（extension_ui_response）到 pi 的 stdin。
 	 * 同时更新对应卡片消息的状态。
 	 */
-	sendUIResponse(agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) {
+	sendUIResponse(agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime) return;
 
@@ -3620,6 +3705,8 @@ export class AgentManager {
 		if ("value" in response) extPayload.value = response.value;
 		// pi 的 ctx.ui.confirm() 检查 confirmed 字段
 		if ("confirmed" in response) extPayload.confirmed = response.confirmed;
+		// omp 原生 ask：answers 必须按请求顺序携带全部问题，pi 会校验 id/数量。
+		if ("answers" in response) extPayload.answers = response.answers;
 		if (response.cancelled) extPayload.cancelled = true;
 		runtime.slot.process.client.sendRaw(extPayload);
 
@@ -4158,27 +4245,59 @@ export class AgentManager {
 	}
 
 	/**
-	 * 会话结束时发送系统通知。
-	 * 仅在设置中启用通知且 Electron Notification 可用时触发，
-	 * 通知用户 agent 已完成响应，可以查看结果或继续对话。
+	 * 会话结束通知延迟触发。
+	 *
+	 * 不在 session_settled 当场弹窗：pi 判定 settle 后，最终 assistant 消息的收尾事件
+	 * 或紧接着的短工作仍可能到达（用户反馈"通知比对话结束早几秒"）。窗口结束时
+	 * 复查状态与本地忙碌信号，只有真正空闲才弹；新 run 的 agent_start 会直接撤销
+	 * 定时器。点击通知会聚焦主窗口并切到该 Agent。
 	 */
-	private notifySessionEnd(sessionTitle: string) {
+	private scheduleSessionEndNotification(runtime: AgentRuntime, agentId: string) {
+		// settingsStore 在单测里可能只是空桩；通知失败不应影响 settle 收口。
+		let enabled = false;
 		try {
-			const settings = this.settingsStore.get();
-			if (!settings.enableNotifications) return;
-			if (!Notification.isSupported()) return;
-
-			// 使用应用名称作为通知标题，在 Windows/macOS 通知中心中显示为应用标识
-			const appName = app.getName();
-			const notification = new Notification({
-				title: appName,
-				body: `${sessionTitle} 已完成响应`,
-				silent: false,
-			});
-			notification.show();
+			enabled = this.settingsStore.get().enableNotifications;
 		} catch {
-			// 通知失败不影响主流程，静默处理
+			return;
 		}
+		if (!enabled) return;
+		const existing = this.sessionEndNotifyTimers.get(agentId);
+		if (existing) clearTimeout(existing);
+		const timer = setTimeout(() => {
+			this.sessionEndNotifyTimers.delete(agentId);
+			// 已被 stop/restart 摘除的 runtime 不再通知。
+			if (this.agents.get(agentId) !== runtime) return;
+			if (runtime.tab.status !== "idle" || runtime.run.recentlyAborted) return;
+			// 延迟窗口内若又长出流式消息/工具/压缩/待回答 UI，说明这一轮并没有真的结束。
+			// 只认这些本地忙碌信号，不用 lastPiEventAt：settle 后的标题更新等元数据事件
+			// 也会刷新时间戳，按时间戳判断会误吞正常通知。
+			if (
+				runtime.transcript.activeAssistantMessageId ||
+				runtime.activeToolCalls.size > 0 ||
+				runtime.toolExecuting ||
+				runtime.pendingUIRequests.size > 0 ||
+				runtime.compacting ||
+				runtime.rpcCompacting
+			) {
+				return;
+			}
+			showAppNotification({
+				body: `${runtime.tab.title} 已完成响应`,
+				icon: this.notificationIcon,
+				agentId,
+				getWindow: this.getWindow,
+			});
+		}, AgentManager.SESSION_END_NOTIFY_DELAY_MS);
+		timer.unref?.();
+		this.sessionEndNotifyTimers.set(agentId, timer);
+	}
+
+	/** 新一轮运行开始时撤销尚未触发的结束通知（排队消息会立刻接续，不应提示完成）。 */
+	private cancelSessionEndNotification(agentId: string) {
+		const timer = this.sessionEndNotifyTimers.get(agentId);
+		if (!timer) return;
+		clearTimeout(timer);
+		this.sessionEndNotifyTimers.delete(agentId);
 	}
 
 	/** agent_start 时尝试推进 generation；若仍在等 abort settled，则只记 pending。 */
@@ -4501,6 +4620,57 @@ type AgentRuntime = {
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
 };
+
+/**
+ * 清洗 omp ask 的 questions 载荷。pi 端已做类型校验，但 RPC 输入是 unknown：
+ * 这里只放宽展示/回答必需字段，丢弃无 question 或非法 option 的条目，
+ * 保证 answer 数组与 id 顺序不会因为脏字段错位。
+ */
+function normalizeAskQuestions(raw: unknown): AgentUiAskQuestion[] {
+	if (!Array.isArray(raw)) return [];
+	const questions: AgentUiAskQuestion[] = [];
+	for (const [index, item] of raw.entries()) {
+		if (!item || typeof item !== "object") continue;
+		const source = item as Record<string, unknown>;
+		const question = typeof source.question === "string" ? source.question : "";
+		if (!question) continue;
+		const options: AgentUiAskOption[] = [];
+		if (Array.isArray(source.options)) {
+			for (const option of source.options) {
+				if (typeof option === "string") {
+					options.push({ label: option });
+					continue;
+				}
+				if (!option || typeof option !== "object") continue;
+				const opt = option as Record<string, unknown>;
+				if (typeof opt.label !== "string") continue;
+				options.push({
+					label: opt.label,
+					description: typeof opt.description === "string" ? opt.description : undefined,
+					preview: typeof opt.preview === "string" ? opt.preview : undefined,
+				});
+			}
+		}
+		const recommended =
+			typeof source.recommended === "number" &&
+			Number.isInteger(source.recommended) &&
+			source.recommended >= 0 &&
+			source.recommended < options.length
+				? source.recommended
+				: undefined;
+		questions.push({
+			id: typeof source.id === "string" && source.id ? source.id : `q${index + 1}`,
+			question,
+			header: typeof source.header === "string" ? source.header : undefined,
+			options,
+			multi: source.multi === true,
+			recommended,
+		});
+	}
+	// 任何一道题被丢弃都会让 answers 数量与 pi 的 questions 错位（pi 会拒绝整包），
+	// 因此宁可整体取消，也不提交半份问卷。
+	return questions.length === raw.length ? questions : [];
+}
 
 /** 创建一个带有全部 per-agent 状态默认值的 AgentRuntime。 */
 function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRuntime {
