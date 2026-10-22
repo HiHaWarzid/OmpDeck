@@ -1,3 +1,4 @@
+import { availableParallelism } from "node:os";
 import type { Worker } from "node:worker_threads";
 import type { SessionSummaryFacts } from "./sessionSummaryFacts";
 import type { SessionParseRequest, SessionParseResponse } from "./sessionParseProtocol";
@@ -20,9 +21,25 @@ interface WorkerSlot {
 export interface SessionParsePoolOptions {
   /** 测试可注入假 worker；生产由 sessionWorkerFactory 提供 electron-vite 的 ?nodeWorker 包装。 */
   createWorker: () => Worker;
-  /** 并发 worker 数。解析是 CPU 密集任务，默认 2，避免和主进程抢满核心。 */
+  /** 并发 worker 数；默认按 CPU 核数自适应（见 defaultPoolSize）。 */
   size?: number;
 }
+
+/**
+ * 冷启动要为数百个会话做整文件解析，2 个 worker 时主线程外的 CPU 利用率不足；
+ * 实测 12 核机器上 2→8 worker 可把 691 个会话的解析从 ~3.8s 降到 ~1.8s，
+ * 再往上收益递减且内存线性增长（约 11MB/worker）。因此至少保留 1 核给主进程/渲染进程，
+ * 上限 8，避免低核设备被 worker 挤占。
+ */
+function defaultPoolSize(): number {
+  return Math.min(8, Math.max(2, availableParallelism() - 1));
+}
+
+/**
+ * 扫描结束后 worker 仍会滞留约 11MB/个；空闲 30s 后回收，下一次扫描再按需创建。
+ * 30s 足够覆盖启动后的项目展开/扫描完成刷新等连续请求。
+ */
+const IDLE_WORKER_TTL_MS = 30_000;
 
 /**
  * 会话摘要解析 worker 池。
@@ -41,14 +58,16 @@ export class SessionParsePool {
   private readonly queue: ParseJob[] = [];
   private nextId = 1;
   private disposed = false;
+  private idleShutdown: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly options: SessionParsePoolOptions) {
-    this.size = Math.max(1, options.size ?? 2);
+    this.size = Math.max(1, options.size ?? defaultPoolSize());
   }
 
   parse(filePath: string, signal?: AbortSignal): Promise<SessionSummaryFacts> {
     if (this.disposed) return Promise.reject(new Error("session parse pool is disposed"));
     if (signal?.aborted) return Promise.reject(abortError());
+    this.cancelIdleShutdown();
 
     return new Promise<SessionSummaryFacts>((resolve, reject) => {
       const job: ParseJob = {
@@ -71,6 +90,7 @@ export class SessionParsePool {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelIdleShutdown();
     const error = new Error("session parse pool is disposed");
     for (const job of this.queue.splice(0)) this.rejectJob(job, error);
     const terminations: Promise<number>[] = [];
@@ -101,6 +121,37 @@ export class SessionParsePool {
       }
       this.dispatch(slot, job);
     }
+    this.scheduleIdleShutdownIfIdle();
+  }
+
+  /** 队列与在途任务都清空后启动回收计时；timer 不阻止进程退出。 */
+  private scheduleIdleShutdownIfIdle(): void {
+    if (this.disposed || this.idleShutdown) return;
+    if (this.queue.length > 0 || this.slots.size === 0) return;
+    for (const slot of this.slots) {
+      if (slot.current) return;
+    }
+    this.idleShutdown = setTimeout(() => {
+      this.idleShutdown = null;
+      if (this.disposed || this.queue.length > 0) return;
+      for (const slot of this.slots) {
+        if (slot.current) return;
+      }
+      const slots = [...this.slots];
+      this.slots.clear();
+      this.idle.length = 0;
+      if (process.env.PIDECK_PERF === "1") {
+        console.log(`[perf] session parse pool idle shutdown workers=${slots.length}`);
+      }
+      for (const slot of slots) void slot.worker.terminate().catch(() => 0);
+    }, IDLE_WORKER_TTL_MS);
+    this.idleShutdown.unref?.();
+  }
+
+  private cancelIdleShutdown(): void {
+    if (!this.idleShutdown) return;
+    clearTimeout(this.idleShutdown);
+    this.idleShutdown = null;
   }
 
   private spawn(): WorkerSlot {

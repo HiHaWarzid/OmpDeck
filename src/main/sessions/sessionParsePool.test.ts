@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { Worker } from "node:worker_threads";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { SessionParsePool } from "./sessionParsePool";
 
 class FakeWorker extends EventEmitter {
@@ -68,6 +68,43 @@ test("取消排队任务后，先到的任务仍能完成且不会重复派发",
   await expect(first).resolves.toMatchObject({ preview: "first.jsonl" });
   expect(worker.requests).toHaveLength(1);
   await pool.dispose();
+});
+
+test("worker 空闲超时后回收，下一次解析重新创建", async () => {
+  vi.useFakeTimers();
+  try {
+    const workers: FakeWorker[] = [];
+    const pool = new SessionParsePool({
+      createWorker: () => {
+        const worker = new FakeWorker();
+        workers.push(worker);
+        return worker as unknown as Worker;
+      },
+      size: 1,
+    });
+
+    const first = pool.parse("first.jsonl");
+    workers[0].respond(workers[0].requests[0].id, "first.jsonl");
+    await expect(first).resolves.toMatchObject({ preview: "first.jsonl" });
+
+    // 未到空闲 TTL：worker 保留，下一次解析复用同一实例。
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(workers[0].terminated).toBe(0);
+    const second = pool.parse("second.jsonl");
+    workers[0].respond(workers[0].requests[1].id, "second.jsonl");
+    await expect(second).resolves.toMatchObject({ preview: "second.jsonl" });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(workers[0].terminated).toBe(1);
+
+    const third = pool.parse("third.jsonl");
+    expect(workers).toHaveLength(2);
+    workers[1].respond(workers[1].requests[0].id, "third.jsonl");
+    await expect(third).resolves.toMatchObject({ preview: "third.jsonl" });
+    await pool.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("worker 崩溃会拒绝当前任务，并在下一次请求时重建", async () => {

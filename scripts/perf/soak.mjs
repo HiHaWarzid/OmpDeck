@@ -9,13 +9,19 @@
  * --duration 支持 30s / 30m / 8h。
  */
 import { spawn } from "node:child_process";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import electronPath from "electron";
 
 const root = process.cwd();
 const resultsDir = join(root, ".perf-results");
 const userDataDir = join(resultsDir, "user-data");
+/**
+ * 开发态主进程会把 userData 改成 `<dir>-dev`，采样文件和 Chromium profile 都落在
+ * 这个目录；两处都看，以免脚本在自己的输出目录里找不到样本。
+ */
+const sampleDirs = [userDataDir, `${userDataDir}-dev`];
+const startedAt = Date.now();
 
 function parseDuration(value) {
 	const match = /^(\d+)(s|m|h)$/.exec(value ?? "");
@@ -53,16 +59,28 @@ const deadline = setTimeout(() => stop(0), durationMs);
 deadline.unref?.();
 
 async function printSummary() {
-	const dir = join(userDataDir);
-	let files = [];
-	try {
-		files = (await readdir(dir)).filter((name) => /^perf-soak-.*\.jsonl$/.test(name));
-	} catch {
+	const files = [];
+	for (const dir of sampleDirs) {
+		try {
+			for (const name of await readdir(dir)) {
+				if (/^perf-soak-.*\.jsonl$/.test(name)) files.push(join(dir, name));
+			}
+		} catch {
+			// 目录不存在说明本次启动没有采样，继续看另一个候选目录。
+		}
+	}
+	// 只汇总本次启动产生的文件；旧 run 的样本留在目录里，不能混进当前结论。
+	const current = [];
+	for (const file of files) {
+		if ((await stat(file)).mtimeMs >= startedAt - 2_000) current.push(file);
+	}
+	if (current.length === 0) {
 		console.log("no soak samples found");
 		return;
 	}
-	for (const name of files) {
-		const lines = (await readFile(join(dir, name), "utf8")).trim().split("\n").filter(Boolean);
+	for (const file of current) {
+		const name = file.split(/[\\/]/).pop();
+		const lines = (await readFile(file, "utf8")).trim().split("\n").filter(Boolean);
 		if (lines.length < 2) {
 			console.log(`${name}: ${lines.length} sample(s)`);
 			continue;
