@@ -88,9 +88,13 @@ async function printSummary() {
 		const first = JSON.parse(lines[0]);
 		const last = JSON.parse(lines[lines.length - 1]);
 		const delta = (key) => last[key] - first[key];
+		// private 是提交内存，主判断指标；workingSet 只作参考（Windows 会换出）。
+		const metric = (sample, key) => sample.processes[key] ?? "?";
 		console.log(
 			`${name}: ${lines.length} samples, ${Math.round(delta("uptimeSec") / 60)} min, ` +
-				`renderer RSS ${first.processes.workingSetMb}→${last.processes.workingSetMb} MB, ` +
+				`private ${metric(first, "privateMb")}→${metric(last, "privateMb")} MB, ` +
+				`total WS ${metric(first, "workingSetMb")}→${metric(last, "workingSetMb")} MB, ` +
+				`peak WS ${metric(last, "peakWorkingSetMb")} MB, ` +
 				`main RSS ${first.main.rssMb}→${last.main.rssMb} MB, ` +
 				`active resources ${first.main.activeResources}→${last.main.activeResources}`,
 		);

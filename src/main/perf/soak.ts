@@ -13,15 +13,23 @@ const SAMPLE_INTERVAL_MS = 30_000;
 
 function summarizeProcesses(metrics: ProcessMetric[]) {
 	let workingSetKb = 0;
+	let peakWorkingSetKb = 0;
+	let privateKb = 0;
 	let cpuPercent = 0;
 	for (const metric of metrics) {
 		workingSetKb += metric.memory?.workingSetSize ?? 0;
+		peakWorkingSetKb += metric.memory?.peakWorkingSetSize ?? 0;
+		// Windows 会在空闲时把 working set 换出，单看 workingSet 会低估真实占用、
+		// 甚至掩盖泄漏；privateBytes 是提交内存，不受换页影响，是泄漏判断的主指标。
+		privateKb += metric.memory?.privateBytes ?? 0;
 		cpuPercent += metric.cpu?.percentCPUUsage ?? 0;
 	}
 	return {
 		processCount: metrics.length,
 		rendererCount: metrics.filter((metric) => metric.type === "Tab").length,
 		workingSetMb: Math.round(workingSetKb / 1024),
+		peakWorkingSetMb: Math.round(peakWorkingSetKb / 1024),
+		privateMb: Math.round(privateKb / 1024),
 		cpuPercent: Number(cpuPercent.toFixed(1)),
 	};
 }
