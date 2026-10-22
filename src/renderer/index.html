@@ -9,7 +9,7 @@
     />
     <title></title>
     <link rel="preload" href="./src/assets/fonts/PlantinNowVariable-Upright.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="./src/assets/fonts/PlantinNowVariable-Italic.woff2" as="font" type="font/woff2" crossorigin />
+    <!-- Italic 仅用于空状态/飞书样式，避免首屏多下载 92KB；字体本身仍按需加载。 -->
     <style>
       /* 启动画面：独立于 #root，React 挂载后淡出移除。
          唯一启动画面：主进程不再有前置 data URL loading 页（曾因跨文档导航

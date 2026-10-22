@@ -25,13 +25,17 @@ export function stripThinkingTags(text: string): string {
 
 /* ── 时间和摘要 ── */
 
+// 复用同一个 Intl 实例：侧栏/时间线/大纲会按行大量调用 formatTime，
+// 每次 new Date().toLocaleString 都会重建格式化器。
+const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+	month: "2-digit",
+	day: "2-digit",
+	hour: "2-digit",
+	minute: "2-digit",
+});
+
 export function formatTime(timestamp: number) {
-	return new Date(timestamp).toLocaleString(undefined, {
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
+	return TIME_FORMATTER.format(timestamp);
 }
 
 export function summarizeMessage(text: string) {
@@ -461,16 +465,49 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 
 /* ── 会话大纲 ── */
 
-export function buildOutline(messages: ChatMessage[]) {
-	return messages
-		.filter((message) => message.role === "user")
-		.map((message) => ({
-			id: message.id,
-			role: message.role,
-			title: summarizeMessage(message.text),
-			time: formatTime(message.timestamp),
-		}))
-		.filter((item) => item.title);
+export type OutlineItem = {
+	id: string;
+	role: string;
+	title: string;
+	time: string;
+};
+
+// 流式期间 transcript 每 50ms 更新一次，但绝大多数历史 user 消息对象引用不变。
+// 用 WeakMap 缓存每条消息的大纲项，避免反复跑摘要正则和 Intl 格式化；
+// 未变化的消息返回同一个 item 对象，宿主据此保持 items 数组引用稳定。
+const outlineItemCache = new WeakMap<
+	ChatMessage,
+	{ text: string; timestamp: number; item: OutlineItem | null }
+>();
+
+export function buildOutline(messages: ChatMessage[]): OutlineItem[] {
+	const result: OutlineItem[] = [];
+	for (const message of messages) {
+		if (message.role !== "user") continue;
+		const cached = outlineItemCache.get(message);
+		// 同一对象也可能被原地改写（刷新/编辑），因此再核对一次文本与时间戳。
+		let item = cached && cached.text === message.text && cached.timestamp === message.timestamp
+			? cached.item
+			: undefined;
+		if (item === undefined) {
+			const title = summarizeMessage(message.text);
+			item = title
+				? {
+						id: message.id,
+						role: message.role,
+						title,
+						time: formatTime(message.timestamp),
+					}
+				: null;
+			outlineItemCache.set(message, {
+				text: message.text,
+				timestamp: message.timestamp,
+				item,
+			});
+		}
+		if (item) result.push(item);
+	}
+	return result;
 }
 
 /* ── 输入框建议 ── */

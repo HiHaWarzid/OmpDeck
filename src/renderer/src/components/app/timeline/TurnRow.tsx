@@ -9,7 +9,6 @@ import {
 	type CSSProperties,
 	type ReactNode,
 } from "react";
-import { toBlob } from "html-to-image";
 import {
 	type ToolGroupItem,
 	type MessageItem,
@@ -58,6 +57,8 @@ async function copyElementAsPng(element: HTMLElement) {
 	}
 	let blob: Blob | null = null;
 	try {
+		// 截图库只在用户点击“复制为图片”时加载，避免 28KB 依赖进入首屏。
+		const { toBlob } = await import("html-to-image");
 		blob = await toBlob(clone, {
 			cacheBust: true,
 			pixelRatio: Math.min(2, window.devicePixelRatio || 1),

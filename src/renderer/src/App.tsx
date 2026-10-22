@@ -150,14 +150,11 @@ import {
   SessionContextMenu,
 } from "./components/app/menus/ContextMenus";
 import { ConversationOutline } from "./components/app/drawers/ConversationOutline";
-import { FilesDrawer } from "./components/app/drawers/FilesDrawer";
-import { SessionsDrawer } from "./components/app/drawers/SessionsDrawer";
 import {
   AgentStatusIndicator,
   BrandLockup,
   ProjectAvatar,
 } from "./components/app/brand/Brand";
-import { EnvironmentDialog } from "./components/app/modals/EnvironmentDialog";
 import { ImagePreviewModal } from "./components/app/timeline/TurnRow";
 import {
   ComposerModePicker,
@@ -166,7 +163,6 @@ import {
   ThinkingPicker,
 } from "./components/app/composer/ComposerPickers";
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
-import { SessionManagerModal } from "./components/app/modals/SessionManagerModal";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
 import { BatchAskInlineBar } from "./components/app/tools/AskQuestionCard";
 import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
@@ -175,10 +171,8 @@ import {
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
 } from "./components/app/widgets/widgetKeys";
-import { WorktreeCreateDialog } from "./components/app/modals/WorktreeCreateDialog";
 import type { DrawerPanel, WidgetLine } from "./components/app/types";
-import { GitPanel } from "./components/app/GitPanel";
-import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
+import { navigateTo } from "./components/app/browserNavigation";
 import { ConversationOutlineHost, ConversationPane, type ConversationPaneHandle } from "./components/app/ConversationPane";
 import { SidebarTree } from "./components/app/sidebar/SidebarTree";
 import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
@@ -219,6 +213,16 @@ const SessionImportModal = lazy(() => import("./components/app/SessionImportModa
 const ProjectResourcesModal = lazy(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
 const UpdateErrorModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
 const UpToDateModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
+// 右侧抽屉面板与低频弹框：默认不挂载，静态导入会把 GitPanel/图标表/面板样式
+// 整块拖进首屏。改为 lazy 后由抽屉/弹框的打开状态触发加载。
+const GitPanel = lazy(() => import("./components/app/GitPanel").then((m) => ({ default: m.GitPanel })));
+const BrowserPanel = lazy(() => import("./components/app/BrowserPanel").then((m) => ({ default: m.BrowserPanel })));
+const FilesDrawer = lazy(() => import("./components/app/drawers/FilesDrawer").then((m) => ({ default: m.FilesDrawer })));
+const SessionsDrawer = lazy(() => import("./components/app/drawers/SessionsDrawer").then((m) => ({ default: m.SessionsDrawer })));
+const EnvironmentDialog = lazy(() => import("./components/app/modals/EnvironmentDialog").then((m) => ({ default: m.EnvironmentDialog })));
+const SessionManagerModal = lazy(() => import("./components/app/modals/SessionManagerModal").then((m) => ({ default: m.SessionManagerModal })));
+const WorktreeCreateDialog = lazy(() => import("./components/app/modals/WorktreeCreateDialog").then((m) => ({ default: m.WorktreeCreateDialog })));
+const LazyPanelFallback = <div className="drawer-panel-loading">{t("common.loading")}</div>;
 import { createDefaultExternalEditorSettings } from "../../shared/types";
 import type {
   AgentRuntimeState,
@@ -5940,6 +5944,98 @@ export function App() {
     setDrawerCollapsed(false);
   };
 
+  // SidebarTree 是 memo 边界，但这些处理函数每次 App 渲染都会重新声明；
+  // 直接把函数传进去会让浅比较恒失败，流式/输入等无关更新都会重算整棵侧栏。
+  // 通过 ref 转发到最新实现，保持传入引用的恒定（与 GitPanel 的 stable* 同策略）。
+  const latestSidebarHandlersRef = useRef({
+    addProject,
+    toggleListCollapsed,
+    setProjectSidebarExpanded,
+    handleProjectDragStart,
+    handleProjectDragOver,
+    handleProjectDragLeave,
+    handleProjectDrop,
+    finishProjectDrag,
+    refreshProjectSessions,
+    ensureAgentMessagesLoaded,
+    openSidebarSession,
+    createAgent,
+    showToast,
+    requestRemoveWorktree,
+    toggleSubagentGroup,
+    adjustMenuPos,
+  });
+  latestSidebarHandlersRef.current = {
+    addProject,
+    toggleListCollapsed,
+    setProjectSidebarExpanded,
+    handleProjectDragStart,
+    handleProjectDragOver,
+    handleProjectDragLeave,
+    handleProjectDrop,
+    finishProjectDrag,
+    refreshProjectSessions,
+    ensureAgentMessagesLoaded,
+    openSidebarSession,
+    createAgent,
+    showToast,
+    requestRemoveWorktree,
+    toggleSubagentGroup,
+    adjustMenuPos,
+  };
+  const stableSidebarHandlers = useMemo(
+    () => ({
+      addProject: () => latestSidebarHandlersRef.current.addProject(),
+      toggleListCollapsed: () => latestSidebarHandlersRef.current.toggleListCollapsed(),
+      setProjectSidebarExpanded: (projectId: string, forceExpand?: boolean) =>
+        latestSidebarHandlersRef.current.setProjectSidebarExpanded(projectId, forceExpand),
+      handleProjectDragStart: (
+        event: React.DragEvent<HTMLButtonElement>,
+        projectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDragStart(event, projectId),
+      handleProjectDragOver: (
+        event: React.DragEvent<HTMLButtonElement>,
+        projectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDragOver(event, projectId),
+      handleProjectDragLeave: (projectId: string) =>
+        latestSidebarHandlersRef.current.handleProjectDragLeave(projectId),
+      handleProjectDrop: (
+        event: React.DragEvent<HTMLButtonElement>,
+        targetProjectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDrop(event, targetProjectId),
+      finishProjectDrag: () => latestSidebarHandlersRef.current.finishProjectDrag(),
+      refreshProjectSessions: (projectId: string, silent?: boolean) =>
+        latestSidebarHandlersRef.current.refreshProjectSessions(projectId, silent),
+      ensureAgentMessagesLoaded: (agentId: string) =>
+        latestSidebarHandlersRef.current.ensureAgentMessagesLoaded(agentId),
+      openSidebarSession: (projectId: string, session: SessionSummary) =>
+        latestSidebarHandlersRef.current.openSidebarSession(projectId, session),
+      createAgent: (
+        projectId?: string,
+        sessionPath?: string,
+        title?: string,
+        noSession?: boolean,
+      ) => latestSidebarHandlersRef.current.createAgent(projectId, sessionPath, title, noSession),
+      showToast: (message: string, duration?: number) =>
+        latestSidebarHandlersRef.current.showToast(message, duration),
+      requestRemoveWorktree: (
+        parentProjectId: string,
+        worktreePath: string,
+        childProject: Project | undefined,
+      ) =>
+        latestSidebarHandlersRef.current.requestRemoveWorktree(
+          parentProjectId,
+          worktreePath,
+          childProject,
+        ),
+      toggleSubagentGroup: (key: string) =>
+        latestSidebarHandlersRef.current.toggleSubagentGroup(key),
+      adjustMenuPos: (x: number, y: number, width?: number, height?: number) =>
+        latestSidebarHandlersRef.current.adjustMenuPos(x, y, width, height),
+    }),
+    [],
+  );
+
   return (
     <div
       className={[
@@ -6054,14 +6150,7 @@ export function App() {
         projectDragPreventClickRef={projectDragPreventClickRef}
         api={api}
         setSearch={setSearch}
-        addProject={addProject}
-        toggleListCollapsed={toggleListCollapsed}
-        setProjectSidebarExpanded={setProjectSidebarExpanded}
-        handleProjectDragStart={handleProjectDragStart}
-        handleProjectDragOver={handleProjectDragOver}
-        handleProjectDragLeave={handleProjectDragLeave}
-        handleProjectDrop={handleProjectDrop}
-        finishProjectDrag={finishProjectDrag}
+        {...stableSidebarHandlers}
         setProjectMenu={setProjectMenu}
         setSessionMenu={setSessionMenu}
         setAgentMenu={setAgentMenu}
@@ -6076,14 +6165,6 @@ export function App() {
         setConfigOpen={setConfigOpen}
         setFeedbackOpen={setFeedbackOpen}
         setAfkOpen={setAfkOpen}
-        refreshProjectSessions={refreshProjectSessions}
-        ensureAgentMessagesLoaded={ensureAgentMessagesLoaded}
-        openSidebarSession={openSidebarSession}
-        createAgent={createAgent}
-        showToast={showToast}
-        requestRemoveWorktree={requestRemoveWorktree}
-        toggleSubagentGroup={toggleSubagentGroup}
-        adjustMenuPos={adjustMenuPos}
       />
 
       <div
@@ -7360,11 +7441,13 @@ export function App() {
 
             {drawerContentPanel === "browser" && (
               <div className="drawer-content-frame">
-                <BrowserPanel
-                  hideChromeClose
-                  onClose={() => setDrawer(null)}
-                  onToggleFullscreen={() => setBrowserFullscreen(true)}
-                />
+                <Suspense fallback={LazyPanelFallback}>
+                  <BrowserPanel
+                    hideChromeClose
+                    onClose={() => setDrawer(null)}
+                    onToggleFullscreen={() => setBrowserFullscreen(true)}
+                  />
+                </Suspense>
               </div>
             )}
 
@@ -7373,16 +7456,18 @@ export function App() {
                 {activeProjectId ? (
                   <div className="git-drawer-stack" data-detail-open={Boolean(gitDrawerDiff && gitDiffDisplayMode === "drawer")}>
                     <div className="git-drawer-source" aria-hidden={Boolean(gitDrawerDiff && gitDiffDisplayMode === "drawer")}>
-                      <GitPanel
-                        projectId={activeProjectId}
-                        projectRoot={activeProject?.path}
-                        git={api.git}
-                        onOpenCommitFileDiff={stableOpenCommitFileDiff}
-                        onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
-                        initialBranchInfo={activeGitInfo}
-                        onSwitchBranch={stableSwitchBranch}
-                        onCreateBranch={stableCreateBranch}
-                      />
+                      <Suspense fallback={LazyPanelFallback}>
+                        <GitPanel
+                          projectId={activeProjectId}
+                          projectRoot={activeProject?.path}
+                          git={api.git}
+                          onOpenCommitFileDiff={stableOpenCommitFileDiff}
+                          onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
+                          initialBranchInfo={activeGitInfo}
+                          onSwitchBranch={stableSwitchBranch}
+                          onCreateBranch={stableCreateBranch}
+                        />
+                      </Suspense>
                     </div>
                     {gitDrawerDiff && gitDrawerDiff.projectId === activeProjectId && gitDiffDisplayMode === "drawer" && (
                       <div className="git-drawer-detail">
@@ -7442,6 +7527,7 @@ export function App() {
                         </div>
                       }
                     >
+                      <Suspense fallback={LazyPanelFallback}>
                       <FilesDrawer
                         files={files}
                         expandedDirs={expandedDirs}
@@ -7506,6 +7592,7 @@ export function App() {
                         }}
                         projectRoot={projects.find((p) => p.id === activeProjectId)?.path}
                       />
+                      </Suspense>
                     </LazyWrapper>
                   </div>
                   {editorMode === "drawer" && activeTab && (
@@ -7558,6 +7645,7 @@ export function App() {
               </div>
             }
           >
+            <Suspense fallback={LazyPanelFallback}>
             <SessionsDrawer
               project={sessionsProject}
               sessions={(sessionsProjectId && sessionSourceFilter[sessionsProjectId]) ? sessions.filter(
@@ -7591,6 +7679,7 @@ export function App() {
               onExportSession={exportHistorySession}
               onDeleteSession={deleteHistorySession}
             />
+            </Suspense>
           </LazyWrapper>
         ) : null}
       </aside>
@@ -7965,29 +8054,31 @@ export function App() {
         </div>
       )}
       {sessionManagerProject && (
-        <SessionManagerModal
-          sessions={sessionsByProject[sessionManagerProject.id] ?? []}
-          onClose={() => setSessionManagerProject(null)}
-          onRename={(session) => {
-            setSessionManagerProject(null);
-            openSessionRename(sessionManagerProject.id, session);
-          }}
-          onExport={(session) => {
-            setSessionManagerProject(null);
-            void exportHistorySession(session);
-          }}
-          onDelete={async (sessions) => {
-            for (const session of sessions) {
-              await api.sessions.delete(session.filePath);
-            }
-            showToast(t("app.sessionDeleted"), 2200);
-            const projectId = sessionManagerProject.id;
-            // 先关闭弹框，避免列表数据在刷新期间显示不一致
-            setSessionManagerProject(null);
-            await refreshSessions(projectId);
-            await refreshProjectSessions(projectId);
-          }}
-        />
+        <Suspense fallback={null}>
+          <SessionManagerModal
+            sessions={sessionsByProject[sessionManagerProject.id] ?? []}
+            onClose={() => setSessionManagerProject(null)}
+            onRename={(session) => {
+              setSessionManagerProject(null);
+              openSessionRename(sessionManagerProject.id, session);
+            }}
+            onExport={(session) => {
+              setSessionManagerProject(null);
+              void exportHistorySession(session);
+            }}
+            onDelete={async (sessions) => {
+              for (const session of sessions) {
+                await api.sessions.delete(session.filePath);
+              }
+              showToast(t("app.sessionDeleted"), 2200);
+              const projectId = sessionManagerProject.id;
+              // 先关闭弹框，避免列表数据在刷新期间显示不一致
+              setSessionManagerProject(null);
+              await refreshSessions(projectId);
+              await refreshProjectSessions(projectId);
+            }}
+          />
+        </Suspense>
       )}
       {projectResourcesProject && (
         <Suspense fallback={null}>
@@ -8057,22 +8148,25 @@ export function App() {
 
 
       {worktreeCreateDialog && (
-        <WorktreeCreateDialog
-          projectId={worktreeCreateDialog.projectId}
-          creating={worktreeCreating}
-          onCreate={async (branchName) => {
-            try {
-              await createWorktree(worktreeCreateDialog.projectId, branchName);
-              setWorktreeCreateDialog(null);
-            } catch {
-              // createWorktree 内部已通过 toast 反馈错误，这里只阻止关闭弹框，
-              // 便于用户修改名称后重试。
-            }
-          }}
-          onClose={() => setWorktreeCreateDialog(null)}
-        />
+        <Suspense fallback={null}>
+          <WorktreeCreateDialog
+            projectId={worktreeCreateDialog.projectId}
+            creating={worktreeCreating}
+            onCreate={async (branchName) => {
+              try {
+                await createWorktree(worktreeCreateDialog.projectId, branchName);
+                setWorktreeCreateDialog(null);
+              } catch {
+                // createWorktree 内部已通过 toast 反馈错误，这里只阻止关闭弹框，
+                // 便于用户修改名称后重试。
+              }
+            }}
+            onClose={() => setWorktreeCreateDialog(null)}
+          />
+        </Suspense>
       )}
       {environmentDialog && (
+        <Suspense fallback={null}>
         <EnvironmentDialog
           status={piStatus}
           checking={piChecking}
@@ -8154,6 +8248,7 @@ export function App() {
             showToast(t("environment.checkFlagCleared"));
           }}
         />
+        </Suspense>
       )}
       {promptTemplatePickerOpen && (
         <PromptTemplatePicker
@@ -8542,16 +8637,18 @@ filePath={gitDrawerDiff.filePath}
       {browserFullscreen && (
         <div className="modal-backdrop" onClick={() => setBrowserFullscreen(false)}>
           <div className="browser-modal" onClick={(e) => e.stopPropagation()}>
-            <BrowserPanel
-              isFullscreen
-              onClose={() => setBrowserFullscreen(false)}
-              onMinimize={() => {
-                setBrowserFullscreen(false);
-                lastToolDrawerRef.current = "browser";
-                setDrawer("browser");
-                setDrawerCollapsed(false);
-              }}
-            />
+            <Suspense fallback={LazyPanelFallback}>
+              <BrowserPanel
+                isFullscreen
+                onClose={() => setBrowserFullscreen(false)}
+                onMinimize={() => {
+                  setBrowserFullscreen(false);
+                  lastToolDrawerRef.current = "browser";
+                  setDrawer("browser");
+                  setDrawerCollapsed(false);
+                }}
+              />
+            </Suspense>
           </div>
         </div>
       )}

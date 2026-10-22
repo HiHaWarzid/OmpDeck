@@ -46,9 +46,22 @@ function katexWoff2OnlyPlugin(): Plugin {
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
+    // Electron 主进程产物每次启动都要解析。electron-vite 默认 minify:false，
+    // 这里显式压缩；keepNames 保留函数/类名，生产日志和崩溃堆栈仍可定位到具体函数。
+    build: {
+      minify: "esbuild",
+      sourcemap: false,
+    },
+    esbuild: {
+      keepNames: true,
+    },
   },
   preload: {
     plugins: [externalizeDepsPlugin()],
+    build: {
+      minify: "esbuild",
+      sourcemap: false,
+    },
   },
   renderer: {
     // Windows 上 localhost 可能优先解析到 IPv6 ::1，Electron 加载 dev server 时会超时；固定 IPv4 保证本机访问稳定。
@@ -65,6 +78,9 @@ export default defineConfig({
     },
     plugins: [react(), tailwindcss(), katexWoff2OnlyPlugin()],
     build: {
+      // 渲染进程是首屏最大产物：默认 minify:false 会保留注释和完整标识符，
+      // 首屏约 2.1MB JS。开启 esbuild 后显著减少读取/解析时间。
+      minify: "esbuild",
       // 不计算 gzip 压缩后大小（节约构建时间）
       reportCompressedSize: false,
       // CSS 压缩使用 esbuild（比 cssnano 快）
@@ -99,8 +115,8 @@ export default defineConfig({
             if (id.includes("/node_modules/lucide-react/")) {
               return "vendor-icons";
             }
-            // html-to-image 被时间线静态引用（复制图片），不能并入 vendor-markdown：
-            // 否则整个 react-markdown/KaTeX 栈会被入口 chunk 静态拉回首屏。
+            // html-to-image 由“复制为图片”按需 dynamic import，独立成小 chunk；
+            // 不能并入 vendor-markdown，避免复制图片时连带加载整条 markdown 渲染栈。
             if (id.includes("/node_modules/html-to-image/")) {
               return "vendor-image";
             }

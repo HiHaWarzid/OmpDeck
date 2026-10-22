@@ -44,15 +44,19 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 	const isStreamingThinking =
 		props.startedAt != null &&
 		(props.endedAt == null || props.endedAt < props.startedAt);
-	const foldedLine = (() => {
-		const clean = stripAnsi(props.text).trim();
-		if (!clean) return "";
-		if (isStreamingThinking) {
-			const lastLine = clean.split("\n").filter(Boolean).pop() ?? "";
-			return lastLine;
-		}
-		return clean.split("\n").find((l) => l.trim()) ?? clean;
-	})();
+	// 折叠摘要只在收起时可见。展开态（默认）每个流式 delta 都对全文跑
+	// stripAnsi/split/filter 是纯浪费，长推理下会放大成 O(n²)。
+	const foldedLine = !expanded
+		? (() => {
+				const clean = stripAnsi(props.text).trim();
+				if (!clean) return "";
+				if (isStreamingThinking) {
+					const lastLine = clean.split("\n").filter(Boolean).pop() ?? "";
+					return lastLine;
+				}
+				return clean.split("\n").find((l) => l.trim()) ?? clean;
+			})()
+		: "";
 	return (
 		<section
 			className={`thinking-card${expanded ? " expanded" : ""}${isStreamingThinking ? " thinking-card--streaming" : ""}`}

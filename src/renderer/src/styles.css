@@ -48,7 +48,7 @@
 }
 @font-face {
   font-family: "PiDeckCommitMono";
-  src: url("./assets/fonts/CommitMono-400-Regular.otf") format("opentype");
+  src: url("./assets/fonts/CommitMono-400-Regular.woff2") format("woff2");
   font-style: normal;
   font-weight: 400;
   font-display: swap;
@@ -9275,6 +9275,15 @@ body.is-composer-resizing .composer-resize-handle::after {
   overflow: hidden;
   /* 强制子像素抗锯齿，避免 GPU 合成层导致 ClearType 降级为灰度渲染 */
   -webkit-font-smoothing: subpixel-antialiased;
+}
+/* lazy 面板加载占位：与抽屉内容区同尺寸，避免 chunk 到达时布局跳动。 */
+.drawer-panel-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-control);
 }
 .drawer-restore {
   position: fixed;

@@ -33,7 +33,7 @@ import { EmptyState } from "./brand/Brand";
 import { MultiSelectModal } from "./modals/MultiSelectModal";
 import { MessageListContent } from "./MessageListContent";
 import { buildStreamState } from "./streamStateSelector";
-import { buildOutline, getMultiSelectImageCaptureIds, groupToolMessages } from "./AppUtils";
+import { buildOutline, getMultiSelectImageCaptureIds, groupToolMessages, type OutlineItem } from "./AppUtils";
 import { stripMarkdown } from "./format";
 
 type AskResponse = {
@@ -632,11 +632,23 @@ export function ConversationOutlineHost(props: {
 }) {
 	const transcript = useWorkspaceSlice(props.activeAgentId, "transcript");
 	const messages = transcript?.messages;
-	const items = useMemo(
-		() => (messages ? buildOutline(messages) : EMPTY_OUTLINE),
-		[messages],
-	);
+	const stableItemsRef = useRef<OutlineItem[]>(EMPTY_OUTLINE);
+	const items = useMemo(() => {
+		if (!messages) return EMPTY_OUTLINE;
+		const next = buildOutline(messages);
+		const previous = stableItemsRef.current;
+		// 历史 user 消息未变时复用旧数组，避免下游 ConversationOutline
+		// 在每个流式 delta 上都被重建（即使只有 assistant 文本增长）。
+		if (
+			previous.length === next.length &&
+			next.every((item, index) => item === previous[index])
+		) {
+			return previous;
+		}
+		stableItemsRef.current = next;
+		return next;
+	}, [messages]);
 	return <>{props.children(items)}</>;
 }
 
-const EMPTY_OUTLINE: Array<{ id: string; role: string; title: string; time: string }> = [];
+const EMPTY_OUTLINE: OutlineItem[] = [];

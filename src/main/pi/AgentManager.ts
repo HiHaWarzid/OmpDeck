@@ -1,6 +1,7 @@
 import { app, type BrowserWindow, Notification } from "electron";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
+import type { Worker } from "node:worker_threads";
 import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -305,10 +306,13 @@ export class AgentManager {
 		private readonly processFactory: AgentProcessFactory = createRealAgentProcess,
 		/** 空响应兜底超时（毫秒）；测试可注入更小值。 */
 		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
+		/** 生产注入归档解析 worker；测试缺省时在主线程解析。 */
+		createArchiveWorker?: () => Worker,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
+			createArchiveWorker,
 			logger: this.appLogger,
 		});
 	}

@@ -190,6 +190,7 @@ import { QuickGenProcess } from "./pi/QuickGenProcess";
 import { ensureAllPiSettingsDefaults } from "./pi/PiSettingsDefaults";
 import { SessionScanner } from "./sessions/SessionScanner";
 import { createSessionParseWorker } from "./sessions/sessionWorkerFactory";
+import { createSessionArchiveWorker } from "./sessions/sessionArchiveWorkerFactory";
 import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
 import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
@@ -1275,6 +1276,9 @@ app.whenReady().then(async () => {
 		},
 		rpcLogger,
 		appLogger,
+		undefined,
+		undefined,
+		createSessionArchiveWorker,
 	);
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),
