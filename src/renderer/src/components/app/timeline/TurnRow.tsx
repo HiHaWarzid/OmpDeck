@@ -38,6 +38,7 @@ import type { ChatMessage, ImageContent } from "../../../../../shared/types";
 import { parseRichInputChips, unwrapFileChipPath } from "../RichInput";
 import { formatDuration, formatTime, stripAnsi, stripMarkdown, stripThinkingTags } from "../format";
 import { AssistantText } from "./AssistantText";
+import { MessageImages } from "./MessageImages";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolGroupCard } from "../tools/ToolCards";
 import type { DiffFileHandler } from "../types";
@@ -399,7 +400,7 @@ export const TurnRow = memo(function TurnRow(props: {
 			);
 		}
 		if (item.kind === "tool-group") {
-			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
+			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} onPreviewImage={props.onPreviewImage} />;
 		}
 		if (item.kind === "message" && item.message.role === "assistant") {
 			const txt = sanitizedMessageText(item.message);
@@ -743,19 +744,12 @@ export const UserBubble = memo(function UserBubble(props: {
 				</div>
 			)}
 			{message.images && message.images.length > 0 && (
-				<div className="user-turn-attachments">
-					{message.images.map((img, index) => (
-						<img
-							key={index}
-							src={`data:${img.mimeType};base64,${img.data}`}
-							alt={t("app.imageAlt", { index: index + 1 })}
-							className="user-turn-attachment"
-							loading="lazy"
-							decoding="async"
-							onClick={() => props.onPreviewImage(img)}
-						/>
-					))}
-				</div>
+				<MessageImages
+					images={message.images}
+					onPreviewImage={props.onPreviewImage}
+					className="user-turn-attachments"
+					imageClassName="user-turn-attachment"
+				/>
 			)}
 			{cleanText && !editing && (
 				<div className="user-turn-bubble">

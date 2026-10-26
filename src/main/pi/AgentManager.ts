@@ -329,8 +329,14 @@ export class AgentManager {
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
 			createArchiveWorker,
+			getBlobsDir: () => this.blobsDir(),
 			logger: this.appLogger,
 		});
+	}
+
+	/** omp blob store 目录：本地 home 或 WSL home（windowsHome 已是 host 可读的 UNC 路径）。 */
+	private blobsDir(): string {
+		return join(this.wslEnvironment?.windowsHome ?? homedir(), ".omp", "agent", "blobs");
 	}
 
 	/**

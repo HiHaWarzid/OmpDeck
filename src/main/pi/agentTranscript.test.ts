@@ -159,6 +159,47 @@ describe("agent transcript", () => {
 		expect(s.messages[0].meta?.isError).toBe(false);
 	});
 
+	it("tool result images are attached on end and survive later updates without result", () => {
+		const s = createTranscriptState();
+		upsertToolMessage(s, {
+			agentId: AGENT,
+			event: { toolName: "read", toolCallId: "t9", args: { path: "a.png" } },
+			status: "running",
+			abortedDuringAsk: false,
+			now: 1,
+		});
+		expect(s.messages[0].images).toBeUndefined();
+
+		upsertToolMessage(s, {
+			agentId: AGENT,
+			event: {
+				toolName: "read",
+				toolCallId: "t9",
+				result: {
+					content: [
+						{ type: "text", text: "image" },
+						{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+					],
+				},
+			},
+			status: "done",
+			abortedDuringAsk: false,
+			now: 2,
+		});
+		expect(s.messages[0].images).toHaveLength(1);
+		expect(s.messages[0].images?.[0].mimeType).toBe("image/png");
+
+		// 后续事件不带 result 时沿用已有图片，不能把刚拿到的图片清掉
+		upsertToolMessage(s, {
+			agentId: AGENT,
+			event: { toolName: "read", toolCallId: "t9" },
+			status: "done",
+			abortedDuringAsk: false,
+			now: 3,
+		});
+		expect(s.messages[0].images).toHaveLength(1);
+	});
+
 	it("error tool results are flagged, and large results keep the full text out of the message", () => {
 		const s = createTranscriptState();
 		const big = "x".repeat(20_000);

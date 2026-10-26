@@ -12,6 +12,7 @@
  */
 
 import type { ChatMessage, ImageContent } from "../../shared/types";
+import { isBlobImageRef } from "./sessionBlobs";
 
 /** 工具结果文本截断阈值（字符数）；超出时 meta 标记 truncated 并缓存全文供「查看完整输出」。 */
 export const MAX_TOOL_RESULT_CHARS = 8000;
@@ -31,6 +32,42 @@ export function safeJson(value: unknown): string {
 /** 清理 ANSI 转义码（模型思考内容中常见终端颜色序列）。 */
 export function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
+/** 工具结果单次保留的图片上限：截图/读图类工具一次通常 1~3 张，超出部分只留文本。 */
+export const MAX_TOOL_RESULT_IMAGES = 8;
+/** 单张图片的 base64 上限（约 3MB 原图），防止一张超大图把 IPC 撑爆。 */
+export const MAX_TOOL_IMAGE_BASE64_CHARS = 4 * 1024 * 1024;
+/**
+ * 单条工具消息的图片总量上限（base64 字符）。
+ *
+ * 时间线总预算是 8MB（`MAX_TRANSCRIPT_BYTES`），裁剪只从头部裁、尾部消息始终保留，
+ * 所以单条消息必须自己设上限：否则 8 张 4MB 的图片能到 32MB，把整段历史挤出预算且
+ * 仍原样过 IPC。4MB 约为预算的一半，同时容得下多张普通截图（单张约 50~200KB）。
+ */
+export const MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS = 4 * 1024 * 1024;
+
+/**
+ * 从工具结果 content 中提取可直接渲染的图片块。
+ *
+ * 与 extractImages 的差异：
+ *   - `blob:sha256:` 引用串不是图片数据，渲染层无法解码，直接丢弃；
+ *     历史读取路径会先用 sessionBlobs 还原，还原失败时这里退化为无图而非坏图。
+ *   - 条数、单张体积、总量都设上限：工具结果图片会随消息一起过 IPC 并计入时间线预算。
+ *     超限时按原顺序保留前面的图片，后面的只留文本。
+ */
+export function extractToolResultImages(content: unknown): ImageContent[] {
+	const images: ImageContent[] = [];
+	let totalChars = 0;
+	for (const image of extractImages(content)) {
+		if (images.length >= MAX_TOOL_RESULT_IMAGES) break;
+		if (isBlobImageRef(image.data)) continue;
+		if (image.data.length > MAX_TOOL_IMAGE_BASE64_CHARS) continue;
+		if (totalChars + image.data.length > MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS) break;
+		images.push(image);
+		totalChars += image.data.length;
+	}
+	return images;
 }
 
 /** 从 pi 历史消息 content 中恢复图片附件，用于历史会话重新打开后的图片展示。 */

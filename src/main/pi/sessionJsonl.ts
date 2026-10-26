@@ -9,6 +9,7 @@ import { extractMessageText } from "./messageContent";
 import { convertAgentMessages, trimHistoryMessages } from "./messageTimeline";
 import { BoundedLruCache } from "./boundedLruCache";
 import { findLastUserMessageLine } from "./sessionEntryIds";
+import { resolveBlobImagesInMessages } from "./sessionBlobs";
 import {
 	emptySessionArchives,
 	extractSessionArchives,
@@ -72,6 +73,13 @@ export interface SessionJsonlDeps {
 	 * 未注入（测试/纯 Node）时退回主线程解析。
 	 */
 	createArchiveWorker?: () => Worker;
+	/**
+	 * omp blob store 目录（`<agent dir>/blobs`）。JSONL 里的图片被外置成
+	 * `blob:sha256:<hash>`，`readRecentMessages` / `readDisplayMessages` 这两个真正
+	 * 进入时间线的读取路径需要它还原成 base64；归档卡片只渲染纯文本，不还原。
+	 * 返回 null（未配置/纯 Node 测试）时保留引用串，渲染层按「无图」处理。
+	 */
+	getBlobsDir?: () => string | null;
 	/** 可选日志；未提供时静默。 */
 	logger?: SessionJsonlLogger;
 }
@@ -120,6 +128,11 @@ export class SessionJsonl {
 
 	private resolve(sessionPath: string): string {
 		return this.deps.resolveHostPath(sessionPath);
+	}
+
+	/** 当前 omp blob store 目录；未注入时为 null（保留引用串，不读盘）。 */
+	private blobsDir(): string | null {
+		return this.deps.getBlobsDir?.() ?? null;
 	}
 
 	/**
@@ -178,8 +191,9 @@ export class SessionJsonl {
 			}
 		}
 
-		// 只保留最近 maxTurns 轮对话
+		// 只保留最近 maxTurns 轮对话；先裁剪再还原 blob，避免为已丢弃的历史图片读盘
 		const trimmed = trimHistoryMessages(messageEntries, maxTurns);
+		resolveBlobImagesInMessages(trimmed, this.blobsDir());
 		const t1 = Date.now();
 
 		void this.deps.logger?.info("agent", "Recent messages read from session file", {
@@ -277,6 +291,9 @@ export class SessionJsonl {
 			.filter((entry) => entry.type === "message" && entry.message);
 		const rawMessages = currentEntries.map((entry) => entry.message);
 		const trimmed = trimHistoryMessages(rawMessages);
+		// blob 图片是引用串，只还原真正会进入时间线的那部分（与 readRecentMessages 同一策略）：
+		// 非活动分支、被 trim 掉的历史轮次、归档卡片都不渲染图片。
+		resolveBlobImagesInMessages(trimmed, this.blobsDir());
 		const trimStart = trimmed.length > 0 ? rawMessages.indexOf(trimmed[0]) : 0;
 		const activeEntryIds = currentEntries.slice(Math.max(0, trimStart)).map((entry) => entry.id);
 
@@ -479,6 +496,8 @@ export class SessionJsonl {
 		}
 
 		let archives: SessionArchives;
+		// 归档卡片只渲染纯文本（DiagnosticCards 的 ArchivedMessage），不还原 blob 图片：
+		// 在这里解码 base64 只会增加同步读盘与 IPC 体积，渲染端没有消费点。
 		if (sessionContent !== undefined) {
 			archives = extractSessionArchives(sessionContent, agentId, (detail) => {
 				void this.deps.logger?.warn("agent", "Failed to convert archived messages", {

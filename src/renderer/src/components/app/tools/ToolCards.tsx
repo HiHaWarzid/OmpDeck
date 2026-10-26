@@ -26,9 +26,10 @@ import {
 	ListTodo,
 } from "lucide-react";
 import { t } from "../../../i18n";
+import { MessageImages } from "../timeline/MessageImages";
 import { showNotice } from "../../../utils/notice";
 import { writeClipboard } from "../../../utils/clipboard";
-import type { ChatMessage, TodoItem } from "../../../../../shared/types";
+import type { ChatMessage, ImageContent, TodoItem } from "../../../../../shared/types";
 import { extractTodoItems, isTodoWriteToolName } from "../../../../../shared/todo";
 import { formatDuration, stripAnsi } from "../format";
 import type { DiffFileHandler } from "../types";
@@ -321,6 +322,7 @@ export const ToolCard = memo(function ToolCard(props: {
 	message: ChatMessage;
 	defaultOpen?: boolean;
 	onDiffFile?: DiffFileHandler;
+	onPreviewImage?: (image: ImageContent) => void;
 }) {
 	const toolName = getToolName(props.message);
 	// TodoWrite 默认展开：todo 列表是执行进度的主视图，折叠态只留一行进度摘要不够直观；
@@ -487,6 +489,20 @@ const statusLabel =
 					</button>
 				)}
 			</div>
+			{/*
+			 * 工具返回的图片（read 图片、浏览器截图、computer-use）：与用户消息共用
+			 * message-images 样式，点击走同一预览弹层。放在折叠区之外是因为图片本身就是
+			 * 工具结果的主内容——折叠起来会让读图/截图看起像「空结果」。缩略图限制更小，
+			 * 避免连续截图把时间线撑高。
+			 */}
+			{props.message.images && props.message.images.length > 0 && (
+				<MessageImages
+					images={props.message.images}
+					onPreviewImage={props.onPreviewImage}
+					className="message-images tool-card-images"
+					imageClassName="message-image"
+				/>
+			)}
 			{expanded && (
 				<div className="tool-card-content">
 					{isAskCard && askCard ? (
@@ -655,12 +671,18 @@ export const ToolGroupCard = memo(
 	function ToolGroupCard(props: {
 		group: ToolGroupItem;
 		onDiffFile?: DiffFileHandler;
+		onPreviewImage?: (image: ImageContent) => void;
 	}) {
 		return (
 			<section className="tool-group-card flat" data-message-id={props.group.id}>
 				<div className="tool-group-card-list">
 					{props.group.messages.map((message) => (
-						<ToolCard key={message.id} message={message} onDiffFile={props.onDiffFile} />
+						<ToolCard
+							key={message.id}
+							message={message}
+							onDiffFile={props.onDiffFile}
+							onPreviewImage={props.onPreviewImage}
+						/>
 					))}
 				</div>
 			</section>

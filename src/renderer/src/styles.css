@@ -5139,6 +5139,16 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   background: transparent;
   position: relative;
 }
+.tool-card-images {
+  /* 工具结果图片在折叠态也展示：它是结果本身，不隐藏；缩略图比消息图片更小，连续截图不撑高时间线 */
+  margin: 0;
+  /* 左右 10px 与工具卡头部文字对齐，上下用栅格 token */
+  padding: var(--space-1) 10px var(--space-2);
+}
+.tool-card-images .message-image {
+  max-width: 240px;
+  max-height: 180px;
+}
 .tool-card-detail {
   margin: 0;
   padding: var(--space-2);

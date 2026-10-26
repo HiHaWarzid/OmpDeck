@@ -11,6 +11,7 @@ import {
 	compactJsonLength,
 	estimateMessageBytes,
 	extractThinking,
+	extractToolResultImages,
 	extractToolResultText,
 	safeJson,
 	stripAnsi,
@@ -540,6 +541,13 @@ export function upsertToolMessage(
 	// 提取 ask_question 详情用于渲染提问卡片；支持批量（questions 数组）和单问题两种格式。
 	const askDetails = extractAskQuestionDetails(toolName, result, args);
 	const askCard = buildAskCard(askDetails, input.abortedDuringAsk);
+	// 工具返回的多模态内容（read 的图片、浏览器截图等）不再丢弃：
+	// extractToolResultText 只拼 text 块，图片单独提取后挂到消息上由工具卡渲染。
+	const resultContent =
+		result !== null && typeof result === "object" && "content" in result
+			? result.content
+			: result;
+	const images = extractToolResultImages(resultContent);
 	if (fullResultText.length > MAX_TOOL_RESULT_CHARS) {
 		cacheFullText(state, messageId, fullResultText);
 	}
@@ -566,6 +574,8 @@ export function upsertToolMessage(
 		existing.text = text;
 		existing.timestamp = now;
 		existing.meta = meta;
+		// 图片只在工具真正返回时出现：start/update 事件不带 result，不能把已有图片清掉。
+		if (images.length > 0) existing.images = images;
 		markDirtyFrom(state, existingIndex);
 	} else {
 		list.push({
@@ -575,6 +585,7 @@ export function upsertToolMessage(
 			text,
 			timestamp: now,
 			meta,
+			...(images.length > 0 ? { images } : {}),
 		});
 		markDirtyFrom(state, list.length - 1);
 	}

@@ -2,6 +2,7 @@ import type { ChatMessage } from "../../shared/types";
 import { extractResultDetails } from "../../shared/todo";
 import { extractMessageText } from "./messageContent";
 import { takeActiveEntryId } from "./sessionEntryIds";
+import { isBlobImageRef } from "./sessionBlobs";
 import {
 	buildAskCard,
 	extractAskQuestionDetails,
@@ -9,6 +10,7 @@ import {
 import {
 	extractImages,
 	extractThinking,
+	extractToolResultImages,
 	extractToolResultText,
 	safeJson,
 	truncateForDetail,
@@ -63,9 +65,12 @@ export function convertAgentMessages(
 				const taken = takeActiveEntryId(activeEntryIds, entryIndex);
 				entryIndex = taken.nextIndex;
 				const currentEntryId = taken.entryId;
-				const images = extractImages(typed.content);
+				const attachments = extractImages(typed.content);
+				// 未还原的 blob 引用串不能进 images：渲染层会拼成坏图。占位文本仍按原始附件数判断，
+				// 这样 blob 缺失（被清理/WSL 不可达）时退化为「[图片]」而不是整条消息消失。
+				const images = attachments.filter((image) => !isBlobImageRef(image.data));
 				const text = extractMessageText(typed.content) ||
-					(images.length > 0 ? "[图片]" : "");
+					(attachments.length > 0 ? "[图片]" : "");
 				if (!text.trim()) return [];
 				return [{
 					id: `${agentId}-history-${currentEntryId ?? index}`,
@@ -140,12 +145,16 @@ export function convertAgentMessages(
 					extractAskQuestionDetails(toolName, typed, historicalCall?.args),
 					aborted,
 				);
+				// 历史工具结果里的图片（含已由 sessionBlobs 还原的 blob）同样保留，
+				// 否则重开会话后读图/截图工具会显示成空结果。
+				const images = extractToolResultImages(typed.content);
 				return [{
 					id: `${agentId}-history-${currentEntryId ?? index}`,
 					agentId,
 					role: "tool" as const,
 					text: `${isError ? "✗" : "✓"} ${toolName}`,
 					timestamp: toTimestamp(typed.timestamp),
+					...(images.length > 0 ? { images } : {}),
 					meta: {
 						...(currentEntryId ? { entryId: currentEntryId } : {}),
 						_piDeckMsgSeq: index,

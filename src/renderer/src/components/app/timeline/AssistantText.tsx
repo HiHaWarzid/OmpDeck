@@ -8,9 +8,9 @@
  */
 import { lazy, memo, Suspense, useMemo } from "react";
 import { sameImageListForRender } from "../AppUtils";
-import { t } from "../../../i18n";
 import type { ImageContent } from "../../../../../shared/types";
 import { stripAnsi, stripThinkingTags } from "../format";
+import { MessageImages } from "./MessageImages";
 
 const LazyMarkdownBody = lazy(() =>
 	import("./MarkdownBody").then((m) => ({ default: m.MarkdownBody })),
@@ -47,19 +47,12 @@ export const AssistantText = memo(
 		const hasMath = useMemo(() => MATH_HINT_RE.test(cleanText), [cleanText]);
 
 		const imagesMarkup = props.images && props.images.length > 0 ? (
-			<div className="message-images">
-				{props.images.map((img, index) => (
-					<img
-						key={index}
-						src={`data:${img.mimeType};base64,${img.data}`}
-						alt={t("app.imageAlt", { index: index + 1 })}
-						className="message-image"
-						loading="lazy"
-						decoding="async"
-						onClick={() => props.onPreviewImage(img)}
-					/>
-				))}
-			</div>
+			<MessageImages
+				images={props.images}
+				onPreviewImage={props.onPreviewImage}
+				className="message-images"
+				imageClassName="message-image"
+			/>
 		) : null;
 
 		// 流式：纯文本 + pre-wrap，不做 markdown 解析（消除 O(n²) 全文重解析）。
