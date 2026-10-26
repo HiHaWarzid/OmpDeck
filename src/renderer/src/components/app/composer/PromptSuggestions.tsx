@@ -84,6 +84,7 @@ export function PromptSuggestions(props: {
 						) : (
 							<span className="command-palette-label">{item.label}</span>
 						)}
+						{item.hint ? <span className="command-palette-hint">{item.hint}</span> : null}
 						<span className="command-palette-desc">{item.description}</span>
 					</button>
 				);

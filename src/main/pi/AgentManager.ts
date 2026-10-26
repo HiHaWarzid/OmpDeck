@@ -25,6 +25,7 @@ import type {
 	ThinkingUpdate,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
 	createRealAgentProcess,
@@ -3198,7 +3199,11 @@ export class AgentManager {
 		runtime.lastPiEventAt = Date.now();
 		// 会话结束通知的静默窗口只看用户可感知的工作事件；session_info 是标题等
 		// 元数据，不能因为它刷新时间戳而让「已完成」通知一直不弹。
-		if (typed.type !== "session_info_changed" && typed.type !== "session_info_update") {
+		if (
+			typed.type !== "session_info_changed" &&
+			typed.type !== "session_info_update" &&
+			typed.type !== "available_commands_update"
+		) {
 			runtime.lastWorkEventAt = runtime.lastPiEventAt;
 		}
 
@@ -3214,6 +3219,17 @@ export class AgentManager {
 				runtime.tab.title = name;
 				this.emitState();
 			}
+		}
+
+		// 命令目录推送：omp 在启动和目录变化（/reload-plugins、扩展/技能热加载）时发出，
+		// 是斜线命令建议的唯一事实源。渲染层原先只在切换 Agent 时拉取一次，
+		// 运行中新增/移除的命令要等重启才可见。
+		if (typed.type === "available_commands_update") {
+			this.emit(ipcChannels.agentsCommandCatalog, {
+				agentId,
+				commands: normalizePiCommands(typed.commands),
+			});
+			return;
 		}
 
 		// omp 的本地斜线命令（/context、/tools、/session、/share 等）不进入 agent run：

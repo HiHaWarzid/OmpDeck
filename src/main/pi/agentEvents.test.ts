@@ -8,6 +8,7 @@ import type {
 	ChatMessage,
 } from "../../shared/types";
 import { AgentManager, isRpcLogWorthy } from "./AgentManager";
+import { ipcChannels } from "../../shared/ipc";
 import { showAppNotification } from "../notifications";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
@@ -811,4 +812,45 @@ test("command_output 落成 commandOutput 系统消息，同一命令多帧沿�
 	const second = runtime.transcript.messages.at(-1);
 	assert.equal(second?.meta?.type, "commandOutput");
 	assert.equal(second?.meta?.command, "context");
+});
+
+// ── 命令目录推送 ──────────────────────────────────────
+
+test("available_commands_update 归一化后推送到 agents:command-catalog，不落时间线", () => {
+	const manager = makeManager();
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "idle"));
+	inner.agents.set("a1", runtime);
+	const emit = vi.fn();
+	inner.emit = emit;
+
+	inner.handlePiEvent("a1", {
+		type: "available_commands_update",
+		commands: [
+			{
+				name: "fast",
+				description: "Toggle priority service tier",
+				source: "builtin",
+				input: { hint: "[on|off|status]" },
+				subcommands: [{ name: "on", description: "Enable" }],
+			},
+			{ name: "" },
+		],
+	});
+
+	assert.equal(emit.mock.calls.length, 1);
+	const [channel, payload] = emit.mock.calls[0] as [string, { agentId: string; commands: unknown[] }];
+	assert.equal(channel, ipcChannels.agentsCommandCatalog);
+	assert.equal(payload.agentId, "a1");
+	assert.deepEqual(payload.commands, [
+		{
+			name: "fast",
+			description: "Toggle priority service tier",
+			source: "builtin",
+			inputHint: "[on|off|status]",
+			subcommands: [{ name: "on", description: "Enable" }],
+		},
+	]);
+	// 目录更新是元数据，不应污染会话时间线
+	assert.equal(runtime.transcript.messages.length, 0);
 });

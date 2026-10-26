@@ -426,6 +426,8 @@ export const ipcTable = {
 		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
 		setThinking: { channel: "agents:set-thinking", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
+		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
+		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-manager" },
 		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager", web: true },
 		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
 		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe", pushFrom: "pet-index" },

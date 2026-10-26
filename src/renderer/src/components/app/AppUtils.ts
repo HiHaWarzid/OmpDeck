@@ -554,6 +554,12 @@ export function detectTrigger(
 			if (/\s/.test(fileSegment)) return null;
 			return { start: atBefore, char: "@", query: fileSegment };
 		}
+		// 子命令输入：`/fast on` 保留触发，让带 subcommands 的命令能继续提示第二段。
+		// 只放行「命令名 + 恰好一个子命令 token」，且 / 必须位于词首（行首或空白之后），
+		// 否则正文里的 "and/or something" 会被误判成命令；再出现空白即关闭，避免面板钉死。
+		const subMatch = /^([\w.:-]+) ([\w.:-]*)$/.exec(segment);
+		const charBeforeSlash = start > 0 ? before[start - 1] : "";
+		if (subMatch && (!charBeforeSlash || /\s/.test(charBeforeSlash))) return { start, char, query: segment };
 	}
 	if (/[\s@/&]/.test(segment)) return null;
 	const prevChar = start > 0 ? before[start - 1] : "";
@@ -582,6 +588,8 @@ export type SuggestionItem = {
 	label: string;
 	description: string;
 	value: string;
+	/** 命令参数提示（omp input.hint），渲染在命令名右侧，如 `[on|off|status]` */
+	hint?: string;
 	/** 不可选中的分组头；目录本身可选，不再使用 disabled 表示目录 */
 	disabled?: boolean;
 	/** 树形缩进层级（0=根目录），仅在 @ 无关键词时使用 */
@@ -600,81 +608,26 @@ export type SuggestionItem = {
 const HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES: Record<string, true> = { model: true };
 
 /**
- * 置顶命令名（暂空）：预留用于将特定内置命令在建议列表中提前。
- * 当前无置顶项，排序退化为原始 index 顺序。
- */
-const PINNED_COMMAND_NAMES: Record<string, true> = {};
-
-function isBuiltinDesktopCommand(command: PiCommand) {
-	return command.source == null || command.source === "builtin";
-}
-
-function isVisibleDesktopCommand(command: PiCommand) {
-	return !(
-		isBuiltinDesktopCommand(command) &&
-		Boolean(HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES[command.name.toLowerCase()])
-	);
-}
-
-/**
- * omp runtime 内置斜线命令清单（仅含 RPC 可执行命令）。
- * 在 RPC `prompt` 链路下真正可执行的内置命令--即 builtin-registry.ts 中
- * 定义了 `handle`（非 `handleTui`-only）的命令。`handleTui`-only 命令
- * （如 /plan、/goal、/vibe、/login）在 RPC 模式下不会被 runtime 拦截，
- * 只会当普通文本发给 LLM，因此不列入，避免误导用户。
+ * 命令目录的唯一事实源是 omp runtime（启动推送 + `agents.commands` 拉取）。
  *
- * description 取自 omp runtime 的 acpDescription/description（英文），
- * 与 runtime 返回的 extension/skill 命令描述语言保持一致。
- * 用户敲这些命令时，runtime 会通过 executeAcpBuiltinSlashCommand 执行，
- * 而非发给模型。
+ * 1. 隐藏「桌面已有等价入口」的内置命令（`model` 有专用模型选择器）；
+ * 2. 再按名字去重，保留先出现的可见项。顺序很关键：必须先隐藏再去重，
+ *    否则 builtin `model` 先占位后，扩展同名命令会被当作重复项丢掉，
+ *    用户可执行的命令从建议里消失。旧实现还维护过一份手写内置命令清单，
+ *    它曾与 runtime 漂移，凭空多出 /copy、/hotkeys、/settings、/vision。
  */
-function getBuiltinCommands(): PiCommand[] {
-	return [
-		{ name: "session", description: "Show or configure the current session", source: "builtin" },
-		{ name: "compact", description: "Manually compact the session context", source: "builtin" },
-		{ name: "export", description: "Export session to HTML file", source: "builtin" },
-		{ name: "dump", description: "Copy session transcript to clipboard", source: "builtin" },
-		{ name: "share", description: "Share session via an encrypted link", source: "builtin" },
-		{ name: "copy", description: "Pick text or code from the conversation to copy", source: "builtin" },
-		{ name: "tools", description: "Show tools currently visible to the agent", source: "builtin" },
-		{ name: "context", description: "Show estimated context usage breakdown", source: "builtin" },
-		{ name: "todo", description: "View or modify the agent's todo list", source: "builtin" },
-		{ name: "jobs", description: "Show async background jobs status", source: "builtin" },
-		{ name: "usage", description: "Show provider usage and limits", source: "builtin" },
-		{ name: "stats", description: "Launch the local stats dashboard", source: "builtin" },
-		{ name: "changelog", description: "Show changelog entries", source: "builtin" },
-		{ name: "hotkeys", description: "Show all keyboard shortcuts", source: "builtin" },
-		{ name: "settings", description: "Open settings menu", source: "builtin" },
-		{ name: "mcp", description: "Manage MCP servers (add, list, remove, test)", source: "builtin" },
-		{ name: "ssh", description: "Manage SSH hosts (add, list, remove)", source: "builtin" },
-		{ name: "marketplace", description: "Manage marketplace plugin sources and installed plugins", source: "builtin" },
-		{ name: "plugins", description: "View and manage installed plugins", source: "builtin" },
-		{ name: "reload-plugins", description: "Reload all plugins (skills, commands, hooks, tools, agents, MCP)", source: "builtin" },
-		{ name: "memory", description: "Inspect and operate memory maintenance", source: "builtin" },
-		{ name: "fast", description: "Toggle priority service tier", source: "builtin" },
-		{ name: "computer", description: "Toggle the native computer-use tool for this session", source: "builtin" },
-		{ name: "vision", description: "Control the inspect_image vision-delegation tool", source: "builtin" },
-		{ name: "prewalk", description: "Switch to a fast/cheap model at the next action", source: "builtin" },
-		{ name: "advisor", description: "Toggle the advisor (a second model that reviews each turn)", source: "builtin" },
-		{ name: "browser", description: "Toggle browser headless vs visible mode", source: "builtin" },
-		{ name: "fresh", description: "Reset provider stream state without changing the local transcript", source: "builtin" },
-		{ name: "shake", description: "Drop heavy content from context (tool results, large blocks)", source: "builtin" },
-		{ name: "rename", description: "Rename the current session", source: "builtin" },
-		{ name: "move", description: "Move the current session to a different directory", source: "builtin" },
-		{ name: "add-dir", description: "Add a workspace directory to this session (multi-root)", source: "builtin" },
-		{ name: "remove-dir", description: "Remove a workspace directory from this session", source: "builtin" },
-		{ name: "dirs", description: "List this session's workspace directories", source: "builtin" },
-		{ name: "force", description: "Force next turn to use a specific tool", source: "builtin" },
-	];
-}
-
-export function mergeCommands(commands: PiCommand[]) {
-	const visibleCommands = commands.filter(isVisibleDesktopCommand);
-	const names = new Set(visibleCommands.map((command) => command.name));
-	const extras = getBuiltinCommands().filter(
-		(command) => !names.has(command.name) && isVisibleDesktopCommand(command),
-	);
-	return [...visibleCommands, ...extras];
+export function filterVisibleCommands(commands: PiCommand[]) {
+	const seen = new Set<string>();
+	const visible: PiCommand[] = [];
+	for (const command of commands) {
+		const key = command.name.toLowerCase();
+		const isBuiltin = command.source == null || command.source === "builtin";
+		if (isBuiltin && HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES[key]) continue;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		visible.push(command);
+	}
+	return visible;
 }
 
 function fuzzyScore(value: string, keyword: string) {
@@ -780,23 +733,35 @@ export function buildSuggestionItems(
 	files: FileTreeNode[],
 	sessions?: { id: string; filePath: string; projectPath?: string; name?: string; preview: string; updatedAt: number }[],
 ): SuggestionItem[] {
-	const allCommands = mergeCommands(commands);
+	const allCommands = filterVisibleCommands(commands);
 	const trigger = detectTrigger(prompt, cursor);
 	if (!trigger) return [];
 	const keyword = trigger.query.toLowerCase();
 	if (trigger.char === "/") {
+		// 已有子命令段：`/fast on`。只有命令自身声明了 subcommands 才展开，
+		// 未声明的组合返回空——参数值不该被当成命令候选。
+		const spaceAt = keyword.indexOf(" ");
+		if (spaceAt > 0) {
+			const commandName = keyword.slice(0, spaceAt);
+			const subQuery = keyword.slice(spaceAt + 1);
+			const command = allCommands.find((item) => item.name.toLowerCase() === commandName);
+			if (!command) return [];
+			return (command.subcommands ?? [])
+				.filter((sub) => sub.name.toLowerCase().includes(subQuery))
+				.map((sub) => ({
+					// 用 runtime 的原始大小写生成插入文本，避免把 `/SkillName` 改写成小写
+					key: `${command.name} ${sub.name}`,
+					label: `/${command.name} ${sub.name}`,
+					description: sub.description ?? "",
+					value: `/${command.name} ${sub.name}`,
+				}));
+		}
 		return allCommands
-			.map((command, index) => ({ command, index }))
-			.filter(({ command }) => command.name.toLowerCase().includes(keyword))
-			.sort((a, b) => {
-				const aPinned = Boolean(PINNED_COMMAND_NAMES[a.command.name]);
-				const bPinned = Boolean(PINNED_COMMAND_NAMES[b.command.name]);
-				if (aPinned !== bPinned) return aPinned ? -1 : 1;
-				return a.index - b.index;
-			})
-			.map(({ command }) => ({
+			.filter((command) => command.name.toLowerCase().includes(keyword))
+			.map((command) => ({
 				key: command.name,
 				label: `/${command.name}`,
+				hint: command.inputHint,
 				description: command.description ?? "",
 				value: `/${command.name}`,
 			}));

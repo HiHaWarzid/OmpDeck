@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 267（266 + 1 新增 sessions:changed 冷扫描完成推送；266 = 265 + 1 新增 sessions:read-archived-messages 归档按需读取；265 = 264 + 1 新增 git:probe 能力探测；264 = 262 - 1 删 vision:test + 3 config 角色通道）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(267);
+	test("总通道数 = 268（267 + 1 新增 agents:command-catalog 命令目录推送；267 = 266 + 1 新增 sessions:changed 冷扫描完成推送；266 = 265 + 1 新增 sessions:read-archived-messages 归档按需读取；265 = 264 + 1 新增 git:probe 能力探测；264 = 262 - 1 删 vision:test + 3 config 角色通道）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(268);
 	});
 });

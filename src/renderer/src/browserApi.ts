@@ -225,6 +225,7 @@ export function createBrowserApi(): PiDesktopApi {
 			onLog: () => () => undefined,
 			onRpcLog: () => () => undefined,
 			onRuntimeState: () => () => undefined,
+			onCommandCatalog: () => () => undefined,
 			onUiRequest: () => () => undefined,
 			onFocusTarget: () => () => undefined,
 			onTrustRequest: () => () => undefined,

@@ -19,10 +19,19 @@ export type AgentTab = {
 	lastError?: string;
 };
 
+/** 斜线命令的子命令（omp `available_commands_update` 的 subcommands 投影）。 */
+export type PiCommandSubcommand = {
+	name: string;
+	description?: string;
+};
+
 export type PiCommand = {
 	name: string;
 	description?: string;
 	source?: string;
+	/** 参数提示，如 `[on|off|status]`（omp 的 input.hint）；建议列表据此展示用法。 */
+	inputHint?: string;
+	subcommands?: PiCommandSubcommand[];
 };
 
 export type AgentRuntimeState = {

@@ -9213,6 +9213,17 @@ body.is-composer-resizing .composer-resize-handle::after {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 命令参数提示（omp input.hint）：紧贴命令名，弱化配色，避免与描述抢注意力 */
+.command-palette-hint {
+  flex: 0 0 auto;
+  max-width: 240px;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-micro);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .command-palette-footer {
   display: flex;
   gap: 16px;

@@ -9,7 +9,8 @@
 import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { AgentUiAskAnswer, CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult } from "../../shared/types";
+import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
@@ -270,8 +271,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			},
 			commands: async (_event, agentId: string) => {
 				try {
-					// getCommands 返回未定型数组，桌面契约声明 PiCommand[]
-					return (await agentManager.getCommands(agentId)) as PiCommand[];
+					// 与 available_commands_update 推送共用同一归一化，保证两条路径形状一致
+					return normalizePiCommands(await agentManager.getCommands(agentId));
 				} catch {
 					// agent 不存在或 RPC 超时时返回空列表，避免控制台报未处理异常
 					return [];

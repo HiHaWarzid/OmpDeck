@@ -504,6 +504,11 @@ export interface AgentsApi {
 	cycleThinking: (agentId: string) => Promise<AgentRuntimeState>;
 	setThinking: (agentId: string, level: string) => Promise<AgentRuntimeState>;
 	commands: (agentId: string) => Promise<PiCommand[]>;
+	/**
+	 * omp 的 `available_commands_update` 推送：命令目录以 runtime 为唯一事实源。
+	 * `/reload-plugins` 等操作后目录变化时触发，渲染层据此替换本地列表。
+	 */
+	onCommandCatalog: (callback: (payload: { agentId: string; commands: PiCommand[] }) => void) => () => void;
 	onState: (callback: (tabs: AgentTab[]) => void) => () => void;
 	/** 桌面宠物点击跳转：主进程通知主窗切换到活跃 Agent tab */
 	onFocusTarget: (callback: (target: { agentId: string }) => void) => () => void;

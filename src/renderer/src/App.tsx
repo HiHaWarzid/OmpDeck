@@ -189,7 +189,7 @@ import {
   displayPath,
   flattenFiles,
   matches,
-  mergeCommands,
+  filterVisibleCommands,
   countTextLines,
   type MessageItem,
 } from "./components/app/AppUtils";
@@ -244,7 +244,6 @@ import type {
   WorktreeEntry,
   ImageContent,
   PiCommand,
-  PiSkillSummary,
   PiInstallStatus,
   PiInstallExecResult,
   NpmAvailabilityResult,
@@ -661,9 +660,6 @@ export function App() {
   const expandedSidebarFromSettingsRef = useRef(false);
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [commands, setCommands] = useState<PiCommand[]>([]);
-  // 全局 + 项目级 skills 合成的斜线命令（/skill:<name>），注入 / 建议与 chip 白名单。
-  // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充，让用户输入 / 即可见到 skills。
-  const [skillCommands, setSkillCommands] = useState<PiCommand[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [promptTemplatePickerOpen, setPromptTemplatePickerOpen] = useState(false);
@@ -1988,22 +1984,22 @@ export function App() {
   const suggestionItems = useMemo(
     () =>
       suggestionsOpen
-        ? buildSuggestionItems(prompt, composerCursor, [...commands, ...skillCommands], flatFiles, activeProjectSessions)
+        ? buildSuggestionItems(prompt, composerCursor, commands, flatFiles, activeProjectSessions)
         : [],
-    [suggestionsOpen, prompt, composerCursor, commands, skillCommands, flatFiles, activeProjectSessions],
+    [suggestionsOpen, prompt, composerCursor, commands, flatFiles, activeProjectSessions],
   );
 
   /** 有效命令名白名单：仅已知命令渲染为 chip */
-  const mergedCommands = useMemo(
-    () => mergeCommands([...commands, ...skillCommands]),
-    [commands, skillCommands],
+  const visibleCommands = useMemo(
+    () => filterVisibleCommands(commands),
+    [commands],
   );
   const validCommandNames = useMemo(
     () => new Set([
-      ...mergedCommands.map((c) => c.name),
+      ...visibleCommands.map((c) => c.name),
       ...promptTemplateList.map((t) => t.name),
     ]),
-    [mergedCommands, promptTemplateList],
+    [visibleCommands, promptTemplateList],
   );
 
   /** 有效文件路径白名单：仅工作区真实存在的 @ 引用渲染为 chip */
@@ -2864,39 +2860,17 @@ export function App() {
         .catch(() => setCommands([]));
     else setCommands([]);
   }, [activeAgentId]);
-  // 拉取全局 + 当前项目 skills，转为 /skill:<name> 命令注入斜线建议与 chip 白名单。
-  // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充。
-  // 只收 enabled 的 skill；disabled 的不发，避免建议出无法执行的命令。
+  // omp 的 available_commands_update 是命令目录的唯一事实源：启动后、/reload-plugins、
+  // 扩展/技能热加载都会推送新目录。只靠切 Agent 时拉取会让运行中变化的命令不可见。
   useEffect(() => {
-    if (!activeAgentId || isPendingAgentId(activeAgentId)) {
-      setSkillCommands([]);
-      return;
-    }
-    const activeProject = activeProjectId
-      ? projects.find((p) => p.id === activeProjectId)
-      : undefined;
-    void Promise.all([
-      api.skills.list().then((res) => res.skills).catch(() => [] as PiSkillSummary[]),
-      activeProject
-        ? api.projectResources.list(activeProject.id).then((res) => res.skills).catch(() => [] as PiSkillSummary[])
-        : Promise.resolve([] as PiSkillSummary[]),
-    ]).then(([globalSkills, projectSkills]) => {
-      const seen = new Set<string>();
-      const cmds: PiCommand[] = [];
-      for (const skill of [...globalSkills, ...projectSkills]) {
-        if (!skill.enabled || !skill.valid) continue;
-        const name = skill.name.toLowerCase();
-        if (seen.has(name)) continue; // 全局与项目同名去重，保留先出现的
-        seen.add(name);
-        cmds.push({
-          name: `skill:${skill.name}`,
-          description: skill.description || "",
-          source: "skill",
-        });
-      }
-      setSkillCommands(cmds);
+    return api.agents.onCommandCatalog((payload) => {
+      if (payload.agentId !== activeAgentId) return;
+      setCommands(payload.commands);
     });
-  }, [activeAgentId, activeProjectId, projects]);
+  }, [activeAgentId]);
+  // skill 命令（/skill:<name>）不在这里本地扫描：omp 会把已加载的 skill 作为
+  // source:"skill" 的命令发布在同一份目录里（全局与项目级都在内），本地扫描既会
+  // 与 runtime 重复，也无法跟随 /reload-plugins 更新。
 
   useEffect(() => {
     // 默认选中第一项（目录树根级目录），便于浏览项目结构
