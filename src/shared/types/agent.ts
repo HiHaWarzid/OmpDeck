@@ -1,4 +1,4 @@
-import type { WidgetLineItem } from "./message";
+import type { ImageContent, WidgetLineItem } from "./message";
 
 export type AgentStatus = "starting" | "idle" | "running" | "error" | "closed";
 
@@ -59,6 +59,40 @@ export type AgentRuntimeState = {
 	cacheTotal?: number;
 	cacheHitPercent?: number | null;
 	cost?: number;
+	/**
+	 * omp 服务端待投递队列（steering / followUp 的 chip 文本）。
+	 * 渲染层必须以它作为队列唯一事实来源；本地只保留投递结果未知的提示。
+	 */
+	queuedMessages?: AgentQueuedMessages;
+};
+
+/** omp `get_state.queuedMessages` / `queue_update` 的投影。 */
+export type AgentQueuedMessages = {
+	steering: string[];
+	followUp: string[];
+};
+
+/** `remove_queued_message` / `abort_and_restore_queue` 返回的草稿（含附件）。 */
+export type RestoredQueuedMessage = {
+	text: string;
+	images?: ImageContent[];
+};
+
+export type RemoveQueuedMessageResult = {
+	removed: boolean;
+	/** 撤回消息携带的图片；文本消息、removed:false 时缺省。 */
+	images?: ImageContent[];
+	/** 图片超出传输上限被省略（消息仍已撤回）。 */
+	imagesDropped?: boolean;
+};
+
+export type PromoteQueuedMessageResult = { promoted: boolean };
+
+export type AbortAndRestoreQueueResult = {
+	steering: RestoredQueuedMessage[];
+	followUp: RestoredQueuedMessage[];
+	imagesDropped?: boolean;
+	truncated?: boolean;
 };
 
 export type AvailableModel = {

@@ -9,6 +9,7 @@
  * 不要在此文件之外另起一份）。
  */
 import type {
+	AbortAndRestoreQueueResult,
 	AgentMessagesDelta,
 	AgentRuntimeState,
 	AgentTab,
@@ -83,8 +84,10 @@ import type {
 	PiUpdateCheckResult,
 	Project,
 	ProjectResourceListResult,
+	PromoteQueuedMessageResult,
 	PromptStoreItem,
 	PromptStoreSearchResult,
+	RemoveQueuedMessageResult,
 	ScratchPadData,
 	SendPromptInput,
 	SendPromptResult,
@@ -472,6 +475,13 @@ export interface AgentsApi {
 	stop: (agentId: string) => Promise<void>;
 	prompt: (input: SendPromptInput) => Promise<SendPromptResult>;
 	abort: (agentId: string) => Promise<void>;
+	abortAndRestoreQueue: (agentId: string) => Promise<AbortAndRestoreQueueResult>;
+	removeQueuedMessage: (
+		agentId: string,
+		message: string,
+		queue: "steering" | "followUp",
+	) => Promise<RemoveQueuedMessageResult>;
+	promoteQueuedMessage: (agentId: string, message: string) => Promise<PromoteQueuedMessageResult>;
 	exportHtml: (agentId: string) => Promise<{ path: string }>;
 	getForkMessages: (agentId: string) => Promise<ForkMessage[]>;
 	forkSession: (agentId: string, entryId: string) => Promise<{ text?: string; cancelled?: boolean }>;

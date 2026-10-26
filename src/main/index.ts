@@ -1332,6 +1332,11 @@ app.whenReady().then(async () => {
 		refreshModels: (agentId) => agentManager.refreshModels(agentId),
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
+		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
+		removeQueuedMessage: (agentId, message, queue) =>
+			agentManager.removeQueuedMessage(agentId, message, queue),
+		promoteQueuedMessage: (agentId, message) =>
+			agentManager.promoteQueuedMessage(agentId, message),
 	});
 	// AFK 编排器：消费 AgentManager 语义事件（settled/statusChanged error）驱动
 	// ticket→worktree→agent→PR 链路；启动自动恢复在 runPostWindowStartupTasks。

@@ -31,7 +31,9 @@ interface AgentHandlerDeps {
 
 type AgentHandlerMaps = {
 	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>,
-		| "list" | "getMessages" | "create" | "rename" | "stop" | "prompt" | "abort" | "exportHtml"
+		| "list" | "getMessages" | "create" | "rename" | "stop" | "prompt" | "abort"
+		| "abortAndRestoreQueue" | "removeQueuedMessage" | "promoteQueuedMessage"
+		| "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
@@ -187,6 +189,39 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				}
 				const result = await agentManager.abort(agentId);
 				void appLogger.info("agent", "Agent aborted", { agentId });
+				return result;
+			},
+			abortAndRestoreQueue: async (_event, agentId: string) => {
+				const bridge = getFeishuBridge();
+				bridge?.stopSessionMirrorRun(agentId);
+				const result = await agentManager.abortAndRestoreQueue(agentId);
+				void appLogger.info("agent", "Agent aborted and queue restored", {
+					agentId,
+					steering: result.steering.length,
+					followUp: result.followUp.length,
+				});
+				return result;
+			},
+			removeQueuedMessage: async (
+				_event,
+				agentId: string,
+				message: string,
+				queue: "steering" | "followUp",
+			) => {
+				const result = await agentManager.removeQueuedMessage(agentId, message, queue);
+				void appLogger.info("agent", "Queued message removed", {
+					agentId,
+					queue,
+					removed: result.removed,
+				});
+				return result;
+			},
+			promoteQueuedMessage: async (_event, agentId: string, message: string) => {
+				const result = await agentManager.promoteQueuedMessage(agentId, message);
+				void appLogger.info("agent", "Queued message promoted", {
+					agentId,
+					promoted: result.promoted,
+				});
 				return result;
 			},
 			exportHtml: async (_event, agentId: string) =>

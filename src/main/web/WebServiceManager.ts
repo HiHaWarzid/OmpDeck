@@ -36,6 +36,9 @@ type WebServiceAgentDeps = Pick<
 	| "refreshModels"
 	| "cycleThinking"
 	| "setThinking"
+	| "abortAndRestoreQueue"
+	| "removeQueuedMessage"
+	| "promoteQueuedMessage"
 >;
 
 type WebServiceDependencies = {
@@ -68,6 +71,9 @@ type _WebAgentDepsDriftGuard = {
 	refreshModels: AgentsNamespace["refreshModels"];
 	cycleThinking: AgentsNamespace["cycleThinking"];
 	setThinking: AgentsNamespace["setThinking"];
+	abortAndRestoreQueue: AgentsNamespace["abortAndRestoreQueue"];
+	removeQueuedMessage: AgentsNamespace["removeQueuedMessage"];
+	promoteQueuedMessage: AgentsNamespace["promoteQueuedMessage"];
 } extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
@@ -259,6 +265,48 @@ export class WebServiceManager {
 				await this.deps.stopAgent(decodeURIComponent(stopMatch[1]));
 				this.invalidateStateCache();
 				this.sendJson(response, { ok: true });
+				return;
+			}
+			const abortRestoreMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/abort-and-restore-queue$/);
+			if (abortRestoreMatch && request.method === "POST") {
+				const result = await this.deps.abortAndRestoreQueue(decodeURIComponent(abortRestoreMatch[1]));
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
+				return;
+			}
+			const removeQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/remove-queued-message$/);
+			if (removeQueuedMatch && request.method === "POST") {
+				const body = await this.readJson<{ message?: string; queue?: "steering" | "followUp" }>(request);
+				if (typeof body.message !== "string" || !body.message) {
+					this.sendError(response, 400, "message 不能为空");
+					return;
+				}
+				if (body.queue !== "steering" && body.queue !== "followUp") {
+					this.sendError(response, 400, "queue 必须是 steering 或 followUp");
+					return;
+				}
+				const result = await this.deps.removeQueuedMessage(
+					decodeURIComponent(removeQueuedMatch[1]),
+					body.message,
+					body.queue,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
+				return;
+			}
+			const promoteQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/promote-queued-message$/);
+			if (promoteQueuedMatch && request.method === "POST") {
+				const body = await this.readJson<{ message?: string }>(request);
+				if (typeof body.message !== "string" || !body.message) {
+					this.sendError(response, 400, "message 不能为空");
+					return;
+				}
+				const result = await this.deps.promoteQueuedMessage(
+					decodeURIComponent(promoteQueuedMatch[1]),
+					body.message,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
 				return;
 			}
 			const runtimeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/runtime$/);

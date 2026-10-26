@@ -158,6 +158,36 @@ export function createBrowserApi(): PiDesktopApi {
 				});
 				await refreshState();
 			},
+			abortAndRestoreQueue: async (agentId) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["abortAndRestoreQueue"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/abort-and-restore-queue`, {
+					method: "POST",
+					body: "{}",
+				});
+				await refreshState();
+				return response.result;
+			},
+			removeQueuedMessage: async (agentId, message, queue) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["removeQueuedMessage"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/remove-queued-message`, {
+					method: "POST",
+					body: JSON.stringify({ message, queue }),
+				});
+				await refreshState();
+				return response.result;
+			},
+			promoteQueuedMessage: async (agentId, message) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["promoteQueuedMessage"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/promote-queued-message`, {
+					method: "POST",
+					body: JSON.stringify({ message }),
+				});
+				await refreshState();
+				return response.result;
+			},
 			prompt: async (input: SendPromptInput) => {
 				const response = await request<{ result: SendPromptResult }>(
 					`/api/agents/${encodeURIComponent(input.agentId)}/prompt`,

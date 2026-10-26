@@ -31,6 +31,9 @@ const deps: WebDeps = {
 	refreshModels: stubRuntimeState,
 	cycleThinking: stubRuntimeState,
 	setThinking: stubRuntimeState,
+	abortAndRestoreQueue: async () => ({ steering: [], followUp: [] }),
+	removeQueuedMessage: async () => ({ removed: false }),
+	promoteQueuedMessage: async () => ({ promoted: false }),
 };
 
 const HOST = "127.0.0.1";

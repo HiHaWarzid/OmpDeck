@@ -409,6 +409,11 @@ export const ipcTable = {
 		stop: { channel: "agents:stop", kind: "invoke", web: true },
 		prompt: { channel: "agents:prompt", kind: "invoke", web: true },
 		abort: { channel: "agents:abort", kind: "invoke", web: true },
+		/** Esc 语义：撤回服务端待投递队列并停止当前 run，返回可取回的草稿。 */
+		abortAndRestoreQueue: { channel: "agents:abort-and-restore-queue", kind: "invoke" },
+		/** 从 omp steering/followUp 队列撤回一条 chip；结果以服务端确认 removed 为准。 */
+		removeQueuedMessage: { channel: "agents:remove-queued-message", kind: "invoke" },
+		promoteQueuedMessage: { channel: "agents:promote-queued-message", kind: "invoke" },
 		exportHtml: { channel: "agents:export-html", kind: "invoke" },
 		getForkMessages: { channel: "agents:fork-messages", kind: "invoke" },
 		forkSession: { channel: "agents:fork-session", kind: "invoke" },

@@ -6,8 +6,10 @@ import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type {
+	AbortAndRestoreQueueResult,
 	AgentManagerEvent,
 	AgentManagerEventListener,
+	AgentQueuedMessages,
 	AgentRuntimeState,
 	AgentStatus,
 	AgentTab,
@@ -20,6 +22,9 @@ import type {
 	ForkMessage,
 	ImageContent,
 	Project,
+	PromoteQueuedMessageResult,
+	RemoveQueuedMessageResult,
+	RestoredQueuedMessage,
 	SendPromptInput,
 	SendPromptResult,
 	ThinkingUpdate,
@@ -1370,6 +1375,143 @@ export class AgentManager {
 	}
 
 	async abort(agentId: string) {
+		// 普通停止不等待响应：前端状态切换已经同步完成，abort 响应只用于命令层确认。
+		await this.abortWithCommand(agentId, { type: "abort" }, false);
+	}
+
+	/**
+	 * Esc 语义：先撤回服务端待投递的用户队列，再中止当前 run。
+	 * 普通 abort 会把已排队/已 live-steer 的输入重新排进新一轮，用户点「停止」后
+	 * 这些消息仍会继续执行；这里拿回草稿后再停止，保证停止就是真的停止。
+	 */
+	async abortAndRestoreQueue(agentId: string): Promise<AbortAndRestoreQueueResult> {
+		const data = await this.abortWithCommand(agentId, { type: "abort_and_restore_queue" }, true);
+		const readMessages = (value: unknown): RestoredQueuedMessage[] => {
+			if (!Array.isArray(value)) return [];
+			const restored: RestoredQueuedMessage[] = [];
+			for (const item of value) {
+				if (!item || typeof item !== "object") continue;
+				const record = item as Record<string, unknown>;
+				if (typeof record.text !== "string" || !record.text) continue;
+				const images = this.normalizeRestoredImages(record.images);
+				restored.push(images ? { text: record.text, images } : { text: record.text });
+			}
+			return restored;
+		};
+		const result: AbortAndRestoreQueueResult = {
+			steering: readMessages(data?.steering),
+			followUp: readMessages(data?.followUp),
+			...(data?.imagesDropped === true ? { imagesDropped: true } : {}),
+			...(data?.truncated === true ? { truncated: true } : {}),
+		};
+		if (data) {
+			const runtime = this.requireRuntime(agentId);
+			// abort 路径已取消节流中的消息推送，撤回气泡后必须立刻全量对齐 renderer，
+			// 否则本地仍会显示一条不会再执行的消息（getMessages 已无此条）。
+			if (this.dropWithdrawnUserBubbles(runtime, result)) {
+				this.scheduleMessageEmit(runtime, true);
+			}
+		}
+		// 撤回后服务端队列已空：立即刷新一次，避免 chip 停在旧快照等待下一次事件。
+		void this.emitRuntimeState(agentId);
+		if (!data) {
+			// 旧版 omp 不认 abort_and_restore_queue（请求失败时并未中止 run），
+			// 必须补发普通 abort；此时队列仍由服务端持有，下次 run 会继续投递。
+			await this.abort(agentId);
+		}
+		return result;
+	}
+
+	/**
+	 * 撤回的服务端队列消息从未写入会话记录，但发送时已在 UI 乐观插入用户气泡。
+	 * 这里按 chip 文本（从后往前、同文取最后一条）删掉这些气泡，避免「草稿已拿回、
+	 * 聊天里还躺着一条没执行的消息」。模板展开后的文本与 chip 原文不一致时匹配不到，
+	 * 这种气泡会在重新载入会话时自然消失。
+	 */
+	private dropWithdrawnUserBubbles(
+		runtime: AgentRuntime,
+		result: AbortAndRestoreQueueResult,
+	): boolean {
+		const remaining = [...result.steering, ...result.followUp].map((item) => item.text);
+		if (remaining.length === 0) return false;
+		const messages = runtime.transcript.messages;
+		let firstRemoved = -1;
+		for (let index = messages.length - 1; index >= 0 && remaining.length > 0; index -= 1) {
+			const message = messages[index];
+			if (!message || message.role !== "user") continue;
+			if (message.meta?.streamingBehavior === undefined) continue;
+			const match = remaining.lastIndexOf(message.text);
+			if (match === -1) continue;
+			messages.splice(index, 1);
+			remaining.splice(match, 1);
+			firstRemoved = index;
+		}
+		if (firstRemoved === -1) return false;
+		this.markMessagesDirty(runtime, firstRemoved);
+		return true;
+	}
+
+	/** 服务端返回的图片条目按 ImageContent 逐项校验，坏条目直接丢弃而不是让整次撤回失败。 */
+	private normalizeRestoredImages(value: unknown): ImageContent[] | undefined {
+		if (!Array.isArray(value)) return undefined;
+		const images = value.filter(
+			(item): item is ImageContent =>
+				!!item &&
+				typeof item === "object" &&
+				(item as Record<string, unknown>).type === "image" &&
+				typeof (item as Record<string, unknown>).data === "string" &&
+				typeof (item as Record<string, unknown>).mimeType === "string",
+		);
+		return images.length > 0 ? images : undefined;
+	}
+
+	/**
+	 * 从 omp 待投递队列撤回一条 chip（首条匹配）。
+	 * 返回 removed:false 表示发送时已不在队列（可能刚被投递），调用方不得重试或改发。
+	 */
+	async removeQueuedMessage(
+		agentId: string,
+		message: string,
+		queue: "steering" | "followUp",
+	): Promise<RemoveQueuedMessageResult> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "remove_queued_message", message, queue },
+			15_000,
+		);
+		if (!response.success) throw new Error(response.error ?? "撤回排队消息失败");
+		const data = (response.data ?? {}) as Record<string, unknown>;
+		const images = this.normalizeRestoredImages(data.images);
+		const result: RemoveQueuedMessageResult = {
+			removed: data.removed === true,
+			...(images ? { images } : {}),
+			...(data.imagesDropped === true ? { imagesDropped: true } : {}),
+		};
+		void this.emitRuntimeState(agentId);
+		return result;
+	}
+
+	/** 把首条匹配的 followUp 移到 steering 队尾（服务端移动，不重跑模板、不重复入队）。 */
+	async promoteQueuedMessage(
+		agentId: string,
+		message: string,
+	): Promise<PromoteQueuedMessageResult> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "promote_queued_message", message },
+			15_000,
+		);
+		if (!response.success) throw new Error(response.error ?? "提升排队消息失败");
+		const data = (response.data ?? {}) as Record<string, unknown>;
+		void this.emitRuntimeState(agentId);
+		return { promoted: data.promoted === true };
+	}
+
+	private async abortWithCommand(
+		agentId: string,
+		command: Record<string, unknown>,
+		awaitResponse: boolean,
+	): Promise<Record<string, unknown> | undefined> {
 		const runtime = this.requireRuntime(agentId);
 		// 用户主动停止的会话不应再弹"已完成"。
 		this.cancelSessionEndNotification(agentId);
@@ -1400,11 +1542,9 @@ export class AgentManager {
 		sealRun(runtime.run, Date.now());
 		this.scheduleAbortSettledFallback(runtime);
 
-		runtime.slot.process.client
-			.request({ type: "abort" }, 10_000)
-			.catch(() => {
-				// abort 超时或失败不影响前端状态切换
-			});
+		const abortRequest = runtime.slot.process.client
+			.request(command, 10_000)
+			.catch(() => undefined);
 
 		// 立即清理 pending UI 记录并移除 ask_question 卡片，不等待 abort 返回
 		if (pending.size > 0) {
@@ -1454,6 +1594,13 @@ export class AgentManager {
 			duration: 2500,
 		});
 		this.emitState();
+		// 撤回队列的结果是 abort_and_restore_queue 的唯一数据来源，必须等响应；
+		// 普通 abort 不等待，避免 omp 卡住时把「停止」也拖成 10s。
+		if (!awaitResponse) return undefined;
+		const response = await abortRequest;
+		return response?.success
+			? (response.data as Record<string, unknown> | undefined)
+			: undefined;
 	}
 
 	/**
@@ -1746,6 +1893,23 @@ export class AgentManager {
 					: undefined,
 			cacheHitPercent,
 			cost: stats?.cost,
+			// omp 的待投递队列是 chip 的唯一事实来源：renderer 直接渲染它，
+			// 撤回/提升都回服务端执行，本地不再维护第二份 pending 队列。
+			queuedMessages: this.normalizeQueuedMessages(state?.queuedMessages),
+		};
+	}
+
+	/** get_state.queuedMessages 容错：缺失/非数组都收敛为空队列，避免 renderer 判空分支散落。 */
+	private normalizeQueuedMessages(value: unknown): AgentQueuedMessages {
+		const readList = (list: unknown): string[] =>
+			Array.isArray(list)
+				? list.filter((item): item is string => typeof item === "string" && item.length > 0)
+				: [];
+		const record =
+			value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+		return {
+			steering: readList(record.steering),
+			followUp: readList(record.followUp),
 		};
 	}
 
@@ -3457,6 +3621,12 @@ export class AgentManager {
 			// 定时查询 get_state 确认是否已无工作可做，避免 UI 动画永久卡住。
 			// 压缩完成后会重新调度；agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
 			this.scheduleSettleCheck(runtime, agentId);
+		}
+
+		if (typed.type === "queue_update") {
+			// 待投递队列的 chip 文本以 get_state.queuedMessages 为准（事件快照同源）。
+			// 这里只触发一次完整状态刷新：节流合并天然吸收连续增删，renderer 不维护第二份队列。
+			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "agent_settled" || typed.type === "session_settled") {

@@ -111,12 +111,11 @@ import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
-  canDiscardQueuedPrompt,
-  canRetractQueuedPromptToInput,
-  QUEUED_PROMPT_LIMIT,
+  buildQueueRows,
   QUEUED_PROMPT_VISIBLE,
-  type QueuedPromptSnapshot,
-} from "./utils/queuedPromptQueue";
+  type QueuePanelRow,
+  type UncertainPrompt,
+} from "./utils/queueChips";
 import { usePersistedState } from "./hooks/usePersistedState";
 import {
   TERMINAL_HEIGHT_STORAGE_KEY,
@@ -252,6 +251,7 @@ import type {
   SessionSummary,
   ComposerAgentMode,
   AgentUiRequest,
+  RestoredQueuedMessage,
   ThinkingUpdate,
   WidgetLineItem,
 } from "../../shared/types";
@@ -478,9 +478,6 @@ function getEditorLogoUrl(editorId: string) {
   return EDITOR_LOGO_URLS[editorId];
 }
 
-/** Agent 运行时暂存在 renderer、尚未提交给 pi 的消息。 */
-type QueuedPrompt = QueuedPromptSnapshot;
-
 class PromptDeliveryUnknownError extends Error {
   constructor(message: string) {
     super(message);
@@ -560,17 +557,15 @@ export function App() {
     activeProjectId,
     onSessionsByProjectChanged: handleSessionsByProjectChanged,
   });
-  // Agent 生命周期 per-agent 状态：prompt/images/queuedPrompts/terminalDock/
-  // drawerPinned/promptHistory/queueFlush，以及 agent 替换时的原子迁移方法。
-  // prompt 的 ref/state 双写、images 的 ref 镜像与终端 Dock 的函数式更新
-  // 都收敛为 hook 内 op（setLivePrompt / setNativePrompt / stageLivePrompt 等）。
+  // Agent 生命周期 per-agent 状态：prompt/images/dock/drawer/promptHistory，
+  // 以及 agent 替换时的原子迁移方法。queuedPrompts 已删除——待投递队列
+  // 以 omp get_state.queuedMessages 为唯一事实来源。
   const {
     getLivePrompt, setLivePrompt, setNativePrompt, stageLivePrompt,
     attachedImagesByAgent, setAttachedImagesForAgent,
-    queuedPrompts, queuedPromptStore,
     terminalDockStateByOwner, setTerminalDockOpen, setTerminalDockCollapsed, pruneTerminalDock,
     drawerPinnedByProject, setDrawerPinnedByProject,
-    promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
+    promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef,
     migratePerAgentState, commitPendingToReal,
   } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
   // ── 会话工作区：结构订阅在根，切片订阅在真正渲染它的组件 ─────────────────
@@ -750,7 +745,17 @@ export function App() {
   const GOAL_MAX_CONTINUATIONS = 5;
   /** 上一次 isAgentBusy 状态,用于检测 busy→idle 转换 */
   const prevIsAgentBusyRef = useRef(false);
-  const activeQueuedPrompts = activeAgentId ? (queuedPrompts[activeAgentId] ?? []) : [];
+  /**
+   * 待发送轨道 = omp 服务端队列（runtimeState.queuedMessages）+ 本地未知投递提示。
+   * omp 队列经 runtime 切片订阅唤醒，服务端增删/提升后自动重渲染。
+   */
+  const [uncertainPrompts, setUncertainPrompts] = useState<
+    Record<string, UncertainPrompt[]>
+  >({});
+  const activeQueueRows: QueuePanelRow[] = buildQueueRows(
+    agentRuntimeState?.queuedMessages,
+    activeAgentId ? uncertainPrompts[activeAgentId] : undefined,
+  );
 
   const [sessionRefPickerOpen, setSessionRefPickerOpen] = useState(false);
   const [sessionRefPickerTarget, setSessionRefPickerTarget] = useState<SessionSummary | null>(null);
@@ -1831,8 +1836,8 @@ export function App() {
   // Queue chrome includes the track gap, panel padding/header/border, and complete rows.
   // Keep this in sync with .queued-list so the third row is never clipped by the composer.
   const queuedChromeBudget =
-    activeQueuedPrompts.length > 0
-      ? 38 + Math.min(activeQueuedPrompts.length, QUEUED_PROMPT_VISIBLE) * 34
+    activeQueueRows.length > 0
+      ? 38 + Math.min(activeQueueRows.length, QUEUED_PROMPT_VISIBLE) * 34
       : 0;
   const terminalRowHeight = terminalCollapsed
     ? requestedTerminalRowHeight
@@ -1840,7 +1845,6 @@ export function App() {
         requestedTerminalRowHeight,
         Math.max(0, chatPaneHeight - fixedChatHeight - queuedChromeBudget),
       );
-  const visibleQueuedPrompts = activeQueuedPrompts;
   // 渲染路径的输入框最大高度：全部由 state 派生（chatLayoutHeight/chatHeaderHeight/
   // composerChrome 由 ResizeObserver + rAF 更新），避免每次 App 重渲染（流式 ~20Hz）
   // 同步读取 4 个 DOM 节点尺寸触发强制同步布局。
@@ -2222,8 +2226,7 @@ export function App() {
       // 让近千行侧栏子树跟着 20Hz 重渲染（见 sameAgentTabList 注释）。
       setAgents((current) => (sameAgentTabList(current, nextAgents) ? current : nextAgents));
       setActiveAgentId(nextActiveAgentId);
-      // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
-      // terminalDock/drawerPinned/promptHistory/queueFlush）
+      // 原子迁移所有 per-agent 状态切片（prompt/images/terminalDock/drawerPinned/promptHistory）
       migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
       // transcript 条目对账：迁移重启占位期间的消息、回收已关闭 agent 的条目。
       // liveIds 必须含占位（重启占位参与 liveIds），避免旧进程移除时聊天记录闪空。
@@ -2264,12 +2267,9 @@ export function App() {
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
       // 解码（序号守卫 + 状态合并 + tool true→false 边沿判定）在 workspace/agentRuntime：
-      // 状态落进 runtime 切片（按 agent 精确订阅），边沿直接在原始事件上投递 steer，
-      // 不依赖 React 批处理时机——很快的 tool_start/tool_end 被合并成一次 render 会漏边沿。
-      const resolved = ingestAgentRuntimeState(payload.agentId, payload.state);
-      if (resolved?.isToolCompletionEdge && isAgentCurrentlyBusy(payload.agentId)) {
-        void flushQueuedSteerPrompts(payload.agentId);
-      }
+      // 状态落进 runtime 切片（按 agent 精确订阅）；待投递队列也随快照更新，
+      // steer/followUp 的投递时序完全由 omp 决定，renderer 不再在工具边沿冲刷本地队列。
+      ingestAgentRuntimeState(payload.agentId, payload.state);
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
@@ -2773,7 +2773,7 @@ export function App() {
     const maxHeight = getComposerMaxHeight();
     setComposerHeight((current) => Math.min(current, maxHeight));
     setComposerAutoHeight((current) => Math.min(current, maxHeight));
-  }, [activeAgentId, activeQueuedPrompts.length]);
+  }, [activeAgentId, activeQueueRows.length]);
 
   useEffect(() => {
     let frame = 0;
@@ -4213,72 +4213,57 @@ export function App() {
     }
     // thinking 切片：清空文本 + 移除起点（reducer 对已空状态空转）
     dispatchToAgent(agentId, thinkingActions.update(""));
-    await api.agents.abort(agentId);
+    // Esc 语义：先撤回 omp 服务端队列，再停止。普通 abort 会把排队消息排进新一轮，
+    // 用户点「停止」后仍会继续执行；这里把草稿拿回输入框，停止就是真的停止。
+    try {
+      const restored = await api.agents.abortAndRestoreQueue(agentId);
+      const messages = [...restored.steering, ...restored.followUp];
+      if (messages.length > 0) {
+        appendDraftToComposer(agentId, messages);
+        showToast(t("app.queueRestored", { count: String(messages.length) }), 3000);
+      }
+      if (restored.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
+      if (restored.truncated) showToast(t("app.queuedRestoreTruncated"), 5000);
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : String(error),
+        4000,
+      );
+    }
     // 不调用 refreshRuntimeState：AgentManager.abort() 会通过 emitState 推送正确状态，
     // 避免后端 get_state 返回过时的 isStreaming: true 覆盖前端立刻设的 false。
   }
 
   /**
-   * 队列唯一事实来源是 queuedPromptStore：所有队列变更（claim/enqueue/resolve/
-   * retract/discard/migrate）都经 store 原子 op，onUpdate 自动回填 React state，
-   * 不再需要 ref/state 双写（见 useAgentLifecycle）。
+   * 队列事实来源是 omp：chip 文本、顺序都来自 runtimeState.queuedMessages。
+   * 本地只保留「投递结果未知」提示（未知 = 可能已写入 omp，不能重试、不能伪造撤回）。
    */
 
-  /** 入队；满员时返回 false，调用方应保留输入框内容并 toast。 */
-  function enqueueQueuedPrompt(agentId: string, queuedPrompt: QueuedPrompt): boolean {
-    const before = queuedPromptStore.state[agentId]?.length ?? 0;
-    if (before >= QUEUED_PROMPT_LIMIT) return false;
-    // store.enqueue 的 FSM 门禁与上限判断一致；返回是否真的入队。
-    return queuedPromptStore.enqueue(agentId, queuedPrompt, QUEUED_PROMPT_LIMIT);
-  }
-
-  function appendUnknownQueuedPrompt(
+  /** 追加恢复的草稿：文字在前、图片在前，光标落到末尾，与撤回编辑的交互保持一致。 */
+  function appendDraftToComposer(
     agentId: string,
-    queuedPrompt: QueuedPrompt,
-    error?: string,
+    messages: RestoredQueuedMessage[],
   ) {
-    queuedPromptStore.enqueue(
-      agentId,
-      { ...queuedPrompt, status: "unknown", error },
-      QUEUED_PROMPT_LIMIT,
-    );
-  }
-
-  /** 撤回输入框：仅 pending/failed 可撤回；sending/unknown 拒绝（防双发/误导）。 */
-  function retractQueuedPrompt(agentId: string, promptId: string) {
-    queuedPromptStore.retract(agentId, promptId);
-  }
-
-  /** 丢弃：sending 拒绝；pending/failed 移除，unknown 仅清提示（不重发）。 */
-  function discardQueuedPrompt(agentId: string, promptId: string) {
-    queuedPromptStore.discard(agentId, promptId);
-  }
-
-  function retractQueuedPromptForEdit(agentId: string, queuedPrompt: QueuedPrompt) {
-    const livePrompt = queuedPromptStore.state[agentId]?.find(
-      (promptItem) => promptItem.id === queuedPrompt.id,
-    );
-    if (
-      !livePrompt ||
-      livePrompt.status === "sending" ||
-      livePrompt.status === "unknown"
-    ) return;
-    retractQueuedPrompt(agentId, livePrompt.id);
-    const currentDraft = getLivePrompt(agentId);
-    const restoredPrompt = [livePrompt.displayText, currentDraft]
+    const restoredText = messages
+      .map((item) => item.text)
       .filter((text) => text.trim())
       .join("\n\n");
-    setLivePrompt(agentId, restoredPrompt);
-    if (livePrompt.images?.length) {
+    const restoredImages = messages.flatMap((item) => item.images ?? []);
+    if (!restoredText && restoredImages.length === 0) return;
+    const currentDraft = getLivePrompt(agentId);
+    const nextPrompt = [restoredText, currentDraft]
+      .filter((text) => text.trim())
+      .join("\n\n");
+    setLivePrompt(agentId, nextPrompt);
+    if (restoredImages.length > 0) {
       setAttachedImagesForAgent(agentId, (current) => [
-        ...livePrompt.images!,
+        ...restoredImages,
         ...current,
       ]);
     }
-    setComposerAgentModeForAgent(agentId, livePrompt.agentMode);
     if (activeAgentIdRef.current === agentId) {
-      setComposerCursor(restoredPrompt.length);
-      pendingComposerCaretRef.current = restoredPrompt.length;
+      setComposerCursor(nextPrompt.length);
+      pendingComposerCaretRef.current = nextPrompt.length;
       requestAnimationFrame(() => {
         const editor = composerTextareaRef.current;
         editor?.focus();
@@ -4287,105 +4272,71 @@ export function App() {
     }
   }
 
-  function isAgentCurrentlyBusy(agentId: string) {
-    const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    return agentBusy(agent, getAgentRuntimeState(agentId));
+  function addUncertainPrompt(agentId: string, text: string, error?: string) {
+    const entry: UncertainPrompt = {
+      id: crypto.randomUUID(),
+      text,
+      error: error ?? t("app.queuedUnknown"),
+    };
+    setUncertainPrompts((current) => ({
+      ...current,
+      [agentId]: [...(current[agentId] ?? []), entry],
+    }));
   }
 
-  function canFlushQueuedPrompt(agentId: string) {
-    const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    return isAgentIdle(agent) && !isAgentCurrentlyBusy(agentId);
+  function dismissUncertainPrompt(agentId: string, promptId: string) {
+    setUncertainPrompts((current) => {
+      const next = (current[agentId] ?? []).filter((item) => item.id !== promptId);
+      if (next.length === 0) {
+        const { [agentId]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [agentId]: next };
+    });
   }
 
-  async function flushQueuedSteerPrompts(agentId: string) {
-    if (queueFlushByAgentRef.current.has(agentId) || !isAgentCurrentlyBusy(agentId)) return;
-    queueFlushByAgentRef.current.add(agentId);
+  /**
+   * 撤回/丢弃只认服务端 removed:true。removed:false 说明消息刚被投递，
+   * 此时既不重发也不猜结果，只刷新一次队列。
+   */
+  async function removeServerQueuedPrompt(
+    agentId: string,
+    row: { queue: "steering" | "followUp"; text: string },
+    restoreDraft: boolean,
+  ) {
     try {
-      // Keep one lock for the whole ordered batch. Releasing it between items would let a second
-      // tool-end/idle event claim the next snapshot while this loop is still advancing.
-      while (isAgentCurrentlyBusy(agentId)) {
-        const claimed = queuedPromptStore.claimNextSteer(agentId);
-        if (!claimed.prompt) break;
-        const queuedPrompt = claimed.prompt;
-
-        try {
-          await dispatchPromptSnapshot(
-            agentId,
-            queuedPrompt.message,
-            queuedPrompt.images,
-            "steer",
-            queuedPrompt.agentMode,
-            queuedPrompt.templateDescription,
-          );
-          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-            type: "accepted",
-          });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-            type: deliveryUnknown ? "unknown" : "failed",
-            error: errorMessage,
-          });
-          showToast(
-            deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
-            deliveryUnknown ? 6000 : 4000,
-          );
-          // Explicit failure and unknown delivery are ordering barriers. Later steer snapshots
-          // stay local until the user resolves this entry.
-          break;
-        }
+      const result = await api.agents.removeQueuedMessage(agentId, row.text, row.queue);
+      if (!result.removed) {
+        showToast(t("app.queuedGone"), 3000);
+        void refreshRuntimeState(agentId);
+        return;
       }
-    } finally {
-      queueFlushByAgentRef.current.delete(agentId);
-      // agent_settled may arrive while the RPC is in flight. Once the ordered batch unlocks,
-      // continue through the normal serial idle drain rather than leaving the queue stranded.
-      if (canFlushQueuedPrompt(agentId)) {
-        void flushNextQueuedPrompt(agentId);
+      if (result.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
+      if (restoreDraft) {
+        appendDraftToComposer(agentId, [
+          { text: row.text, ...(result.images ? { images: result.images } : {}) },
+        ]);
       }
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : String(error),
+        4000,
+      );
     }
   }
 
-  /** Paseo 同款串行策略：agent 每次空闲只发送队首，其余消息继续可撤回。 */
-  async function flushNextQueuedPrompt(agentId: string) {
-    if (queueFlushByAgentRef.current.has(agentId) || !canFlushQueuedPrompt(agentId)) return;
-    const claimed = queuedPromptStore.claimIdleHead(agentId);
-    if (!claimed.prompt) return;
-    const queuedPrompt = claimed.prompt;
-
-    queueFlushByAgentRef.current.add(agentId);
+  async function promoteServerQueuedPrompt(agentId: string, text: string) {
     try {
-      await dispatchPromptSnapshot(
-        agentId,
-        queuedPrompt.message,
-        queuedPrompt.images,
-        queuedPrompt.behavior === "direct" ? undefined : queuedPrompt.behavior,
-        queuedPrompt.agentMode,
-        queuedPrompt.templateDescription,
-      );
-      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-        type: "accepted",
-      });
+      const result = await api.agents.promoteQueuedMessage(agentId, text);
+      if (!result.promoted) {
+        showToast(t("app.queuedGone"), 3000);
+        void refreshRuntimeState(agentId);
+      }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-        type: deliveryUnknown ? "unknown" : "failed",
-        error: errorMessage,
-      });
       showToast(
-        deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
-        deliveryUnknown ? 6000 : 4000,
+        error instanceof Error ? error.message : String(error),
+        4000,
       );
-    } finally {
-      queueFlushByAgentRef.current.delete(agentId);
-      // 扩展命令可能预检成功后仍保持 idle；等待主进程 running/idle 推送落地后再判断，
-      // 避免 IPC 事件尚未渲染时把多条普通 prompt 一次性并发发送。
-      window.setTimeout(() => {
-        if (canFlushQueuedPrompt(agentId)) {
-          void flushNextQueuedPrompt(agentId);
-        }
-      }, 150);
     }
   }
 
@@ -4678,22 +4629,6 @@ export function App() {
     return resolved;
   }
 
-  // 处理所有 agent 的 idle 队列：隐藏会话也不会因切换选中项而卡住。
-  // tool-end 的 steer 投递直接在 onRuntimeState 原始事件上处理，避免批量 render 漏边沿。
-  // 运行态不再住根 state，这里改用跨条目切片订阅（命令式，不触发渲染）——
-  // 若改回 root state 依赖，任一 agent 的工具循环都会唤醒整个 App（5b 要消除的开销）。
-  useEffect(() => {
-    const flushIdleQueues = () => {
-      for (const agentId of Object.keys(queuedPrompts)) {
-        if (canFlushQueuedPrompt(agentId)) {
-          void flushNextQueuedPrompt(agentId);
-        }
-      }
-    };
-    flushIdleQueues();
-    return sessionWorkspaceStore.subscribeSliceChange("runtime", flushIdleQueues);
-  }, [agents, queuedPrompts]);
-
   useEffect(() => {
     return () => {
       if (sendBehaviorMenuCloseTimerRef.current) {
@@ -4748,7 +4683,6 @@ export function App() {
       message: livePrompt,
       imageCount: attachedImagesSnapshot.length,
       emptyTemplateName,
-      isBusy: isAgentBusy,
     });
     if (decision.action === "ignore") return;
     const agentId = targetAgentId as string; // ignore 已排除无 target，后续分支必有值
@@ -4817,31 +4751,8 @@ export function App() {
     // 让输入框保持固定大小，超出部分滚动显示
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
 
-    const queuedPromptSnapshot: QueuedPrompt = {
-      id: crypto.randomUUID(),
-      message: expandedMessage,
-      displayText: message,
-      images,
-      behavior: "steer",
-      agentMode,
-      templateDescription,
-      timestamp: Date.now(),
-
-    };
-    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
-    if (decision.action === "enqueue") {
-      if (!enqueueQueuedPrompt(agentId, queuedPromptSnapshot)) {
-        setLivePrompt(agentId, (current) =>
-          [message, current].filter((text) => text.trim()).join("\n\n"),
-        );
-        if (images) {
-          setAttachedImagesForAgent(agentId, (current) => [...images, ...current]);
-        }
-        showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
-      }
-      return;
-    }
-
+    // 忙时由 omp 官方 steer 队列接管（runtime 保证工具结束后、下次 LLM 调用前注入），
+    // renderer 不再自建待发队列；队列快照经 runtimeState.queuedMessages 回显。
     const accepted = await submitPromptSnapshot(
       agentId,
       expandedMessage,
@@ -4851,10 +4762,8 @@ export function App() {
       templateDescription,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(agentId, {
-        ...queuedPromptSnapshot,
-        behavior: "direct",
-      });
+      // 写 stdin 后超时/断开：omp 可能已收下，重试会重复执行，只能挂一条本地未知提示。
+      addUncertainPrompt(agentId, message);
       return;
     }
     if (!accepted) {
@@ -4885,7 +4794,6 @@ export function App() {
       hasTarget: Boolean(targetAgentId),
       message: livePrompt,
       imageCount: attachedImages.length,
-      isBusy: isAgentBusy,
       commandRoutes: false,
     });
     if (followUpDecision.action === "ignore") return;
@@ -4918,30 +4826,6 @@ export function App() {
     setSendBehaviorMenuOpen(false);
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
 
-
-    const queuedPromptSnapshot: QueuedPrompt = {
-      id: crypto.randomUUID(),
-      message,
-      displayText: message,
-      images,
-      behavior: "followUp",
-      agentMode: currentComposerAgentMode,
-      timestamp: Date.now(),
-    };
-    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
-    if (followUpDecision.action === "enqueue") {
-      if (!enqueueQueuedPrompt(followUpAgentId, queuedPromptSnapshot)) {
-        setLivePrompt(followUpAgentId, (current) =>
-          [message, current].filter((text) => text.trim()).join("\n\n"),
-        );
-        if (images) {
-          setAttachedImagesForAgent(followUpAgentId, (current) => [...images, ...current]);
-        }
-        showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
-      }
-      return;
-    }
-
     const accepted = await submitPromptSnapshot(
       followUpAgentId,
       message,
@@ -4950,7 +4834,7 @@ export function App() {
       currentComposerAgentMode,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(followUpAgentId, queuedPromptSnapshot);
+      addUncertainPrompt(followUpAgentId, message);
       return;
     }
     if (!accepted) {
@@ -5014,8 +4898,8 @@ export function App() {
     /** prompt 模板匹配到的 description，作为元数据发给 pi agent 标识意图 */
     templateDescription?: string,
   ) {
-    // 非队列入口继续保持原有行为：当前选中 agent 忙碌时默认 steer。
-    // 客户端队列 drain 直接调用 dispatchPromptSnapshot，并显式指定其投递语义。
+    // 运行中发送默认 steer：omp 在工具结束后、下次 LLM 调用前注入；
+    // follow-up 入口显式传 "followUp" 走排队语义。
     const behavior =
       streamingBehavior ??
       (agentId === activeAgentId && isAgentBusy ? "steer" : undefined);
@@ -6259,15 +6143,8 @@ export function App() {
                           disabled={
                             isAgentStarting(activeAgent) ||
                             restartingAgentId === activeAgentId ||
-                            Boolean(
-                              activeAgentId &&
-                              (queueFlushByAgentRef.current.has(activeAgentId) ||
-                                (queuedPrompts[activeAgentId] ?? []).some(
-                                  (queuedPrompt) =>
-                                    queuedPrompt.status === "sending" ||
-                                    queuedPrompt.status === "unknown",
-                                )),
-                            )
+                            // 重启会丢掉 omp 内存里的待投递队列：先把 chip 撤回或等它投递完。
+                            activeQueueRows.length > 0
                           }
                           onClick={async () => {
                             if (!activeAgentId || !activeAgent) return;
@@ -6529,7 +6406,7 @@ export function App() {
               </button>
             </div>
           )}
-          {activeQueuedPrompts.length > 0 && activeAgentId && (
+          {activeQueueRows.length > 0 && activeAgentId && (
             <div
               ref={queuedTrackRef}
               className="queued-track"
@@ -6539,66 +6416,70 @@ export function App() {
                 <div className="queued-panel-header">
                   <span>{t("app.queuedMessagesLabel")}</span>
                   <span className="queued-panel-count">
-                    {activeQueuedPrompts.length}
+                    {activeQueueRows.length}
                   </span>
                 </div>
                 <div className="queued-list">
-                  {visibleQueuedPrompts.map((queuedPrompt, index) => {
-                    const status = queuedPrompt.status ?? "pending";
-                    const canRetractToInput = canRetractQueuedPromptToInput(status);
-                    const canDiscard = canDiscardQueuedPrompt(status);
-                    const previewText =
-                      queuedPrompt.displayText.trim() ||
-                      t("app.queuedImageMessage");
-                    const rowTitle = [
-                      previewText,
-                      queuedPrompt.error,
-                      status === "unknown" ? t("app.queuedUnknown") : "",
-                    ]
-                      .filter(Boolean)
-                      .join("\n");
+                  {activeQueueRows.map((row, index) => {
+                    if (row.kind === "uncertain") {
+                      // 未知投递：不在 omp 队列里，没有可撤回的副本，只允许关闭提示。
+                      return (
+                        <div
+                          key={row.key}
+                          className="queued-row unknown"
+                          title={[row.text, row.error].filter(Boolean).join("\n")}
+                        >
+                          <span className="queued-index" aria-hidden="true">
+                            {index + 1}
+                          </span>
+                          <span className="queued-text">
+                            {row.text.trim() || t("app.queuedImageMessage")}
+                          </span>
+                          <span className="queued-meta unknown">
+                            {t("app.queuedUnknownShort")}
+                          </span>
+                          <div className="queued-actions">
+                            <button
+                              type="button"
+                              className="queued-icon-btn danger"
+                              title={t("app.queuedDismiss")}
+                              aria-label={t("app.queuedDismiss")}
+                              onClick={() =>
+                                dismissUncertainPrompt(activeAgentId, row.id)
+                              }
+                            >
+                              <X size={13} strokeWidth={2} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    const isFollowUp = row.queue === "followUp";
                     return (
                       <div
-                        key={queuedPrompt.id}
-                        className={`queued-row ${status} queued-behavior-${queuedPrompt.behavior}`}
-                        title={rowTitle}
+                        key={row.key}
+                        className={`queued-row queued-behavior-${isFollowUp ? "followUp" : "steer"}`}
+                        title={row.text}
                       >
                         <span className="queued-index" aria-hidden="true">
                           {index + 1}
                         </span>
-                        <span className="queued-text">{previewText}</span>
-                        {queuedPrompt.images?.length ? (
-                          <span className="queued-meta">
-                            {t("app.queuedImageCount", {
-                              count: String(queuedPrompt.images.length),
-                            })}
-                          </span>
-                        ) : null}
-                        {status === "sending" ? (
-                          <span className="queued-meta">
-                            {t("app.queuedSending")}
-                          </span>
-                        ) : status === "failed" ? (
-                          <span className="queued-meta failed">
-                            {t("app.queuedFailed")}
-                          </span>
-                        ) : status === "unknown" ? (
-                          <span className="queued-meta unknown">
-                            {t("app.queuedUnknownShort")}
-                          </span>
-                        ) : null}
+                        <span className="queued-text">
+                          {row.text.trim() || t("app.queuedImageMessage")}
+                        </span>
+                        <span className="queued-meta">
+                          {isFollowUp
+                            ? t("app.queuedFollowUp")
+                            : t("app.queuedSteer")}
+                        </span>
                         <div className="queued-actions">
                           <button
                             type="button"
                             className="queued-icon-btn"
-                            disabled={!canRetractToInput}
                             title={t("app.retractToInput")}
                             aria-label={t("app.retractToInput")}
                             onClick={() =>
-                              retractQueuedPromptForEdit(
-                                activeAgentId,
-                                queuedPrompt,
-                              )
+                              void removeServerQueuedPrompt(activeAgentId, row, true)
                             }
                           >
                             <Pencil size={13} strokeWidth={2} />
@@ -6606,18 +6487,27 @@ export function App() {
                           <button
                             type="button"
                             className="queued-icon-btn danger"
-                            disabled={!canDiscard}
                             title={t("app.retractDiscard")}
                             aria-label={t("app.retractDiscard")}
                             onClick={() =>
-                              discardQueuedPrompt(
-                                activeAgentId,
-                                queuedPrompt.id,
-                              )
+                              void removeServerQueuedPrompt(activeAgentId, row, false)
                             }
                           >
                             <X size={13} strokeWidth={2} />
                           </button>
+                          {isFollowUp ? (
+                            <button
+                              type="button"
+                              className="queued-icon-btn"
+                              title={t("app.promoteQueued")}
+                              aria-label={t("app.promoteQueued")}
+                              onClick={() =>
+                                void promoteServerQueuedPrompt(activeAgentId, row.text)
+                              }
+                            >
+                              <ArrowUp size={13} strokeWidth={2} />
+                            </button>
+                          ) : null}
                         </div>
                       </div>
                     );
