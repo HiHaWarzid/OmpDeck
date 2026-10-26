@@ -268,15 +268,22 @@ export class PiProcess extends EventEmitter {
 
     this.rpc = new PiRpcClient(this.proc.stdin, this.proc.stdout);
 
-    // 显式启用 omp 原生 ask 对话框（ctx.ui.askDialog）。旧版 pi 没有该命令会返回
-    // unknown command，此时 ask 工具自动回退到 select，由现有 UI 兜底；因此这里
-    // 不等待响应、失败也不影响启动。命令先于用户 prompt 写入 stdin，顺序有保证。
-    void this.rpc.request({ type: "set_ask_dialog", enabled: true }, 10_000).catch(() => undefined);
-
     this.rpc.on("event", event => this.emit("event", event));
     this.rpc.on("protocol-error", line => this.emit("protocol-error", line));
     // 转发 RPC 日志到 AgentManager，用于前端调试面板展示
     this.rpc.on("log", entry => this.emit("rpc-log", entry));
+
+    // 显式启用 omp 原生 ask 对话框（ctx.ui.askDialog）。旧版 pi 没有该命令会返回
+    // unknown command，此时 ask 工具自动回退到 select，由现有 UI 兜底；因此这里
+    // 不等待响应、失败也不影响启动。命令先于用户 prompt 写入 stdin，顺序有保证。
+    void this.rpc.request({ type: "set_ask_dialog", enabled: true }, 10_000).catch(() => undefined);
+    // 订阅子代理 registry 帧（subagent_lifecycle / subagent_progress）。默认 off，
+    // 不订阅时 OmpDeck 只能靠会话文件扫描事后发现子会话；同样不等待响应，
+    // 旧版 pi 返回 unknown command 时静默退化为「无实时子代理视图」。
+    // 必须在 event 监听挂载之后再发订阅命令，否则首批 registry 帧可能无人接收。
+    void this.rpc
+      .request({ type: "set_subagent_subscription", level: "progress" }, 10_000)
+      .catch(() => undefined);
 
     this.proc.stderr.on("data", chunk => {
       const text = chunk.toString("utf8");

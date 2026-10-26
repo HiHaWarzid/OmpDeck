@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AgentRuntimeState } from "../../../shared/types";
-import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState } from "./agentRuntime";
+import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState, ingestAgentSubagents } from "./agentRuntime";
 import { createSessionWorkspaceStore } from "./sessionWorkspace";
 
 const AGENT = "agent-1";
@@ -104,5 +104,40 @@ describe("applyAgentRuntimeState（RPC 结果路径）", () => {
     applyAgentRuntimeState(AGENT, { modelId: "m1" }, store);
     store.leave(AGENT);
     expect(getAgentRuntimeState(AGENT, store)).toBeUndefined();
+  });
+});
+
+describe("ingestAgentSubagents（agents:subagents 高频推送）", () => {
+  it("只写 subagents 切片，不唤醒 runtime 订阅者", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(AGENT);
+    ingestAgentRuntimeState(AGENT, { isStreaming: true }, store);
+    const runtimeListener = vi.fn();
+    const unsubscribe = store.subscribeSlice(AGENT, "runtime", runtimeListener);
+
+    ingestAgentSubagents(
+      AGENT,
+      [{ id: "sub-1", status: "running", description: "scan" }],
+      store,
+    );
+
+    expect(store.getSlice(AGENT, "subagents")).toEqual([
+      { id: "sub-1", status: "running", description: "scan" },
+    ]);
+    expect(getAgentRuntimeState(AGENT, store)?.isStreaming).toBe(true);
+    expect(runtimeListener).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
+  it("同一数组引用重复推送不唤醒订阅者（same-ref 语义）", () => {
+    const store = createSessionWorkspaceStore();
+    store.joinTab(AGENT);
+    const subagents = [{ id: "sub-1", status: "completed" }];
+    ingestAgentSubagents(AGENT, subagents, store);
+    const listener = vi.fn();
+    const unsubscribe = store.subscribeSlice(AGENT, "subagents", listener);
+    ingestAgentSubagents(AGENT, subagents, store);
+    expect(listener).not.toHaveBeenCalled();
+    unsubscribe();
   });
 });

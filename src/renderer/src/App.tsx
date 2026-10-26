@@ -132,7 +132,7 @@ import { useSessionImport } from "./hooks/useSessionImport";
 import { reconcileAgentState, sameAgentTabList } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
-import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState } from "./workspace/agentRuntime";
+import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState, ingestAgentSubagents } from "./workspace/agentRuntime";
 import { dispatchToAgent } from "./workspace/dispatch";
 import { createTranscriptRuntime, reconcileTranscriptEntries, type TranscriptRuntime } from "./workspace/transcriptRuntime";
 import { composerActions } from "./workspace/slices/composerSlice";
@@ -164,6 +164,7 @@ import {
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
 import { BatchAskInlineBar, NativeAskInlineBar } from "./components/app/tools/AskQuestionCard";
+import { SubagentBar } from "./components/app/subagents/SubagentBar";
 import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
 import {
   MERGED_TASK_WIDGET_KEY,
@@ -2271,6 +2272,11 @@ export function App() {
       // steer/followUp 的投递时序完全由 omp 决定，renderer 不再在工具边沿冲刷本地队列。
       ingestAgentRuntimeState(payload.agentId, payload.state);
     });
+    // 子代理 registry：独立通道高频推送，写独立 subagents 切片，避免唤醒
+    // 订阅 runtime 的 App 根组件；也不参与 runtimeStateSeq 的旧快照守卫。
+    const offSubagents = api.agents.onSubagents((payload) => {
+      ingestAgentSubagents(payload.agentId, payload.subagents);
+    });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
       // 纯归约（同文本空转、首次非空记起点、清空移除）收敛为 workspace thinking 切片；
@@ -2469,6 +2475,7 @@ export function App() {
       offUpdateProgress();
       offOpenInBrowser?.();
       offRuntimeState();
+      offSubagents();
       offThinking();
       offNotice();
       offUiRequest();
@@ -6280,6 +6287,11 @@ export function App() {
 
         {activeAgent && (
         <footer ref={composerRef} className="composer">
+          {/* 子代理实时面板：与扩展 widget 一样固定在输入框上方；无子代理时不渲染。
+              key 绑定 agent：切 Agent 即重挂载，隐藏列表/草稿/弹框状态一并归零。 */}
+          {activeAgentId && (
+            <SubagentBar key={activeAgentId} agentId={activeAgentId} agents={api.agents} />
+          )}
           {/* 扩展 widget 固定在输入框上方；Todo+Plan 合并成一张任务卡，内部分区区分来源。 */}
           {activeAgentId && activeExtensionWidgets && Object.keys(activeExtensionWidgets).length > 0 && (() => {
             const entries = Object.entries(activeExtensionWidgets);

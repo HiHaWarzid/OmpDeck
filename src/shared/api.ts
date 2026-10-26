@@ -12,6 +12,7 @@ import type {
 	AbortAndRestoreQueueResult,
 	AgentMessagesDelta,
 	AgentRuntimeState,
+	AgentSubagent,
 	AgentTab,
 	AgentUiAskAnswer,
 	AgentUiRequest,
@@ -510,6 +511,16 @@ export interface AgentsApi {
 	 */
 	compact: (agentId: string, prompt?: string) => Promise<AgentRuntimeState>;
 	runtimeState: (agentId: string) => Promise<AgentRuntimeState>;
+	/** omp 子代理 registry 推送（progress 帧合并后的完整快照，按父 agent 分组）。 */
+	onSubagents: (callback: (payload: { agentId: string; subagents: AgentSubagent[] }) => void) => () => void;
+	/** 取消运行中的子代理；返回 omp 是否确认取消。 */
+	cancelSubagent: (agentId: string, subagentId: string) => Promise<boolean>;
+	/** 向运行中的子代理追加一条 steering 消息。 */
+	steerSubagent: (agentId: string, subagentId: string, message: string) => Promise<void>;
+	/** 读取子代理会话 transcript（只允许已登记在父 agent registry 的 subagentId）。 */
+	subagentMessages: (agentId: string, subagentId: string) => Promise<ChatMessage[]>;
+	/** 读取当前子代理 registry 快照（渲染层重载后补历史卡片；增量走 onSubagents）。 */
+	subagents: (agentId: string) => Promise<AgentSubagent[]>;
 	cycleModel: (agentId: string) => Promise<AgentRuntimeState>;
 	availableModels: (agentId: string) => Promise<AvailableModel[]>;
 	setModel: (agentId: string, provider: string, modelId: string) => Promise<AgentRuntimeState>;

@@ -428,6 +428,23 @@ export const ipcTable = {
 		compact: { channel: "agents:compact", kind: "invoke" },
 		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），配对见 onRuntimeState
 		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state", web: true },
+		/**
+		 * omp 子代理 registry 推送（订阅 subagent_lifecycle/subagent_progress 后）。
+		 * 与 runtime-state 分开：progress 帧频率高，单独推送避免每次 progress 都触发
+		 * get_state + get_session_stats 两次 RPC。
+		 */
+		onSubagents: {
+			channel: "agents:subagents",
+			kind: "subscribe",
+			pushFrom: "agent-manager",
+			pairKey: "agents:subagents",
+		},
+		/** 同一通道的 invoke 侧：渲染层重载/切 Agent 时拉取主进程 registry 快照。 */
+		subagents: { channel: "agents:subagents", kind: "invoke", pairKey: "agents:subagents" },
+		cancelSubagent: { channel: "agents:cancel-subagent", kind: "invoke" },
+		steerSubagent: { channel: "agents:steer-subagent", kind: "invoke" },
+		/** 按需读取子代理会话 transcript（仅允许 runtime 已登记的 subagentId）。 */
+		subagentMessages: { channel: "agents:subagent-messages", kind: "invoke" },
 		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true },
 		availableModels: { channel: "agents:available-models", kind: "invoke", web: true },
 		setModel: { channel: "agents:set-model", kind: "invoke", web: true },

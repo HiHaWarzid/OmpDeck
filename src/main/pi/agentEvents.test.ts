@@ -4,6 +4,7 @@ import { test, vi } from "vitest";
 import type {
 	AgentManagerEvent,
 	AgentStatus,
+	AgentSubagent,
 	AgentTab,
 	ChatMessage,
 } from "../../shared/types";
@@ -58,6 +59,8 @@ type TestRuntime = {
 	/** 待消费的本地斜线命令名（command_output 标注来源用） */
 	lastLocalCommand?: string;
 	pendingUIRequests: Map<string, { method: string; title: string }>;
+	/** omp 子代理 registry（lifecycle/progress 帧维护）；状态快照从这里投影。 */
+	subagents: Map<string, AgentSubagent>;
 	rpcLogging: boolean;
 	compacting: boolean;
 	rpcCompacting: boolean;
@@ -89,6 +92,7 @@ function makeRuntime(
 		toolExecuting: null,
 		runtimeStateSeq: 0,
 		pendingUIRequests: new Map(),
+		subagents: new Map(),
 		rpcLogging: false,
 		compacting: false,
 		rpcCompacting: false,
@@ -113,7 +117,7 @@ function makeManager(appLogger?: AppLogger): AgentManager {
 	return new AgentManager(
 		() => undefined, // getProject：不涉及项目解析
 		() => null, // getWindow：不推送 IPC
-		{} as unknown as SettingsStore, // 测试桩：不读写设置
+		{ get: () => ({}) } as unknown as SettingsStore, // 测试桩：不读写设置
 		{} as unknown as AgentConfigDeps, // 测试桩：不读写配置
 		undefined, // rpcLogger：本测试不落 RPC 日志
 		appLogger,
@@ -853,4 +857,111 @@ test("available_commands_update 归一化后推送到 agents:command-catalog，�
 	]);
 	// 目录更新是元数据，不应污染会话时间线
 	assert.equal(runtime.transcript.messages.length, 0);
+});
+
+// ── omp 子代理 registry 帧 ─────────────────────────────
+
+test("subagent_lifecycle/progress 合并进 registry，终态保留进度统计且可重置", async () => {
+	const manager = makeManager();
+	const emit = vi.spyOn(internals(manager), "emit").mockImplementation(() => undefined);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+	});
+	inner.agents.set("a1", runtime);
+
+	// lifecycle 只带身份和 started；对外归一为 running（UI 只判一个运行态值）。
+	inner.handlePiEvent("a1", {
+		type: "subagent_lifecycle",
+		payload: {
+			id: "sub-1",
+			agent: "explore",
+			status: "started",
+			index: 0,
+			description: "scan the repo",
+			sessionFile: "C:/sessions/sub-1.jsonl",
+		},
+	});
+	assert.equal(runtime.subagents.get("sub-1")?.status, "running");
+	assert.equal(runtime.subagents.get("sub-1")?.description, "scan the repo");
+
+	// progress 携带运行摘要；身份字段在后到的帧里可能缺失，必须向后合并保留。
+	inner.handlePiEvent("a1", {
+		type: "subagent_progress",
+		payload: {
+			index: 0,
+			agent: "explore",
+			progress: {
+				id: "sub-1",
+				status: "running",
+				lastIntent: "grep for handlers",
+				toolCount: 7,
+				tokens: 12_345,
+				durationMs: 4200,
+				recentTools: [{ tool: "grep", args: "set_ask_dialog", isError: false }],
+			},
+		},
+	});
+	const running = runtime.subagents.get("sub-1");
+	assert.equal(running?.toolCount, 7);
+	assert.equal(running?.lastIntent, "grep for handlers");
+	assert.equal(running?.recentTools?.[0]?.tool, "grep");
+	assert.equal(running?.sessionFile, "C:/sessions/sub-1.jsonl");
+	assert.equal(emit.mock.calls.at(-1)?.[0], ipcChannels.agentsSubagents);
+
+	// 终态 lifecycle 只有 id/status；不能把 progress 的统计和 description 清空。
+	inner.handlePiEvent("a1", {
+		type: "subagent_lifecycle",
+		payload: { id: "sub-1", status: "completed" },
+	});
+	const completed = runtime.subagents.get("sub-1");
+	assert.equal(completed?.status, "completed");
+	assert.equal(completed?.toolCount, 7);
+	assert.equal(completed?.description, "scan the repo");
+
+	// 迟到的 progress 帧（定时产出）不能把终态翻回 running，否则 UI 永远转圈。
+	inner.handlePiEvent("a1", {
+		type: "subagent_progress",
+		payload: {
+			index: 0,
+			agent: "explore",
+			progress: { id: "sub-1", status: "running", toolCount: 8 },
+		},
+	});
+	assert.equal(runtime.subagents.get("sub-1")?.status, "completed");
+	assert.equal(runtime.subagents.get("sub-1")?.toolCount, 8);
+
+	// subagentId 复用：新的 lifecycle(started) 必须重置上一次运行的统计与终态。
+	inner.handlePiEvent("a1", {
+		type: "subagent_lifecycle",
+		payload: { id: "sub-1", status: "started" },
+	});
+	assert.equal(runtime.subagents.get("sub-1")?.status, "running");
+	assert.equal(runtime.subagents.get("sub-1")?.toolCount, undefined);
+});
+
+test("会话切换清空子代理 registry，避免把旧会话的子代理带进新会话", async () => {
+	const manager = makeManager();
+	const emit = vi.spyOn(internals(manager), "emit").mockImplementation(() => undefined);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "idle"), {
+		request: async () => ({ success: true, data: {} }),
+	});
+	inner.agents.set("a1", runtime);
+	inner.handlePiEvent("a1", {
+		type: "subagent_lifecycle",
+		payload: { id: "sub-1", agent: "explore", status: "running" },
+	});
+	assert.equal(runtime.subagents.size, 1);
+
+	const internalsWithRefresh = inner as typeof inner & {
+		refreshRuntimeAfterSessionReplacement(agentId: string): Promise<void>;
+	};
+	await internalsWithRefresh.refreshRuntimeAfterSessionReplacement("a1");
+	assert.equal(runtime.subagents.size, 0);
+	const subagentEmits = emit.mock.calls.filter(([channel]) => channel === ipcChannels.agentsSubagents);
+	assert.deepEqual(
+		(subagentEmits.at(-1)?.[1] as { subagents: unknown[] } | undefined)?.subagents,
+		[],
+	);
 });

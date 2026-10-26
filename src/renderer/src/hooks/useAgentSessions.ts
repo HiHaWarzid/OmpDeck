@@ -21,7 +21,7 @@ import { showNotice } from "../utils/notice";
 import { t } from "../i18n";
 import { withTimeout } from "../utils/withTimeout";
 import { sameSessionSummaryList as sameCatalogSummaryList } from "../agentListDisplay";
-import { applyAgentRuntimeState } from "../workspace/agentRuntime";
+import { applyAgentRuntimeState, ingestAgentSubagents } from "../workspace/agentRuntime";
 
 /** 会话扫描超时：避免 IPC 无响应时 UI 永久等待。 */
 const SESSION_REFRESH_TIMEOUT_MS = 20_000;
@@ -141,6 +141,10 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		if (!agentId || isPendingAgentId(agentId)) return;
 		const state = await api.agents.runtimeState(agentId).catch(() => undefined);
 		if (state) applyAgentRuntimeState(agentId, state);
+		// registry 帧只推增量；渲染层重载后已完成/空闲子代理不会再发帧，
+		// 这里补一次快照，避免面板在重载后空白直到下一个 progress。
+		const subagents = await api.agents.subagents(agentId).catch(() => undefined);
+		if (subagents) ingestAgentSubagents(agentId, subagents);
 	}
 
 	/** 循环切换当前 agent 的模型，并通知用户切换结果。 */

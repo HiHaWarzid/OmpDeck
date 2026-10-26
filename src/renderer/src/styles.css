@@ -22929,3 +22929,276 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   accent-color: var(--color-accent);
   margin: 0;
 }
+
+/* ── 子代理实时面板（composer 上方，和扩展 widget 同层） ─────────────────── */
+.subagent-bar {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-panel);
+  overflow: hidden;
+}
+.subagent-bar-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-control);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+.subagent-bar-head:hover {
+  background: var(--color-bg-hover);
+}
+.subagent-bar-head:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.subagent-bar-title {
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.subagent-bar-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+}
+.subagent-list {
+  display: flex;
+  flex-direction: column;
+  max-height: min(220px, 30vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--color-border-subtle);
+}
+.subagent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  min-width: 0;
+  cursor: pointer;
+}
+.subagent-row + .subagent-row {
+  border-top: 1px dashed var(--color-border-subtle);
+}
+.subagent-row:hover {
+  background: color-mix(in srgb, var(--color-bg-hover) 55%, transparent);
+}
+.subagent-row.status-settled {
+  opacity: 0.72;
+}
+.subagent-row.status-settled:hover {
+  opacity: 1;
+}
+.subagent-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  flex-shrink: 0;
+  color: var(--color-text-tertiary);
+}
+.subagent-status.status-running,
+.subagent-status.status-started {
+  color: var(--color-info);
+}
+.subagent-status.status-completed {
+  color: var(--color-info);
+}
+.subagent-status.status-failed,
+.subagent-status.status-error {
+  color: var(--color-danger);
+}
+.subagent-spin {
+  animation: subagent-spin 1s linear infinite;
+}
+@keyframes subagent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.subagent-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.subagent-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.subagent-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-caption);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+.subagent-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: var(--radius-xs);
+  background: var(--color-bg-active);
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  line-height: 16px;
+}
+.subagent-stats {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+}
+.subagent-intent {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-body);
+  color: var(--color-text-secondary);
+  word-break: break-word;
+}
+.subagent-tool {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+}
+.subagent-tool.is-error {
+  color: var(--color-danger);
+}
+.subagent-tool-name {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+.subagent-tool-args {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-error {
+  font-size: var(--font-size-micro);
+  color: var(--color-danger);
+}
+.subagent-steer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  margin-top: 2px;
+}
+.subagent-steer .ui-text-field {
+  flex: 1;
+  min-width: 0;
+}
+.subagent-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.subagent-row:hover .subagent-actions,
+.subagent-row:focus-within .subagent-actions {
+  opacity: 1;
+}
+
+/* transcript 弹框 */
+.subagent-transcript-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: min(600px, calc(100vh - 220px));
+  overflow: hidden;
+}
+.subagent-transcript-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-1) var(--space-4) var(--space-4);
+}
+.subagent-transcript-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--color-border-subtle);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+}
+.subagent-transcript-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-transcript-message {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-panel);
+}
+.subagent-transcript-message.role-user {
+  background: color-mix(in srgb, var(--color-info) 7%, transparent);
+}
+.subagent-transcript-role {
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+}
+.subagent-transcript-text {
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-body);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+.subagent-transcript-thinking {
+  margin: 0;
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--color-border-subtle);
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-micro);
+  color: var(--color-text-tertiary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

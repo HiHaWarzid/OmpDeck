@@ -1,7 +1,8 @@
-import type { AgentRuntimeState } from "../../../shared/types";
+import type { AgentRuntimeState, AgentSubagent } from "../../../shared/types";
 import { mergeAgentRuntimeState, resolveIncomingRuntimeState } from "../utils/agentRuntimeState";
 import { dispatchToAgent } from "./dispatch";
 import { runtimeActions, type RuntimeState } from "./slices/runtimeSlice";
+import { subagentsActions } from "./slices/subagentsSlice";
 import type { SessionWorkspaceStore } from "./sessionWorkspace";
 import { sessionWorkspaceStore } from "./store";
 
@@ -49,4 +50,19 @@ export function applyAgentRuntimeState(
   // 同值合并返回原引用：无变更就不 dispatch，订阅者不被唤醒（批次 0 的 same-ref 语义）
   if (next !== current) dispatchToAgent(agentId, runtimeActions.set(next), store);
   return next;
+}
+
+/**
+ * 子代理 registry 推送入口（agents:subagents）。
+ *
+ * 写独立的 subagents 切片，不进 runtime：progress 帧约 150ms 一批，
+ * 混进 runtime 会持续唤醒订阅 runtime 的 App 根组件（与 thought 流同类的回归）。
+ * runtimeStateSeq 也不适用——registry 帧不和 get_state 快照共享序号。
+ */
+export function ingestAgentSubagents(
+  agentId: string,
+  subagents: AgentSubagent[],
+  store: SessionWorkspaceStore = sessionWorkspaceStore,
+): void {
+  dispatchToAgent(agentId, subagentsActions.set(subagents), store);
 }

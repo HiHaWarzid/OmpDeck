@@ -12,6 +12,7 @@ import type {
 	AgentQueuedMessages,
 	AgentRuntimeState,
 	AgentStatus,
+	AgentSubagent,
 	AgentTab,
 	AgentUiAskAnswer,
 	AgentUiAskOption,
@@ -194,6 +195,15 @@ export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
  * 调用都 warn，日志会在几秒内被同一条记录刷爆，反而掩盖真正的问题。
  */
 const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
+
+/** 子代理已收口状态：到达后不再被迟到的 progress("running") 覆盖。 */
+const SUBAGENT_TERMINAL_STATUSES = new Set([
+	"completed",
+	"aborted",
+	"cancelled",
+	"failed",
+	"error",
+]);
 
 export class AgentManager {
 	/**
@@ -1913,6 +1923,129 @@ export class AgentManager {
 		};
 	}
 
+	/** 子代理快照按 omp registry 的 index 排序（无 index 的按 id 稳定排序）。 */
+	private getSubagentSnapshot(runtime: AgentRuntime): AgentSubagent[] {
+		return [...runtime.subagents.values()].sort(
+			(a, b) => (a.index ?? 0) - (b.index ?? 0) || a.id.localeCompare(b.id),
+		);
+	}
+
+	/** 子代理状态变化只走独立通道：progress 帧频率高，不能顺带触发 get_state RPC。 */
+	private emitSubagents(runtime: AgentRuntime) {
+		this.emit(ipcChannels.agentsSubagents, {
+			agentId: runtime.tab.id,
+			subagents: this.getSubagentSnapshot(runtime),
+		});
+	}
+
+	/** registry 快照（无 RPC）：渲染层重载后恢复已有子代理卡片。 */
+	async getSubagents(agentId: string): Promise<AgentSubagent[]> {
+		return this.getSubagentSnapshot(this.requireRuntime(agentId));
+	}
+
+	/**
+	 * 合并 subagent_lifecycle / subagent_progress 帧。
+	 *
+	 * 帧结构（omp rpc-types）：
+	 * - lifecycle: { payload: { id, agent, status, parentToolCallId, sessionFile, index, description? } }
+	 * - progress:  { payload: { index, agent, ...身份字段, progress: { id, status, task, assignment,
+	 *                lastIntent, recentTools, recentOutput, toolCount, requests, tokens, cost,
+	 *                durationMs, resolvedModel, ... }, sessionFile } }
+	 *
+	 * lifecycle 只保证身份和终态，progress 才有运行摘要；两者按字段向后合并，
+	 * 避免后到的 lifecycle(completed) 把 progress 的统计清空。
+	 */
+	private applySubagentFrame(runtime: AgentRuntime, frame: Record<string, any>) {
+		const payload =
+			frame.payload && typeof frame.payload === "object"
+				? (frame.payload as Record<string, any>)
+				: undefined;
+		if (!payload) return;
+		const progress =
+			payload.progress && typeof payload.progress === "object"
+				? (payload.progress as Record<string, any>)
+				: undefined;
+		const source = progress ?? payload;
+		const id =
+			typeof source.id === "string" && source.id
+				? source.id
+				: typeof payload.id === "string" && payload.id
+					? payload.id
+					: "";
+		if (!id) return;
+
+		// omp 的 subagentId 在 session 内可能复用（同 agent 名再次派生）：新的
+		// lifecycle(started) 视为全新一次运行，丢弃上一次的统计/终态，否则终态粘滞
+		// 会把新运行永久钉在 completed。
+		if (frame.type === "subagent_lifecycle" && source.status === "started") {
+			runtime.subagents.delete(id);
+		}
+
+		const previous = runtime.subagents.get(id);
+		const pickText = (value: unknown) =>
+			typeof value === "string" && value.trim() ? value : undefined;
+		const pickNumber = (value: unknown) =>
+			typeof value === "number" && Number.isFinite(value) ? value : undefined;
+		// omp 的 lifecycle 用 "started" 表示开跑，progress/lifecycle 终态用
+		// completed/aborted/failed；对外统一 running，UI 只需判一个运行态值。
+		// 终态粘滞：progress 帧按固定间隔产出，理论上可能晚于 lifecycle 终态帧排队到达；
+		// 若让 "running" 覆盖 "completed"，面板会永远转圈，所以终态一旦到达就不再回退。
+		const rawStatus =
+			typeof source.status === "string" && source.status
+				? source.status
+				: previous?.status ?? "running";
+		const normalizedStatus = rawStatus === "started" ? "running" : rawStatus;
+		// 终态之间允许互相覆盖（lifecycle 的 failed/aborted 比 progress 的 completed 权威），
+		// 只禁止终态回退到 running 等非终态。
+		const status =
+			previous &&
+			SUBAGENT_TERMINAL_STATUSES.has(previous.status) &&
+			!SUBAGENT_TERMINAL_STATUSES.has(normalizedStatus)
+				? previous.status
+				: normalizedStatus;
+
+		const recentTools = Array.isArray(source.recentTools)
+			? source.recentTools
+					.filter((item): item is Record<string, unknown> =>
+						Boolean(item) && typeof item === "object",
+					)
+					.map((item) => ({
+						tool: typeof item.tool === "string" ? item.tool : "tool",
+						args: pickText(item.args),
+						isError: item.isError === true,
+					}))
+			: previous?.recentTools;
+
+		const next: AgentSubagent = {
+			...(previous ?? {}),
+			id,
+			status,
+			agent: pickText(source.agent) ?? pickText(payload.agent) ?? previous?.agent,
+			description:
+				pickText(payload.description) ?? pickText(source.description) ?? previous?.description,
+			index: pickNumber(source.index) ?? previous?.index,
+			sessionFile:
+				pickText(source.sessionFile) ?? pickText(payload.sessionFile) ?? previous?.sessionFile,
+			task: pickText(source.task) ?? previous?.task,
+			assignment: pickText(source.assignment) ?? previous?.assignment,
+			lastIntent: pickText(source.lastIntent) ?? previous?.lastIntent,
+			recentTools,
+			toolCount: pickNumber(source.toolCount) ?? previous?.toolCount,
+			tokens: pickNumber(source.tokens) ?? previous?.tokens,
+			durationMs: pickNumber(source.durationMs) ?? previous?.durationMs,
+			resolvedModel: pickText(source.resolvedModel) ?? previous?.resolvedModel,
+		};
+		runtime.subagents.set(id, next);
+		this.emitSubagents(runtime);
+	}
+
+	/** 新会话不继承旧会话的子代理 registry（旧进程仍可能继续跑 detached 子代理）。 */
+	private clearSubagents(runtime: AgentRuntime) {
+		if (runtime.subagents.size === 0) return;
+		runtime.subagents.clear();
+		this.emitSubagents(runtime);
+	}
+
 	private applyActiveToolCallState(runtime: AgentRuntime, state: ActiveToolCallState) {
 		if (state.calls.size > 0) {
 			runtime.activeToolCalls = state.calls;
@@ -2176,6 +2309,10 @@ export class AgentManager {
 				type: "switch_session",
 				sessionPath: sessionProtocolPath,
 			}, 30_000);
+
+			// reload 也是会话替换：进程内的子代理 registry 随旧会话丢弃，且不会补发
+			// 终态帧。不主动清空的话，编辑/删除消息后卡片会永远停在 Running。
+			if (response.success) this.clearSubagents(runtime);
 
 			void this.appLogger?.info("agent", "Session reload: switch_session done", {
 				agentId,
@@ -2882,6 +3019,9 @@ export class AgentManager {
 
 	private async refreshRuntimeAfterSessionReplacement(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
+		// 新会话不继承旧会话的子代理卡片；旧 detached 子代理最多失去实时入口，
+		// 其会话文件仍可通过会话列表打开（避免新会话时间线挂着上一会话的子代理）。
+		this.clearSubagents(runtime);
 		const stateResponse = await runtime.slot.process.client
 			.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout)
 			.catch(() => ({ data: undefined }));
@@ -2923,6 +3063,47 @@ export class AgentManager {
 	async getCommands(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
 		return this.readPiSlashCommands(runtime, agentId);
+	}
+
+	/**
+	 * 取消一个运行中的子代理。omp 返回 `{ cancelled: boolean }`：
+	 * false 表示子代理已自行结束/不存在，调用方按「已无运行子代理」处理即可。
+	 */
+	async cancelSubagent(agentId: string, subagentId: string): Promise<boolean> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "cancel_subagent", subagentId },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error ?? "cancel_subagent failed");
+		}
+		return (response.data as { cancelled?: unknown } | undefined)?.cancelled === true;
+	}
+
+	/** 给运行中的子代理追加 steering 消息（不打断其当前 run）。 */
+	async steerSubagent(agentId: string, subagentId: string, message: string): Promise<void> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "steer_subagent", subagentId, message },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error ?? "steer_subagent failed");
+		}
+	}
+
+	/**
+	 * 读取子代理会话 transcript。只接受本 agent registry 里登记过、且带 sessionFile 的子代理：
+	 * 渲染层传入的 subagentId 是外部输入，不能当任意文件路径使用。
+	 */
+	async getSubagentMessages(agentId: string, subagentId: string): Promise<ChatMessage[]> {
+		const runtime = this.requireRuntime(agentId);
+		const subagent = runtime.subagents.get(subagentId);
+		if (!subagent?.sessionFile) {
+			throw new Error(`Unknown subagent: ${subagentId}`);
+		}
+		return this.readSessionDisplayMessages(subagent.sessionFile, "_viewer");
 	}
 
 	private async promptMatchesRegisteredExtensionCommand(runtime: AgentRuntime, message: string): Promise<boolean> {
@@ -3389,6 +3570,15 @@ export class AgentManager {
 				runtime.tab.title = name;
 				this.emitState();
 			}
+		}
+
+		// omp 子代理 registry 帧：lifecycle 带身份/终态，progress 带运行摘要。
+		// 帧只在 set_subagent_subscription:progress 后到达；旧版 pi 没有该帧，走不到这里。
+		// 子代理状态独立于父 agent 的 run 生命周期（detached 子代理在父 agent_end 后仍运行），
+		// 所以只更新 subagents 表并推送专门的 agents:subagents 通道，不触发 get_state RPC。
+		if (typed.type === "subagent_lifecycle" || typed.type === "subagent_progress") {
+			this.applySubagentFrame(runtime, typed);
+			return;
 		}
 
 		// 命令目录推送：omp 在启动和目录变化（/reload-plugins、扩展/技能热加载）时发出，
@@ -4837,6 +5027,12 @@ type AgentRuntime = {
 	toolExecuting: string | null;
 	/** 完整运行态推送的单调序号：渲染层据此丢弃乱序到达的旧快照（长任务后 RPC 慢更容易乱序）。 */
 	runtimeStateSeq: number;
+	/**
+	 * omp 子代理 registry 的本地投影（subagentId -> 最新状态）。
+	 * 订阅 set_subagent_subscription:progress 后由 lifecycle/progress 帧维护；
+	 * 进程重启即清空（registry 属于单个 omp 进程）。
+	 */
+	subagents: Map<string, AgentSubagent>;
 	/** 「IPC 基线截断」告警上次输出的时刻（毫秒）：getMessages 被高频调用，告警据此限频。 */
 	lastTranscriptTruncationWarnAt?: number;
 
@@ -4942,6 +5138,7 @@ function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRunt
 		toolStateSequence: 0,
 		activeToolCalls: new Map(),
 		toolExecuting: null,
+		subagents: new Map(),
 		pendingUIRequests: new Map(),
 		rpcLogging: false,
 		compacting: false,

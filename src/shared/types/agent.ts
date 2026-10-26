@@ -34,6 +34,41 @@ export type PiCommand = {
 	subcommands?: PiCommandSubcommand[];
 };
 
+/**
+ * omp 子代理（task 工具派生的子会话）在父会话里的实时投影。
+ *
+ * 事实源是 omp RPC 的 `subagent_lifecycle` / `subagent_progress` 帧：
+ * progress 帧会带上 registry 的完整行（含 status/durationMs/model 等），
+ * 而 lifecycle 帧只带身份与终态，所以字段全部可选、按帧合并。
+ * 子代理 transcript 不进这里：卡片只展示进度摘要，正文按需从会话文件读取。
+ */
+export type AgentSubagent = {
+	id: string;
+	/** 子代理类型（omp agent 名，如 task / scout），不是 UI 角色。 */
+	agent?: string;
+	description?: string;
+	/** omp registry 原始状态：started/running/completed/aborted/failed。 */
+	status: string;
+	index?: number;
+	/** 子会话 JSONL 路径（宿主机路径），用于按需读取 transcript。 */
+	sessionFile?: string;
+	task?: string;
+	assignment?: string;
+	/** 子代理最近一次自述意图（progress.lastIntent），用于卡片副标题。 */
+	lastIntent?: string;
+	recentTools?: AgentSubagentTool[];
+	toolCount?: number;
+	tokens?: number;
+	durationMs?: number;
+	resolvedModel?: string;
+};
+
+export type AgentSubagentTool = {
+	tool: string;
+	args?: string;
+	isError?: boolean;
+};
+
 export type AgentRuntimeState = {
 	modelName?: string;
 	provider?: string;

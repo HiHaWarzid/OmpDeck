@@ -36,6 +36,7 @@ type AgentHandlerMaps = {
 		| "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
+		| "cancelSubagent" | "steerSubagent" | "subagentMessages" | "subagents"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
 		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk"
 		| "respondTrustRequest">;
@@ -284,6 +285,32 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			},
 			runtimeState: async (_event, agentId: string) =>
 				agentManager.getRuntimeState(agentId),
+			cancelSubagent: async (_event, agentId: string, subagentId: string) => {
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				const cancelled = await agentManager.cancelSubagent(agentId, subagentId);
+				void appLogger.info("agent", "Subagent cancel requested", { agentId, subagentId, cancelled });
+				return cancelled;
+			},
+			steerSubagent: async (_event, agentId: string, subagentId: string, message: string) => {
+				// IPC 入参来自渲染层，边界校验后再发给 omp（空消息会被 omp 拒绝）。
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				if (typeof message !== "string" || !message.trim()) {
+					throw new Error("Invalid subagent steering message");
+				}
+				await agentManager.steerSubagent(agentId, subagentId, message.trim());
+			},
+			subagentMessages: async (_event, agentId: string, subagentId: string) => {
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				return agentManager.getSubagentMessages(agentId, subagentId);
+			},
+			subagents: async (_event, agentId: string) =>
+				agentManager.getSubagents(agentId),
 			cycleModel: async (_event, agentId: string) =>
 				agentManager.cycleModel(agentId),
 			availableModels: async (_event, agentId: string) =>
