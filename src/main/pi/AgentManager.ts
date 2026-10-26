@@ -53,6 +53,7 @@ import {
 	estimateMessageBytes,
 	extractImages,
 	stripAnsi,
+	truncateForDetail,
 } from "./messageTextUtils";
 import {
 	assertResendRootEntry,
@@ -1169,6 +1170,10 @@ export class AgentManager {
 		// 当前端排队 flush 连续发送多条消息时，第一条会触发 agent_start 使 agent 变忙碌，
 		// 后续消息必须带 streamingBehavior 否则 pi 直接返回 error。这里自动兜底。
 		// images 用于传递粘贴/拖拽的图片，pi 会将 base64 图片直接传给支持视觉的模型。
+		// 记下斜线命令名：command_output 帧不带命令名，命中时用它标注输出来源。
+		runtime.lastLocalCommand = trimmed.startsWith("/")
+			? trimmed.slice(1).split(/\s+/, 1)[0] || undefined
+			: undefined;
 		try {
 			const promptIsExtensionCommand = await this.promptMatchesRegisteredExtensionCommand(runtime, agentMessage);
 			const requestPayload: Record<string, unknown> = {
@@ -1190,12 +1195,30 @@ export class AgentManager {
 			if (!response.success) {
 				// pi RPC 会把不支持图片、忙碌队列参数缺失等前置错误作为 success:false 返回；
 				// 必须显式显示出来，否则 UI 会停在"已发送但无响应"的状态。
+				runtime.lastLocalCommand = undefined;
 				const errorMessage = response.error ?? "图片消息发送失败";
 				runtime.tab.status = statusBeforePrompt === "running" ? "running" : "idle";
 				this.addMessage(runtime, "error", errorMessage);
 				this.emitState();
 				return { accepted: false, error: errorMessage };
 			}
+
+			// agentInvoked:false 表示 omp 把这个 prompt 当本地命令就地执行完了：
+			// 不会有 agent_start / agent_end，也不会触发 provider 请求。必须立即收口，
+			// 否则空响应兜底会把它误报成"Provider 未返回流式响应"（问错方向）。
+			// 旧版 pi 不返回该字段，undefined 时保持原有兜底路径。
+			const agentInvoked = (response.data as { agentInvoked?: unknown } | undefined)?.agentInvoked;
+			if (agentInvoked === false) {
+				runtime.lastLocalCommand = undefined;
+				// 只回退本函数乐观设置的 running。发送前已在跑的 run 不归这条本地命令管：
+				// 期间若已 abort/收口，用旧快照写回 running 会造出没有 run 的假运行态。
+				if (statusBeforePrompt !== "running") runtime.tab.status = "idle";
+				// 不碰空响应兜底：这里若存在定时器，它属于另一条仍在等 provider 流的 prompt。
+				this.emitState();
+				return { accepted: true };
+			}
+			// 普通 agent prompt 不会来 command_output；清掉标签，防止后续无关输出被旧命令名标注。
+			runtime.lastLocalCommand = undefined;
 
 			if (promptIsExtensionCommand) {
 				// 机制：Pi 扩展命令可在 prompt 阶段直接执行并返回，不进入 agent run。
@@ -1211,6 +1234,7 @@ export class AgentManager {
 			}
 			return { accepted: true };
 		} catch (error) {
+			runtime.lastLocalCommand = undefined;
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			// prompt RPC 调用前已通过同步 write() 写入 pi stdin；此处所有异常都只说明
 			// preflight 响应未到达，无法证明 pi 没有接收。返回 unknown，renderer 会永久禁用
@@ -3192,6 +3216,22 @@ export class AgentManager {
 			}
 		}
 
+		// omp 的本地斜线命令（/context、/tools、/session、/share 等）不进入 agent run：
+		// 只发 command_output 帧 + 带 agentInvoked:false 的 prompt 响应，既没有 agent_end
+		// 也没有工具消息。这里把输出落成时间线条目，否则命令执行完界面毫无反馈。
+		if (typed.type === "command_output") {
+			const text = typeof typed.text === "string" ? stripAnsi(typed.text).trim() : "";
+			if (text) {
+				this.addMessage(runtime, "system", truncateForDetail(text), {
+					type: "commandOutput",
+					// 帧里没有命令名，用发送时记下的名字标注来源；缺失时卡片退回通用标题。
+					// 同一条命令可能分多帧到达，标签保留到 prompt 响应再清（见 sendPrompt）。
+					...(runtime.lastLocalCommand ? { command: runtime.lastLocalCommand } : {}),
+				});
+			}
+			return;
+		}
+
 		if (typed.type === "agent_start") {
 			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知。
 			this.cancelSessionEndNotification(agentId);
@@ -4611,7 +4651,12 @@ type AgentRuntime = {
 	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
 	settleCheckTimer?: NodeJS.Timeout;
 	/**
-	 * 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
+	 * 本次 prompt 里待消费的本地斜线命令名（不含前导 "/"）。
+	 * omp 的 command_output 帧不带命令名，只能由发送方在 prompt 前记下；
+	 * 标签保留到 prompt 响应再清（同一命令可能分多帧到达）。
+	 */
+	lastLocalCommand?: string;
+	/** 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
 	 * 只由 handlePiEvent 刷新——get_state 是我们主动发的请求，其响应不算事件流活性。
 	 */
 	lastPiEventAt?: number;

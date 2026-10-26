@@ -1,6 +1,6 @@
 /** 诊断与压缩卡片：压缩摘要、诊断提示及其归档消息展开。 */
 import { memo, useState } from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Terminal } from "lucide-react";
 import { t, type TranslationKey } from "../../../i18n";
 import type { ChatMessage } from "../../../../../shared/types";
 import { Button } from "../../ui/Button";
@@ -164,18 +164,31 @@ function ArchivedMessage({ message }: { message: ChatMessage }) {
 export const DiagnosticMessageCard = memo(function DiagnosticMessageCard(props: {
 	message: ChatMessage;
 }) {
+	// 本地斜线命令（/context、/tools 等）的输出共用这张卡：中性色 + 终端图标，
+	// 不能沿用警告图标，否则用户会以为是异常诊断。
+	const isCommandOutput = props.message.meta?.type === "commandOutput";
+	const command =
+		isCommandOutput && typeof props.message.meta?.command === "string"
+			? props.message.meta.command
+			: "";
 	const tone = getDiagnosticTone(props.message);
-	const title = props.message.role === "error"
-		? t("diagnostic.errorTitle")
-		: t("diagnostic.systemTitle");
+	const title = isCommandOutput
+		? command
+			? `/${command}`
+			: t("diagnostic.commandOutputTitle")
+		: props.message.role === "error"
+			? t("diagnostic.errorTitle")
+			: t("diagnostic.systemTitle");
+	const Icon = isCommandOutput ? Terminal : AlertTriangle;
 	return (
 		<article
 			className={`diagnostic-card tone-${tone}`}
 			data-message-id={props.message.id}
 			data-role={props.message.role}
+			data-type={isCommandOutput ? "commandOutput" : undefined}
 		>
 			<div className="diagnostic-card-header">
-				<AlertTriangle size={14} aria-hidden="true" />
+				<Icon size={14} aria-hidden="true" />
 				<span>{title}</span>
 				<time>{formatTime(props.message.timestamp)}</time>
 			</div>

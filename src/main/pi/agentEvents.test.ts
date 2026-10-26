@@ -54,6 +54,8 @@ type TestRuntime = {
 	lastPiEventAt?: number;
 	/** 最近一次工作事件时刻：会话结束通知按它计算静默窗口 */
 	lastWorkEventAt?: number;
+	/** 待消费的本地斜线命令名（command_output 标注来源用） */
+	lastLocalCommand?: string;
 	pendingUIRequests: Map<string, { method: string; title: string }>;
 	rpcLogging: boolean;
 	compacting: boolean;
@@ -124,7 +126,12 @@ function makeManager(appLogger?: AppLogger): AgentManager {
 type ManagerInternals = {
 	agents: Map<string, TestRuntime>;
 	emitStateNow(): void;
-	addMessage(runtime: TestRuntime, role: string, text: string): void;
+	addMessage(
+		runtime: TestRuntime,
+		role: string,
+		text: string,
+		meta?: Record<string, unknown>,
+	): void;
 	handlePiEvent(agentId: string, event: unknown): void;
 	handleUIRequest(runtime: TestRuntime, event: Record<string, unknown>): void;
 	emit: (channel: string, payload: unknown) => void;
@@ -771,4 +778,37 @@ test("native ask 载荷有坏题时整体取消，避免 answers 与问题错位
 			(item) => item.payload?.requestId === "r3" && item.payload?.method === "ask",
 		),
 	);
+});
+
+// ── 本地斜线命令输出（command_output） ───────────────────
+
+test("command_output 落成 commandOutput 系统消息，同一命令多帧沿用命令名", () => {
+	const manager = makeManager();
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"));
+	inner.agents.set("a1", runtime);
+	runtime.lastLocalCommand = "context";
+
+	inner.handlePiEvent("a1", {
+		type: "command_output",
+		// omp 输出带终端颜色序列，落库前必须清掉，否则卡片里是乱码。
+		text: "\u001b[38;5;243mContext window\u001b[39m: 1000000 tokens (1% used)\n",
+	});
+
+	const message = runtime.transcript.messages.at(-1);
+	assert(message);
+	assert.equal(message.role, "system");
+	assert.equal(message.text, "Context window: 1000000 tokens (1% used)");
+	assert.equal(message.meta?.type, "commandOutput");
+	assert.equal(message.meta?.command, "context");
+	// 标签由 sendPrompt 在收到 prompt 响应时清理，事件层只读不消费。
+	assert.equal(runtime.lastLocalCommand, "context");
+
+	// 空白输出不造消息；同一条命令的第二帧仍带命令名。
+	inner.handlePiEvent("a1", { type: "command_output", text: "  \n" });
+	inner.handlePiEvent("a1", { type: "command_output", text: "No background jobs running." });
+	assert.equal(runtime.transcript.messages.length, 2);
+	const second = runtime.transcript.messages.at(-1);
+	assert.equal(second?.meta?.type, "commandOutput");
+	assert.equal(second?.meta?.command, "context");
 });
