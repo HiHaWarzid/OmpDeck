@@ -208,7 +208,6 @@ import { AgentManager } from "./pi/AgentManager";
 import { PiLocator } from "./pi/PiLocator";
 import { PiProcess } from "./pi/PiProcess";
 import { QuickGenProcess } from "./pi/QuickGenProcess";
-import { ensureAllPiSettingsDefaults } from "./pi/PiSettingsDefaults";
 import { SessionScanner } from "./sessions/SessionScanner";
 import { createSessionParseWorker } from "./sessions/sessionWorkerFactory";
 import { createSessionArchiveWorker } from "./sessions/sessionArchiveWorkerFactory";
@@ -1426,11 +1425,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 			installationType: settingsStore.get().installationType,
 		}),
 	]);
-
-	// 补齐 pi settings.json 缺失的默认配置项，新安装或精简配置的用户无需手动添加。
-	void ensureAllPiSettingsDefaults(settingsStore.get(), piLocator, activeWslEnvironment).catch((error) => {
-		console.error("Failed to ensure pi settings defaults:", error);
-	});
 
 	// AFK 启动自动恢复：设置持久化的 enabled 时恢复轮询与未完成任务判定。
 	if (settingsStore.get().afk?.enabled) {

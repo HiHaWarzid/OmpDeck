@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -65,7 +65,7 @@ describe("export/import extended package", () => {
 		expect(await manager.trustStore.getDecision("C:\\B")).toBe(null);
 	});
 
-	it("legacy package without new keys restores the three JSON files only", async () => {
+	it("legacy package ignores settings.json (omp no longer reads it)", async () => {
 		const pkg = JSON.stringify({
 			files: {
 				"models.json": { providers: {} },
@@ -74,7 +74,68 @@ describe("export/import extended package", () => {
 			},
 		});
 		expect((await manager.importConfig(pkg)).valid).toBe(true);
-		expect((await manager.getSettingsConfig()).parsed).toEqual({ theme: "dark" });
+		// settings.json 已不是 omp 的读取源：导入不应把它搬进 config.yml
+		expect((await manager.ompConfig.read()).parsed).toEqual({});
 		expect(await manager.trustStore.getDecision("C:\\Work\\proj")).toBe(null);
+	});
+
+	it("import applies editable settings from config.yml and keeps other keys", async () => {
+		await manager.ompConfig.patch({
+			set: [
+				{ path: "auth.broker.token", value: "keep-me" },
+				{ path: "retry.maxRetries", value: 9 },
+			],
+		});
+		const pkg = JSON.stringify({
+			files: {
+				"config.yml": {
+					enabledModels: ["openai/gpt-4o"],
+					retry: { baseDelayMs: 250 },
+					compaction: { enabled: false },
+				},
+			},
+		});
+		expect((await manager.importConfig(pkg)).valid).toBe(true);
+		const parsed = (await manager.ompConfig.read()).parsed;
+		expect(parsed.enabledModels).toEqual(["openai/gpt-4o"]);
+		// 包内缺失的 retry.maxRetries 保持目标原值（只写给出项）
+		expect(parsed.retry).toEqual({ maxRetries: 9, baseDelayMs: 250 });
+		expect(parsed.compaction).toEqual({ enabled: false });
+		expect(parsed.auth).toEqual({ broker: { token: "keep-me" } });
+	});
+	it("rejects the whole package when the existing config.yml is unparsable", async () => {
+		const broken = "modelRoles: [unclosed\n";
+		await writeFile(join(dir, "config.yml"), broken);
+		await manager.trustStore.setDecision("C:\\Existing", true);
+
+		const pkg = JSON.stringify({
+			files: {
+				"config.yml": {
+					modelRoles: { default: "openai/gpt-4o:high" },
+					retry: { maxRetries: 2 },
+				},
+				"trust.json": { "C:\\New": true },
+			},
+		});
+		const result = await manager.importConfig(pkg);
+		expect(result.valid).toBe(false);
+		// 预检发生在任何写入之前：文件与受影响状态都保持原样
+		expect(await readFile(join(dir, "config.yml"), "utf8")).toBe(broken);
+		expect(await manager.trustStore.getDecision("C:\\New")).toBeNull();
+		expect(await manager.trustStore.getDecision("C:\\Existing")).toBe(true);
+	});
+
+	it("export includes editable settings but no credential keys", async () => {
+		await manager.ompConfig.patch({
+			set: [
+				{ path: "enabledModels", value: ["openai/gpt-4o"] },
+				{ path: "compaction.keepRecentTokens", value: 1234 },
+				{ path: "auth.broker.token", value: "secret" },
+			],
+		});
+		const pkg = JSON.parse(await manager.exportConfig());
+		expect(pkg.files["config.yml"].enabledModels).toEqual(["openai/gpt-4o"]);
+		expect(pkg.files["config.yml"].compaction).toEqual({ keepRecentTokens: 1234 });
+		expect(pkg.files["config.yml"].auth).toBeUndefined();
 	});
 });

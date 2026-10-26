@@ -15455,16 +15455,6 @@ a.config-btn {
   color: var(--color-text-tertiary);
 }
 
-.config-settings-row--add {
-  justify-content: center;
-  border-style: dashed;
-  opacity: 0.7;
-}
-
-.config-settings-row--add:hover {
-  opacity: 1;
-}
-
 /* Settings 行内 combobox：复用 config-combobox 样式，适配 settings-row 布局 */
 .config-settings-combobox {
   flex: 1;

@@ -17,3 +17,22 @@ export type ConfigSaveWarning = {
 	code: ConfigSaveWarningCode;
 	detail: string;
 };
+
+/**
+ * config.yml 点路径补丁（omp 全局设置的权威源）。
+ *
+ * 键 = `omp config list --json` 里的键路径（`retry.maxRetries`、`enabledModels` ...）。
+ * 渲染层只提交用户改动过的键，主进程在最新文档上做一次 read-modify-write，
+ * 这样注释、schema 外键（modelRoles 等）和其它设置不会被整文件覆盖。
+ */
+export type OmpConfigSetEntry = {
+	/** 点分键路径；每一段对应一层映射键。 */
+	path: string;
+	/** 省略 / undefined = 删除该键（回到 omp 默认）。 */
+	value?: unknown;
+};
+
+export type OmpConfigPatch = {
+	set?: OmpConfigSetEntry[];
+	unset?: string[];
+};

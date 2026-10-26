@@ -18,9 +18,11 @@ import {
 	redactDiagnostics,
 	sessionBaseUrlHint,
 } from "./providerProbe";
+import { OmpConfigFile } from "./OmpConfigFile";
 import { OmpRolesStore } from "./OmpRolesStore";
 import { TrustStore } from "./TrustStore";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { ompSettingsPatchFromPackage, pickOmpSettings } from "../../shared/ompConfigSettings";
 import { parseDocument } from "yaml";
 import type { WslEnvironment } from "../wsl/WslPaths";
 
@@ -74,9 +76,9 @@ export type PiAuthItem = {
 
 export type PiAuthFile = Record<string, PiAuthItem>;
 
-// ── settings.json ─────────────────────────────────────
-
-export type PiSettings = Record<string, unknown>;
+// ── config.yml ────────────────────────────────────────
+// omp 的全局设置权威源；读写收敛在 OmpConfigFile（原文/点路径补丁）与
+// OmpRolesStore（modelRoles）。settings.json 只是历史迁移残留，本类不再写它。
 
 export type ConfigValidationResult = {
 	valid: boolean;
@@ -96,8 +98,9 @@ type TestRequest = {
 };
 
 /**
- * 管理 omp 全局配置文件（~/.omp/agent/ 下的 models.json、auth.json、settings.json）。
- * 按照 pi 实际文件格式解析：models.json 是嵌套 providers 结构，auth.json 是对象映射。
+ * 管理 omp 全局配置文件（~/.omp/agent/ 下的 models.json、auth.json、trust.json、
+ * config.yml）。按照 pi 实际文件格式解析：models.json 是嵌套 providers 结构，
+ * auth.json 是对象映射，config.yml 是 YAML 设置权威源（见 OmpConfigFile）。
  */
 export class ConfigManager {
 	private configDir: string;
@@ -109,13 +112,19 @@ export class ConfigManager {
 	readonly rolesStore: OmpRolesStore;
 	/** trust.json 专属存取（信任决策存储/探测/编排），configDir 经 accessor 注入。 */
 	readonly trustStore: TrustStore;
-	/** models/auth/settings.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
+	/**
+	 * config.yml 通用读写（原文 + 点路径补丁），configDir 经 accessor 注入。
+	 * 公开只读：设置页的键级写入由 OmpConfigFile 承担（与 rolesStore 共享路径队列）。
+	 */
+	readonly ompConfig: OmpConfigFile;
+	/** models/auth.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
 	private readonly jsonFiles = new Map<string, JsonFileStore<string>>();
 
 	constructor(configDir?: string) {
 		this.configDir = configDir ?? PI_AGENT_DIR;
 		this.rolesStore = new OmpRolesStore({ resolveConfigDir: () => this.configDir });
 		this.trustStore = new TrustStore({ resolveConfigDir: () => this.configDir });
+		this.ompConfig = new OmpConfigFile({ resolveConfigDir: () => this.configDir });
 	}
 
 	/** 将配置目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
@@ -249,10 +258,6 @@ export class ConfigManager {
 			}
 		}
 		return this.readJsonFile<PiAuthFile>("auth.json", {});
-	}
-
-	async getSettingsConfig(): Promise<ConfigFileReadResult<PiSettings>> {
-		return this.readJsonFile<PiSettings>("settings.json", {});
 	}
 
 	async getTrustConfig(): Promise<ConfigFileReadResult<Record<string, boolean>>> {
@@ -494,20 +499,12 @@ export class ConfigManager {
 		return { valid: true };
 	}
 
-	async saveSettingsConfig(
-		settings: PiSettings,
-	): Promise<ConfigValidationResult> {
-		await this.writeJsonFile("settings.json", settings);
-		return { valid: true };
-	}
-
 	// ── omp 权威全局配置 config.yml ─────────────────────
 	// 当前 omp 以 ~/.omp/agent/config.yml（YAML）为全局 settings 权威源，
-	// settings.json 只是历史迁移遗留、不再被读取；模型角色（modelRoles）与
-	// 默认思考等级必须写 config.yml 才会生效。config.yml 的读写与原子单文档写
-	// 收敛于 OmpRolesStore（原两次串行全文件 RMW 的撕裂窗口在此关闭）；消费方
-	// 直取 this.rolesStore（configureWsl 切换 home 时经 accessor 现取 configDir，指针跟随）。
-	// 本类保留的唯一角色相关逻辑是 export/import 的打包（见下方）。
+	// settings.json 只是历史迁移遗留、不再被读取。config.yml 的读写收敛于
+	// this.ompConfig（原文 / 点路径补丁）与 this.rolesStore（modelRoles），
+	// 两者共享 JsonFileStore 的按路径队列，不会互相覆盖。本类保留的
+	// config.yml 相关逻辑只有 export/import 的打包（见下方）。
 
 	// ── 保存（源文件编辑） ────────────────────────────────
 
@@ -524,7 +521,8 @@ export class ConfigManager {
 			};
 		}
 
-		const allowed = ["models.json", "auth.json", "settings.json", "trust.json"];
+		// config.yml 不在此列：它是 YAML，走 config.saveOmpConfigRaw（校验映射后原子写）
+		const allowed = ["models.json", "auth.json", "trust.json"];
 		if (!allowed.includes(fileName)) {
 			return { valid: false, error: `不允许编辑的文件：${fileName}` };
 		}
@@ -664,7 +662,6 @@ export class ConfigManager {
 
 	private docsUrlForFile(fileName: string) {
 		if (fileName === "models.json") return "https://pi.dev/docs/latest/models";
-		if (fileName === "settings.json") return "https://pi.dev/docs/latest/settings";
 		return "https://pi.dev/docs/latest/providers";
 	}
 
@@ -873,14 +870,14 @@ export class ConfigManager {
 
 	/** 将配置文件打包为单个 JSON 对象，便于用户备份和迁移（含信任决策与模型角色）。 */
 	async exportConfig(): Promise<string> {
-		const [models, auth, settings] = await Promise.all([
+		const [models, auth] = await Promise.all([
 			this.readJsonFile<PiModelsFile>("models.json", { providers: {} }),
 			this.readJsonFile<PiAuthFile>("auth.json", {}),
-			this.readJsonFile<PiSettings>("settings.json", {}),
 		]);
 		const trust = await this.getTrustConfig();
 		const roles = await this.rolesStore.readRolesState();
 		const defaultLevel = await this.rolesStore.readDefaultThinkingLevel();
+		const ompConfig = await this.ompConfig.read();
 		return JSON.stringify(
 			{
 				version: 1,
@@ -888,11 +885,12 @@ export class ConfigManager {
 				files: {
 					"models.json": models.parsed,
 					"auth.json": auth.parsed,
-					"settings.json": settings.parsed,
-					// Q31：导出无声丢失的信任决策与 OMP 角色补上。config.yml 只取两个
-					// schema 槽位（modelRoles/defaultThinkingLevel），omp 自有键不动。
+					// 设置权威源是 config.yml；settings.json 已不被 omp 读取，不再进包。
 					"trust.json": trust.parsed,
+					// config.yml 只取设置页可编辑键 + modelRoles/defaultThinkingLevel，
+					// omp 自有键（含可能带凭据的 auth.broker.*）不动、不入包。
 					"config.yml": {
+						...pickOmpSettings(ompConfig.parsed),
 						modelRoles: Object.fromEntries(
 							Object.entries(roles)
 								.filter(([, assignment]) => assignment.selector)
@@ -924,11 +922,26 @@ export class ConfigManager {
 			return { valid: false, error: "导入文件缺少 files 字段，请确认是 OmpDeck 导出的配置包" };
 		}
 
-		// 按需写入，只处理已知文件名，忽略其他 key（旧包无新键 = 原样恢复三 JSON）
+		const rawOmpConfig = files["config.yml"];
+		const ompConfig =
+			rawOmpConfig && typeof rawOmpConfig === "object" && !Array.isArray(rawOmpConfig)
+				? (rawOmpConfig as Record<string, unknown>)
+				: undefined;
+		// 预检现有 config.yml：角色与设置键是两次文档写入，文件已损坏时第二次写入
+		// 会在第一次成功后才失败，用户看到「导入失败」但配置只落了一半。这里在
+		// 任何写入（含 models/auth/trust）之前先确认现有文件可解析，损坏则整包放弃。
+		if (ompConfig) {
+			const existing = await this.ompConfig.read();
+			if (existing.diagnostic) {
+				return { valid: false, error: existing.diagnostic.message };
+			}
+		}
+
+		// 按需写入，只处理已知文件名，忽略其他 key（旧包里的 settings.json 不再恢复：
+		// omp 不读它，写回反而会在 config.yml 缺失时被当成设置迁移过去）
 		const allowed: Array<[string, string]> = [
 			["models.json", "models.json"],
 			["auth.json", "auth.json"],
-			["settings.json", "settings.json"],
 		];
 		for (const [key, fileName] of allowed) {
 			if (files[key] != null) {
@@ -947,10 +960,13 @@ export class ConfigManager {
 				await this.trustStore.importEntries(validEntries);
 			}
 		}
-		const ompConfig = files["config.yml"];
-		if (ompConfig && typeof ompConfig === "object" && !Array.isArray(ompConfig)) {
+		if (ompConfig) {
 			const result = await this.rolesStore.importPackage(ompConfig);
 			if (!result.valid) return result;
+			// 设置页可编辑键单独走点路径补丁：rolesStore 只认角色槽位，不碰其它键。
+			const patch = ompSettingsPatchFromPackage(ompConfig);
+			const patchResult = await this.ompConfig.patch(patch);
+			if (!patchResult.valid) return patchResult;
 		}
 		return { valid: true };
 	}

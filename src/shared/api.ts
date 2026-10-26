@@ -64,6 +64,7 @@ import type {
 	OpenCodeImportReport,
 	OpenCodeSessionSummary,
 	OmpModelRole,
+	OmpConfigPatch,
 	OmpRolesState,
 	PetAggregateState,
 	PetManifest,
@@ -371,10 +372,9 @@ export interface ExtensionsApi {
 
 /**
  * 类型化设置表面：AppSettings 强类型读写（SettingsStore，含热更新副作用：代理/主题/
- * Web 服务/宠物联动）。与 config.getSettings/saveSettings/saveRaw（settings.json 原始
- * JSON 文件级读写，ConfigModal 编辑器用）并行存在 —— 边界：settings.* = 应用语义 +
- * 副作用；config.* = 文件内容编辑。W6-7 记录，不合并（两套都是真实服务面，合并有
- * 回归风险，留待未来波次）。
+ * Web 服务/宠物联动）。与 config.getOmpConfig/saveOmpConfigRaw/patchOmpConfig
+ * （config.yml 文件级读写，ConfigModal 编辑器用）并行存在 —— 边界：settings.* =
+ * 应用语义 + 副作用；config.* = omp 配置文件内容编辑。
  */
 export interface SettingsApi {
 	get: () => Promise<AppSettings>;
@@ -387,16 +387,20 @@ export interface ConfigApi {
 	getModels: () => Promise<{ raw: string; parsed: { providers: Record<string, unknown> }; diagnostic?: ConfigFileDiagnostic }>;
 	getAuth: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	/**
-	 * settings.json 原始文件级读取（ConfigModal 编辑器）。与 settings.get（typed
-	 * AppSettings + 热更新副作用）并行 —— 这边返回 raw/parsed/diagnostic，供编辑器
-	 * 展示与诊断；界别见 SettingsApi 注释（W6-7 记录，不合并）。
+	 * 读取 omp 全局设置权威源 config.yml（原文 + 解析后的映射，供设置页与源文件编辑器）。
+	 * 与 settings.get（typed AppSettings + 热更新副作用）并行 —— 这边是文件级编辑。
 	 */
-	getSettings: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
+	getOmpConfig: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	getTrust: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
 	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
-	/** 原始 settings.json 写回（编辑器保存）；语义同 getSettings —— 文件级，无类型化副作用。 */
-	saveSettings: (settings: Record<string, unknown>) => Promise<{ valid: boolean; error?: string }>;
+	/** config.yml 原文写回（源文件编辑器）；校验 YAML 顶层为映射后原子写，失败不落盘。 */
+	saveOmpConfigRaw: (raw: string) => Promise<{ valid: boolean; error?: string }>;
+	/**
+	 * config.yml 键级补丁：只提交用户改动过的点路径键（`retry.maxRetries` 等）。
+	 * 主进程在最新文档上做一次 read-modify-write，注释与未触及的键保持不变。
+	 */
+	patchOmpConfig: (patch: OmpConfigPatch) => Promise<{ valid: boolean; error?: string }>;
 	/**
 	 * 读取 omp 权威全局配置（config.yml）中的默认模型角色与默认思考档。
 	 * 当前 omp 的全局 settings 源是 config.yml（"provider/modelId[:thinkingLevel]"），

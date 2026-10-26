@@ -437,11 +437,12 @@ const previewOverrides: NamespaceOverrides = {
 			parsed: { providers: {} },
 		}),
 		getAuth: async () => ({ raw: "{}", parsed: {} }),
-		getSettings: async () => ({ raw: "{}", parsed: {} }),
+		getOmpConfig: async () => ({ raw: "", parsed: {} }),
 		getTrust: async () => ({ raw: "{}", parsed: {} }),
 		saveModels: async () => ({ valid: true }),
 		saveAuth: async () => ({ valid: true }),
-		saveSettings: async () => ({ valid: true }),
+		saveOmpConfigRaw: async () => ({ valid: true }),
+		patchOmpConfig: async () => ({ valid: true }),
 		getOmpDefault: async () => ({}),
 		setDefaultModel: async () => ({ valid: true }),
 		clearOmpDefault: async () => ({ valid: true }),
@@ -450,7 +451,7 @@ const previewOverrides: NamespaceOverrides = {
 			JSON.stringify({
 				version: 1,
 				exportedAt: new Date().toISOString(),
-				files: { "models.json": {}, "auth.json": {}, "settings.json": {} },
+				files: { "models.json": {}, "auth.json": {}, "config.yml": {} },
 			}),
 		import: async () => ({ valid: true }),
 		fetchModels: async () => ({

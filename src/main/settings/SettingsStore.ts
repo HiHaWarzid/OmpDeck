@@ -1,19 +1,19 @@
 import { app, BrowserWindow, Menu } from "electron";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { createDefaultExternalEditorSettings, type AfkSettings, type AppSettings } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { readShowThinkingSetting } from "../../shared/ompConfigSettings";
+import { resolveOmpConfigFileName } from "../config/OmpConfigFile";
 
 /** 桌面端 settings.json（userData），与 pi agent settings 分离 */
 function desktopSettingsPath() {
 	return join(app.getPath("userData"), "settings.json");
 }
 
-/** pi agent 的 settings.json 路径（~/.omp/agent/settings.json） */
-function piAgentSettingsPath() {
-	return join(app.getPath("home"), ".omp", "agent", "settings.json");
-}
 
 /**
  * 同步读取桌面 settings.json（app.ready 前可用）。文件缺失时返回空对象。
@@ -72,15 +72,23 @@ export function readPetEnabledPreference(
 }
 
 /**
- * 读取 pi agent 的 settings.json 并从中提取 showThinking（取 hideThinkingBlock 的反值）。
- * pi CLI 的 hideThinkingBlock 语义：true=隐藏思考，false=显示思考。
+ * 读取 omp agent 的 config.yml 并从中提取 showThinking（取 hideThinkingBlock 的反值）。
+ * omp 18 只读 config.yml/config.yaml 作为全局设置权威源，settings.json 仅在
+ * config.yml 缺失时被一次性迁移；因此这里必须读的也是 config.yml，否则用户
+ * 在 omp 里改的 hidden 状态在桌面上永远不生效。
+ * hideThinkingBlock 语义：true=隐藏思考，false=显示思考。
  * 桌面端 showThinking 语义：true=显示，false=隐藏。
  * 映射：showThinking = !hideThinkingBlock
- * 若 pi agent 文件不存在或 hideThinkingBlock 未设置，返回 undefined。
+ * 若文件不存在或 hideThinkingBlock 未设置，返回 undefined。
  *
- * 该文件只由 pi CLI 进程写入，桌面进程只读；短 TTL 缓存消除高频路径
+ * 该文件只由 omp CLI 与桌面设置页写入；短 TTL 缓存消除高频路径
  * （git diff 点击、创建 agent、发送 prompt 等都会调 get()）上的同步读盘 +
- * JSON.parse，外部变更仍在秒级内可见。
+ * YAML 解析，外部变更仍在秒级内可见。
+ *
+ * 目录用 node:os 的 homedir()，与 ConfigManager 写 config.yml 时用的是同一个
+ * 解析（进程环境 USERPROFILE/HOME）。不用 app.getPath("home")：Windows 上后者走
+ * SHGetKnownFolderPath，不跟随 USERPROFILE，重定向 home 的环境里会读到与 omp
+ * CLI 不同的目录。
  */
 const PI_AGENT_SETTINGS_TTL_MS = 1_500;
 let piShowThinkingCache: { value: boolean | undefined; at: number } | null = null;
@@ -92,10 +100,11 @@ function readPiAgentShowThinking(): boolean | undefined {
 	}
 	let value: boolean | undefined;
 	try {
-		const agentRaw = readFileSync(piAgentSettingsPath(), "utf8");
-		const agentSettings = JSON.parse(agentRaw) as Record<string, unknown>;
-		if (typeof agentSettings.hideThinkingBlock === "boolean") {
-			value = !agentSettings.hideThinkingBlock;
+		const configDir = join(homedir(), ".omp", "agent");
+		const raw = readFileSync(join(configDir, resolveOmpConfigFileName(configDir)), "utf8");
+		const parsed: unknown = parseYaml(raw);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			value = readShowThinkingSetting(parsed as Record<string, unknown>);
 		}
 	} catch {
 		// 文件不存在或解析失败，静默忽略

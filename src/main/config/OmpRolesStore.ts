@@ -10,6 +10,7 @@ import {
 	type OmpRolesState,
 } from "../../shared/types/ompRoles";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { resolveOmpConfigFileName } from "./OmpConfigFile";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
@@ -77,24 +78,21 @@ export class OmpRolesStore {
 		return created;
 	}
 
-	/** 读取 config.yml/config.yaml 原文；两者都不存在返回 null。 */
+	/** 读取当前生效的 config.yml(config.yaml) 原文；不存在返回 null。 */
 	private async readRawConfigYaml(): Promise<string | null> {
-		for (const name of ["config.yml", "config.yaml"]) {
-			try {
-				const raw = await this.yamlFile(join(this.configDir, name)).readRaw();
-				if (raw !== null) return raw;
-			} catch {
-				// 单个文件读失败继续尝试下一个
-			}
+		try {
+			return await this.yamlFile(
+				join(this.configDir, this.ompConfigYamlName()),
+			).readRaw();
+		} catch {
+			// 读取失败按缺失处理：不基于不可读内容做迁移/合并
+			return null;
 		}
-		return null;
 	}
 
-	/** 写入文件名：优先已存在的 config.yaml，否则 config.yml（与原行为一致）。 */
+	/** 写入文件名与读取文件保持一致（见 resolveOmpConfigFileName 的优先级说明）。 */
 	private ompConfigYamlName(): string {
-		return existsSync(join(this.configDir, "config.yaml"))
-			? "config.yaml"
-			: "config.yml";
+		return resolveOmpConfigFileName(this.configDir);
 	}
 
 	private async parseDoc(): Promise<Record<string, unknown> | null> {

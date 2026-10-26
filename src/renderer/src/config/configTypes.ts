@@ -35,4 +35,3 @@ export type AuthFile = Record<
 	string,
 	{ type?: string; key?: string; [key: string]: unknown }
 >;
-export type SettingsFile = Record<string, unknown>;

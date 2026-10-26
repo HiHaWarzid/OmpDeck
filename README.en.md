@@ -61,7 +61,7 @@
 | **Message Edit/Delete** | Copy, edit, and delete AI responses and user messages; edited text is backfilled to the composer for re-sending. |
 | **ScratchPad** | Overlay-style scratch pad with content preview, selection mapping, and theme-aware semantic colors. |
 | **Content Width Restriction** | Draggable content width slider (unlimited by default, drag left to narrow) for long code lines or compact layouts. |
-| **Configuration, Skill & Extension Management** | Visual editors for pi's `models.json`, `auth.json`, and `settings.json`, plus global Skill and Extension management. |
+| **Configuration, Skill & Extension Management** | Visual editors for omp's `models.json`, `auth.json`, and `config.yml` (the authoritative settings source), plus global Skill and Extension management. |
 | **Extension Enable/Disable** | Disable/enable built-in extensions, project-level skill/extension management, distinguishing global vs project config. |
 | **Trust Confirmation System** | Desktop-intercepted trust confirmation; untrusted projects can still be opened; projects with running agents cannot be deleted. |
 | **Proxy Settings** | Manage pi agent process proxy and desktop proxy separately; model discovery and connection tests can use the desktop proxy. |

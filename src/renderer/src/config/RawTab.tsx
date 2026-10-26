@@ -4,9 +4,9 @@ import { ConfigSelect } from "./ConfigShared";
 // ── Raw Tab ─────────────────────────────────────────────
 
 const RAW_FILE_OPTIONS = [
+	{ value: "config.yml", label: "config.yml" },
 	{ value: "models.json", label: "models.json" },
 	{ value: "auth.json", label: "auth.json" },
-	{ value: "settings.json", label: "settings.json" },
 	{ value: "trust.json", label: "trust.json" },
 ];
 

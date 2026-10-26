@@ -27,7 +27,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 		config: {
 			getModels: async () => configManager.getModelsConfig(),
 			getAuth: async () => configManager.getAuthConfig(),
-			getSettings: async () => configManager.getSettingsConfig(),
+			getOmpConfig: async () => configManager.ompConfig.read(),
 			getOmpDefault: async () => rolesStore.readDefaultModel(),
 			getTrust: async () => configManager.getTrustConfig(),
 			saveModels: async (_event, data) => {
@@ -49,10 +49,24 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				void appLogger.info("config", "Auth config saved", { authCount });
 				return result;
 			},
-			saveSettings: async (_event, settings) => {
-				const result = await configManager.saveSettingsConfig(settings);
-				const keyCount = settings && typeof settings === "object" ? Object.keys(settings).length : 0;
-				void appLogger.info("config", "Pi settings config saved", { keys: keyCount });
+			saveOmpConfigRaw: async (_event, raw) => {
+				const result = await configManager.ompConfig.writeRaw(raw);
+				if (result.valid) {
+					void appLogger.info("config", "config.yml saved from source editor", {
+						bytes: typeof raw === "string" ? raw.length : 0,
+					});
+				}
+				return result;
+			},
+			patchOmpConfig: async (_event, patch) => {
+				const result = await configManager.ompConfig.patch(patch);
+				if (result.valid) {
+					// 只记键路径、不记值：config.yml 可能含 auth.broker.token 等凭据
+					void appLogger.info("config", "config.yml patched", {
+						set: patch.set?.map((entry) => entry.path) ?? [],
+						unset: patch.unset ?? [],
+					});
+				}
 				return result;
 			},
 			// 原子设置 omp 默认模型：写 ~/.omp/agent/config.yml 的 modelRoles.default

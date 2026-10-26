@@ -23,11 +23,11 @@ import type {
 	ConfigTab,
 	ModelItem,
 	ModelsFile,
-	SettingsFile,
 } from "./config/configTypes";
 import type { ConfigFileDiagnostic, CreatePiPromptTemplateInput, PiExtensionListResult, PiExtensionSummary, PiPromptTemplateListResult, PiPromptTemplateSummary, PiSkillListResult, PiSkillLocation, PiSkillSummary } from "../../shared/types";
 import { getProviderHeaders, KNOWN_PROVIDER_ENDPOINTS } from "./config/providerHeaders";
 import { lookupBuiltinApiRoute } from "../../shared/providerApiRoutes";
+import { diffOmpSettings } from "../../shared/ompConfigSettings";
 
 const api: PiDesktopApi = (window as unknown as { piDesktop: PiDesktopApi })
 	.piDesktop;
@@ -192,10 +192,12 @@ function ConfigModalContent(props: ConfigModalProps) {
 	// 各 tab 的数据
 	const [modelsData, setModelsData] = useState<ModelsFile>({ providers: {} });
 	const [authData, setAuthData] = useState<AuthFile>({});
-	const [settingsData, setSettingsData] = useState<SettingsFile>({});
+	/** omp 全局设置权威源 config.yml 的草稿与载入基线（保存时据此生成补丁） */
+	const [settingsData, setSettingsData] = useState<Record<string, unknown>>({});
+	const [settingsBaseline, setSettingsBaseline] = useState<Record<string, unknown>>({});
 	/**
-	 * 当前 omp settings.json 的默认模型配置（defaultProvider/defaultModel/
-	 * defaultThinkingLevel），供 ModelsTab 提供商卡片标记与快速设定默认。
+	 * 当前 omp config.yml 的默认模型配置（modelRoles.default + defaultThinkingLevel），
+	 * 供 ModelsTab 提供商卡片标记与快速设定默认。
 	 */
 	const [ompDefault, setOmpDefault] = useState<{
 		provider?: string;
@@ -339,19 +341,20 @@ function ConfigModalContent(props: ConfigModalProps) {
 					setRawFileName("auth.json");
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "settings") {
-					// 同时加载 settings、auth 和 models 数据，确保 defaultProvider / defaultModel 下拉能聚合所有可用信息
+					// 设置页数据源 = omp 权威设置 config.yml；auth/models 仅用于 enabledModels 候选
 					const [settingsRes, authRes, modelsRes] = await Promise.all([
-						api.config.getSettings(),
+						api.config.getOmpConfig(),
 						api.config.getAuth(),
 						api.config.getModels(),
 					]);
-					setSettingsData(settingsRes.parsed as SettingsFile);
+					setSettingsData(settingsRes.parsed);
+					setSettingsBaseline(settingsRes.parsed);
 					setAuthData(authRes.parsed as AuthFile);
 					setModelsData(normalizeModelsFile(modelsRes.parsed));
 					setRawContent(settingsRes.raw);
-					setRawFileName("settings.json");
+					setRawFileName("config.yml");
 					setConfigDiagnostic(settingsRes.diagnostic ?? null);
-					// 默认模型权威源是 config.yml（omp 不再读 settings.json 的 modelRoles）
+					// 默认模型权威源同样是 config.yml（modelRoles.default）
 					setOmpDefault(await api.config.getOmpDefault());
 
 					// 对于 auth 中有但 models 中没有模型的供应商，自动尝试获取模型列表
@@ -413,24 +416,10 @@ function ConfigModalContent(props: ConfigModalProps) {
 					setRawFileName("trust.json");
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "raw") {
-					// 源文件 tab 复用当前 tab 对应的文件
-					const fileName =
-						tab === "models"
-							? "models.json"
-							: tab === "auth"
-								? "auth.json"
-								: tab === "trust"
-									? "trust.json"
-									: "settings.json";
+					// 源文件 tab 默认打开 omp 设置权威源 config.yml；其它文件由下拉切换
+					const fileName = "config.yml";
 					setRawFileName(fileName);
-					const res =
-						fileName === "models.json"
-							? await api.config.getModels()
-							: fileName === "auth.json"
-								? await api.config.getAuth()
-								: fileName === "trust.json"
-									? await api.config.getTrust()
-									: await api.config.getSettings();
+					const res = await api.config.getOmpConfig();
 					setRawContent(res.raw);
 					setConfigDiagnostic(res.diagnostic ?? null);
 				}
@@ -511,6 +500,10 @@ function ConfigModalContent(props: ConfigModalProps) {
 
 	};
 
+	/**
+	 * 保存并提示。返回是否真正落盘：调用方必须据此决定是否 reload，
+	 * 否则失败时随后的 loadConfig 会 setError(null) 并覆盖用户草稿。
+	 */
 	const saveAndReload = async (
 		saveFn: () => Promise<{
 			valid: boolean;
@@ -518,14 +511,14 @@ function ConfigModalContent(props: ConfigModalProps) {
 			warnings?: ConfigSaveWarning[];
 		}>,
 		successMessage?: string,
-	) => {
+	): Promise<boolean> => {
 		setSaving(true);
 		setError(null);
 		try {
 			const result = await saveFn();
 			if (!result.valid) {
 				setError(result.error ?? t("config.saveFailed"));
-				return;
+				return false;
 			}
 			onSaved();
 			// 「已保存但有降级」必须说出来：例如 models.yml 镜像写失败时，
@@ -541,11 +534,13 @@ function ConfigModalContent(props: ConfigModalProps) {
 					6000,
 					"warning",
 				);
-				return;
+				return true;
 			}
 			showToast(successMessage ?? t("config.saved"));
+			return true;
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
+			return false;
 		} finally {
 			setSaving(false);
 		}
@@ -965,10 +960,11 @@ function ConfigModalContent(props: ConfigModalProps) {
 				]),
 			),
 		};
-		await saveAndReload(
+		const saved = await saveAndReload(
 			() => api.config.saveModels(normalizedData),
 			t("config.modelsSaved"),
 		);
+		if (!saved) return;
 		await loadConfig("models");
 
 		// 保存后自动刷新所有运行中的 Agent，使模型配置实时生效
@@ -1065,21 +1061,30 @@ function ConfigModalContent(props: ConfigModalProps) {
 	};
 
 	const handleSaveAuth = async () => {
-		await saveAndReload(() => api.config.saveAuth(authData));
+		if (!(await saveAndReload(() => api.config.saveAuth(authData)))) return;
 		await loadConfig("auth");
 	};
 
 	// ── Settings 操作 ────────────────────────────────────
 
 	const handleSaveSettings = async () => {
-		await saveAndReload(() => api.config.saveSettings(settingsData));
+		const patch = diffOmpSettings(settingsBaseline, settingsData);
+		// 没有改动就不落盘（避免把空补丁写成一次无意义写入）
+		if ((patch.set?.length ?? 0) === 0 && (patch.unset?.length ?? 0) === 0) {
+			await loadConfig("settings");
+			return;
+		}
+		if (!(await saveAndReload(() => api.config.patchOmpConfig(patch)))) return;
 		await loadConfig("settings");
 	};
 
 	// ── Trust 操作 ────────────────────────────────────────
 
 	const handleSaveTrust = async () => {
-		await saveAndReload(() => api.config.saveRaw("trust.json", JSON.stringify(trustData, null, 2)));
+		const saved = await saveAndReload(() =>
+			api.config.saveRaw("trust.json", JSON.stringify(trustData, null, 2)),
+		);
+		if (!saved) return;
 		await loadConfig("trust");
 	};
 
@@ -1087,10 +1092,14 @@ function ConfigModalContent(props: ConfigModalProps) {
 
 	const handleSaveRaw = async () => {
 		const isModelsFile = rawFileName === "models.json";
-		await saveAndReload(
-			() => api.config.saveRaw(rawFileName, rawContent),
+		const saved = await saveAndReload(
+			() =>
+				rawFileName === "config.yml"
+					? api.config.saveOmpConfigRaw(rawContent)
+					: api.config.saveRaw(rawFileName, rawContent),
 			isModelsFile ? t("config.modelsSaved") : undefined,
 		);
+		if (!saved) return;
 		if (isModelsFile) {
 			await loadConfig("models");
 			// Raw 保存也触发模型刷新，确保运行中的 Agent 实时生效
@@ -1113,7 +1122,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 						? await api.config.getAuth()
 						: fileName === "trust.json"
 							? await api.config.getTrust()
-							: await api.config.getSettings();
+							: await api.config.getOmpConfig();
 			setRawContent(res.raw);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
@@ -1677,7 +1686,6 @@ function ConfigModalContent(props: ConfigModalProps) {
 							data={settingsData}
 							saving={saving}
 							modelsData={modelsData}
-							authData={authData}
 							discoveredModels={discoveredModels}
 							onChange={setSettingsData}
 							onSave={handleSaveSettings}

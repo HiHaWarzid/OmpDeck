@@ -350,11 +350,15 @@ export const ipcTable = {
 	config: {
 		getModels: { channel: "config:get-models", kind: "invoke" },
 		getAuth: { channel: "config:get-auth", kind: "invoke" },
-		getSettings: { channel: "config:get-settings", kind: "invoke" },
+		/** 读取 omp 全局设置权威源 config.yml（原文 + 解析后的映射） */
+		getOmpConfig: { channel: "config:get-omp-config", kind: "invoke" },
 		getTrust: { channel: "config:get-trust", kind: "invoke" },
 		saveModels: { channel: "config:save-models", kind: "invoke" },
 		saveAuth: { channel: "config:save-auth", kind: "invoke" },
-		saveSettings: { channel: "config:save-settings", kind: "invoke" },
+		/** config.yml 原文写回（源文件编辑器；校验 YAML 映射后原子写） */
+		saveOmpConfigRaw: { channel: "config:save-omp-config-raw", kind: "invoke" },
+		/** config.yml 键级补丁（设置页保存：只写改动过的键，保留注释与其它键） */
+		patchOmpConfig: { channel: "config:patch-omp-config", kind: "invoke" },
 		getOmpDefault: { channel: "config:get-omp-default", kind: "invoke" },
 		/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write config.yml，避免渲染层并发覆盖） */
 		setDefaultModel: { channel: "config:set-default-model", kind: "invoke" },

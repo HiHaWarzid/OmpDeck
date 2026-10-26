@@ -1,11 +1,15 @@
-import { useState, useRef, useCallback, useEffect } from "react";
-import { X, Plus, Check } from "lucide-react";
-import type { AuthFile, SettingsFile, ModelsFile } from "./configTypes";
-import { ConfigComboboxInput } from "./ConfigShared";
+import { useState, useRef, useEffect } from "react";
+import { X, Check } from "lucide-react";
+import type { ModelsFile } from "./configTypes";
+import {
+	readOmpPath,
+	setEnabledModelSelected,
+	writeOmpPath,
+} from "../../../shared/ompConfigSettings";
+import type { OmpSettingsPath } from "../../../shared/ompConfigSettings";
 import { t } from "../i18n";
 
-// ── 可用模型列表聚合（含供应商信息，供 enabledModels 多选用） ──
-
+// ── 可用模型列表聚合（含供应商信息,供 enabledModels 多选用） --
 interface ModelRecord {
 	id: string;
 	provider: string;
@@ -40,244 +44,99 @@ function collectModels(
 	return [...map.values()];
 }
 
-// ── Settings Tab ────────────────────────────────────────
+// ── config.yml 草稿的点路径读写 ────────────────────────
+// 设置页只编辑 OMP_SETTINGS_PATHS 里列出的键；保存时由 ConfigModal 按
+// 「草稿 vs 载入基线」生成点路径补丁，主进程只写改动过的键（保留注释与其它键）。
+// 读写实现与主进程共用 shared/ompConfigSettings，避免两套剪枝/遍历语义漂移。
 
+/** 有限非负整数（token 数/重试次数），非法输入返回 undefined = 不写该键。 */
+function nonNegativeInt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? Math.floor(value)
+		: undefined;
+}
+
+// ── Settings Tab ----------------------------------------
 export function SettingsTab(props: {
-	data: SettingsFile;
+	/** config.yml 解析后的映射（草稿） */
+	data: Record<string, unknown>;
 	saving: boolean;
-	/** 已配置的模型/服务商数据，用于 defaultProvider / defaultModel 下拉选项 */
 	modelsData?: ModelsFile;
-	/** 已配置的认证数据，配合 modelsData 一起为 defaultProvider 聚合所有可用的供应商 */
-	authData?: AuthFile;
-	/** 通过已知端点自动发现的模型（auth-only 供应商） */
 	discoveredModels?: Record<string, Array<{ id: string; name?: string }>>;
-	onChange: (data: SettingsFile) => void;
+	onChange: (data: Record<string, unknown>) => void;
 	onSave: () => void;
 }) {
-	const { data, saving } = props;
-	const entries = Object.entries(data);
-	// enabledModels 已配置时合并到 entries 前端展示，未配置时通过「添加」按钮单独显示
-	const hasEnabledModels = "enabledModels" in data;
+	const { data } = props;
+	const update = (path: OmpSettingsPath, value: unknown) =>
+		props.onChange(writeOmpPath(data, path, value));
 
-	/**
-	 * 设置页只暴露外层重试次数和基础延迟。
-	 * provider 级 timeout/maxRetries 的单位和 SDK 语义容易误解，写入后可能导致立即超时或长时间重试卡住。
-	 */
-	const retryConfig = {
-		maxRetries: (data as any).retry?.maxRetries ?? 10,
-		baseDelayMs: (data as any).retry?.baseDelayMs ?? 5000,
-	};
+	// 保留原始数组：enabledModels 允许 path-scoped 对象条目（{ path, models }），
+	// 只把字符串当作可勾选的模型 id；对象条目在写回时原样保留，不能被 UI 过滤掉。
+	const enabledModels = Array.isArray(data.enabledModels) ? data.enabledModels : undefined;
+	const retryMaxRetries = readOmpPath(data, "retry.maxRetries");
+	const retryBaseDelay = readOmpPath(data, "retry.baseDelayMs");
+	const compactionEnabled = readOmpPath(data, "compaction.enabled");
+	const reserveTokens = readOmpPath(data, "compaction.reserveTokens");
+	const keepRecentTokens = readOmpPath(data, "compaction.keepRecentTokens");
 
-	/**
-	 * pi 会话压缩配置（~/.omp/agent/settings.json 的 compaction）。
-	 * 与 pi 文档默认值对齐：自动压缩开启、预留 16k 回复空间、保留最近 20k tokens。
-	 * 只规范化这 3 个字段，避免把未知扩展字段写丢。
-	 */
-	const rawCompaction =
-		data.compaction && typeof data.compaction === "object" && !Array.isArray(data.compaction)
-			? (data.compaction as Record<string, unknown>)
-			: {};
-	const compactionConfig = {
-		enabled: typeof rawCompaction.enabled === "boolean" ? rawCompaction.enabled : true,
-		reserveTokens:
-			typeof rawCompaction.reserveTokens === "number" && Number.isFinite(rawCompaction.reserveTokens)
-				? Math.max(0, Math.floor(rawCompaction.reserveTokens))
-				: 16384,
-		keepRecentTokens:
-			typeof rawCompaction.keepRecentTokens === "number" &&
-			Number.isFinite(rawCompaction.keepRecentTokens)
-				? Math.max(0, Math.floor(rawCompaction.keepRecentTokens))
-				: 20000,
-	};
-
-	// 首次进入设置页时清理旧版 UI 写入的 provider/enable 等字段，保证后续保存只留下安全的两个参数。
-	const retryInitializedRef = useRef(false);
-	useEffect(() => {
-		if (retryInitializedRef.current) return;
-		const existingRetry = (data as any).retry;
-		if (!existingRetry || Object.keys(existingRetry).some((key) => !(key in retryConfig))) {
-			props.onChange({ ...data, retry: retryConfig });
-		}
-		retryInitializedRef.current = true;
-	}, []);
-
-	// 首次进入时把 compaction 规范化成可编辑结构；保留用户已有的额外字段。
-	const compactionInitializedRef = useRef(false);
-	useEffect(() => {
-		if (compactionInitializedRef.current) return;
-		const existing = data.compaction;
-		const next = {
-			...(existing && typeof existing === "object" && !Array.isArray(existing)
-				? (existing as Record<string, unknown>)
-				: {}),
-			...compactionConfig,
-		};
-		const needsNormalize =
-			!existing ||
-			typeof existing !== "object" ||
-			Array.isArray(existing) ||
-			typeof (existing as any).enabled !== "boolean" ||
-			typeof (existing as any).reserveTokens !== "number" ||
-			typeof (existing as any).keepRecentTokens !== "number";
-		if (needsNormalize) {
-			props.onChange({ ...data, compaction: next });
-		}
-		compactionInitializedRef.current = true;
-	}, []);
-
-	const updateRetry = (patch: Record<string, unknown>) => {
-		props.onChange({
-			...data,
-			retry: { ...retryConfig, ...patch },
-		});
-	};
-
-	const updateCompaction = (patch: Partial<typeof compactionConfig>) => {
-		const existingExtra =
-			data.compaction && typeof data.compaction === "object" && !Array.isArray(data.compaction)
-				? (data.compaction as Record<string, unknown>)
-				: {};
-		props.onChange({
-			...data,
-			compaction: {
-				...existingExtra,
-				...compactionConfig,
-				...patch,
-			},
-		});
-	};
-
-	/**
-	 * 配置键名 → 显示标签。
-	 * 退役字段（C3 Q17a）：defaultProvider/defaultModel/defaultThinkingLevel 不再
-	 * 在此编辑——omp 不再读取前两者，defaultThinkingLevel 桌面端已改读 config.yml。
-	 * 旧文件残留这些键时渲染为只读行（展示现值，不可编辑、不写回）。
-	 * 已登记 i18n 的键走多语言；未登记回退原始 key，避免未知字段空白。
-	 */
-	const configLabel = (key: string): string => {
-		switch (key) {
-			case "enabledModels": return t("config.label.enabledModels");
-			case "defaultProvider": return t("config.label.defaultProvider");
-			case "defaultModel": return t("config.label.defaultModel");
-			case "lastChangelogVersion": return t("config.label.lastChangelogVersion");
-			case "customPrompt": return t("config.label.customPrompt");
-			case "promptGuidelines": return t("config.label.promptGuidelines");
-			case "appendSystemPrompt": return t("config.label.appendSystemPrompt");
-			case "proxy": return t("config.label.proxy");
-			case "proxyUrl": return t("config.label.proxyUrl");
-			case "proxyBypass": return t("config.label.proxyBypass");
-			case "theme": return t("config.label.theme");
-			case "language": return t("config.label.language");
-			case "disabledSkills": return t("config.label.disabledSkills");
-			case "disabledExtensions": return t("config.label.disabledExtensions");
-			case "noProjectDiscovery": return t("config.label.noProjectDiscovery");
-			case "defaultProjectTrust": return t("config.label.defaultProjectTrust");
-			case "allowProjectChanges": return t("config.label.allowProjectChanges");
-			case "enableSkillCommands": return t("config.label.enableSkillCommands");
-			case "temperature": return t("config.label.temperature");
-			case "systemPrompt": return t("config.label.systemPrompt");
-			case "hideThinkingBlock": return t("config.label.hideThinkingBlock");
-			case "packages": return t("config.label.packages");
-			case "defaultThinkingLevel": return t("config.label.defaultThinkingLevel");
-			case "quietStartup": return t("config.label.quietStartup");
-			case "collapseChangelog": return t("config.label.collapseChangelog");
-			case "compaction": return t("config.label.compaction");
-			case "sessionDir": return t("config.label.sessionDir");
-			case "steeringMode": return t("config.label.steeringMode");
-			case "followUpMode": return t("config.label.followUpMode");
-			case "transport": return t("config.label.transport");
-			case "httpProxy": return t("config.label.httpProxy");
-			case "shellPath": return t("config.label.shellPath");
-			case "shellCommandPrefix": return t("config.label.shellCommandPrefix");
-			case "npmCommand": return t("config.label.npmCommand");
-			case "thinkingBudgets": return t("config.label.thinkingBudgets");
-			case "branchSummary": return t("config.label.branchSummary");
-			case "doubleEscapeAction": return t("config.label.doubleEscapeAction");
-			case "treeFilterMode": return t("config.label.treeFilterMode");
-			default: return key;
-		}
-	};
-	const RETIRED_SETTINGS_KEYS = new Set([
-		"defaultProvider",
-		"defaultModel",
-		"defaultThinkingLevel",
-	]);
-
-	/** 全局会话目录：空值表示使用 pi 默认 ~/.omp/agent/sessions/<encoded-cwd>/ */
-	const sessionDirValue = typeof data.sessionDir === "string" ? data.sessionDir : "";
-	const updateSessionDir = (raw: string) => {
-		const next = raw.trim();
-		if (!next) {
-			// 清空时移除字段，避免写入空字符串覆盖默认行为
-			const { sessionDir: _removed, ...rest } = data;
-			props.onChange(rest);
-			return;
-		}
-		props.onChange({ ...data, sessionDir: raw });
-	};
+	/** 数字输入：留空 = 删除该键（omp 用自己的默认值）。 */
+	const numberInput = (path: OmpSettingsPath, value: unknown, placeholder?: string, step?: number) => (
+		<input
+			className="config-settings-input"
+			type="number"
+			min={0}
+			step={step}
+			value={nonNegativeInt(value) ?? ""}
+			placeholder={placeholder}
+			onChange={(e) => {
+				const raw = e.target.value.trim();
+				if (!raw) {
+					update(path, undefined);
+					return;
+				}
+				const parsed = Number(raw);
+				if (!Number.isFinite(parsed)) return;
+				update(path, Math.max(0, Math.floor(parsed)));
+			}}
+		/>
+	);
 
 	return (
 		<div className="config-settings-tab">
 			<div className="config-toolbar">
-				<span className="config-count">
-					{t("config.count.configItems", { count: entries.length })}
-				</span>
-				<button
-					className="config-btn primary"
-					onClick={props.onSave}
-					disabled={saving}
-				>
-					{saving ? t("common.saving") : t("common.save")}
+				<span className="config-settings-section-hint">{t("config.settings.yamlSourceHint")}</span>
+				<button className="config-btn primary" onClick={props.onSave} disabled={props.saving}>
+					{props.saving ? t("common.saving") : t("common.save")}
 				</button>
 			</div>
 			<div className="config-settings-list">
 				{/* enabledModels 始终显示在最前面 */}
 				<div className="config-settings-row">
-					<span className="config-settings-key">{configLabel("enabledModels")}</span>
+					<span className="config-settings-key">{t("config.label.enabledModels")}</span>
 					<EnabledModelsInput
-						value={
-							Array.isArray(data.enabledModels) ? data.enabledModels : undefined
-						}
+						value={enabledModels}
 						models={collectModels(props.modelsData, props.discoveredModels)}
-						onChange={(v) => props.onChange({ ...data, enabledModels: v })}
+						onChange={(v) => update("enabledModels", v)}
 					/>
 				</div>
 
-			{/* ── 全局会话目录（仅编辑 ~/.omp/agent/settings.json 的 sessionDir） ── */}
+				{/* ── 重试配置（config.yml retry.*） ── */}
 				<div className="config-retry-group">
 					<div className="config-settings-row config-retry-header-row">
-						<span className="config-settings-section-title">{t("config.sessionDir.title")}</span>
-						<span className="config-settings-section-hint">{t("config.sessionDir.hint")}</span>
+						<span className="config-settings-section-title">{t("config.retry.title")}</span>
+						<span className="config-settings-section-hint">{t("config.retry.hint")}</span>
 					</div>
 					<div className="config-settings-row">
-						<span className="config-settings-key">{t("config.label.sessionDir")}</span>
-						<input
-							className="config-settings-input"
-							type="text"
-							value={sessionDirValue}
-							placeholder={t("config.sessionDir.placeholder")}
-							onChange={(e) => updateSessionDir(e.target.value)}
-						/>
+						<span className="config-settings-key">{t("config.retry.maxRetries")}</span>
+						{numberInput("retry.maxRetries", retryMaxRetries, "10")}
+					</div>
+					<div className="config-settings-row">
+						<span className="config-settings-key">{t("config.retry.baseDelayMs")}</span>
+						{numberInput("retry.baseDelayMs", retryBaseDelay, "500", 100)}
 					</div>
 				</div>
 
-				{/* ── 重试配置 ── */}
-				<div className="config-retry-group">
-					<div className="config-settings-row config-retry-header-row">
-					<span className="config-settings-section-title">{t("config.retry.title")}</span>
-					<span className="config-settings-section-hint">{t("config.retry.hint")}</span>
-				</div>
-				<div className="config-settings-row">
-					<span className="config-settings-key">{t("config.retry.maxRetries")}</span>
-					<input className="config-settings-input" type="number" min={0} max={50} value={retryConfig.maxRetries} onChange={(e) => updateRetry({ maxRetries: Number(e.target.value) })} />
-				</div>
-				<div className="config-settings-row">
-					<span className="config-settings-key">{t("config.retry.baseDelayMs")}</span>
-					<input className="config-settings-input" type="number" min={100} step={100} value={retryConfig.baseDelayMs} onChange={(e) => updateRetry({ baseDelayMs: Number(e.target.value) })} />
-				</div>
-				</div>
-
-				{/* ── 会话压缩：拆成开关 + 两个 token 数，避免用户直接改 JSON 对象 ── */}
+				{/* ── 会话压缩（config.yml compaction.*） ── */}
 				<div className="config-retry-group">
 					<div className="config-settings-row config-retry-header-row">
 						<span className="config-settings-section-title">{t("config.compaction.title")}</span>
@@ -288,11 +147,11 @@ export function SettingsTab(props: {
 						<label className="config-checkbox-label">
 							<input
 								type="checkbox"
-								checked={compactionConfig.enabled}
-								onChange={(e) => updateCompaction({ enabled: e.target.checked })}
+								checked={compactionEnabled !== false}
+								onChange={(e) => update("compaction.enabled", e.target.checked)}
 							/>
 							<span>
-								{compactionConfig.enabled
+								{compactionEnabled !== false
 									? t("config.compaction.enabledOn")
 									: t("config.compaction.enabledOff")}
 							</span>
@@ -302,86 +161,23 @@ export function SettingsTab(props: {
 						<span className="config-settings-key" title={t("config.compaction.reserveTokensHint")}>
 							{t("config.compaction.reserveTokens")}
 						</span>
-						<input
-							className="config-settings-input"
-							type="number"
-							min={0}
-							step={1024}
-							value={compactionConfig.reserveTokens}
-							onChange={(e) =>
-								updateCompaction({
-									reserveTokens: Math.max(0, Math.floor(Number(e.target.value) || 0)),
-								})
-							}
-						/>
+						{numberInput(
+							"compaction.reserveTokens",
+							reserveTokens,
+							t("config.compaction.reserveTokensAuto"),
+							1024,
+						)}
 					</div>
 					<div className="config-settings-row">
 						<span className="config-settings-key" title={t("config.compaction.keepRecentTokensHint")}>
 							{t("config.compaction.keepRecentTokens")}
 						</span>
-						<input
-							className="config-settings-input"
-							type="number"
-							min={0}
-							step={1024}
-							value={compactionConfig.keepRecentTokens}
-							onChange={(e) =>
-								updateCompaction({
-									keepRecentTokens: Math.max(0, Math.floor(Number(e.target.value) || 0)),
-								})
-							}
-						/>
+						{numberInput("compaction.keepRecentTokens", keepRecentTokens, "20000", 1024)}
 					</div>
 					<div className="config-settings-row config-retry-header-row">
 						<span className="config-settings-section-hint">{t("config.compaction.manualHint")}</span>
 					</div>
 				</div>
-
-				{entries
-					// sessionDir / retry / compaction / enabledModels 已有专用区块，避免列表里重复一行
-					.filter(
-						([key]) =>
-							key !== "enabledModels" &&
-							key !== "retry" &&
-							key !== "sessionDir" &&
-							key !== "compaction",
-					)
-					.map(([key, value]) => (
-						<div key={key} className="config-settings-row">
-							<span className="config-settings-key">{configLabel(key)}</span>
-							{RETIRED_SETTINGS_KEYS.has(key) ? (
-								<span
-									className="config-settings-value config-settings-value--retired"
-									title={t("config.settings.retiredField")}
-								>
-									{typeof value === "string" || typeof value === "number" ? String(value) : JSON.stringify(value ?? null)}
-									{" · "}
-									{t("config.settings.retiredField")}
-								</span>
-							) : (
-								<SettingsValueInput
-									value={value}
-									fieldKey={key}
-									modelsData={props.modelsData}
-									authData={props.authData}
-									discoveredModels={props.discoveredModels}
-									allSettings={data}
-									onChange={(v) => props.onChange({ ...data, [key]: v })}
-								/>
-							)}
-						</div>
-					))}
-				{!hasEnabledModels && (
-					<div className="config-settings-row config-settings-row--add">
-						<button
-							className="config-btn"
-							onClick={() => props.onChange({ ...data, enabledModels: [] })}
-						>
-							{t("config.settings.addEnabledModels")}
-						</button>
-					</div>
-				)}
-				{entries.length === 0 && <div className="config-empty">{t("config.emptyConfig")}</div>}
 			</div>
 		</div>
 	);
@@ -393,10 +189,11 @@ export function SettingsTab(props: {
  * 输入含 * 或 ? 时可添加 glob 模式。
  */
 function EnabledModelsInput(props: {
-	value?: string[];
+	/** 字符串 = 模型 id；对象 = path-scoped 条目（{ path, models }），UI 不展示但写回时必须原样保留 */
+	value?: unknown[];
 	/** 按模型的 provider/id 分组，每项含 provider 信息 */
 	models: ModelRecord[];
-	onChange: (value: string[]) => void;
+	onChange: (value: unknown[]) => void;
 }) {
 	const [open, setOpen] = useState(false);
 	const [filter, setFilter] = useState("");
@@ -409,7 +206,10 @@ function EnabledModelsInput(props: {
 		return set;
 	});
 	const containerRef = useRef<HTMLDivElement>(null);
-	const selected = new Set(props.value ?? []);
+	const entries = props.value ?? [];
+	const selected = new Set(
+		entries.filter((entry): entry is string => typeof entry === "string"),
+	);
 
 	// 点击外部关闭下拉
 	useEffect(() => {
@@ -424,19 +224,11 @@ function EnabledModelsInput(props: {
 	}, [open]);
 
 	const toggleModel = (id: string) => {
-		const next = new Set(selected);
-		if (next.has(id)) {
-			next.delete(id);
-		} else {
-			next.add(id);
-		}
-		props.onChange([...next]);
+		props.onChange(setEnabledModelSelected(entries, id, !selected.has(id)));
 	};
 
 	const removeSelected = (id: string) => {
-		const next = new Set(selected);
-		next.delete(id);
-		props.onChange([...next]);
+		props.onChange(setEnabledModelSelected(entries, id, false));
 	};
 
 	// 过滤 & 按供应商分组
@@ -563,191 +355,3 @@ function EnabledModelsInput(props: {
 		</div>
 	);
 }
-
-function SettingsValueInput(props: {
-	value: unknown;
-	fieldKey: string;
-	modelsData?: ModelsFile;
-	authData?: AuthFile;
-	discoveredModels?: Record<string, Array<{ id: string; name?: string }>>;
-	allSettings?: SettingsFile;
-	onChange: (v: unknown) => void;
-}) {
-	const { value, fieldKey, modelsData, authData, discoveredModels, allSettings } = props;
-
-	// defaultProvider: 从 modelsData.providers + authData 的 key 列表聚合所有可用的供应商
-	if (fieldKey === "defaultProvider") {
-		const providerSet = new Set<string>();
-		if (modelsData) {
-			for (const name of Object.keys(modelsData.providers)) {
-				providerSet.add(name);
-			}
-		}
-		if (authData) {
-			for (const name of Object.keys(authData)) {
-				providerSet.add(name);
-			}
-		}
-		const providerOptions = [...providerSet].map((name) => ({ value: name }));
-		return (
-			<ConfigComboboxInput
-				value={typeof value === "string" ? value : ""}
-				options={providerOptions}
-				onChange={(v) => props.onChange(v)}
-				placeholder={t("config.settings.selectProvider")}
-			/>
-		);
-	}
-
-	// defaultModel: 根据当前选中的 defaultProvider 联动过滤
-	if (fieldKey === "defaultModel") {
-		const selectedProvider = allSettings?.["defaultProvider"];
-		const selectedProviderName = typeof selectedProvider === "string" ? selectedProvider : "";
-		const currentModel = typeof value === "string" ? value : "";
-		const modelOptions: Array<{ value: string; label?: string }> = [];
-		const seen = new Set<string>();
-
-		// 始终将当前已配置的值作为首选项，确保已生效的配置在列表中可见
-		if (currentModel && !seen.has(currentModel)) {
-			seen.add(currentModel);
-			const currentLabel = selectedProviderName
-				? `${currentModel} (${selectedProviderName})`
-				: currentModel;
-			modelOptions.push({ value: currentModel, label: currentLabel });
-		}
-
-		if (selectedProviderName) {
-			// 优先从模型配置中取该供应商的模型
-			const provider = modelsData?.providers[selectedProviderName];
-			if (provider) {
-				for (const model of provider.models) {
-					if (!seen.has(model.id)) {
-						seen.add(model.id);
-						const label = model.name && model.name !== model.id
-							? `${model.name} (${selectedProviderName})`
-							: `${model.id} (${selectedProviderName})`;
-						modelOptions.push({ value: model.id, label });
-					}
-				}
-			}
-			// 尝试从自动发现的模型中获取（auth-only 供应商通过已知端点获取）
-			const discovered = discoveredModels?.[selectedProviderName];
-			if (discovered) {
-				for (const model of discovered) {
-					if (!seen.has(model.id)) {
-						seen.add(model.id);
-						modelOptions.push({
-							value: model.id,
-							label: model.name
-								? `${model.name} (${selectedProviderName})`
-								: `${model.id} (${selectedProviderName})`,
-						});
-					}
-				}
-			}
-			// 如果该供应商只有 auth 没有模型配置，尝试从 auth 条目的 model 字段获取
-			const authEntry = authData?.[selectedProviderName];
-			if (authEntry && typeof authEntry.model === "string" && authEntry.model && !seen.has(authEntry.model)) {
-				seen.add(authEntry.model);
-				modelOptions.push({ value: authEntry.model, label: `${authEntry.model} (${selectedProviderName})` });
-			}
-		} else {
-			// 未选择供应商时，展示全部模型的精简列表供参考
-			if (modelsData) {
-				for (const [pName, provider] of Object.entries(modelsData.providers)) {
-					for (const model of provider.models) {
-						if (!seen.has(model.id)) {
-							seen.add(model.id);
-							const label = model.name && model.name !== model.id
-								? `${model.name} (${pName})`
-								: `${model.id} (${pName})`;
-							modelOptions.push({ value: model.id, label });
-						}
-					}
-				}
-			}
-			if (authData) {
-				for (const [pName, auth] of Object.entries(authData)) {
-					if (typeof auth.model === "string" && auth.model && !seen.has(auth.model)) {
-						seen.add(auth.model);
-						modelOptions.push({ value: auth.model, label: `${auth.model} (${pName})` });
-					}
-				}
-			}
-			// 从自动发现的模型中获取
-			if (discoveredModels) {
-				for (const [pName, models] of Object.entries(discoveredModels)) {
-					for (const model of models) {
-						if (!seen.has(model.id)) {
-							seen.add(model.id);
-							modelOptions.push({
-								value: model.id,
-								label: model.name
-									? `${model.name} (${pName})`
-									: `${model.id} (${pName})`,
-							});
-						}
-					}
-				}
-			}
-		}
-
-		return (
-			<ConfigComboboxInput
-				value={typeof value === "string" ? value : ""}
-				options={modelOptions}
-				onChange={(v) => props.onChange(v)}
-				placeholder={selectedProviderName
-					? t("config.settings.selectModelFor", { provider: selectedProviderName })
-					: t("config.settings.selectModelFirst")}
-			/>
-		);
-	}
-
-	if (typeof value === "boolean") {
-		return (
-			<label className="config-checkbox-label">
-				<input
-					type="checkbox"
-					checked={value}
-					onChange={(e) => props.onChange(e.target.checked)}
-				/>
-				<span>{value ? t("common.true") : t("common.false")}</span>
-			</label>
-		);
-	}
-	if (typeof value === "number") {
-		return (
-			<input
-				type="number"
-				value={value}
-				onChange={(e) => props.onChange(Number(e.target.value))}
-				className="config-settings-input"
-			/>
-		);
-	}
-	if (typeof value === "string") {
-		return (
-			<input
-				value={value}
-				onChange={(e) => props.onChange(e.target.value)}
-				className="config-settings-input"
-			/>
-		);
-	}
-	return (
-		<input
-			value={JSON.stringify(value)}
-			onChange={(e) => {
-				try {
-					props.onChange(JSON.parse(e.target.value));
-				} catch {
-					/* 输入过程中 JSON 不合法时暂不更新 */
-				}
-			}}
-			className="config-settings-input"
-		/>
-	);
-}
-
-
