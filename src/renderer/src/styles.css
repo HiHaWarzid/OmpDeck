@@ -9031,13 +9031,14 @@ body.is-composer-resizing .composer-resize-handle::after {
   right: 0;
   bottom: calc(100% + 6px);
   z-index: 120;
-  width: 156px;
-  padding: 4px;
-  border: 1px solid color-mix(in srgb, var(--color-border-default) 72%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--color-bg-panel) 96%, transparent);
-  box-shadow: 0 8px 24px color-mix(in srgb, #000 16%, transparent), 0 2px 6px color-mix(in srgb, #000 8%, transparent);
-  backdrop-filter: blur(12px);
+  width: max-content;
+  min-width: 236px;
+  max-width: min(320px, calc(100vw - 32px));
+  padding: var(--space-1);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-panel);
+  box-shadow: var(--shadow-popover);
   animation: send-behavior-menu-in 0.12s ease-out;
 }
 @keyframes send-behavior-menu-in {
@@ -9054,26 +9055,66 @@ body.is-composer-resizing .composer-resize-handle::after {
 .composer-bottom-bar .send-behavior-menu .send-behavior-option:not(:disabled) {
   width: 100%;
   min-width: 0;
-  height: 32px;
-  padding: 0 9px;
+  height: auto;
+  min-height: 44px;
+  padding: 7px 8px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--color-text-primary);
   text-align: left;
-  display: flex;
-  flex-direction: row;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
-  font-size: var(--font-size-caption);
-  font-weight: 520;
+  column-gap: 10px;
   white-space: nowrap;
   cursor: pointer;
 }
 .composer-bottom-bar .send-behavior-menu .send-behavior-option:hover,
 .composer-bottom-bar .send-behavior-menu .send-behavior-option:focus-visible {
   outline: none;
-  background: var(--color-bg-active);
+  background: var(--color-bg-hover);
+  box-shadow: var(--focus-ring);
+}
+.composer-bottom-bar .send-behavior-option-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.composer-bottom-bar .send-behavior-option-title {
+  font-size: var(--font-size-control);
+  line-height: var(--line-height-control);
+  font-weight: 520;
+  color: var(--color-text-primary);
+}
+.composer-bottom-bar .send-behavior-option-desc {
+  font-size: var(--font-size-micro);
+  line-height: var(--line-height-micro);
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 快捷键键帽：放右列，避免把说明文字挤进标题里 */
+.composer-bottom-bar .send-behavior-option-keys {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.composer-bottom-bar .send-behavior-option-keys kbd {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xs);
+  background: var(--color-bg-muted);
+  box-shadow: 0 1px 0 var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-micro);
+  line-height: 16px;
+  text-align: center;
 }
 .composer-bottom-bar .send-behavior-option-dot {
   flex: 0 0 auto;

@@ -13,6 +13,7 @@ import {
   useSyncExternalStore,
   type PointerEvent,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import {
@@ -666,6 +667,9 @@ export function App() {
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 菜单外层容器：用于「点击外部关闭」判定；chevron 引用用于 Escape 关闭后还焦。
+  const sendBehaviorMenuWrapRef = useRef<HTMLDivElement | null>(null);
+  const sendBehaviorChevronRef = useRef<HTMLButtonElement | null>(null);
   const [sessionFeishuBotId, setSessionFeishuBotId] = useState<
     string | undefined
   >(undefined);
@@ -4580,6 +4584,13 @@ export function App() {
     activeAgentId && hasComposerContent && activeBusyDraft,
   );
   const showBusySendControls = isAgentBusy || keepBusyDraftControls;
+  // 菜单里的 steer 快捷键跟随设置；↓ + Enter 是固定组合，不随设置变化。
+  const sendShortcutKeys =
+    settings.sendShortcut === "ctrl-enter-send"
+      ? ["Ctrl", "Enter"]
+      : settings.sendShortcut === "shift-enter-send"
+        ? ["Shift", "Enter"]
+        : ["Enter"];
 
   // 图片附件等非文本输入同样应锁定忙碌草稿控件；内容清空后再释放锁定。
   useEffect(() => {
@@ -4661,6 +4672,51 @@ export function App() {
       setSendBehaviorMenuOpen(false);
       sendBehaviorMenuCloseTimerRef.current = null;
     }, 160);
+  }
+
+  // hover 打开不会移动焦点，焦点仍可能留在输入框：补上全局「点击外部关闭」
+  // 和 Escape，否则菜单只能靠鼠标移出时的 160ms 延迟关闭。
+  useEffect(() => {
+    if (!sendBehaviorMenuOpen) return;
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      if (sendBehaviorMenuWrapRef.current?.contains(event.target as Node)) return;
+      setSendBehaviorMenuOpen(false);
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // 捕获阶段拦下，避免同时触发输入框的 Esc（历史导航/关闭建议）分支。
+      event.preventDefault();
+      event.stopPropagation();
+      // 先还焦再关闭：chevron 的 onFocus 会重新打开菜单，同批次内以关闭收尾。
+      sendBehaviorChevronRef.current?.focus();
+      setSendBehaviorMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [sendBehaviorMenuOpen]);
+
+  /** 菜单内上下键循环移动焦点；菜单项本身不参与 Tab 序列。 */
+  function handleSendBehaviorMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    );
+    if (items.length === 0) return;
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const delta = event.key === "ArrowDown" ? 1 : -1;
+    // 焦点还在 chevron（index -1）时：ArrowDown 进首项，ArrowUp 进末项。
+    const nextIndex =
+      current < 0
+        ? delta > 0
+          ? 0
+          : items.length - 1
+        : (current + delta + items.length) % items.length;
+    items[nextIndex]?.focus();
   }
 
   async function sendPrompt(override?: {
@@ -7125,7 +7181,16 @@ export function App() {
                 )}
                 {/* 队列/发送按钮：有内容时才显示行为选择器（靠左） */}
                 {showBusySendControls && hasComposerContent && (
-                  <div style={{ position: "relative" }}>
+                  <div
+                    className="send-behavior-menu-wrap"
+                    ref={sendBehaviorMenuWrapRef}
+                    onKeyDown={handleSendBehaviorMenuKeyDown}
+                    onBlur={(event) => {
+                      if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                      setSendBehaviorMenuOpen(false);
+                    }}
+                    onMouseLeave={scheduleSendBehaviorMenuClose}
+                  >
                     <div className="send-behavior-toggle">
                       <button
                         type="button"
@@ -7139,6 +7204,7 @@ export function App() {
                       <button
                         type="button"
                         className="send-behavior-chevron"
+                        ref={sendBehaviorChevronRef}
                         title={t("app.sendBehaviorTitle")}
                         aria-label={t("app.sendBehaviorTitle")}
                         aria-haspopup="menu"
@@ -7150,19 +7216,57 @@ export function App() {
                         <ChevronDown size={12} strokeWidth={2.2} />
                       </button>
                     </div>
-                    {/* 行为选择下拉菜单 */}
+                    {/* 行为选择下拉菜单：标题 + 生效时机 + 快捷键，避免只有一行文案难以区分语义 */}
                     {sendBehaviorMenuOpen && (
-                      <div className="send-behavior-menu" role="menu"
+                      <div
+                        className="send-behavior-menu"
+                        role="menu"
+                        aria-label={t("app.sendBehaviorTitle")}
                         onMouseEnter={keepSendBehaviorMenuOpen}
                         onMouseLeave={scheduleSendBehaviorMenuClose}
                       >
-                        <button className="send-behavior-option steer" type="button" role="menuitem" onClick={() => void sendPrompt()}>
+                        <button
+                          className="send-behavior-option steer"
+                          type="button"
+                          role="menuitem"
+                          tabIndex={-1}
+                          aria-keyshortcuts={sendShortcutKeys.join("+")}
+                          onClick={() => {
+                            setSendBehaviorMenuOpen(false);
+                            void sendPrompt();
+                          }}
+                        >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
-                          <span>{t("app.sendSteerTitle")}</span>
+                          <span className="send-behavior-option-text">
+                            <span className="send-behavior-option-title">{t("app.sendSteerTitle")}</span>
+                            <span className="send-behavior-option-desc">{t("app.sendSteerDesc")}</span>
+                          </span>
+                          <span className="send-behavior-option-keys" aria-hidden="true">
+                            {sendShortcutKeys.map((key) => (
+                              <kbd key={key}>{key}</kbd>
+                            ))}
+                          </span>
                         </button>
-                        <button className="send-behavior-option follow-up" type="button" role="menuitem" onClick={sendPromptAsFollowUp}>
+                        <button
+                          className="send-behavior-option follow-up"
+                          type="button"
+                          role="menuitem"
+                          tabIndex={-1}
+                          aria-keyshortcuts="ArrowDown+Enter"
+                          onClick={() => {
+                            setSendBehaviorMenuOpen(false);
+                            void sendPromptAsFollowUp();
+                          }}
+                        >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
-                          <span>{t("app.sendFollowUpTitle")}</span>
+                          <span className="send-behavior-option-text">
+                            <span className="send-behavior-option-title">{t("app.sendFollowUpTitle")}</span>
+                            <span className="send-behavior-option-desc">{t("app.sendFollowUpDesc")}</span>
+                          </span>
+                          <span className="send-behavior-option-keys" aria-hidden="true">
+                            <kbd>↓</kbd>
+                            <kbd>Enter</kbd>
+                          </span>
                         </button>
                       </div>
                     )}
