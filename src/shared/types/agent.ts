@@ -94,6 +94,14 @@ export type AgentRuntimeState = {
 	cacheTotal?: number;
 	cacheHitPercent?: number | null;
 	cost?: number;
+	/** fast 服务档：enabled 是持久化偏好，active 是当前模型实际使用中。 */
+	fastModeEnabled?: boolean;
+	fastModeActive?: boolean;
+	/** slow 服务档是否受当前模型支持。 */
+	slowModeSupported?: boolean;
+	slowModeEnabled?: boolean;
+	/** slow 档的作用域（global/session 等，由 omp 返回）。 */
+	slowModeScope?: string;
 	/**
 	 * omp 服务端待投递队列（steering / followUp 的 chip 文本）。
 	 * 渲染层必须以它作为队列唯一事实来源；本地只保留投递结果未知的提示。

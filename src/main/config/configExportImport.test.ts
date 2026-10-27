@@ -146,6 +146,8 @@ describe("export/import extended package", () => {
 		await manager.rolesStore.applyDefault("openai/gpt-4o", "high");
 		await manager.rolesStore.saveModelPreset("fast-lane");
 		await manager.rolesStore.setCycleOrder(["smol", "default"]);
+		await manager.rolesStore.setProviderOrder(["anthropic", "openai"]);
+		await manager.rolesStore.setRoleStorage("project");
 		await manager.rolesStore.setFallbackChains({ default: ["openai/gpt-4o-mini"] });
 		const exported = await manager.exportConfig();
 		const pkg = JSON.parse(exported);
@@ -153,6 +155,8 @@ describe("export/import extended package", () => {
 			"openai/gpt-4o:high",
 		);
 		expect(pkg.files["config.yml"].cycleOrder).toEqual(["smol", "default"]);
+		expect(pkg.files["config.yml"].modelProviderOrder).toEqual(["anthropic", "openai"]);
+		expect(pkg.files["config.yml"].modelRoleStorage).toBe("project");
 		expect(pkg.files["config.yml"].retry.fallbackChains).toEqual({
 			default: ["openai/gpt-4o-mini"],
 		});
@@ -163,6 +167,8 @@ describe("export/import extended package", () => {
 			expect((await restored.importConfig(exported)).valid).toBe(true);
 			expect(Object.keys(await restored.rolesStore.readModelPresets())).toEqual(["fast-lane"]);
 			expect(await restored.rolesStore.readCycleOrder()).toEqual(["smol", "default"]);
+			expect(await restored.rolesStore.readProviderOrder()).toEqual(["anthropic", "openai"]);
+			expect(await restored.rolesStore.readRoleStorage()).toBe("project");
 			expect(await restored.rolesStore.readFallbackChains()).toEqual({
 				default: ["openai/gpt-4o-mini"],
 			});

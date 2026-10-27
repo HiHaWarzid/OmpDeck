@@ -8877,6 +8877,28 @@ body.is-composer-resizing .composer-resize-handle::after {
 .composer-bar-btn.thinking:hover {
   color: var(--color-accent);
 }
+/* 服务档 chip：Fast/Slow 用等宽小字，开启时用 info/accent 轻底标出 */
+.composer-bar-btn.service-tier {
+  height: 24px;
+  padding: 0 7px;
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--color-text-tertiary);
+}
+.composer-bar-btn.service-tier.fast.on {
+  color: var(--color-info);
+  background: color-mix(in srgb, var(--color-info) 10%, transparent);
+}
+.composer-bar-btn.service-tier.slow.on {
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+.composer-bar-btn.service-tier:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
 /* 上下文压缩：默认像次级 chip，不高对比；warn/critical 仅靠文字色提示紧迫度 */
 .composer-bar-btn.compact {
   height: 26px;
@@ -11556,6 +11578,55 @@ body.is-composer-resizing .composer-resize-handle::after {
   overflow-x: hidden;
   padding: 6px;
 }
+/* 模型选择器底部服务档：与列表用分隔线隔开，避免被当成模型项 */
+.model-picker-tier-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-muted);
+}
+.model-picker-tier-label {
+  margin-right: auto;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.model-picker-tier-btn {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-panel);
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+.model-picker-tier-btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.model-picker-tier-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+.model-picker-tier-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.model-picker-tier-btn.on {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  color: var(--color-accent);
+}
 .model-group {
   margin-bottom: 4px;
 }
@@ -12058,14 +12129,6 @@ body.is-composer-resizing .composer-resize-handle::after {
   white-space: nowrap;
   max-width: 220px;
 }
-.model-role-level {
-  font-family: var(--font-family-business);
-  font-size: var(--font-size-micro);
-  color: var(--color-accent);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  padding: 1px 6px;
-}
 .model-role-unset {
   color: var(--color-text-tertiary);
   font-size: var(--font-size-caption);
@@ -12226,6 +12289,16 @@ body.is-composer-resizing .composer-resize-handle::after {
   font-family: var(--font-family-business);
   font-size: var(--font-size-micro);
   color: var(--color-text-tertiary);
+}
+.model-roles-popup-custom {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-muted);
+}
+.model-roles-popup-custom .ui-button {
+  justify-self: start;
 }
 
 /* 设置字段容器 */

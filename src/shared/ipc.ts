@@ -388,6 +388,14 @@ export const ipcTable = {
 		getOmpCycleOrder: { channel: "config:get-omp-cycle-order", kind: "invoke" },
 		/** 写入模型循环顺序 */
 		setOmpCycleOrder: { channel: "config:set-omp-cycle-order", kind: "invoke" },
+		/** 读取 modelProviderOrder（裸模型 id 的供应商优先级） */
+		getOmpProviderOrder: { channel: "config:get-omp-provider-order", kind: "invoke" },
+		/** 写入 modelProviderOrder */
+		setOmpProviderOrder: { channel: "config:set-omp-provider-order", kind: "invoke" },
+		/** 读取 modelRoleStorage（global/project） */
+		getOmpRoleStorage: { channel: "config:get-omp-role-storage", kind: "invoke" },
+		/** 写入 modelRoleStorage */
+		setOmpRoleStorage: { channel: "config:set-omp-role-storage", kind: "invoke" },
 		/** 读取 retry.fallbackChains */
 		getOmpFallbackChains: { channel: "config:get-omp-fallback-chains", kind: "invoke" },
 		/** 写入 retry.fallbackChains */
@@ -474,6 +482,9 @@ export const ipcTable = {
 		refreshModels: { channel: "agents:refresh-models", kind: "invoke", web: true },
 		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
 		setThinking: { channel: "agents:set-thinking", kind: "invoke", web: true },
+		availableThinkingLevels: { channel: "agents:available-thinking-levels", kind: "invoke", web: true },
+		setFastMode: { channel: "agents:set-fast-mode", kind: "invoke", web: true },
+		setSlowMode: { channel: "agents:set-slow-mode", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
 		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
 		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-manager" },

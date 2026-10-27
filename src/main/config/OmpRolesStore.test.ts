@@ -203,4 +203,24 @@ describe("OmpRolesStore", () => {
 		expect((await store.setFallbackChains({})).valid).toBe(true);
 		expect(await store.readFallbackChains()).toEqual({});
 	});
+
+	it("provider order dedupes, trims, and removes the key when empty", async () => {
+		const store = createStore();
+		expect(
+			(await store.setProviderOrder([" openai ", "anthropic", "openai", ""])).valid,
+		).toBe(true);
+		expect(await store.readProviderOrder()).toEqual(["openai", "anthropic"]);
+
+		expect((await store.setProviderOrder([])).valid).toBe(true);
+		expect(await store.readProviderOrder()).toEqual([]);
+	});
+
+	it("role storage defaults to global and round-trips project", async () => {
+		const store = createStore();
+		expect(await store.readRoleStorage()).toBe("global");
+		expect((await store.setRoleStorage("project")).valid).toBe(true);
+		expect(await store.readRoleStorage()).toBe("project");
+		expect((await store.setRoleStorage("global")).valid).toBe(true);
+		expect(await store.readRoleStorage()).toBe("global");
+	});
 });

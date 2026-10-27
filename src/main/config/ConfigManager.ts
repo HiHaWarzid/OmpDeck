@@ -969,6 +969,8 @@ export class ConfigManager {
 		const presets = await this.rolesStore.readModelPresets();
 		const cycleOrder = await this.rolesStore.readCycleOrder();
 		const fallbackChains = await this.rolesStore.readFallbackChains();
+		const providerOrder = await this.rolesStore.readProviderOrder();
+		const roleStorage = await this.rolesStore.readRoleStorage();
 		const ompConfig = await this.ompConfig.read();
 		const settings = pickOmpSettings(ompConfig.parsed);
 		const existingRetry =
@@ -1000,6 +1002,8 @@ export class ConfigManager {
 						...(defaultLevel ? { defaultThinkingLevel: defaultLevel } : {}),
 						...(Object.keys(presets).length > 0 ? { modelPresets: presets } : {}),
 						...(cycleOrder.length > 0 ? { cycleOrder } : {}),
+						...(providerOrder.length > 0 ? { modelProviderOrder: providerOrder } : {}),
+						...(roleStorage === "project" ? { modelRoleStorage: roleStorage } : {}),
 						...(Object.keys(exportedRetry).length > 0
 							? { retry: exportedRetry }
 							: {}),

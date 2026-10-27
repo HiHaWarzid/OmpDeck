@@ -4,7 +4,7 @@
  */
 import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRolePayload, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import { formatRoleSelector, isOmpModelRole } from "../../shared/types/ompRoles";
+import { formatRoleSelector, isOmpModelRole, isValidOmpRoleSelector } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
 import type { OmpRolesStore } from "../config/OmpRolesStore";
 import type { AppLogger } from "../logging/AppLogger";
@@ -119,6 +119,9 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				if (!selector) {
 					return { valid: false, error: "selector 不能为空" };
 				}
+				if (!isValidOmpRoleSelector(selector)) {
+					return { valid: false, error: "selector 格式无效（支持 provider/model、@role、逗号候选）" };
+				}
 				const result = await rolesStore.applyRole(
 					role,
 					selector,
@@ -180,6 +183,30 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				);
 				if (result.valid) {
 					void appLogger.info("config", "Model cycle order set", { order });
+				}
+				return result;
+			},
+			getOmpProviderOrder: async () => rolesStore.readProviderOrder(),
+			setOmpProviderOrder: async (_event, order: unknown) => {
+				if (!Array.isArray(order)) {
+					return { valid: false, error: "modelProviderOrder 必须是字符串数组" };
+				}
+				const result = await rolesStore.setProviderOrder(
+					order.filter((item): item is string => typeof item === "string"),
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model provider order set", { order });
+				}
+				return result;
+			},
+			getOmpRoleStorage: async () => rolesStore.readRoleStorage(),
+			setOmpRoleStorage: async (_event, value: unknown) => {
+				if (value !== "global" && value !== "project") {
+					return { valid: false, error: "modelRoleStorage 必须是 global 或 project" };
+				}
+				const result = await rolesStore.setRoleStorage(value);
+				if (result.valid) {
+					void appLogger.info("config", "Model role storage set", { value });
 				}
 				return result;
 			},

@@ -67,8 +67,10 @@ export const ComposerStatusChips = memo(
 		isAgentBusy: boolean;
 		isAgentStarting: boolean;
 		compacting: boolean;
+		serviceTierBusy: boolean;
 		onOpenModelPicker: () => void;
 		onOpenThinkingPicker: () => void;
+		onToggleServiceTier: (kind: "fast" | "slow", enabled: boolean) => void;
 		onCompact: () => void;
 	}) {
 		const {
@@ -77,8 +79,10 @@ export const ComposerStatusChips = memo(
 			isAgentBusy,
 			isAgentStarting,
 			compacting,
+			serviceTierBusy,
 			onOpenModelPicker,
 			onOpenThinkingPicker,
+			onToggleServiceTier,
 			onCompact,
 		} = props;
 		return (
@@ -106,6 +110,37 @@ export const ComposerStatusChips = memo(
 							const level = THINKING_LEVELS.find((l) => l.value === state.thinkingLevel);
 							return level ? t(level.labelKey) : state.thinkingLevel;
 						})()}
+					</button>
+				)}
+				{/* fast 只有已开启时才露出（部分 provider 不支持，常驻会误导）；
+				    slow 只要模型声明支持就露出，作为发现/开启入口。点击直接切档。 */}
+				{(state?.fastModeEnabled || state?.fastModeActive) && (
+					<button
+						type="button"
+						className={`composer-bar-btn service-tier fast${state.fastModeEnabled ? " on" : ""}`}
+						disabled={serviceTierBusy}
+						aria-pressed={!!state.fastModeEnabled}
+						onClick={() => onToggleServiceTier("fast", !state.fastModeEnabled)}
+						title={state.fastModeActive ? t("app.serviceFastActive") : t("app.serviceFastIdle")}
+					>
+						{t("app.serviceFastChip")}
+					</button>
+				)}
+				{(state?.slowModeSupported || state?.slowModeEnabled) && (
+					<button
+						type="button"
+						className={`composer-bar-btn service-tier slow${state.slowModeEnabled ? " on" : ""}`}
+						disabled={serviceTierBusy}
+						aria-pressed={!!state.slowModeEnabled}
+						onClick={() => onToggleServiceTier("slow", !state.slowModeEnabled)}
+						title={t("app.serviceSlowTitle", {
+							scope:
+								state.slowModeScope === "session"
+									? t("app.serviceSlowScopeSession")
+									: t("app.serviceSlowScopeGlobal"),
+						})}
+					>
+						{t("app.serviceSlowChip")}
 					</button>
 				)}
 				{/* 上下文压缩：与 /compact 同一路径。
@@ -168,7 +203,8 @@ export const ComposerStatusChips = memo(
 		previous.activeAgentId === next.activeAgentId &&
 		previous.isAgentBusy === next.isAgentBusy &&
 		previous.isAgentStarting === next.isAgentStarting &&
-		previous.compacting === next.compacting,
+		previous.compacting === next.compacting &&
+		previous.serviceTierBusy === next.serviceTierBusy,
 );
 export function ComposerToolbar(props: {
 	state?: AgentRuntimeState;

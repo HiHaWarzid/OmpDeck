@@ -36,6 +36,9 @@ type WebServiceAgentDeps = Pick<
 	| "refreshModels"
 	| "cycleThinking"
 	| "setThinking"
+	| "availableThinkingLevels"
+	| "setFastMode"
+	| "setSlowMode"
 	| "abortAndRestoreQueue"
 	| "removeQueuedMessage"
 	| "promoteQueuedMessage"
@@ -71,6 +74,9 @@ type _WebAgentDepsDriftGuard = {
 	refreshModels: AgentsNamespace["refreshModels"];
 	cycleThinking: AgentsNamespace["cycleThinking"];
 	setThinking: AgentsNamespace["setThinking"];
+	availableThinkingLevels: AgentsNamespace["availableThinkingLevels"];
+	setFastMode: AgentsNamespace["setFastMode"];
+	setSlowMode: AgentsNamespace["setSlowMode"];
 	abortAndRestoreQueue: AgentsNamespace["abortAndRestoreQueue"];
 	removeQueuedMessage: AgentsNamespace["removeQueuedMessage"];
 	promoteQueuedMessage: AgentsNamespace["promoteQueuedMessage"];
@@ -358,6 +364,44 @@ export class WebServiceManager {
 			if (setThinkingMatch && request.method === "POST") {
 				const body = await this.readJson<{ level?: string }>(request);
 				const state = await this.deps.setThinking(decodeURIComponent(setThinkingMatch[1]), body.level ?? "");
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const thinkingLevelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/thinking-levels$/);
+			if (thinkingLevelsMatch && request.method === "GET") {
+				const levels = await this.deps.availableThinkingLevels(
+					decodeURIComponent(thinkingLevelsMatch[1]),
+				);
+				this.sendJson(response, { levels });
+				return;
+			}
+			const fastModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/fast-mode$/);
+			if (fastModeMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setFastMode(
+					decodeURIComponent(fastModeMatch[1]),
+					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const slowModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/slow-mode$/);
+			if (slowModeMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setSlowMode(
+					decodeURIComponent(slowModeMatch[1]),
+					body.enabled,
+				);
 				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;

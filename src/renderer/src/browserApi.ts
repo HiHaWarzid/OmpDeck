@@ -248,6 +248,26 @@ export function createBrowserApi(): PiDesktopApi {
 				);
 				return result.state;
 			},
+			availableThinkingLevels: async (agentId) => {
+				const result = await request<{ levels: Awaited<ReturnType<PiDesktopApi["agents"]["availableThinkingLevels"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/thinking-levels`,
+				);
+				return result.levels;
+			},
+			setFastMode: async (agentId, enabled) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setFastMode"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/fast-mode`,
+					{ method: "POST", body: JSON.stringify({ enabled }) },
+				);
+				return result.state;
+			},
+			setSlowMode: async (agentId, enabled) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setSlowMode"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/slow-mode`,
+					{ method: "POST", body: JSON.stringify({ enabled }) },
+				);
+				return result.state;
+			},
 			onState: (callback) => subscribe(stateListeners, callback),
 			onMessages: (callback) => subscribe(messageListeners, callback),
 			onThinking: () => () => undefined,

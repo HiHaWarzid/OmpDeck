@@ -657,6 +657,7 @@ export function App() {
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [commands, setCommands] = useState<PiCommand[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+  const [modelProviderOrder, setModelProviderOrder] = useState<string[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [promptTemplatePickerOpen, setPromptTemplatePickerOpen] = useState(false);
   const [promptTemplateList, setPromptTemplateList] = useState<
@@ -664,6 +665,8 @@ export function App() {
   >([]);
   const [composerModePickerOpen, setComposerModePickerOpen] = useState(false);
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
+  const [availableThinkingLevels, setAvailableThinkingLevels] = useState<string[]>([]);
+  const [serviceTierBusy, setServiceTierBusy] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 菜单外层容器：用于「点击外部关闭」判定；chevron 引用用于 Escape 关闭后还焦。
@@ -4027,6 +4030,11 @@ export function App() {
   const [defaultModelKey, setDefaultModelKey] = useState<string | undefined>(undefined);
 
   async function openModelPicker() {
+    // 供应商排序随时可能被设置页改写；打开时刷新，失败保持上一次值。
+    void api.config
+      .getOmpProviderOrder()
+      .then(setModelProviderOrder)
+      .catch(() => undefined);
     // 顺路读取 omp 默认模型（config.yml 的 modelRoles.default = "provider/modelId"），
     // 供弹框内“设为默认”按钮标记当前默认项；未设置/无法解析时视为无默认。
     try {
@@ -4171,12 +4179,50 @@ export function App() {
       } catch (error) {
         showToast(
           t("app.thinkingSwitchFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    } else {
+      setThinkingPickerOpen(false);
+    }
+  }
+
+  /** 打开思考档位选择器前向 omp 查询当前模型实际支持的档位。 */
+  async function openThinkingPicker() {
+    setThinkingPickerOpen(true);
+    setAvailableThinkingLevels([]);
+    const agentId = activeAgentId;
+    if (!agentId || isPendingAgentId(agentId)) return;
+    try {
+      const levels = await api.agents.availableThinkingLevels(agentId);
+      // RPC 有 15s 超时窗口：期间切会话后，旧 agent 的档位不能覆盖当前 Picker。
+      if (levels.length > 0 && activeAgentIdRef.current === agentId) {
+        setAvailableThinkingLevels(levels);
+      }
+    } catch {
+      // 旧版 omp 没有该 RPC：保留空数组，Picker 回退到内置档位表。
+    }
+  }
+
+  /** fast/slow 服务档切换。失败信息来自 omp（模型不支持时返回明确原因）。 */
+  async function toggleServiceTier(kind: "fast" | "slow", enabled: boolean) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setServiceTierBusy(true);
+    try {
+      const state =
+        kind === "fast"
+          ? await api.agents.setFastMode(activeAgentId, enabled)
+          : await api.agents.setSlowMode(activeAgentId, enabled);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.serviceTierFailed", {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
-    }
-    } else {
-      setThinkingPickerOpen(false);
+    } finally {
+      setServiceTierBusy(false);
     }
   }
 
@@ -7172,8 +7218,10 @@ export function App() {
                   isAgentBusy={isAgentBusy}
                   isAgentStarting={agentStarting}
                   compacting={compacting}
+                  serviceTierBusy={serviceTierBusy}
                   onOpenModelPicker={openModelPicker}
-                  onOpenThinkingPicker={() => setThinkingPickerOpen(true)}
+                  onOpenThinkingPicker={() => void openThinkingPicker()}
+                  onToggleServiceTier={toggleServiceTier}
                   onCompact={() => void compactAgent()}
                 />
               </div>
@@ -8305,11 +8353,25 @@ export function App() {
           }}
           onClose={() => setModelPickerOpen(false)}
           onPick={selectModel}
-						  favoriteModels={settings.favoriteModels}
-						  onToggleFavorite={toggleFavoriteModel}
-						  defaultModelKey={defaultModelKey}
-						  onSetDefault={setDefaultModel}
-					/>
+          favoriteModels={settings.favoriteModels}
+          onToggleFavorite={toggleFavoriteModel}
+          defaultModelKey={defaultModelKey}
+          onSetDefault={setDefaultModel}
+          providerOrder={modelProviderOrder}
+          serviceTiers={
+            activeAgentId && !isPendingAgentId(activeAgentId)
+              ? {
+                  fastEnabled: activeRuntimeState?.fastModeEnabled,
+                  fastActive: activeRuntimeState?.fastModeActive,
+                  slowSupported: activeRuntimeState?.slowModeSupported,
+                  slowEnabled: activeRuntimeState?.slowModeEnabled,
+                  slowScope: activeRuntimeState?.slowModeScope,
+                }
+              : undefined
+          }
+          serviceTierBusy={serviceTierBusy}
+          onToggleServiceTier={(kind, enabled) => void toggleServiceTier(kind, enabled)}
+        />
       )}
       {composerModePickerOpen && (
         <ComposerModePicker
@@ -8324,6 +8386,7 @@ export function App() {
       {thinkingPickerOpen && (
         <ThinkingPicker
           current={activeRuntimeState?.thinkingLevel}
+          levels={availableThinkingLevels}
           onClose={() => setThinkingPickerOpen(false)}
           onPick={selectThinking}
         />

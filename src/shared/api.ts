@@ -70,6 +70,7 @@ import type {
 	OmpLogoutAccount,
 	OmpModelPresets,
 	OmpModelRole,
+	OmpModelRoleStorage,
 	OmpConfigPatch,
 	OmpRolesState,
 	PetAggregateState,
@@ -456,6 +457,16 @@ export interface ConfigApi {
 	getOmpCycleOrder: () => Promise<string[]>;
 	/** 写入模型循环顺序；空数组删除该键回到 omp 默认。 */
 	setOmpCycleOrder: (order: string[]) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 modelProviderOrder（裸模型 id 解析时的供应商优先级；空数组为 omp 内置顺序）。 */
+	getOmpProviderOrder: () => Promise<string[]>;
+	/** 写入 modelProviderOrder；空数组删除该键。 */
+	setOmpProviderOrder: (order: string[]) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 modelRoleStorage（global 写全局 config.yml，project 让 omp 写项目 .omp/config.yml）。 */
+	getOmpRoleStorage: () => Promise<OmpModelRoleStorage>;
+	/** 写入 modelRoleStorage。 */
+	setOmpRoleStorage: (
+		value: OmpModelRoleStorage,
+	) => Promise<{ valid: boolean; error?: string }>;
 	/** 读取 retry.fallbackChains。 */
 	getOmpFallbackChains: () => Promise<OmpFallbackChains>;
 	/** 写入 retry.fallbackChains；空映射删除该键。 */
@@ -564,6 +575,12 @@ export interface AgentsApi {
 	refreshModels: (agentId: string) => Promise<AgentRuntimeState>;
 	cycleThinking: (agentId: string) => Promise<AgentRuntimeState>;
 	setThinking: (agentId: string, level: string) => Promise<AgentRuntimeState>;
+	/** 当前模型可用的思考档位；旧版 omp 返回空数组。 */
+	availableThinkingLevels: (agentId: string) => Promise<string[]>;
+	/** 切换 fast/priority 服务档。 */
+	setFastMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 切换 slow/thinking 服务档。 */
+	setSlowMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
 	commands: (agentId: string) => Promise<PiCommand[]>;
 	/**
 	 * omp 的 `available_commands_update` 推送：命令目录以 runtime 为唯一事实源。

@@ -1903,6 +1903,14 @@ export class AgentManager {
 					: undefined,
 			cacheHitPercent,
 			cost: stats?.cost,
+			// omp 服务档位：enabled 是持久化设置，active 是当前请求实际生效的档。
+			// 两者分开，避免用户在全局开启后误以为每个模型都支持。
+			fastModeEnabled: normalizePiBoolean(state?.fastModeEnabled),
+			fastModeActive: normalizePiBoolean(state?.fastModeActive),
+			slowModeSupported: normalizePiBoolean(state?.slowModeSupported),
+			slowModeEnabled: normalizePiBoolean(state?.slowModeEnabled),
+			slowModeScope:
+				typeof state?.slowModeScope === "string" ? state.slowModeScope : undefined,
 			// omp 的待投递队列是 chip 的唯一事实来源：renderer 直接渲染它，
 			// 撤回/提升都回服务端执行，本地不再维护第二份 pending 队列。
 			queuedMessages: this.normalizeQueuedMessages(state?.queuedMessages),
@@ -2404,6 +2412,49 @@ export class AgentManager {
 			{ type: "set_thinking_level", level },
 			60_000,
 		);
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 当前模型的可用思考档位（omp `get_available_thinking_levels`）。
+	 * 老版本没有该命令时返回空数组，渲染层回退到内置档位表。
+	 */
+	async getAvailableThinkingLevels(agentId: string): Promise<string[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_available_thinking_levels" },
+			15_000,
+		);
+		const levels = (response.data as { levels?: unknown } | undefined)?.levels;
+		if (!Array.isArray(levels)) return [];
+		return levels.filter((level): level is string => typeof level === "string" && !!level);
+	}
+
+	/** 切换 fast/priority 服务档；模型不支持时 omp 返回 success:false，需交给渲染层提示。 */
+	async setFastMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		// PiRpcClient 只在超时/断连时 reject，omp 的业务错误以 success:false 返回；
+		// 不检查会把“模型无优先通道”静默当成成功。
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_fast_mode", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_fast_mode failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/** 切换 slow/thinking 服务档；scope 由 omp 持久化设置决定。 */
+	async setSlowMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_slow_mode", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_slow_mode failed");
+		}
 		return this.getRuntimeState(agentId);
 	}
 

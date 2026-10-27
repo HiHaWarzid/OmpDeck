@@ -31,6 +31,9 @@ const deps: WebDeps = {
 	refreshModels: stubRuntimeState,
 	cycleThinking: stubRuntimeState,
 	setThinking: stubRuntimeState,
+	availableThinkingLevels: async () => [],
+	setFastMode: stubRuntimeState,
+	setSlowMode: stubRuntimeState,
 	abortAndRestoreQueue: async () => ({ steering: [], followUp: [] }),
 	removeQueuedMessage: async () => ({ removed: false }),
 	promoteQueuedMessage: async () => ({ promoted: false }),
@@ -162,6 +165,63 @@ describe("WebServiceManager 生命周期", () => {
 			expect(migrated.ok).toBe(true);
 			expect(migrated.port).toBe(newPort);
 			await expect(health(oldPort)).rejects.toThrow();
+		} finally {
+			await manager.stop();
+		}
+	});
+
+	test("思考档位与服务档 REST 端点透传到 web deps", async () => {
+		const port = await freePort();
+		const calls: Array<{ kind: string; agentId: string; enabled?: boolean }> = [];
+		const manager = new WebServiceManager(
+			{
+				...deps,
+				availableThinkingLevels: async (agentId) => {
+					calls.push({ kind: "levels", agentId });
+					return ["low", "high"];
+				},
+				setFastMode: async (agentId, enabled) => {
+					calls.push({ kind: "fast", agentId, enabled });
+					return { fastModeEnabled: enabled } as AgentRuntimeState;
+				},
+				setSlowMode: async (agentId, enabled) => {
+					calls.push({ kind: "slow", agentId, enabled });
+					return { slowModeEnabled: enabled } as AgentRuntimeState;
+				},
+			},
+			50,
+		);
+		try {
+			await manager.applySettings({ webServiceEnabled: true, webServiceHost: HOST, webServicePort: port });
+			const levelsResponse = await fetch(`http://${HOST}:${port}/api/agents/agent-1/thinking-levels`);
+			expect(await levelsResponse.json()).toEqual({ levels: ["low", "high"] });
+
+			const fastResponse = await fetch(`http://${HOST}:${port}/api/agents/agent-1/fast-mode`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ enabled: true }),
+			});
+			expect(await fastResponse.json()).toEqual({ state: { fastModeEnabled: true } });
+
+			const slowResponse = await fetch(`http://${HOST}:${port}/api/agents/agent-1/slow-mode`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ enabled: false }),
+			});
+			expect(await slowResponse.json()).toEqual({ state: { slowModeEnabled: false } });
+
+			// 缺省/非布尔 enabled 必须拒绝，避免一次空请求把档位误关掉。
+			const invalidResponse = await fetch(`http://${HOST}:${port}/api/agents/agent-1/fast-mode`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}",
+			});
+			expect(invalidResponse.status).toBe(400);
+			expect(calls).toEqual([
+				{ kind: "levels", agentId: "agent-1" },
+				{ kind: "fast", agentId: "agent-1", enabled: true },
+				{ kind: "slow", agentId: "agent-1", enabled: false },
+			]);
 		} finally {
 			await manager.stop();
 		}

@@ -527,6 +527,17 @@ const previewOverrides: NamespaceOverrides = {
 			modelName: "Preview GPT",
 			thinkingLevel: level,
 		}),
+		availableThinkingLevels: async () => ["off", "low", "medium", "high"],
+		setFastMode: async () => ({
+			modelName: "Preview GPT",
+			fastModeEnabled: true,
+			fastModeActive: true,
+		}),
+		setSlowMode: async () => ({
+			modelName: "Preview GPT",
+			slowModeEnabled: true,
+			slowModeSupported: true,
+		}),
 		commands: async () => [
 			{ name: "reload", description: "Reload runtime", source: "builtin" },
 		],

@@ -4,13 +4,16 @@ import { join } from "node:path";
 import { parseDocument, type Document } from "yaml";
 import {
 	isValidOmpModelPresetName,
+	isValidOmpRoleSelector,
 	OMP_MODEL_ROLES,
 	isOmpModelRole,
 	parseRoleSelector,
+	stripRoleThinkingSuffix,
 	type OmpFallbackChains,
 	type OmpModelPreset,
 	type OmpModelPresets,
 	type OmpModelRole,
+	type OmpModelRoleStorage,
 	type OmpRolesState,
 } from "../../shared/types/ompRoles";
 import { JsonFileStore } from "../storage/JsonFileStore";
@@ -242,6 +245,46 @@ export class OmpRolesStore {
 			.map((item) => item.trim());
 	}
 
+	/**
+	 * `modelProviderOrder`：omp 解析裸模型 id/选择器时的供应商优先级。
+	 * 未配置返回空数组（omp 内置顺序）。
+	 */
+	async readProviderOrder(): Promise<string[]> {
+		const parsed = await this.parseDoc();
+		const raw = parsed?.modelProviderOrder;
+		if (!Array.isArray(raw)) return [];
+		return raw
+			.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+			.map((item) => item.trim());
+	}
+
+	/** 写入 `modelProviderOrder`；空数组删除该键回到 omp 内置顺序。 */
+	async setProviderOrder(order: readonly string[]): Promise<ConfigValidationResult> {
+		const normalized: string[] = [];
+		for (const provider of order) {
+			const trimmed = provider.trim();
+			if (trimmed && !normalized.includes(trimmed)) normalized.push(trimmed);
+		}
+		return this.writeDoc((doc) => {
+			if (normalized.length === 0) doc.delete("modelProviderOrder");
+			else doc.set("modelProviderOrder", normalized);
+		});
+	}
+
+	/** `modelRoleStorage`：决定 omp 把角色写入全局还是项目 config.yml。 */
+	async readRoleStorage(): Promise<OmpModelRoleStorage> {
+		const parsed = await this.parseDoc();
+		return parsed?.modelRoleStorage === "project" ? "project" : "global";
+	}
+
+	/** 写入 `modelRoleStorage`；global 是 omp 默认值，删除键即回归默认。 */
+	async setRoleStorage(value: OmpModelRoleStorage): Promise<ConfigValidationResult> {
+		return this.writeDoc((doc) => {
+			if (value === "global") doc.delete("modelRoleStorage");
+			else doc.set("modelRoleStorage", "project");
+		});
+	}
+
 	/** `retry.fallbackChains`（缺失/损坏按空处理）。 */
 	async readFallbackChains(): Promise<OmpFallbackChains> {
 		const parsed = await this.parseDoc();
@@ -383,10 +426,16 @@ export class OmpRolesStore {
 		selector: string,
 		thinkingLevel?: string,
 	): Promise<ConfigValidationResult> {
-		if (role === "default") return this.applyDefault(selector, thinkingLevel);
+		const normalized = selector.trim();
+		if (!isValidOmpRoleSelector(normalized)) {
+			return { valid: false, error: "selector 格式无效" };
+		}
+		if (role === "default") return this.applyDefault(normalized, thinkingLevel);
 		return this.writeDoc((doc) => {
 			const trimmed = thinkingLevel?.trim();
-			doc.setIn(["modelRoles", role], trimmed ? `${selector}:${trimmed}` : selector);
+			// selector 可自带 `:level`；先剥掉再拼，避免 "a:b" + "b" → "a:b:b"。
+			const bare = trimmed ? stripRoleThinkingSuffix(normalized) : normalized;
+			doc.setIn(["modelRoles", role], trimmed ? `${bare}:${trimmed}` : bare);
 		});
 	}
 	/** 只写顶层 defaultThinkingLevel（导入恢复用：保留已有档位的兜底项）。 */
@@ -415,11 +464,16 @@ export class OmpRolesStore {
 		selector: string,
 		thinkingLevel?: string,
 	): Promise<ConfigValidationResult> {
+		const normalized = selector.trim();
+		if (!isValidOmpRoleSelector(normalized)) {
+			return { valid: false, error: "selector 格式无效" };
+		}
 		return this.writeDoc((doc) => {
 			const trimmed = thinkingLevel?.trim();
+			const bare = trimmed ? stripRoleThinkingSuffix(normalized) : normalized;
 			doc.setIn(
 				["modelRoles", "default"],
-				trimmed ? `${selector}:${trimmed}` : selector,
+				trimmed ? `${bare}:${trimmed}` : bare,
 			);
 			if (trimmed) doc.set("defaultThinkingLevel", trimmed);
 			else doc.delete("defaultThinkingLevel");
@@ -444,19 +498,18 @@ export class OmpRolesStore {
 		const topLevel = incoming.defaultThinkingLevel;
 		const rawPresets = asRecord(incoming.modelPresets);
 		const rawCycle = incoming.cycleOrder;
+		const rawProviderOrder = incoming.modelProviderOrder;
+		const rawRoleStorage = incoming.modelRoleStorage;
 		const rawFallback = asRecord(asRecord(incoming.retry)?.fallbackChains);
 		return this.writeDoc((doc) => {
 			if (roles && typeof roles === "object" && !Array.isArray(roles)) {
 				for (const [role, selector] of Object.entries(roles)) {
-					if (!isOmpModelRole(role) || typeof selector !== "string" || !selector) continue;
-					const parsed = parseRoleSelector(selector);
-					if (!parsed.provider || !parsed.modelId) continue;
-					// 先剥离、再统一拼后缀，避免 "a:b" + "b" → "a:b:b"。
-					const bare = `${parsed.provider}/${parsed.modelId}`;
-					doc.setIn(
-						["modelRoles", role],
-						parsed.thinkingLevel ? `${bare}:${parsed.thinkingLevel}` : bare,
-					);
+					if (!isOmpModelRole(role) || typeof selector !== "string") continue;
+					// 导出包必须原样保留别名/候选列表（`@slow`、`a/b,c/d`）：
+					// 旧实现重建 provider/model 会把它们静默丢弃。
+					const normalized = selector.trim();
+					if (!isValidOmpRoleSelector(normalized)) continue;
+					doc.setIn(["modelRoles", role], normalized);
 				}
 			}
 			if (typeof topLevel === "string" && topLevel) {
@@ -476,6 +529,17 @@ export class OmpRolesStore {
 					.filter((item, index, all) => item && all.indexOf(item) === index);
 				if (order.length > 0) doc.set("cycleOrder", order);
 			}
+			if (Array.isArray(rawProviderOrder)) {
+				const order = rawProviderOrder
+					.filter((item): item is string => typeof item === "string")
+					.map((item) => item.trim())
+					.filter((item, index, all) => item && all.indexOf(item) === index);
+				// 空数组在 omp 语义里等价于未配置（内置顺序），导入时删键而不是留空列表。
+				if (order.length > 0) doc.set("modelProviderOrder", order);
+				else doc.delete("modelProviderOrder");
+			}
+			if (rawRoleStorage === "project") doc.set("modelRoleStorage", "project");
+			else if (rawRoleStorage === "global") doc.delete("modelRoleStorage");
 			if (rawFallback) {
 				const chains = readStringArrayRecord(rawFallback);
 				if (Object.keys(chains).length > 0) {

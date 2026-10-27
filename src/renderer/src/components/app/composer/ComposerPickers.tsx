@@ -15,6 +15,7 @@ import {
 import { t } from "../../../i18n";
 import { IconButton } from "../../ui/IconButton";
 import type { ComposerAgentMode, AvailableModel } from "../../../../../shared/types";
+import { sortProvidersByOrder } from "../../../../../shared/types/ompRoles";
 import { THINKING_LEVELS } from "./thinkingLevels";
 
 export function ModelPicker(props: {
@@ -30,6 +31,18 @@ export function ModelPicker(props: {
 	defaultModelKey?: string;
 	/** 将某模型设为 omp 默认模型（新会话初始模型），由调用方负责 IPC 写入与 toast */
 	onSetDefault: (provider: string, modelId: string) => void;
+	/** omp `modelProviderOrder`：供应商分组顺序与 omp 解析优先级一致。 */
+	providerOrder?: string[];
+	/** 运行中 agent 的服务档状态；无 agent 时省略，footer 不显示。 */
+	serviceTiers?: {
+		fastEnabled?: boolean;
+		fastActive?: boolean;
+		slowSupported?: boolean;
+		slowEnabled?: boolean;
+		slowScope?: string;
+	};
+	serviceTierBusy?: boolean;
+	onToggleServiceTier?: (kind: "fast" | "slow", enabled: boolean) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -95,16 +108,11 @@ export function ModelPicker(props: {
 		);
 	}
 
-	// 供应商排序：常见的放前面
-	const providerOrder = ['anthropic', 'openai', 'google', 'deepseek', 'other'];
-	const sortedProviders = Object.keys(groupedModels).sort((a, b) => {
-		const aIndex = providerOrder.indexOf(a);
-		const bIndex = providerOrder.indexOf(b);
-		if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
-		if (aIndex !== -1) return -1;
-		if (bIndex !== -1) return 1;
-		return a.localeCompare(b);
-	});
+	// 供应商排序与 omp `modelProviderOrder` 一致；未列出的按字母序排在后面。
+	const sortedProviders = sortProvidersByOrder(
+		Object.keys(groupedModels),
+		props.providerOrder ?? [],
+	);
 	const providerGroupKeys = favorites.length > 0
 		? ['__favorites__', ...sortedProviders]
 		: sortedProviders;
@@ -295,6 +303,48 @@ export function ModelPicker(props: {
 						<MoveDown size={14} strokeWidth={1.8} aria-hidden="true" />
 					</button>
 				</div>
+				{props.serviceTiers && props.onToggleServiceTier && (
+					<div className="model-picker-tier-footer">
+						<span className="model-picker-tier-label">{t("app.serviceTierSection")}</span>
+						<button
+							type="button"
+							className={`model-picker-tier-btn${props.serviceTiers.fastEnabled ? " on" : ""}`}
+							aria-pressed={props.serviceTiers.fastEnabled}
+							disabled={props.serviceTierBusy}
+							onClick={() =>
+								props.onToggleServiceTier?.("fast", !props.serviceTiers?.fastEnabled)
+							}
+							title={
+								props.serviceTiers.fastActive
+									? t("app.serviceFastActive")
+									: t("app.serviceFastIdle")
+							}
+						>
+							{t("app.serviceFastChip")}
+						</button>
+						<button
+							type="button"
+							className={`model-picker-tier-btn${props.serviceTiers.slowEnabled ? " on" : ""}`}
+							aria-pressed={props.serviceTiers.slowEnabled}
+							disabled={props.serviceTierBusy || !props.serviceTiers.slowSupported}
+							onClick={() =>
+								props.onToggleServiceTier?.("slow", !props.serviceTiers?.slowEnabled)
+							}
+							title={
+								props.serviceTiers.slowSupported
+									? t("app.serviceSlowTitle", {
+											scope:
+												props.serviceTiers.slowScope === "session"
+													? t("app.serviceSlowScopeSession")
+													: t("app.serviceSlowScopeGlobal"),
+										})
+									: t("app.serviceSlowUnsupported")
+							}
+						>
+							{t("app.serviceSlowChip")}
+						</button>
+					</div>
+				)}
 			</div>
 		</div>
 	);
@@ -357,9 +407,28 @@ export function ComposerModePicker(props: {
 }
 export function ThinkingPicker(props: {
 	current?: string;
+	/** omp `get_available_thinking_levels` 的返回；空/缺省时回退内置表。 */
+	levels?: string[];
 	onClose: () => void;
 	onPick: (level: string) => void;
 }) {
+	// 以 omp 的实际可用档位为准：不同模型支持的强度不同（例如没有 minimal/max）。
+	// 服务端顺序保留（off → … → max），未知值原样展示，避免模型新增档位时不可选。
+	const levelItems =
+		props.levels && props.levels.length > 0
+			? props.levels.map((value) => {
+					const meta = THINKING_LEVELS.find((entry) => entry.value === value);
+					return {
+						value,
+						label: meta ? t(meta.labelKey) : value,
+						description: meta ? t(meta.descriptionKey) : "",
+					};
+				})
+			: THINKING_LEVELS.map((entry) => ({
+					value: entry.value,
+					label: t(entry.labelKey),
+					description: t(entry.descriptionKey),
+				}));
 	return (
 		<div className="picker-backdrop" onClick={props.onClose}>
 			<div
@@ -382,7 +451,7 @@ export function ThinkingPicker(props: {
 					</IconButton>
 				</div>
 				<div className="picker-palette-list">
-					{THINKING_LEVELS.map((level) => {
+					{levelItems.map((level) => {
 						const selected = level.value === props.current;
 						return (
 							<button
@@ -390,8 +459,10 @@ export function ThinkingPicker(props: {
 								className={`picker-palette-item${selected ? " selected" : ""}`}
 								onClick={() => props.onPick(level.value)}
 							>
-								<span className="picker-palette-label">{t(level.labelKey)}</span>
-								<span className="picker-palette-desc">{t(level.descriptionKey)}</span>
+								<span className="picker-palette-label">{level.label}</span>
+								{level.description && (
+									<span className="picker-palette-desc">{level.description}</span>
+								)}
 								{selected && <span className="picker-palette-check">✓</span>}
 							</button>
 						);

@@ -21,15 +21,20 @@ import {
 	OMP_CHAT_MODEL_ROLES,
 	OMP_MODEL_ROLES,
 	formatRoleSelector,
+	isValidOmpRoleSelector,
 	ompRoleAcceptsModelKind,
+	parseRoleSelector,
+	sortProvidersByOrder,
 	type OmpFallbackChains,
 	type OmpModelPresets,
 	type OmpModelRole,
+	type OmpModelRoleStorage,
 } from "../../../../shared/types/ompRoles";
 import type { AvailableModel } from "../../../../shared/types";
 import { t, type TranslationKey } from "../../i18n";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
+import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 
 /** 角色元数据：本地化由 i18n 键提供（settings.role.<key>.name/.desc）。 */
@@ -52,13 +57,17 @@ type ModelsState =
 function ModelListPopup(props: {
 	role: OmpModelRole;
 	modelsState: ModelsState;
+	providerOrder: readonly string[];
 	onPick: (model: AvailableModel) => void;
+	onPickSelector: (selector: string) => void;
 	onClose: () => void;
 }) {
 	const [query, setQuery] = useState("");
+	const [customSelector, setCustomSelector] = useState("");
 	const normalized = query.trim().toLowerCase();
 	const models =
 		props.modelsState.status === "ready" ? props.modelsState.models : [];
+	const customValid = isValidOmpRoleSelector(customSelector);
 
 	// 角色只接受对应 kind：default/smol 等选 chat，image/tts/stt/judge 各自
 	// 只出现匹配条目；web 在 JSON 目录没有能力位，放宽到 chat + search。
@@ -75,15 +84,8 @@ function ModelListPopup(props: {
 		(acc[p] ??= []).push(m);
 		return acc;
 	}, {});
-	const providerOrder = ["anthropic", "openai", "google", "deepseek", "commandcode", "other"];
-	const sortedGroups = Object.keys(groups).sort((a, b) => {
-		const ai = providerOrder.indexOf(a);
-		const bi = providerOrder.indexOf(b);
-		if (ai !== -1 && bi !== -1) return ai - bi;
-		if (ai !== -1) return -1;
-		if (bi !== -1) return 1;
-		return a.localeCompare(b);
-	});
+	// 分组顺序严格跟 omp `modelProviderOrder` 一致；未列出的供应商按字母序。
+	const sortedGroups = sortProvidersByOrder(Object.keys(groups), props.providerOrder);
 	return (
 		<div className="model-roles-popup">
 			<div className="model-roles-popup-header">
@@ -127,6 +129,31 @@ function ModelListPopup(props: {
 					))}
 				</div>
 			)}
+			{/* omp 选择器支持别名、候选列表与 :thinking 后缀，模型目录无法覆盖，
+			    所以保留一个直接输入入口；合法性用 omp 同口径的校验提前拦截。 */}
+			<form
+				className="model-roles-popup-custom"
+				onSubmit={(event) => {
+					event.preventDefault();
+					if (!customValid) return;
+					props.onPickSelector(customSelector.trim());
+				}}
+			>
+				<TextField
+					label={t("settings.modelRoles.selectorLabel")}
+					value={customSelector}
+					placeholder={t("settings.modelRoles.selectorPlaceholder")}
+					description={t("settings.modelRoles.selectorDesc")}
+					onChange={setCustomSelector}
+				/>
+				<Button
+					buttonSize="sm"
+					type="submit"
+					disabled={!customValid}
+				>
+					{t("settings.modelRoles.selectorApply")}
+				</Button>
+			</form>
 		</div>
 	);
 }
@@ -147,6 +174,10 @@ export function ModelRolesTab() {
 	const [fallbackChains, setFallbackChains] = useState<OmpFallbackChains>({});
 	const [fallbackRole, setFallbackRole] = useState<string>("default");
 	const [fallbackDraft, setFallbackDraft] = useState("");
+	const [providerOrderDraft, setProviderOrderDraft] = useState("");
+	const [providerOrder, setProviderOrder] = useState<string[]>([]);
+	const [roleStorage, setRoleStorage] = useState<OmpModelRoleStorage>("global");
+	const [roleStorageDraft, setRoleStorageDraft] = useState<OmpModelRoleStorage>("global");
 	const [extrasSaving, setExtrasSaving] = useState<string | null>(null);
 
 	/** 只读 config.yml 的角色映射（快），不依赖模型目录扫描。 */
@@ -164,14 +195,21 @@ export function ModelRolesTab() {
 	/** 读取预设/循环/回退链；与角色读取相互独立，失败时保持空值。 */
 	const loadExtras = async () => {
 		try {
-			const [nextPresets, nextCycle, nextFallbacks] = await Promise.all([
-				window.piDesktop.config.getOmpModelPresets(),
-				window.piDesktop.config.getOmpCycleOrder(),
-				window.piDesktop.config.getOmpFallbackChains(),
-			]);
+			const [nextPresets, nextCycle, nextFallbacks, nextProviderOrder, nextRoleStorage] =
+				await Promise.all([
+					window.piDesktop.config.getOmpModelPresets(),
+					window.piDesktop.config.getOmpCycleOrder(),
+					window.piDesktop.config.getOmpFallbackChains(),
+					window.piDesktop.config.getOmpProviderOrder(),
+					window.piDesktop.config.getOmpRoleStorage(),
+				]);
 			setPresets(nextPresets ?? {});
 			setCycleDraft(nextCycle.join(", "));
 			setFallbackChains(nextFallbacks ?? {});
+			setProviderOrder(nextProviderOrder ?? []);
+			setProviderOrderDraft((nextProviderOrder ?? []).join(", "));
+			setRoleStorage(nextRoleStorage);
+			setRoleStorageDraft(nextRoleStorage);
 		} catch {
 			// 旧版 omp 可能没有这些 RPC；附加项保持空态，不影响角色编辑。
 		}
@@ -237,25 +275,18 @@ export function ModelRolesTab() {
 		};
 	}, [activeRole]);
 
-	const pickModel = async (role: OmpModelRole, model: AvailableModel) => {
+	const saveRoleSelector = async (role: OmpModelRole, selector: string) => {
 		setSavingRole(role);
 		setNotice(null);
 		try {
-			const selector = formatRoleSelector(model.provider, model.id);
 			const result = await window.piDesktop.config.setOmpRole(role, selector);
 			if (result.valid) {
 				setRoles((prev) => {
 					if (!prev) return prev;
-					return {
-						...prev,
-						[role]: {
-							selector,
-							provider: model.provider,
-							modelId: model.id,
-						},
-					};
+					return { ...prev, [role]: parseRoleSelector(selector) };
 				});
 				setNotice(t("settings.modelRoles.saved", { role: t(`settings.role.${role}.name`) }));
+				setActiveRole(null);
 			} else {
 				setNotice(result.error ?? t("settings.modelRoles.saveFailed"));
 			}
@@ -263,7 +294,6 @@ export function ModelRolesTab() {
 			setNotice(err instanceof Error ? err.message : String(err));
 		} finally {
 			setSavingRole(null);
-			setActiveRole(null);
 		}
 	};
 
@@ -363,6 +393,38 @@ export function ModelRolesTab() {
 		}
 	};
 
+	const saveProviderOrder = async () => {
+		setExtrasSaving("provider-order");
+		setNotice(null);
+		try {
+			const order = providerOrderDraft
+				.split(",")
+				.map((item) => item.trim())
+				.filter(Boolean);
+			const result = await window.piDesktop.config.setOmpProviderOrder(order);
+			reportResult(result, "settings.modelProvider.saved");
+			if (result.valid) await loadExtras();
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	const saveRoleStorage = async () => {
+		setExtrasSaving("role-storage");
+		setNotice(null);
+		try {
+			const result = await window.piDesktop.config.setOmpRoleStorage(roleStorageDraft);
+			reportResult(result, "settings.modelStorage.saved");
+			if (result.valid) await loadExtras();
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
 	/** 回退链整体写回：先合并本地状态，再提交完整映射（空链会删除该键）。 */
 	const commitFallback = async (next: OmpFallbackChains, savingKey: string) => {
 		setExtrasSaving(savingKey);
@@ -443,14 +505,9 @@ export function ModelRolesTab() {
 										</div>
 										<div className="model-role-value">
 											{hasValue ? (
-												<>
-													<code className="model-role-current">
-														{assignment.provider}/{assignment.modelId}
-													</code>
-													{assignment.thinkingLevel && (
-														<span className="model-role-level">{assignment.thinkingLevel}</span>
-													)}
-												</>
+												<code className="model-role-current" title={assignment.selector}>
+													{assignment.selector}
+												</code>
 											) : (
 												<span className="model-role-unset">{t("settings.modelRoles.unset")}</span>
 											)}
@@ -480,8 +537,12 @@ export function ModelRolesTab() {
 												<ModelListPopup
 													role={role}
 													modelsState={modelsState}
+													providerOrder={providerOrder}
 													onClose={() => setActiveRole(null)}
-													onPick={(m) => void pickModel(role, m)}
+													onPick={(m) =>
+														void saveRoleSelector(role, formatRoleSelector(m.provider, m.id))
+													}
+													onPickSelector={(selector) => void saveRoleSelector(role, selector)}
 												/>
 											</div>
 										)}
@@ -575,6 +636,59 @@ export function ModelRolesTab() {
 										onClick={() => void saveCycleOrder()}
 									>
 										{t("settings.modelCycle.save")}
+									</Button>
+								</div>
+							</div>
+
+							<div className="model-extras-section">
+								<div className="settings-section-header">
+									<strong>{t("settings.modelProvider.section")}</strong>
+									<small>{t("settings.modelProvider.sectionDesc")}</small>
+								</div>
+								<div className="model-extras-form">
+									<TextField
+										label={t("settings.modelProvider.orderLabel")}
+										value={providerOrderDraft}
+										placeholder={t("settings.modelProvider.orderPlaceholder")}
+										description={t("settings.modelProvider.orderDesc")}
+										onChange={setProviderOrderDraft}
+									/>
+									<Button
+										buttonSize="sm"
+										loading={extrasSaving === "provider-order"}
+										disabled={extrasSaving !== null}
+										onClick={() => void saveProviderOrder()}
+									>
+										{t("settings.modelProvider.save")}
+									</Button>
+								</div>
+							</div>
+
+							<div className="model-extras-section">
+								<div className="settings-section-header">
+									<strong>{t("settings.modelStorage.section")}</strong>
+									<small>{t("settings.modelStorage.sectionDesc")}</small>
+								</div>
+								<div className="model-extras-form">
+									<SelectField
+										label={t("settings.modelStorage.label")}
+										value={roleStorageDraft}
+										options={[
+											{ value: "global", label: t("settings.modelStorage.global") },
+											{ value: "project", label: t("settings.modelStorage.project") },
+										]}
+										onChange={(value) =>
+											setRoleStorageDraft(value === "project" ? "project" : "global")
+										}
+										description={t("settings.modelStorage.hint")}
+									/>
+									<Button
+										buttonSize="sm"
+										loading={extrasSaving === "role-storage"}
+										disabled={extrasSaving !== null || roleStorageDraft === roleStorage}
+										onClick={() => void saveRoleStorage()}
+									>
+										{t("settings.modelStorage.save")}
 									</Button>
 								</div>
 							</div>

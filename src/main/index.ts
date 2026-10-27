@@ -1330,6 +1330,9 @@ app.whenReady().then(async () => {
 		refreshModels: (agentId) => agentManager.refreshModels(agentId),
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
+		availableThinkingLevels: (agentId) => agentManager.getAvailableThinkingLevels(agentId),
+		setFastMode: (agentId, enabled) => agentManager.setFastMode(agentId, enabled),
+		setSlowMode: (agentId, enabled) => agentManager.setSlowMode(agentId, enabled),
 		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
 		removeQueuedMessage: (agentId, message, queue) =>
 			agentManager.removeQueuedMessage(agentId, message, queue),

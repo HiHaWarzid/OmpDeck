@@ -38,7 +38,7 @@ type AgentHandlerMaps = {
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
 		| "cancelSubagent" | "steerSubagent" | "subagentMessages" | "subagents"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
-		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "setThinking" | "availableThinkingLevels" | "setFastMode" | "setSlowMode" | "commands" | "sendUiResponse" | "notifyAsk"
 		| "getLoginProviders" | "login" | "getLogoutAccounts" | "logout"
 		| "respondTrustRequest">;
 };
@@ -359,6 +359,20 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			setThinking: async (_event, agentId: string, level: string) => {
 				const result = await agentManager.setThinking(agentId, level);
 				void appLogger.info("agent", "Agent thinking level changed", { agentId, level });
+				return result;
+			},
+			availableThinkingLevels: async (_event, agentId: string) =>
+				agentManager.getAvailableThinkingLevels(agentId),
+			setFastMode: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setFastMode(agentId, enabled);
+				void appLogger.info("agent", "Agent fast mode changed", { agentId, enabled });
+				return result;
+			},
+			setSlowMode: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setSlowMode(agentId, enabled);
+				void appLogger.info("agent", "Agent slow mode changed", { agentId, enabled });
 				return result;
 			},
 			commands: async (_event, agentId: string) => {
