@@ -18,6 +18,8 @@ import type {
 	AgentUiAskOption,
 	AgentUiAskQuestion,
 	AvailableModel,
+	OmpLoginProvider,
+	OmpLogoutAccount,
 	ChatMessage,
 	CreateAgentInput,
 	ForkMessage,
@@ -173,15 +175,13 @@ import {
 /**
  * AgentManager 用到的配置能力（窄接口）。
  *
- * 原先整类依赖 862 行的 ConfigManager（实际只用到 3 个能力，且其中多数是
+ * 原先整类依赖 862 行的 ConfigManager（实际只用到少数能力，且其中多数是
  * ConfigManager 对 rolesStore/trustStore 的纯转发）。收窄后依赖面就是这个对象：
- * 角色读取只留一个函数，信任决策拿到 store 本体，模型收敛只留一个函数。
+ * 角色读取只留一个函数，信任决策拿到 store 本体。
  */
 export type AgentConfigDeps = {
 	/** 顶层 defaultThinkingLevel（config.yml，缺省 undefined）。 */
 	readOmpDefaultThinkingLevel: () => Promise<string | undefined>;
-	/** 按 models.json 收敛可用模型（pi 内置目录里未配置的供应商/模型剔除）。 */
-	filterConfiguredModels: (models: AvailableModel[]) => Promise<AvailableModel[]>;
 	/** 项目信任决策存储（探测/decide 注入 ask）。 */
 	trustStore: TrustStore;
 };
@@ -2166,8 +2166,148 @@ export class AgentManager {
 			60_000,
 		);
 		const models = ((response.data as any)?.models ?? []) as AvailableModel[];
-		// pi 会把有 Key（含环境变量）的供应商内置目录也返回，这里只保留 models.json 显式配置的模型
-		return this.config.filterConfiguredModels(models);
+		// 目录包含 embedding/vision 等非对话条目；omp 的 kind 只在 chat 时可被
+		// set_model/模型角色选择使用。旧版没有 kind 字段，按可对话处理。
+		return models.filter((model) => !model.kind || model.kind === "chat");
+	}
+
+	/** omp 原生 OAuth provider 列表（登录动作必须绑定一个运行中的 agent）。 */
+	async getLoginProviders(agentId: string): Promise<OmpLoginProvider[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_login_providers" },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "get_login_providers failed");
+		}
+		const raw = (response.data as { providers?: unknown } | undefined)?.providers;
+		if (!Array.isArray(raw)) return [];
+		return raw.flatMap((entry): OmpLoginProvider[] => {
+			if (!entry || typeof entry !== "object") return [];
+			const item = entry as Record<string, unknown>;
+			if (typeof item.id !== "string" || !item.id) return [];
+			return [{
+				id: item.id,
+				name: typeof item.name === "string" && item.name ? item.name : item.id,
+				available: item.available === true,
+				authenticated: item.authenticated === true,
+			}];
+		});
+	}
+
+	/**
+	 * 触发 omp OAuth 登录。omp 在流程中通过 `extension_ui_request` 发出
+	 * `open_url` / 非敏感 `input`；超时按 omp 的 10 分钟输入窗口放宽到 11 分钟。
+	 */
+	async login(agentId: string, providerId: string): Promise<{ providerId: string }> {
+		const runtime = this.requireRuntime(agentId);
+		const trimmed = providerId.trim();
+		if (!trimmed) throw new Error("providerId is required");
+		runtime.loginFlowProviderId = trimmed;
+		this.emit(ipcChannels.agentsUiRequest, {
+			agentId,
+			requestId: `login-${trimmed}`,
+			method: "login_flow",
+			title: "",
+			loginStatus: "started",
+			loginProviderId: trimmed,
+			loginFlow: true,
+		});
+		try {
+			const response = await runtime.slot.process.client.request(
+				{ type: "login", providerId: trimmed },
+				660_000,
+			);
+			if (!response.success) {
+				throw new Error(response.error || "login failed");
+			}
+			const data = response.data as { providerId?: unknown } | undefined;
+			const completedProvider =
+				typeof data?.providerId === "string" && data.providerId
+					? data.providerId
+					: trimmed;
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: `login-${trimmed}`,
+				method: "login_flow",
+				title: "",
+				loginStatus: "succeeded",
+				loginProviderId: completedProvider,
+				loginFlow: true,
+			});
+			return { providerId: completedProvider };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: `login-${trimmed}`,
+				method: "login_flow",
+				title: "",
+				loginStatus: "failed",
+				loginProviderId: trimmed,
+				loginFlow: true,
+				error: message,
+			});
+			throw error;
+		} finally {
+			if (runtime.loginFlowProviderId === trimmed) {
+				runtime.loginFlowProviderId = undefined;
+			}
+		}
+	}
+
+	/** 列出 provider 已存储的可登出凭据（active 在前）。 */
+	async getLogoutAccounts(agentId: string, providerId: string): Promise<OmpLogoutAccount[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_logout_accounts", providerId },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "get_logout_accounts failed");
+		}
+		const raw = (response.data as { accounts?: unknown } | undefined)?.accounts;
+		if (!Array.isArray(raw)) return [];
+		return raw.flatMap((entry): OmpLogoutAccount[] => {
+			if (!entry || typeof entry !== "object") return [];
+			const item = entry as Record<string, unknown>;
+			if (
+				typeof item.credentialId !== "number" ||
+				typeof item.provider !== "string" ||
+				typeof item.label !== "string"
+			) {
+				return [];
+			}
+			return [{
+				credentialId: item.credentialId,
+				provider: item.provider,
+				label: item.label,
+				detail: typeof item.detail === "string" ? item.detail : "",
+				type: item.type === "oauth" ? "oauth" : "api_key",
+				active: item.active === true,
+			}];
+		});
+	}
+
+	/** 移除一条凭据；remainingSource 表示仍能认证该 provider 的来源。 */
+	async logout(
+		agentId: string,
+		providerId: string,
+		credentialId: number,
+	): Promise<{ remainingSource?: string }> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "logout", providerId, credentialId },
+			60_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "logout failed");
+		}
+		const data = response.data as { remainingSource?: unknown } | undefined;
+		return typeof data?.remainingSource === "string" && data.remainingSource
+			? { remainingSource: data.remainingSource }
+			: {};
 	}
 
 	async setModel(agentId: string, provider: string, modelId: string) {
@@ -4032,6 +4172,24 @@ export class AgentManager {
 			});
 			return;
 		}
+
+		// omp 原生 OAuth：浏览器地址必须交给宿主打开；桌面端由登录浮层展示/打开。
+		if (method === "open_url") {
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method,
+				title: "",
+				url: typeof typed.url === "string" ? typed.url : undefined,
+				launchUrl: typeof typed.launchUrl === "string" ? typed.launchUrl : undefined,
+				instructions:
+					typeof typed.instructions === "string" ? typed.instructions : undefined,
+				loginFlow: runtime.loginFlowProviderId !== undefined,
+				loginProviderId: runtime.loginFlowProviderId,
+			});
+			return;
+		}
+
 		// 其他非对话 UI 方法暂不占用桌面 UI 空间。
 		if (["setStatus", "setTitle"].includes(method)) return;
 
@@ -4066,9 +4224,30 @@ export class AgentManager {
 
 		if (!["select", "confirm", "input", "editor"].includes(method)) return;
 
-		// select 无选项时自动取消，不等用户响应
+		// select 无选项时对任何流程都无法作答：先自动取消，避免登录浮层渲染空选择器。
 		if (method === "select" && (!Array.isArray(typed.options) || typed.options.length === 0)) {
 			this.sendUIResponse(agentId, requestId, { cancelled: true });
+			return;
+		}
+
+		// 登录流程的粘贴回调/确认不进入时间线，由登录浮层承接；否则会留下
+		// 一张永远无人回答的 askQuestion 卡片。
+		if (runtime.loginFlowProviderId) {
+			const loginTitle = String(typed.title ?? typed.question ?? "");
+			runtime.pendingUIRequests.set(requestId, { method, title: loginTitle });
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method,
+				title: loginTitle,
+				options: typed.options as string[] | undefined,
+				placeholder: typed.placeholder as string | undefined,
+				prefill: typed.prefill as string | undefined,
+				allowOther: typed.allowOther === true,
+				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+				loginFlow: true,
+				loginProviderId: runtime.loginFlowProviderId,
+			});
 			return;
 		}
 
@@ -5059,6 +5238,11 @@ type AgentRuntime = {
 
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;
+	/**
+	 * 正在进行的原生 OAuth 登录 provider。omp 的 `open_url` / 登录输入请求
+	 * 不带流程标记，只能按宿主发起的 login 调用窗口识别，避免进入时间线。
+	 */
+	loginFlowProviderId?: string;
 
 	/**
 	 * 会话文件写入互斥锁链（readFile→modify→writeFile 原子化）

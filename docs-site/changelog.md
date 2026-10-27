@@ -5,26 +5,14 @@
 - [中文 CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.zh-CN.md)
 - [English CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.md)
 
-## v0.6.7
+## 未发布
 
-发布时间：2026-07-29
-
-- 🚀 **紧凑标题栏 + Codex 风格右侧栏**
-- 🚀 **文件编辑器收纳到 Files Tab**
-- 🚀 **文件树拖放 / 粘贴 / 移动**
-- 🚀 **@ 文件建议支持目录树与搜索**
-- 🚀 **Composer 粘贴 / 拖入路径引用**
-- 🚀 **文本链接默认内置编辑器打开**
-- 🚀 **批量提问 Tab UI**
-- 🚀 **Ctrl/Cmd+点击 Markdown 链接打开系统浏览器**
-- 🚀 **Tailwind CSS v4 + shadcn + sonner Toast**
-- 🚀 **侧栏项目展开/折叠状态持久化**
-- 🚀 **会话消息 Fork**
-- 🚀 **启动页官方 pi 拼装动画**
-- ✨ **Plan 模式流程打磨**
-- ✨ **Composer 挂件与扩展 UI**
-- ✨ **上下文压缩入口**
-- ✨ **UI 去饱和绿色**
+- 🚀 **omp 原生 OAuth 登录** — Auth 页浏览器授权、回跳地址复制、授权码回填与凭据登出
+- 🚀 **Kind 模型角色** — 新增 image / web / speech / dictation / judge，按 kind 过滤候选模型
+- 🚀 **模型预设 / 循环顺序 / 回退链** — `modelPresets`、`cycleOrder`、`retry.fallbackChains` 可视化编辑
+- ✨ **Auth 页写 models.yml** — API Key 落在 `providers.<name>.apiKey`，保留注释与手工字段
+- ✨ **导出/导入不含凭据** — 导出包不带 `apiKey`，导入保留本机已有 Key
+- 🐛 **models.yml 损坏时拒绝保存** — 提示先到源文件页修复，不再写出半份配置
 
 ## v0.6.7
 

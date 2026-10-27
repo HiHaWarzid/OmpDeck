@@ -31,7 +31,4 @@ export type ProviderConfig = {
 };
 
 export type ModelsFile = { providers: Record<string, ProviderConfig> };
-export type AuthFile = Record<
-	string,
-	{ type?: string; key?: string; [key: string]: unknown }
->;
+export type AuthFile = Record<string, { key?: string }>;

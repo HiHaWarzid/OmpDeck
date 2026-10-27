@@ -111,7 +111,7 @@ const moduleRegistrations = [
 	{ module: "clipboardHandlers", map: registerClipboardHandlers() },
 	{
 		module: "piHandlers",
-		map: registerPiHandlers({ piLocator: stubs, settingsStore: stubs, extensionManager: stubs, appLogger: stubs, configManager: stubs }),
+		map: registerPiHandlers({ piLocator: stubs, settingsStore: stubs, extensionManager: stubs, appLogger: stubs }),
 	},
 	{ module: "afkHandlers", map: registerAfkHandlers({ orchestrator: stubs }) },
 	{

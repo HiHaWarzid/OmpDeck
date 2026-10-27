@@ -11,7 +11,7 @@
  */
 export type ConfigSaveWarningCode =
 	| "models-yml-mirror-failed"
-	| "auth-json-sync-failed";
+	| "models-json-mirror-failed";
 
 export type ConfigSaveWarning = {
 	code: ConfigSaveWarningCode;

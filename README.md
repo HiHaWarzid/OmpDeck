@@ -64,7 +64,9 @@
 | **消息编辑/删除** | AI 回答和用户消息均支持复制、编辑和删除，编辑后回填到输入框重新发送。 |
 | **草稿本 (ScratchPad)** | 浮层式草稿本，支持内容预览、勾选映射和动画，颜色使用主题语义 token。 |
 | **内容行宽限制** | 可拖拽的内容宽度滑块，默认不限宽，往左拖逐渐变窄，适应长行代码阅读或紧凑布局需求。 |
-| **配置、Skill 与 Extension 管理** | 可视化编辑器管理 omp 的 `models.json`、`auth.json`、`config.yml`（设置权威源），并可管理全局 Skills 与 Extensions。 |
+| **配置、Skill 与 Extension 管理** | 可视化编辑器管理 omp 的 `models.yml`（含凭据的 Provider/模型权威源）、`models.json`（兼容镜像）、`config.yml`（设置权威源），并可管理全局 Skills 与 Extensions。 |
+| **omp 原生 OAuth 登录** | Auth 页直接发起 omp 原生 OAuth：自动打开系统浏览器、可复制回跳地址、回填授权码；已存凭据可查看并逐条登出，API Key 统一写入 `models.yml`。 |
+| **模型角色与预设** | 设置页「模型角色」按模型 kind 分配 15 个角色（对话角色 + 生图/语音/听写/判定等），支持命名预设、模型循环顺序（`cycleOrder`）和 `retry.fallbackChains` 回退链。 |
 | **扩展启用/禁用** | 支持禁用/启用内置扩展，项目级技能/扩展管理，区分全局与项目级配置。 |
 | **信任确认系统** | 桌面端拦截信任确认，不信任仍可打开项目；有 Agent 运行时禁止删除项目。 |
 | **代理设置** | 独立管理 pi agent 子进程代理和桌面端代理，模型拉取与连接测试可走桌面端代理。 |
@@ -97,7 +99,7 @@ Markdown 渲染 + 流式输出、活动轨迹、工具调用详情、回答级�
 
 ![配置管理](docs/images/config.png)
 
-可视化编辑器：Models（Provider 卡片 + 模型网格 + 连接测试）、Auth（API Key 管理）、Settings（类型感知的键值编辑器）、源文件（原始 JSON 编辑）——保存后可按需重启 Agent 生效。
+可视化编辑器：Models（Provider 卡片 + 模型网格 + 连接测试）、Auth（omp 原生 OAuth 登录/登出 + API Key，写入 `models.yml`）、Settings（类型感知的键值编辑器）、源文件（原始 JSON 编辑）——保存后可按需重启 Agent 生效。设置页另有「模型角色」：按 kind 分配角色、命名预设、循环顺序与回退链。
 
 ### 斜线命令与会话历史
 

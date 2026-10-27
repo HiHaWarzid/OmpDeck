@@ -37,6 +37,7 @@ import type {
 	CommitDetail,
 	CommitEntry,
 	ConfigFileDiagnostic,
+	ConfigSaveWarning,
 	CreateAgentInput,
 	CreatePiPromptTemplateInput,
 	CreatePiSkillInput,
@@ -64,6 +65,10 @@ import type {
 	NpmAvailabilityResult,
 	OpenCodeImportReport,
 	OpenCodeSessionSummary,
+	OmpFallbackChains,
+	OmpLoginProvider,
+	OmpLogoutAccount,
+	OmpModelPresets,
 	OmpModelRole,
 	OmpConfigPatch,
 	OmpRolesState,
@@ -131,7 +136,7 @@ export interface ProjectsApi {
 	 * 三者缓存与用途不同（项目 vs 运行态 vs 配置编辑），语义不等价，合并需先理清
 	 * 缓存层级；留待后续波次评估，这里仅标注重叠。
 	 */
-	listModels: (projectId?: string) => Promise<AvailableModel[]>;
+	listModels: (projectId?: string, includeNonChat?: boolean) => Promise<AvailableModel[]>;
 }
 
 export interface ProjectResourcesApi {
@@ -394,8 +399,8 @@ export interface ConfigApi {
 	 */
 	getOmpConfig: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	getTrust: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
-	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
-	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
+	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string; warnings?: ConfigSaveWarning[] }>;
+	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string; warnings?: ConfigSaveWarning[] }>;
 	/** config.yml 原文写回（源文件编辑器）；校验 YAML 顶层为映射后原子写，失败不落盘。 */
 	saveOmpConfigRaw: (raw: string) => Promise<{ valid: boolean; error?: string }>;
 	/**
@@ -439,6 +444,24 @@ export interface ConfigApi {
 	) => Promise<{ valid: boolean; error?: string }>;
 	/** 清除 config.yml 中某个 omp 模型角色（modelRoles.<role>） */
 	clearOmpRole: (role: OmpModelRole) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 config.yml 的 modelPresets（仅结构合法的条目）。 */
+	getOmpModelPresets: () => Promise<OmpModelPresets>;
+	/** 把当前 modelRoles + defaultThinkingLevel 快照保存为命名预设。 */
+	saveOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 应用预设：整块替换 modelRoles；预设未记录 thinking 时保留当前档位。 */
+	applyOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 删除全局预设。 */
+	deleteOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取模型循环顺序（未配置返回空数组，表示 omp 默认 smol→default→slow）。 */
+	getOmpCycleOrder: () => Promise<string[]>;
+	/** 写入模型循环顺序；空数组删除该键回到 omp 默认。 */
+	setOmpCycleOrder: (order: string[]) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 retry.fallbackChains。 */
+	getOmpFallbackChains: () => Promise<OmpFallbackChains>;
+	/** 写入 retry.fallbackChains；空映射删除该键。 */
+	setOmpFallbackChains: (
+		chains: OmpFallbackChains,
+	) => Promise<{ valid: boolean; error?: string }>;
 	saveRaw: (fileName: string, rawJson: string) => Promise<{ valid: boolean; error?: string }>;
 	export: () => Promise<string>;
 	import: (packageJson: string) => Promise<{ valid: boolean; error?: string }>;
@@ -521,6 +544,21 @@ export interface AgentsApi {
 	subagents: (agentId: string) => Promise<AgentSubagent[]>;
 	cycleModel: (agentId: string) => Promise<AgentRuntimeState>;
 	availableModels: (agentId: string) => Promise<AvailableModel[]>;
+	/** omp 原生 OAuth 登录：列出 provider（登录需要运行中的 agent）。 */
+	getLoginProviders: (agentId: string) => Promise<OmpLoginProvider[]>;
+	/**
+	 * 触发 OAuth 登录。omp 会通过 `agents:ui-request` 推送 `open_url` 和
+	 * 非敏感 input 请求；登录完成或失败后 promise settle。
+	 */
+	login: (agentId: string, providerId: string) => Promise<{ providerId: string }>;
+	/** 列出某 provider 已存储、可登出的凭据（active 在前）。 */
+	getLogoutAccounts: (agentId: string, providerId: string) => Promise<OmpLogoutAccount[]>;
+	/** 移除一条凭据；remainingSource 表示仍能认证该 provider 的来源。 */
+	logout: (
+		agentId: string,
+		providerId: string,
+		credentialId: number,
+	) => Promise<{ remainingSource?: string }>;
 	setModel: (agentId: string, provider: string, modelId: string) => Promise<AgentRuntimeState>;
 	/** 刷新模型配置，让运行中的 agent 重新加载 models.json */
 	refreshModels: (agentId: string) => Promise<AgentRuntimeState>;

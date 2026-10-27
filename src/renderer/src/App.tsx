@@ -59,6 +59,7 @@ import { createBrowserApi } from "./browserApi";
 const ConfigModal = lazy(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
 import { isTextFile } from "./utils/isTextFile";
 import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
+import { NativeLoginModal } from "./components/app/modals/NativeLoginModal";
 // 懒加载：@xterm/xterm（含 FitAddon + 主题 CSS）约数百 KB，终端 Dock 按需打开，
 // 不应在首屏解析执行（此前 xterm 完整打进 1.8MB 入口 chunk）。
 const TerminalDock = lazy(() =>
@@ -2294,6 +2295,10 @@ export function App() {
     });
     // 监听 Extension UI 请求：对话类渲染为提问卡片；setWidget 类作为 composer 上方的轻量状态块展示。
     const offUiRequest = api.agents.onUiRequest((request) => {
+      // OAuth 登录流程由 NativeLoginModal 统一处理；这里必须提前返回，
+      // 否则 open_url / login_flow 会被当成时间线里的通用提问卡片。
+      if (request.loginFlow || request.method === "open_url") return;
+
       if (request.method === "notify") {
         const notifyRequest = request;
         if (notifyRequest.message) {
@@ -8525,6 +8530,9 @@ filePath={gitDrawerDiff.filePath}
           }}
         />
       )}
+
+      {/* omp 原生 OAuth 登录：常驻挂载，接收 open_url / 敏感输入请求 */}
+      <NativeLoginModal />
 
       {renamingFile && (
         <div className="config-modal-overlay" onClick={() => setRenamingFile(null)}>

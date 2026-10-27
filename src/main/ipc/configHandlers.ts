@@ -145,6 +145,57 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				}
 				return result;
 			},
+			getOmpModelPresets: async () => rolesStore.readModelPresets(),
+			saveOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.saveModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset saved", { name: presetName });
+				}
+				return result;
+			},
+			applyOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.applyModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset applied", { name: presetName });
+				}
+				return result;
+			},
+			deleteOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.deleteModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset deleted", { name: presetName });
+				}
+				return result;
+			},
+			getOmpCycleOrder: async () => rolesStore.readCycleOrder(),
+			setOmpCycleOrder: async (_event, order: unknown) => {
+				if (!Array.isArray(order)) {
+					return { valid: false, error: "cycleOrder 必须是字符串数组" };
+				}
+				const result = await rolesStore.setCycleOrder(
+					order.filter((item): item is string => typeof item === "string"),
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model cycle order set", { order });
+				}
+				return result;
+			},
+			getOmpFallbackChains: async () => rolesStore.readFallbackChains(),
+			setOmpFallbackChains: async (_event, chains: unknown) => {
+				if (!chains || typeof chains !== "object" || Array.isArray(chains)) {
+					return { valid: false, error: "fallbackChains 必须是对象" };
+				}
+				const result = await rolesStore.setFallbackChains(
+					chains as Record<string, string[]>,
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model fallback chains set", { chains });
+				}
+				return result;
+			},
 			saveRaw: async (_event, fileName, rawJson) => {
 				const result = await configManager.saveRawConfig(fileName, rawJson);
 				void appLogger.info("config", "Raw config saved", {

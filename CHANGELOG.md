@@ -4,6 +4,43 @@
 
 All notable changes to PiDeck are documented here.
 
+## Unreleased
+
+### 🚀 New Features
+
+- **omp-native OAuth login** — The Auth tab can start omp's OAuth directly: the
+  authorization URL opens in the system browser while a copyable loopback URL
+  and code input stay in the dialog. Login callbacks never leak into the session
+  timeline and survive tab switches; authenticated providers can list and revoke
+  stored credentials. Requires at least one running agent.
+- **Kind-scoped model roles** — The Model Roles page gains `image` / `web` /
+  `speech` / `dictation` / `judge`, and the picker filters models by the kind the
+  role accepts. The catalog is fetched with `omp models --kind all`; `embedding`
+  entries are never offered.
+- **Model presets / cycle order / fallback chains** — Snapshot every role plus
+  the default thinking level into `modelPresets.<name>`, set `cycleOrder`, and
+  configure `retry.fallbackChains`; all three are written to global `config.yml`.
+
+### ✨ Improvements
+
+- **Auth tab edits the authoritative model file** — API keys are written to
+  `providers.<name>.apiKey` in `models.yml`, preserving comments and hand-written
+  fields; clearing a key deletes just that field. The obsolete `type` field and
+  the duplicate-credential action are gone.
+- **Config export/import no longer carries credentials** — Exports contain no
+  `apiKey`; imports keep the target machine's existing keys and only take an
+  explicitly non-empty key from the package.
+
+### 🐛 Bug Fixes
+
+- **Refuse to save a broken `models.yml`** — The Auth tab no longer rewrites an
+  unparsable `models.yml` into a half-empty file and points at the raw-file tab
+  instead; empty declarations like `providers: null` or `openai:` no longer fail.
+- **Validated import baseline** — Imports abort when `models.yml` has parse
+  diagnostics, so repairable content is not discarded before being overwritten.
+- **Mirror warning code** — With `auth.json` sync removed, model mirror failures
+  report `models-json-mirror-failed` instead of "auth.json sync failed".
+
 ## v0.6.7 - 2026-07-29
 
 ### 🚀 New Features

@@ -1,5 +1,9 @@
-/** omp 内置模型角色（modelRoles.<role>）。角色集取自 omp v18 runtime 元数据表。 */
-export const OMP_MODEL_ROLES = [
+/**
+ * omp 内置模型角色（modelRoles.<role>）。角色集取自 omp v18 的
+ * `MODEL_ROLES` 表（src/config/model-roles.ts），顺序与模型中心一致：
+ * 前 10 个是对话角色，后 5 个按模型 kind 选择（image/web/speech/dictation/judge）。
+ */
+export const OMP_CHAT_MODEL_ROLES = [
 	"default",
 	"smol",
 	"slow",
@@ -7,11 +11,66 @@ export const OMP_MODEL_ROLES = [
 	"plan",
 	"commit",
 	"tiny",
+	"memory",
 	"task",
 	"advisor",
 ] as const;
 
+export const OMP_KIND_MODEL_ROLES = [
+	"image",
+	"web",
+	"speech",
+	"dictation",
+	"judge",
+] as const;
+
+export const OMP_MODEL_ROLES = [
+	...OMP_CHAT_MODEL_ROLES,
+	...OMP_KIND_MODEL_ROLES,
+] as const;
+
 export type OmpModelRole = (typeof OMP_MODEL_ROLES)[number];
+
+/** 角色接受的模型 kind（与 omp `roleCandidatePool` 的 accepts 逻辑一致）。 */
+export function ompRoleAcceptsModelKind(
+	role: OmpModelRole,
+	kind: string | undefined,
+): boolean {
+	switch (role) {
+		case "image":
+			return kind === "image";
+		case "web":
+			// JSON 目录不暴露 webSearch 能力位；search 模型必选，chat 由 omp 侧再校验。
+			return kind === "search" || kind === "chat" || kind === undefined;
+		case "speech":
+			return kind === "tts";
+		case "dictation":
+			return kind === "stt";
+		case "judge":
+			return kind === "judge" || kind === "tiny" || kind === "chat" || kind === undefined;
+		case "tiny":
+		case "memory":
+			return kind === "tiny" || kind === "chat" || kind === undefined;
+		default:
+			return kind === "chat" || kind === undefined;
+	}
+}
+
+/** 模型预设：角色快照 + 可选默认思考档；值与 omp `modelPresets.<name>` 对齐。 */
+export type OmpModelPreset = {
+	modelRoles: Record<string, string>;
+	defaultThinkingLevel?: string;
+};
+
+export type OmpModelPresets = Record<string, OmpModelPreset>;
+
+/** 预设名规则（omp `isValidModelPresetName`）：字母开头，后接字母/数字/下划线/连字符。 */
+export function isValidOmpModelPresetName(name: string): boolean {
+	return /^[a-zA-Z][\w-]*$/.test(name);
+}
+
+/** `retry.fallbackChains`：角色或模型选择器 → 有序回退选择器。 */
+export type OmpFallbackChains = Record<string, string[]>;
 
 /** 单个角色当前配置：selector 形如 "provider/modelId[:thinkingLevel]"。 */
 export type OmpRoleAssignment = {

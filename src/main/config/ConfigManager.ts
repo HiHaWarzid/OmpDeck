@@ -4,7 +4,6 @@ import { normalize, join, dirname } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
 import { net } from "electron";
-import type { AvailableModel } from "../../shared/types";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
 import type { ConfigSaveWarning } from "../../shared/types";
 import {
@@ -23,7 +22,7 @@ import { OmpRolesStore } from "./OmpRolesStore";
 import { TrustStore } from "./TrustStore";
 import { JsonFileStore } from "../storage/JsonFileStore";
 import { ompSettingsPatchFromPackage, pickOmpSettings } from "../../shared/ompConfigSettings";
-import { parseDocument } from "yaml";
+import { isMap, isScalar, parseDocument } from "yaml";
 import type { WslEnvironment } from "../wsl/WslPaths";
 
 /** pi 全局配置目录：~/.omp/agent/ */
@@ -65,13 +64,13 @@ export type PiModelsFile = {
 	providers: Record<string, PiProviderConfig>;
 };
 
-// ── auth.json 结构 ────────────────────────────────────
-// { [providerName]: { type: "api_key", key: "..." } }
+// ── Auth 视图结构 ─────────────────────────────────────
+// Auth 页的唯一落盘目标是 models.yml 的 providers.<name>.apiKey（omp 凭据解析的
+// 第一优先级）。这里只给渲染层一个扁平的 { provider: { key } } 视图，不再模拟
+// omp 18 已废弃的 auth.json type/oauth 字段。
 
 export type PiAuthItem = {
-	type?: string;
 	key?: string;
-	[key: string]: unknown;
 };
 
 export type PiAuthFile = Record<string, PiAuthItem>;
@@ -98,9 +97,9 @@ type TestRequest = {
 };
 
 /**
- * 管理 omp 全局配置文件（~/.omp/agent/ 下的 models.json、auth.json、trust.json、
- * config.yml）。按照 pi 实际文件格式解析：models.json 是嵌套 providers 结构，
- * auth.json 是对象映射，config.yml 是 YAML 设置权威源（见 OmpConfigFile）。
+ * 管理 omp 全局配置文件（~/.omp/agent/ 下的 models.yml、models.json、trust.json、
+ * config.yml）。models.yml 是含凭据的权威模型配置，models.json 是其兼容镜像；
+ * config.yml 是 YAML 设置权威源（见 OmpConfigFile）。
  */
 export class ConfigManager {
 	private configDir: string;
@@ -117,7 +116,7 @@ export class ConfigManager {
 	 * 公开只读：设置页的键级写入由 OmpConfigFile 承担（与 rolesStore 共享路径队列）。
 	 */
 	readonly ompConfig: OmpConfigFile;
-	/** models/auth.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
+	/** models.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
 	private readonly jsonFiles = new Map<string, JsonFileStore<string>>();
 
 	constructor(configDir?: string) {
@@ -145,8 +144,9 @@ export class ConfigManager {
 				// 同时写一份 models.json 供后续使用。这里不阻塞读取（迁移是尽力而为，
 				// 下次启动会重试），但失败要留痕：否则用户会一直读到 yml 回退路径。
 				// 空 providers 不迁移：多半意味着 yml 损坏（或为空），落空配置会把
-				// 「用户手编 yml 暂不可读」固化成永久空配置（孤儿化）。
-				if (Object.keys(ymlResult.parsed.providers).length > 0) {
+				// 「用户手编 yml 暂不可读」固化成永久空配置（孤儿化）。有解析诊断时
+				// 同样不迁移：部分恢复的数据写进 json 后会在 yml 修好前抢先成为读源。
+				if (!ymlResult.diagnostic && Object.keys(ymlResult.parsed.providers).length > 0) {
 					void this.writeJsonFile("models.json", ymlResult.parsed).catch((error: unknown) => {
 						console.warn(
 							`[ConfigManager] models.json 迁移写入失败，本次仍从 models.yml 读取：${
@@ -162,42 +162,47 @@ export class ConfigManager {
 	}
 
 	/**
-	 * 只保留 models.json 里显式配置过的模型。
-	 * pi 会把「配置了 API Key（含环境变量）的供应商」的完整内置目录也算作可用模型，
-	 * 例如设置了 OPENAI_API_KEY 但从未在 models.json 配置 openai 时，模型选择器会
-	 * 冒出一整组未配置的 gpt 模型。这里以 models.json 为准做两层收敛：
-	 * - 供应商不在配置中 → 整个剔除；
-	 * - 供应商配置里显式列出了 models → 再按模型 id 收敛（pi 可能混入发现/缓存的多余模型）。
+	 * 读取 omp 真正生效的模型配置。
+	 *
+	 * omp 18 的 models.yml 是权威源，models.json 只是 OmpDeck 的镜像。Auth 编辑和
+	 * 导出必须基于 yml，否则会拿旧的 json 覆盖用户刚在 yml 里改过的 key/字段。
+	 * yml 缺失时才回退 json（首次安装/旧版本迁移）。
 	 */
-	async filterConfiguredModels(models: AvailableModel[]): Promise<AvailableModel[]> {
-		const result = await this.getModelsConfig();
-		const providers = result.parsed.providers ?? {};
-		const allowedProviders = new Set(Object.keys(providers));
-		if (allowedProviders.size === 0) return [];
-		// 显式列出模型的供应商：仅放行清单内的 id
-		const explicitModelIds = new Map<string, Set<string>>();
-		for (const [provider, config] of Object.entries(providers)) {
-			const ids = (config.models ?? [])
-				.map((m) => m.id)
-				.filter((id): id is string => typeof id === "string");
-			if (ids.length > 0) explicitModelIds.set(provider, new Set(ids));
+	private async readAuthoritativeModels(): Promise<ConfigFileReadResult<PiModelsFile>> {
+		if (existsSync(join(this.configDir, "models.yml"))) {
+			return this.readModelsYml();
 		}
-		return models.filter((model) => {
-			if (!allowedProviders.has(model.provider)) return false;
-			const ids = explicitModelIds.get(model.provider);
-			return !ids || ids.has(model.id);
-		});
+		return this.readJsonFile<PiModelsFile>("models.json", { providers: {} });
 	}
 
-	/** 回退：从 models.yml 解析为 PiModelsFile（简单缩进 YAML，不支持嵌套数组/对象以外的复杂结构） */
+	/** 读取 models.yml 并解析；解析/读取失败只降级为空配置，但必须把原因交给调用方展示。 */
 	private async readModelsYml(): Promise<ConfigFileReadResult<PiModelsFile>> {
 		try {
 			const ymlPath = join(this.configDir, "models.yml");
 			const raw = await readFile(ymlPath, "utf-8");
 			const parsed = this.parseSimpleYaml(raw);
-			return { raw, parsed };
-		} catch {
-			return { raw: "", parsed: { providers: {} } };
+			const errors = parseDocument(raw).errors;
+			return errors.length > 0
+				? {
+						raw,
+						parsed,
+						diagnostic: {
+							fileName: "models.yml",
+							message: `models.yml 解析失败：${errors[0].message}`,
+							docsUrl: "",
+						},
+					}
+				: { raw, parsed };
+		} catch (error) {
+			return {
+				raw: "",
+				parsed: { providers: {} },
+				diagnostic: {
+					fileName: "models.yml",
+					message: `models.yml 读取失败：${error instanceof Error ? error.message : String(error)}`,
+					docsUrl: "",
+				},
+			};
 		}
 	}
 
@@ -243,21 +248,21 @@ export class ConfigManager {
 	}
 
 	async getAuthConfig(): Promise<ConfigFileReadResult<PiAuthFile>> {
-		const jsonPath = join(this.configDir, "auth.json");
-		if (!existsSync(jsonPath)) {
-			// 从 models.yml 提取 apiKey 回退
-			const modelsResult = await this.readModelsYml();
-			if (modelsResult.parsed.providers && Object.keys(modelsResult.parsed.providers).length > 0) {
-				const auth: PiAuthFile = {};
-				for (const [provider, config] of Object.entries(modelsResult.parsed.providers)) {
-					if (config.apiKey) {
-						auth[provider] = { type: "api_key", key: config.apiKey };
-					}
-				}
-				return { raw: modelsResult.raw, parsed: auth };
+		const models = await this.readAuthoritativeModels();
+		const auth: PiAuthFile = {};
+		for (const [provider, config] of Object.entries(models.parsed.providers ?? {})) {
+			// models.json 可能是用户手编的；provider 值不是对象时跳过，不能让坏数据
+			// 把整个 Auth 页读崩（yml 路径的 parseSimpleYaml 已过滤，json 路径没有）。
+			if (!config || typeof config !== "object") continue;
+			if (typeof config.apiKey === "string" && config.apiKey.trim()) {
+				auth[provider] = { key: config.apiKey };
 			}
 		}
-		return this.readJsonFile<PiAuthFile>("auth.json", {});
+		return {
+			raw: models.raw,
+			parsed: auth,
+			...(models.diagnostic ? { diagnostic: models.diagnostic } : {}),
+		};
 	}
 
 	async getTrustConfig(): Promise<ConfigFileReadResult<Record<string, boolean>>> {
@@ -298,39 +303,7 @@ export class ConfigManager {
 			const detail = error instanceof Error ? error.message : String(error);
 			warnings.push({ code: "models-yml-mirror-failed", detail });
 		}
-		// 同步 apiKey 到 auth.json：pi 内置 provider（如 commandcode）走 auth.json
-		// 取 key，不读 models.json 里的 apiKey 字段（也不读 yml 回退）。OmpDeck 镜像
-		// 到 yml 仅是给 getAuthConfig 做读路径回退，会话侧仍取 auth.json。不在保存时
-		// 同步的话,用户在表单改 key 看似成功,实际会话 401。仅同步非空 apiKey；oauth
-		// provider 的 auth 走专用通道,不在此覆盖。auth.json 失败仅警告、不回滚
-		// models.json(用户可手动补 auth.json)。
-		try {
-			await this.syncAuthFromModels(normalized);
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			warnings.push({ code: "auth-json-sync-failed", detail });
-		}
 		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
-	}
-
-	/**
-	 * 把 models.json 里非空 apiKey 同步到 auth.json。不删旧条目（其他 provider 的 key
-	 * 可能仍生效,只是当前没列在 models.json 中,如 disabled 状态）。不覆盖已有 key
-	 * 不同的条目:AuthTab 直接编辑的 key 是用户最新意图,不应被 stale 的 models.json 改写。
-	 */
-	private async syncAuthFromModels(data: PiModelsFile): Promise<void> {
-		const authResult = await this.readJsonFile<PiAuthFile>("auth.json", {});
-		const auth = authResult.parsed ?? {};
-		let changed = false;
-		for (const [name, provider] of Object.entries(data.providers)) {
-			const key = typeof provider.apiKey === "string" ? provider.apiKey.trim() : "";
-			if (!key) continue;
-			const existing = auth[name];
-			if (existing?.key === key) continue;
-			auth[name] = { type: "api_key", key };
-			changed = true;
-		}
-		if (changed) await this.writeJsonFile("auth.json", auth);
 	}
 
 	/**
@@ -476,27 +449,132 @@ export class ConfigManager {
 	}
 
 
+	/**
+	 * Auth 页保存：只改 providers.<name>.apiKey，落盘目标是 omp 的 models.yml。
+	 *
+	 * 三个关键约束：
+	 * 1. 读-改-写基于 models.yml 而不是 models.json：omp 18 只认 yml，json 可能是旧镜像。
+	 * 2. yml 存在时用 YAML Document 原位 patch，保留用户的注释和其它手工字段；解析失败
+	 *    直接拒绝保存，避免把损坏文件重写成半份配置。
+	 * 3. `apiKey` 可以是环境变量名或 `!command`，原样保存，不做 prefix/类型判断。
+	 *
+	 * 删除语义：Auth 页展示的是 yml 里所有非空 apiKey，因此提交数据中缺席的 provider
+	 * 视为“清空该 provider 的 key”（provider 本身及 models/baseUrl 保留），因此
+	 * models.json 镜像里的 apiKey 也会同步消失。
+	 */
 	async saveAuthConfig(data: PiAuthFile): Promise<ConfigValidationResult> {
-		await this.writeJsonFile("auth.json", data);
-		// 同步更新 models.json 中的 apiKey，确保 OMP models.yml 与 auth 一致
+		const ymlPath = join(this.configDir, "models.yml");
+		const ymlExists = existsSync(ymlPath);
+		let ymlText: string | null = null;
+		let base: PiModelsFile;
+		if (ymlExists) {
+			try {
+				ymlText = await readFile(ymlPath, "utf-8");
+			} catch (error) {
+				return {
+					valid: false,
+					error: `读取 models.yml 失败：${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			base = this.parseSimpleYaml(ymlText);
+		} else {
+			base = (await this.getModelsConfig()).parsed;
+		}
+
+		// 以 yml 当前内容为基线，构建下一版 providers；只动 apiKey，不碰 models/compat。
+		const providers: Record<string, PiProviderConfig> = { ...(base.providers ?? {}) };
+		const requested = new Set<string>();
+		for (const [name, entry] of Object.entries(data)) {
+			const key = typeof entry?.key === "string" ? entry.key : "";
+			if (!key.trim()) continue;
+			requested.add(name);
+			const existing = providers[name];
+			providers[name] = {
+				...(existing && typeof existing === "object" && !Array.isArray(existing)
+					? existing
+					: { models: [] }),
+				apiKey: key,
+			};
+		}
+		for (const [name, provider] of Object.entries(providers)) {
+			if (!provider || typeof provider !== "object" || Array.isArray(provider)) continue;
+			if (requested.has(name) || typeof provider.apiKey !== "string") continue;
+			const nextProvider = { ...provider };
+			delete nextProvider.apiKey;
+			providers[name] = nextProvider;
+		}
+
 		try {
-			const modelsPath = join(this.configDir, "models.json");
-			if (existsSync(modelsPath)) {
-				const modelsRaw = await readFile(modelsPath, "utf-8");
-				const models = JSON.parse(modelsRaw) as PiModelsFile;
-				let changed = false;
-				for (const [provider, authEntry] of Object.entries(data)) {
-					if (models.providers[provider] && authEntry.key) {
-						models.providers[provider].apiKey = authEntry.key;
-						changed = true;
+			if (ymlText !== null) {
+				const doc = parseDocument(ymlText);
+				if (doc.errors.length > 0) {
+					return {
+						valid: false,
+						error: `models.yml 解析失败：${doc.errors[0].message}。请先在原始文件页修复后重试。`,
+					};
+				}
+				// `providers:`（显式 null）或空文件是合法的 omp 初始状态；不先补成映射，
+				// setIn 会抛 “Expected YAML collection at providers”。反过来，providers
+				// 已是标量/数组时不能静默替换，否则会抹掉用户文件内容。
+				const providersNode = doc.get("providers", true);
+				// 显式 `providers:` / `providers: null` 会被 yaml 解析成 value=null 的
+				// Scalar 节点，而不是 undefined；两者都按空映射处理。
+				if (providersNode === undefined || (isScalar(providersNode) && providersNode.value == null)) {
+					doc.set("providers", doc.createNode({}));
+				} else if (!isMap(providersNode)) {
+					return {
+						valid: false,
+						error: "models.yml 的 providers 必须是映射，请先在原始文件页修复后重试。",
+					};
+				}
+				for (const [name, provider] of Object.entries(providers)) {
+					const key = typeof provider.apiKey === "string" ? provider.apiKey : undefined;
+					// `openai:` / `openai: null` 是合法的空 provider 声明，yaml 解析为
+					// Scalar(null)，直接 setIn 会抛 “Expected YAML collection”。补成映射再写。
+					const providerNode = doc.getIn(["providers", name], true);
+					if (
+						providerNode === undefined ||
+						(isScalar(providerNode) && providerNode.value == null)
+					) {
+						doc.setIn(["providers", name], doc.createNode({}));
+					} else if (!isMap(providerNode)) {
+						return {
+							valid: false,
+							error: `models.yml 的 providers.${name} 必须是映射，请先在原始文件页修复后重试。`,
+						};
+					}
+					if (key !== undefined) {
+						doc.setIn(["providers", name, "apiKey"], key);
+					} else if (doc.hasIn(["providers", name, "apiKey"])) {
+						doc.deleteIn(["providers", name, "apiKey"]);
 					}
 				}
-				if (changed) await this.writeJsonFile("models.json", models);
+				const nextText = doc.toString();
+				await this.jsonFile("models.yml").write(
+					nextText.endsWith("\n") ? nextText : `${nextText}\n`,
+				);
+			} else {
+				await this.writeModelsYml({ providers });
 			}
-		} catch {
-			// 同步失败不影响 auth 保存
+		} catch (error) {
+			return {
+				valid: false,
+				error: `保存 models.yml 失败：${error instanceof Error ? error.message : String(error)}`,
+			};
 		}
-		return { valid: true };
+
+		const warnings: ConfigSaveWarning[] = [];
+		try {
+			// models.json 是 OmpDeck 的读镜像：整份写成 yml 的视图，避免旧 key/旧字段
+			// 在 Models 页继续出现，之后整表保存又把过期内容盖回 yml。
+			await this.writeJsonFile("models.json", { providers });
+		} catch (error) {
+			warnings.push({
+				code: "models-json-mirror-failed",
+				detail: error instanceof Error ? error.message : String(error),
+			});
+		}
+		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 	}
 
 	// ── omp 权威全局配置 config.yml ─────────────────────
@@ -522,7 +600,7 @@ export class ConfigManager {
 		}
 
 		// config.yml 不在此列：它是 YAML，走 config.saveOmpConfigRaw（校验映射后原子写）
-		const allowed = ["models.json", "auth.json", "trust.json"];
+		const allowed = ["models.json", "trust.json"];
 		if (!allowed.includes(fileName)) {
 			return { valid: false, error: `不允许编辑的文件：${fileName}` };
 		}
@@ -532,7 +610,7 @@ export class ConfigManager {
 		if (fileName === "models.json") {
 			const warnings: ConfigSaveWarning[] = [];
 			// JSON.parse 提到 try 外：避免重复解析同一份字符串，且只在这一个
-			// 失败点返回错误——后续 yml/auth 同步的因果就清晰了。
+			// 失败点返回错误——后续 yml 同步的因果就清晰了。
 			let data: PiModelsFile;
 			try {
 				data = JSON.parse(rawJson) as PiModelsFile;
@@ -548,13 +626,6 @@ export class ConfigManager {
 			} catch (error) {
 				const detail = error instanceof Error ? error.message : String(error);
 				warnings.push({ code: "models-yml-mirror-failed", detail });
-			}
-			// 同步 apiKey 到 auth.json(与 saveModelsConfig 同一处理:内置 provider 走 auth.json 取 key)
-			try {
-				await this.syncAuthFromModels(data);
-			} catch (error) {
-				const detail = error instanceof Error ? error.message : String(error);
-				warnings.push({ code: "auth-json-sync-failed", detail });
 			}
 			return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 		}
@@ -868,35 +939,70 @@ export class ConfigManager {
 
 	// ── 导出 / 导入 ───────────────────────────────────────
 
+	/**
+	 * 导出包不携带任何明文凭据。
+	 *
+	 * `apiKey` 可能是用户直接粘贴的密钥，把它塞进可分享/可上传的 JSON 包是明确的
+	 * 泄露路径；环境变量名和 `!command` 引用虽然不敏感，但一并省略能让导出格式
+	 * 规则简单（导入时保留目标机器已有的 key）。
+	 */
+	private withoutModelCredentials(data: PiModelsFile): PiModelsFile {
+		return {
+			...data,
+			providers: Object.fromEntries(
+				Object.entries(data.providers ?? {}).map(([name, provider]) => {
+					if (!provider || typeof provider !== "object") return [name, provider];
+					const { apiKey: _apiKey, ...rest } = provider;
+					return [name, rest as PiProviderConfig];
+				}),
+			),
+		};
+	}
+
 	/** 将配置文件打包为单个 JSON 对象，便于用户备份和迁移（含信任决策与模型角色）。 */
 	async exportConfig(): Promise<string> {
-		const [models, auth] = await Promise.all([
-			this.readJsonFile<PiModelsFile>("models.json", { providers: {} }),
-			this.readJsonFile<PiAuthFile>("auth.json", {}),
-		]);
+		// 以 omp 实际读取的 models.yml 为准，避免把旧 models.json 镜像导出。
+		const models = await this.readAuthoritativeModels();
 		const trust = await this.getTrustConfig();
 		const roles = await this.rolesStore.readRolesState();
 		const defaultLevel = await this.rolesStore.readDefaultThinkingLevel();
+		const presets = await this.rolesStore.readModelPresets();
+		const cycleOrder = await this.rolesStore.readCycleOrder();
+		const fallbackChains = await this.rolesStore.readFallbackChains();
 		const ompConfig = await this.ompConfig.read();
+		const settings = pickOmpSettings(ompConfig.parsed);
+		const existingRetry =
+			settings.retry && typeof settings.retry === "object" && !Array.isArray(settings.retry)
+				? (settings.retry as Record<string, unknown>)
+				: {};
+		const exportedRetry = {
+			...existingRetry,
+			...(Object.keys(fallbackChains).length > 0 ? { fallbackChains } : {}),
+		};
 		return JSON.stringify(
 			{
 				version: 1,
 				exportedAt: new Date().toISOString(),
 				files: {
-					"models.json": models.parsed,
-					"auth.json": auth.parsed,
+					"models.json": this.withoutModelCredentials(models.parsed),
 					// 设置权威源是 config.yml；settings.json 已不被 omp 读取，不再进包。
 					"trust.json": trust.parsed,
-					// config.yml 只取设置页可编辑键 + modelRoles/defaultThinkingLevel，
-					// omp 自有键（含可能带凭据的 auth.broker.*）不动、不入包。
+					// config.yml 只取设置页可编辑键 + modelRoles/modelPresets/cycleOrder/
+					// fallbackChains/defaultThinkingLevel，omp 自有键（含可能带凭据的
+					// auth.broker.*）不动、不入包。
 					"config.yml": {
-						...pickOmpSettings(ompConfig.parsed),
+						...settings,
 						modelRoles: Object.fromEntries(
 							Object.entries(roles)
 								.filter(([, assignment]) => assignment.selector)
 								.map(([role, assignment]) => [role, assignment.selector]),
 						),
 						...(defaultLevel ? { defaultThinkingLevel: defaultLevel } : {}),
+						...(Object.keys(presets).length > 0 ? { modelPresets: presets } : {}),
+						...(cycleOrder.length > 0 ? { cycleOrder } : {}),
+						...(Object.keys(exportedRetry).length > 0
+							? { retry: exportedRetry }
+							: {}),
 					},
 				},
 			},
@@ -937,15 +1043,61 @@ export class ConfigManager {
 			}
 		}
 
-		// 按需写入，只处理已知文件名，忽略其他 key（旧包里的 settings.json 不再恢复：
-		// omp 不读它，写回反而会在 config.yml 缺失时被当成设置迁移过去）
-		const allowed: Array<[string, string]> = [
-			["models.json", "models.json"],
-			["auth.json", "auth.json"],
-		];
-		for (const [key, fileName] of allowed) {
-			if (files[key] != null) {
-				await this.writeJsonFile(fileName, files[key]);
+		// 只处理已知文件名，忽略其他 key（旧包里的 settings.json 不再恢复：
+		// omp 不读它，写回反而会在 config.yml 缺失时被当成设置迁移过去）。
+		// 旧包里的 auth.json 同样忽略：凭据只认 models.yml，避免恢复成无效文件。
+		const warnings: ConfigSaveWarning[] = [];
+		const rawModels = files["models.json"];
+		if (rawModels !== undefined) {
+			if (!rawModels || typeof rawModels !== "object" || Array.isArray(rawModels)) {
+				return { valid: false, error: "导入包的 models.json 格式无效" };
+			}
+			const incoming = rawModels as PiModelsFile;
+			if (
+				!incoming.providers ||
+				typeof incoming.providers !== "object" ||
+				Array.isArray(incoming.providers)
+			) {
+				return { valid: false, error: "导入包的 models.json 缺少 providers 对象" };
+			}
+			const existing = await this.readAuthoritativeModels();
+			// 损坏的 models.yml 不能作为合并基线：继续写会先静默丢掉文件里恢复不了的
+			// 字段/注释，再覆盖掉用户本可手工修复的内容。
+			if (existing.diagnostic) {
+				return { valid: false, error: existing.diagnostic.message };
+			}
+			const localProviders = existing.parsed;
+			const mergedProviders: Record<string, PiProviderConfig> = {};
+			for (const [name, provider] of Object.entries(incoming.providers)) {
+				if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
+					return { valid: false, error: `导入包的 provider "${name}" 格式无效` };
+				}
+				const merged = { ...provider };
+				const localKey = localProviders.providers?.[name]?.apiKey;
+				// 新导出包故意不带 apiKey；旧包也可能带空字符串（用户清空后导出）。
+				// 这两种情况都保留目标机器已有的 key，避免“恢复配置后所有 provider 变 401”。
+				// 只有包内显式提供非空 key 时才以包内为准。
+				if (
+					(merged.apiKey === undefined || merged.apiKey === "") &&
+					typeof localKey === "string" &&
+					localKey.trim()
+				) {
+					merged.apiKey = localKey;
+				}
+				mergedProviders[name] = merged;
+			}
+			const merged: PiModelsFile = { ...incoming, providers: mergedProviders };
+			const validation = this.validateModels(merged);
+			if (!validation.valid) return validation;
+			const normalized = this.normalizeModelsForPi(merged);
+			await this.writeJsonFile("models.json", normalized);
+			try {
+				await this.writeModelsYml(normalized);
+			} catch (error) {
+				warnings.push({
+					code: "models-yml-mirror-failed",
+					detail: error instanceof Error ? error.message : String(error),
+				});
 			}
 		}
 		const trustEntries = files["trust.json"];
@@ -968,6 +1120,6 @@ export class ConfigManager {
 			const patchResult = await this.ompConfig.patch(patch);
 			if (!patchResult.valid) return patchResult;
 		}
-		return { valid: true };
+		return warnings.length > 0 ? { valid: true, warnings } : { valid: true };
 	}
 }

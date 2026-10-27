@@ -1162,7 +1162,7 @@ function registerIpc() {
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
 		registerConfigHandlers({ configManager, rolesStore: configManager.rolesStore, appLogger }),
 		registerClipboardHandlers(),
-		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
+		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger }),
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
 		registerAgentHandlers({
 			agentManager,
@@ -1303,7 +1303,6 @@ app.whenReady().then(async () => {
 		settingsStore,
 		{
 			readOmpDefaultThinkingLevel: () => configManager.rolesStore.readDefaultThinkingLevel(),
-			filterConfiguredModels: (models) => configManager.filterConfiguredModels(models),
 			trustStore: configManager.trustStore,
 		},
 		rpcLogger,

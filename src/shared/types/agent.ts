@@ -134,10 +134,35 @@ export type AvailableModel = {
 	id: string;
 	name?: string;
 	provider: string;
+	/** omp 目录条目的用途；仅 `chat` 可用于 set_model / 模型角色。旧版无此字段。 */
+	kind?: string;
+	/** omp 目录给出的完整选择器（通常是 `provider/id`），供需要原样 selector 的入口使用。 */
+	selector?: string;
 	contextWindow?: number;
 	reasoning?: boolean;
 	/** 是否支持图片输入（pi --list-models 的 images 列）。缺省 = 能力未知（目录未收录/未上报）。 */
 	supportsImages?: boolean;
+};
+
+/** omp 原生 OAuth 登录供应商标记（RPC `get_login_providers`）。 */
+export type OmpLoginProvider = {
+	id: string;
+	name: string;
+	/** 本机是否具备该 provider 的登录实现。 */
+	available: boolean;
+	/** 是否已有存储的 OAuth 凭据。 */
+	authenticated: boolean;
+};
+
+/** omp `get_logout_accounts` 返回的一条可移除凭据。 */
+export type OmpLogoutAccount = {
+	credentialId: number;
+	provider: string;
+	label: string;
+	detail: string;
+	type: "api_key" | "oauth";
+	/** 当前会话可能正在使用该凭据。 */
+	active: boolean;
 };
 
 export type CreateAgentInput = {
@@ -230,4 +255,18 @@ export type AgentUiRequest = {
 	/** widget 行元素：兼容老协议的 string 和新协议的 WidgetLineItem（结构化三态）。 */
 	widgetLines?: Array<string | WidgetLineItem>;
 	widgetPlacement?: "aboveEditor" | "belowEditor";
+	/** 宿主发起的 OAuth 登录流程：这些请求不进入时间线，由登录浮层处理。 */
+	loginFlow?: boolean;
+	/** 登录供应商标识（loginFlow 时存在）。 */
+	loginProviderId?: string;
+	/** 登录流程状态：started / succeeded / failed（method === "login_flow"）。 */
+	loginStatus?: "started" | "succeeded" | "failed";
+	/** open_url 的目标地址。 */
+	url?: string;
+	/** 推荐复制的短 loopback 跳转地址（终端截断安全的复制目标）。 */
+	launchUrl?: string;
+	/** 登录 provider 给出的操作说明。 */
+	instructions?: string;
+	/** 登录失败原因。 */
+	error?: string;
 };

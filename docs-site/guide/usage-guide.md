@@ -231,14 +231,15 @@ Agent 关闭后，它会在左侧栏消失，重新变为可点击的历史会�
 
 ## 配置 API 密钥
 
-如果你需要在 PiDeck 里配置密钥（而不是用 pi 的已有配置）：
+如果你需要在 PiDeck 里配置密钥（而不是用 omp 的已有配置）：
 
-1. 点击左下角齿轮 ⚙️
-2. 进入 **Auth** 页面
-3. 点击 "添加认证"
-4. 选择供应商（Anthropic、OpenAI、DeepSeek 等），或手动输入
-5. 填入你的 API Key
-6. 点击保存
+1. 打开配置管理弹窗，进入 **Auth** 页面
+2. 点击「+ 添加认证」
+3. 选择供应商（Anthropic、OpenAI、DeepSeek 等），或手动输入
+4. 填入你的 API Key
+5. 点击保存（写入 `models.yml` 的 `providers.<name>.apiKey`）
+
+如果想用浏览器授权而不是粘贴 Key，用页面顶部的 OAuth 区域：选中 provider 点「登录」，PiDeck 会打开系统浏览器，并保留可复制的回跳地址与授权码输入框。OAuth 登录需要至少一个运行中的 Agent。
 
 ### 我该用哪个 API？
 

@@ -337,8 +337,6 @@ function ConfigModalContent(props: ConfigModalProps) {
 				} else if (target === "auth") {
 					const res = await api.config.getAuth();
 					setAuthData(res.parsed as AuthFile);
-					setRawContent(res.raw);
-					setRawFileName("auth.json");
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "settings") {
 					// 设置页数据源 = omp 权威设置 config.yml；auth/models 仅用于 enabledModels 候选
@@ -528,8 +526,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 				showNotice(
 					warning.code === "models-yml-mirror-failed"
 						? t("config.modelsMirrorFailed", { detail: warning.detail })
-						: warning.code === "auth-json-sync-failed"
-							? t("config.authJsonSyncFailed", { detail: warning.detail })
+						: warning.code === "models-json-mirror-failed"
+							? t("config.modelsJsonMirrorFailed", { detail: warning.detail })
 							: warning.detail,
 					6000,
 					"warning",
@@ -974,7 +972,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 
 	// ── Auth 操作 ────────────────────────────────────────
 
-	const handleUpdateAuth = (provider: string, field: string, value: string) => {
+	const handleUpdateAuth = (provider: string, field: "key", value: string) => {
 		setAuthData({
 			...authData,
 			[provider]: { ...authData[provider], [field]: value },
@@ -989,9 +987,12 @@ function ConfigModalContent(props: ConfigModalProps) {
 	const handleAddAuth = (name?: string, key?: string) => {
 		const finalName = name ?? newAuthName.trim();
 		if (!finalName) return;
+		// 重复添加已配置 provider 且没填新 key 时必须保留原 key：保存时缺席/空 key
+		// 会被后端解释为“清空该 provider 的 apiKey”，否则点一下添加就静默删掉凭据。
+		const existingKey = authData[finalName]?.key;
 		setAuthData({
 			...authData,
-			[finalName]: { type: "api_key", key: key ?? "" },
+			[finalName]: { key: key?.trim() ? key : existingKey ?? "" },
 		});
 		setExpandedAuth(finalName);
 		setAddingAuth(false);
@@ -1011,23 +1012,6 @@ function ConfigModalContent(props: ConfigModalProps) {
 				setDeleteConfirm(null);
 			},
 		});
-	};
-
-	const handleDuplicateAuth = (provider: string) => {
-		const sourceAuth = authData[provider];
-		if (!sourceAuth) return;
-		const duplicatedAuth = JSON.parse(JSON.stringify(sourceAuth));
-		let newName = `${provider} copy`;
-		let counter = 2;
-		while (authData[newName]) {
-			newName = `${provider} copy ${counter}`;
-			counter++;
-		}
-		setAuthData({
-			...authData,
-			[newName]: duplicatedAuth,
-		});
-		setExpandedAuth(newName);
 	};
 
 	const handleDeleteProviders = (names: string[]) => {
@@ -1105,8 +1089,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 			// Raw 保存也触发模型刷新，确保运行中的 Agent 实时生效
 			// pi 官方尚未支持，先注释
 			// void refreshRunningAgents();
-		} else if (rawFileName === "auth.json") await loadConfig("auth");
-		else if (rawFileName === "trust.json") await loadConfig("trust");
+		} else if (rawFileName === "trust.json") await loadConfig("trust");
 		else await loadConfig("settings");
 	};
 
@@ -1118,11 +1101,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 			const res =
 				fileName === "models.json"
 					? await api.config.getModels()
-					: fileName === "auth.json"
-						? await api.config.getAuth()
-						: fileName === "trust.json"
-							? await api.config.getTrust()
-							: await api.config.getOmpConfig();
+					: fileName === "trust.json"
+						? await api.config.getTrust()
+						: await api.config.getOmpConfig();
 			setRawContent(res.raw);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
@@ -1673,12 +1654,11 @@ function ConfigModalContent(props: ConfigModalProps) {
 							onCancelAddAuth={() => setAddingAuth(false)}
 							onChangeNewAuthName={setNewAuthName}
 							onConfirmAddAuth={(name, key) => handleAddAuth(name, key)}
-							onDuplicateAuth={handleDuplicateAuth}
 						onDeleteAuths={handleDeleteAuths}
 						onDeleteAuth={handleDeleteAuth}
-							onUpdate={handleUpdateAuth}
-							onSave={handleSaveAuth}
-						/>
+						onUpdate={handleUpdateAuth}
+						onSave={handleSaveAuth}
+					/>
 					)}
 
 					{section === "config" && !loading && tab === "settings" && (

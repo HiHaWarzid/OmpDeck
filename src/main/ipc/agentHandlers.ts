@@ -39,6 +39,7 @@ type AgentHandlerMaps = {
 		| "cancelSubagent" | "steerSubagent" | "subagentMessages" | "subagents"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
 		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "getLoginProviders" | "login" | "getLogoutAccounts" | "logout"
 		| "respondTrustRequest">;
 };
 
@@ -315,6 +316,35 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				agentManager.cycleModel(agentId),
 			availableModels: async (_event, agentId: string) =>
 				agentManager.getAvailableModels(agentId),
+			getLoginProviders: async (_event, agentId: string) => {
+				try {
+					return await agentManager.getLoginProviders(agentId);
+				} catch (error) {
+					// 旧版 omp 没有该命令：返回空列表让 UI 隐藏登录入口，不弹错误。
+					void appLogger.warn("agent", "get_login_providers failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return [];
+				}
+			},
+			login: async (_event, agentId: string, providerId: string) => {
+				const result = await agentManager.login(agentId, providerId);
+				void appLogger.info("agent", "OAuth login completed", { agentId, providerId });
+				return result;
+			},
+			getLogoutAccounts: async (_event, agentId: string, providerId: string) =>
+				agentManager.getLogoutAccounts(agentId, providerId),
+			logout: async (_event, agentId: string, providerId: string, credentialId: number) => {
+				const result = await agentManager.logout(agentId, providerId, credentialId);
+				void appLogger.info("agent", "Credential logged out", {
+					agentId,
+					providerId,
+					credentialId,
+					remainingSource: result.remainingSource,
+				});
+				return result;
+			},
 			setModel: async (_event, agentId: string, provider: string, modelId: string) => {
 				const result = await agentManager.setModel(agentId, provider, modelId);
 				void appLogger.info("agent", "Agent model changed", { agentId, provider, modelId });

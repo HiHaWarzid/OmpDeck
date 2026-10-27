@@ -10,17 +10,38 @@ Click the gear icon in the toolbar to open the settings panel. Settings are orga
 
 Configure the AI models available to your agents:
 
-- **Provider** — Select from supported providers (OpenAI, Anthropic, etc.).
+- **Provider** — Select from supported providers (OpenAI, Anthropic, etc.) or add a custom name.
 - **Model** — Choose the specific model version.
 - **Endpoint** — Custom API endpoint URL (for proxies or self-hosted models).
-- **Parameters** — Temperature, max tokens, top-p, and other model parameters.
+- **Connection test** — Verify a provider without leaving the dialog.
+
+Saving writes `models.json` and mirrors it into `models.yml`.
 
 ### Auth
 
-Manage authentication credentials:
+Two credential sources, both surfaced in the Auth tab:
 
-- **API Keys** — Add, remove, and test API keys for each provider.
-- **Environment Variables** — Some keys can be set via environment variables for security.
+**omp-native OAuth** (top section) — talks to omp's `get_login_providers` / `login` / `get_logout_accounts` / `logout`:
+
+1. Requires a running agent; without one the section only shows a hint.
+2. Clicking Login makes omp return the authorization URL, which PiDeck opens in the system browser and also shows as a copyable loopback URL, with an input for the pasted code. Switching tabs does not lose the callback.
+3. Authenticated providers offer **Manage credentials**, listing stored credentials for individual revocation.
+4. omp builds without these RPCs report "no OAuth provider available" instead of failing the dialog.
+
+**API keys** — keys are written to `providers.<name>.apiKey` in `models.yml`; environment variable names and `!command` values are stored verbatim. Clearing a key removes that provider's `apiKey` while keeping the provider entry, its `models` and `baseUrl`. If `models.yml` cannot be parsed, saving is refused so a broken file is never rewritten half-empty.
+
+`auth.json` is no longer read or written. Exported config packages never contain API keys; importing keeps the local keys.
+
+### Model Roles
+
+The Settings **Model Roles** tab visualizes omp's `modelRoles` with 15 roles in two groups:
+
+- Chat roles: `default`, `smol`, `slow`, `vision`, `plan`, `commit`, `tiny`, `memory`, `task`, `advisor`.
+- Kind-scoped roles: `image`, `web`, `speech`, `dictation`, `judge`.
+
+The picker only lists models whose kind the role accepts. The same page also edits model presets (`modelPresets`), the model cycle order (`cycleOrder`), and fallback chains (`retry.fallbackChains`) — all written to the global `config.yml` and picked up by running sessions after a restart.
+
+Accepted kinds, selector format, preset rules and troubleshooting live in [Model Configuration](/en/guide/models).
 
 ### General Settings
 

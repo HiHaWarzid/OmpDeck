@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test, vi } from "vitest";
 
-import type { AgentTab, AvailableModel, ChatMessage, Project } from "../../shared/types";
+import type { AgentTab, ChatMessage, Project } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
 import type { AgentProcessFactory, AgentProcessPort } from "./agentProcessSlot";
 import type { PiRpcClient } from "./PiRpcClient";
@@ -103,7 +103,6 @@ function makeHarness(configureChild?: (child: FakeChild) => void): Harness {
 		{ get: () => ({ rpcTimeout: 1_000 }) } as unknown as SettingsStore,
 		{
 			readOmpDefaultThinkingLevel: async () => undefined,
-			filterConfiguredModels: async (models: AvailableModel[]) => models,
 			trustStore: { decide: async () => undefined },
 		} as unknown as AgentConfigDeps,
 		undefined,

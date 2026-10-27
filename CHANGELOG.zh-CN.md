@@ -4,6 +4,36 @@
 
 这里记录 PiDeck 各版本的重要变化。
 
+## 未发布
+
+### 🚀 新功能
+
+- **omp 原生 OAuth 登录** — Auth 页直接发起 omp OAuth：自动用系统浏览器打开授权地址，
+  同时展示可复制的回跳地址与授权码输入框；登录回调不进入会话时间线，切 tab 也不丢。
+  已登录 provider 可「管理凭据」查看并逐条登出。需要至少一个运行中的 Agent。
+- **模型角色补齐 kind 角色** — 模型角色页新增 `image` / `web` / `speech` / `dictation` /
+  `judge` 五个角色，选模型时按角色接受的 kind 过滤；模型目录改用
+  `omp models --kind all` 拉取，`embedding` 条目不参与选择。
+- **模型预设 / 循环顺序 / 回退链** — 模型角色页可把当前全部角色与默认思考档保存为
+  命名预设（`modelPresets.<name>`），并可设置 `cycleOrder` 与 `retry.fallbackChains`，
+  均写入全局 `config.yml`。
+
+### ✨ 交互优化
+
+- **Auth 页改为编辑模型权威文件** — API Key 直接写 `models.yml` 的
+  `providers.<name>.apiKey`，保留文件注释与其它手工字段；清空某个 key 即删除该字段。
+  移除已废弃的 `type` 字段与「复制凭据」操作。
+- **配置导出/导入不再夹带凭据** — 导出包不含任何 `apiKey`；导入时保留目标机器已有的
+  key，仅包内显式提供非空 key 时才覆盖。
+
+### 🐛 Bug 修复
+
+- **`models.yml` 损坏时拒绝保存** — Auth 页不再把无法解析的 `models.yml` 重写成半份
+  配置，改为提示先到源文件页修复；`providers: null` / `openai:` 这类空声明也不再报错。
+- **导入前校验基线** — `models.yml` 存在解析诊断时中止导入，避免先丢弃可修复内容再覆盖。
+- **镜像失败告警** — 移除 `auth.json` 同步后，模型镜像失败提示改为
+  `models-json-mirror-failed`，不再出现「auth.json 同步失败」文案。
+
 ## v0.6.7 - 2026-07-29
 
 ### 🚀 新功能

@@ -437,7 +437,7 @@ const previewOverrides: NamespaceOverrides = {
 			JSON.stringify({
 				version: 1,
 				exportedAt: new Date().toISOString(),
-				files: { "models.json": {}, "auth.json": {}, "config.yml": {} },
+				files: { "models.json": {}, "config.yml": {} },
 			}),
 		import: async () => ({ valid: true }),
 		fetchModels: async () => ({

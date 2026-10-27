@@ -17,11 +17,20 @@
 
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
-import { OMP_MODEL_ROLES, formatRoleSelector, type OmpModelRole } from "../../../../shared/types/ompRoles";
+import {
+	OMP_CHAT_MODEL_ROLES,
+	OMP_MODEL_ROLES,
+	formatRoleSelector,
+	ompRoleAcceptsModelKind,
+	type OmpFallbackChains,
+	type OmpModelPresets,
+	type OmpModelRole,
+} from "../../../../shared/types/ompRoles";
 import type { AvailableModel } from "../../../../shared/types";
-import { t } from "../../i18n";
+import { t, type TranslationKey } from "../../i18n";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
+import { TextField } from "../ui/TextField";
 
 /** 角色元数据：本地化由 i18n 键提供（settings.role.<key>.name/.desc）。 */
 const ROLE_META: Array<{ role: OmpModelRole }> = OMP_MODEL_ROLES.map((role) => ({ role }));
@@ -41,6 +50,7 @@ type ModelsState =
 
 /** omp 模型选择弹层：一组可用模型（provider 分组、可搜索），选中回调。 */
 function ModelListPopup(props: {
+	role: OmpModelRole;
 	modelsState: ModelsState;
 	onPick: (model: AvailableModel) => void;
 	onClose: () => void;
@@ -50,13 +60,16 @@ function ModelListPopup(props: {
 	const models =
 		props.modelsState.status === "ready" ? props.modelsState.models : [];
 
+	// 角色只接受对应 kind：default/smol 等选 chat，image/tts/stt/judge 各自
+	// 只出现匹配条目；web 在 JSON 目录没有能力位，放宽到 chat + search。
+	const byKind = models.filter((m) => ompRoleAcceptsModelKind(props.role, m.kind));
 	const filtered = normalized
-		? models.filter((m) =>
+		? byKind.filter((m) =>
 				[m.id, m.provider, m.name, `${m.provider}/${m.id}`]
 					.filter(Boolean)
 					.some((v) => String(v).toLowerCase().includes(normalized)),
 			)
-		: models;
+		: byKind;
 	const groups = filtered.reduce<Record<string, AvailableModel[]>>((acc, m) => {
 		const p = m.provider || "other";
 		(acc[p] ??= []).push(m);
@@ -106,6 +119,7 @@ function ModelListPopup(props: {
 									<span className="model-roles-popup-item-name">{m.name ?? m.id}</span>
 									<span className="model-roles-popup-item-id">
 										{provider}/{m.id}
+										{m.kind && m.kind !== "chat" ? ` · ${m.kind}` : ""}
 									</span>
 								</button>
 							))}
@@ -126,6 +140,15 @@ export function ModelRolesTab() {
 	const [notice, setNotice] = useState<string | null>(null);
 	const popupRef = useRef<HTMLDivElement | null>(null);
 
+	// 模型中心附加项：预设 / 循环顺序 / 回退链（都写 config.yml）。
+	const [presets, setPresets] = useState<OmpModelPresets>({});
+	const [presetName, setPresetName] = useState("");
+	const [cycleDraft, setCycleDraft] = useState("");
+	const [fallbackChains, setFallbackChains] = useState<OmpFallbackChains>({});
+	const [fallbackRole, setFallbackRole] = useState<string>("default");
+	const [fallbackDraft, setFallbackDraft] = useState("");
+	const [extrasSaving, setExtrasSaving] = useState<string | null>(null);
+
 	/** 只读 config.yml 的角色映射（快），不依赖模型目录扫描。 */
 	const loadRoles = async () => {
 		setLoadState("loading");
@@ -135,6 +158,22 @@ export function ModelRolesTab() {
 			setLoadState("ready");
 		} catch {
 			setLoadState("error");
+		}
+	};
+
+	/** 读取预设/循环/回退链；与角色读取相互独立，失败时保持空值。 */
+	const loadExtras = async () => {
+		try {
+			const [nextPresets, nextCycle, nextFallbacks] = await Promise.all([
+				window.piDesktop.config.getOmpModelPresets(),
+				window.piDesktop.config.getOmpCycleOrder(),
+				window.piDesktop.config.getOmpFallbackChains(),
+			]);
+			setPresets(nextPresets ?? {});
+			setCycleDraft(nextCycle.join(", "));
+			setFallbackChains(nextFallbacks ?? {});
+		} catch {
+			// 旧版 omp 可能没有这些 RPC；附加项保持空态，不影响角色编辑。
 		}
 	};
 
@@ -151,6 +190,7 @@ export function ModelRolesTab() {
 				if (!cancelled) setLoadState("error");
 			}
 		})();
+		void loadExtras();
 		return () => {
 			cancelled = true;
 		};
@@ -161,7 +201,9 @@ export function ModelRolesTab() {
 		if (modelsState.status === "ready" || modelsState.status === "loading") return;
 		setModelsState({ status: "loading" });
 		try {
-			const available = await window.piDesktop.projects.listModels().catch(() => [] as AvailableModel[]);
+			const available = await window.piDesktop.projects
+				.listModels(undefined, true)
+				.catch(() => [] as AvailableModel[]);
 			setModelsState({ status: "ready", models: available });
 		} catch {
 			setModelsState({ status: "ready", models: [] });
@@ -248,6 +290,113 @@ export function ModelRolesTab() {
 
 	const isSaving = (role: OmpModelRole) => savingRole === role;
 
+	const reportResult = (result: { valid: boolean; error?: string }, successKey: TranslationKey) => {
+		if (result.valid) setNotice(t(successKey));
+		else setNotice(result.error ?? t("settings.modelRoles.saveFailed"));
+	};
+
+	const saveCurrentAsPreset = async () => {
+		const name = presetName.trim();
+		if (!name) return;
+		setExtrasSaving("preset-save");
+		setNotice(null);
+		try {
+			const result = await window.piDesktop.config.saveOmpModelPreset(name);
+			reportResult(result, "settings.modelPresets.saved");
+			if (result.valid) {
+				setPresetName("");
+				await loadExtras();
+			}
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	const applyPreset = async (name: string) => {
+		setExtrasSaving(`preset-apply-${name}`);
+		setNotice(null);
+		try {
+			const result = await window.piDesktop.config.applyOmpModelPreset(name);
+			reportResult(result, "settings.modelPresets.applied");
+			if (result.valid) {
+				await loadRoles();
+				await loadExtras();
+			}
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	const deletePreset = async (name: string) => {
+		setExtrasSaving(`preset-delete-${name}`);
+		setNotice(null);
+		try {
+			const result = await window.piDesktop.config.deleteOmpModelPreset(name);
+			reportResult(result, "settings.modelPresets.deleted");
+			if (result.valid) await loadExtras();
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	const saveCycleOrder = async () => {
+		setExtrasSaving("cycle");
+		setNotice(null);
+		try {
+			const order = cycleDraft
+				.split(",")
+				.map((item) => item.trim())
+				.filter(Boolean);
+			const result = await window.piDesktop.config.setOmpCycleOrder(order);
+			reportResult(result, "settings.modelCycle.saved");
+			if (result.valid) await loadExtras();
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	/** 回退链整体写回：先合并本地状态，再提交完整映射（空链会删除该键）。 */
+	const commitFallback = async (next: OmpFallbackChains, savingKey: string) => {
+		setExtrasSaving(savingKey);
+		setNotice(null);
+		try {
+			const result = await window.piDesktop.config.setOmpFallbackChains(next);
+			reportResult(result, "settings.modelFallback.saved");
+			if (result.valid) {
+				setFallbackChains(next);
+				setFallbackDraft("");
+				await loadExtras();
+			}
+		} catch (err) {
+			setNotice(err instanceof Error ? err.message : String(err));
+		} finally {
+			setExtrasSaving(null);
+		}
+	};
+
+	const addFallback = () => {
+		const chain = fallbackDraft
+			.split(",")
+			.map((item) => item.trim())
+			.filter(Boolean);
+		if (!fallbackRole || chain.length === 0) return;
+		void commitFallback({ ...fallbackChains, [fallbackRole]: chain }, "fallback-add");
+	};
+
+	const removeFallback = (key: string) => {
+		const next = { ...fallbackChains };
+		delete next[key];
+		void commitFallback(next, `fallback-remove-${key}`);
+	};
+
 	const summary =
 		loadState === "loading"
 			? t("settings.modelRoles.loading")
@@ -329,6 +478,7 @@ export function ModelRolesTab() {
 										{activeRole === role && (
 											<div className="model-role-picker" ref={popupRef}>
 												<ModelListPopup
+													role={role}
 													modelsState={modelsState}
 													onClose={() => setActiveRole(null)}
 													onPick={(m) => void pickModel(role, m)}
@@ -339,6 +489,152 @@ export function ModelRolesTab() {
 								);
 							})}
 						</div>
+
+						<div className="model-extras">
+							<div className="model-extras-section">
+								<div className="settings-section-header">
+									<strong>{t("settings.modelPresets.section")}</strong>
+									<small>{t("settings.modelPresets.sectionDesc")}</small>
+								</div>
+								<div className="model-extras-form">
+									<TextField
+										label={t("settings.modelPresets.nameLabel")}
+										value={presetName}
+										placeholder={t("settings.modelPresets.namePlaceholder")}
+										onChange={setPresetName}
+									/>
+									<Button
+										buttonSize="sm"
+										loading={extrasSaving === "preset-save"}
+										disabled={!presetName.trim() || extrasSaving !== null}
+										onClick={() => void saveCurrentAsPreset()}
+									>
+										{t("settings.modelPresets.saveCurrent")}
+									</Button>
+								</div>
+								<div className="model-preset-list">
+									{Object.keys(presets).length === 0 && (
+										<small className="ui-field-description">
+											{t("settings.modelPresets.empty")}
+										</small>
+									)}
+									{Object.entries(presets).map(([name, preset]) => (
+										<div key={name} className="model-preset-row">
+											<div className="model-preset-info">
+												<strong>{name}</strong>
+												<small>
+													{t("settings.modelPresets.roleCount", {
+														count: String(Object.keys(preset.modelRoles).length),
+													})}
+													{preset.defaultThinkingLevel
+														? ` · ${preset.defaultThinkingLevel}`
+														: ""}
+												</small>
+											</div>
+											<div className="model-role-actions">
+												<Button
+													buttonSize="sm"
+													loading={extrasSaving === `preset-apply-${name}`}
+													disabled={extrasSaving !== null}
+													onClick={() => void applyPreset(name)}
+												>
+													{t("settings.modelPresets.apply")}
+												</Button>
+												<Button
+													buttonSize="sm"
+													variant="ghost"
+													loading={extrasSaving === `preset-delete-${name}`}
+													disabled={extrasSaving !== null}
+													onClick={() => void deletePreset(name)}
+												>
+													{t("settings.modelPresets.delete")}
+												</Button>
+											</div>
+										</div>
+									))}
+								</div>
+							</div>
+
+							<div className="model-extras-section">
+								<div className="settings-section-header">
+									<strong>{t("settings.modelCycle.section")}</strong>
+									<small>{t("settings.modelCycle.sectionDesc")}</small>
+								</div>
+								<div className="model-extras-form">
+									<TextField
+										label={t("settings.modelCycle.orderLabel")}
+										value={cycleDraft}
+										placeholder={t("settings.modelCycle.orderPlaceholder")}
+										description={t("settings.modelCycle.orderDesc")}
+										onChange={setCycleDraft}
+									/>
+									<Button
+										buttonSize="sm"
+										loading={extrasSaving === "cycle"}
+										disabled={extrasSaving !== null}
+										onClick={() => void saveCycleOrder()}
+									>
+										{t("settings.modelCycle.save")}
+									</Button>
+								</div>
+							</div>
+
+							<div className="model-extras-section">
+								<div className="settings-section-header">
+									<strong>{t("settings.modelFallback.section")}</strong>
+									<small>{t("settings.modelFallback.sectionDesc")}</small>
+								</div>
+								<div className="model-fallback-list">
+									{Object.keys(fallbackChains).length === 0 && (
+										<small className="ui-field-description">
+											{t("settings.modelFallback.empty")}
+										</small>
+									)}
+									{Object.entries(fallbackChains).map(([key, chain]) => (
+										<div key={key} className="model-preset-row">
+											<div className="model-preset-info">
+												<strong>{key}</strong>
+												<small>{chain.join(" → ")}</small>
+											</div>
+											<div className="model-role-actions">
+												<Button
+													buttonSize="sm"
+													variant="ghost"
+													loading={extrasSaving === `fallback-remove-${key}`}
+													disabled={extrasSaving !== null}
+													onClick={() => removeFallback(key)}
+												>
+													{t("settings.modelFallback.remove")}
+												</Button>
+											</div>
+										</div>
+									))}
+								</div>
+								<div className="model-extras-form">
+									<TextField
+										label={t("settings.modelFallback.keyLabel")}
+										value={fallbackRole}
+										placeholder={t("settings.modelFallback.keyPlaceholder")}
+										onChange={setFallbackRole}
+									/>
+									<TextField
+										label={t("settings.modelFallback.chainLabel")}
+										value={fallbackDraft}
+										placeholder={t("settings.modelFallback.chainPlaceholder")}
+										onChange={setFallbackDraft}
+									/>
+									<Button
+										buttonSize="sm"
+										loading={extrasSaving === "fallback-add"}
+										disabled={extrasSaving !== null || !fallbackDraft.trim()}
+										onClick={addFallback}
+									>
+										{t("settings.modelFallback.add")}
+									</Button>
+								</div>
+							</div>
+						</div>
+
 						{notice && (
 							<small className="model-roles-notice" role="status">
 								{notice}

@@ -35,7 +35,7 @@ export function detectModelListCommand(helpText: string): ModelListCommand | und
 }
 
 /** 解析 `models --json` 输出。字段名与 models.yml 的 provider/id 保持一致，便于 set_model 直接使用。 */
-export function parseModelsJson(stdout: string): AvailableModel[] {
+export function parseModelsJson(stdout: string, includeNonChat = false): AvailableModel[] {
 	let payload: unknown;
 	try {
 		payload = JSON.parse(stdout);
@@ -51,20 +51,32 @@ export function parseModelsJson(stdout: string): AvailableModel[] {
 		const item = entry as {
 			provider?: unknown;
 			id?: unknown;
+			kind?: unknown;
+			selector?: unknown;
 			name?: unknown;
 			contextWindow?: unknown;
 			reasoning?: unknown;
 			thinking?: unknown;
 			input?: unknown;
 		};
-		// provider + id 是 set_model 的入参，缺一不可解析（目录里存在 kind != chat 的条目）。
+		// provider + id 是 set_model 的入参，缺一不可解析。
 		if (typeof item.provider !== "string" || !item.provider) continue;
 		if (typeof item.id !== "string" || !item.id) continue;
+		// 目录同时包含 embedding/vision/tts 等条目；它们不能被 set_model 选中。
+		// 旧版 omp 不返回 kind，此时保持兼容（全部视为可用）。模型中心角色页
+		// 需要 image/tts/stt/judge 等条目，传 includeNonChat 时只排除无 kind 的
+		// embedding（kind 为 "embedding" 的条目任何角色都不接受）。
+		if (typeof item.kind === "string") {
+			if (item.kind === "embedding") continue;
+			if (!includeNonChat && item.kind !== "chat") continue;
+		}
 
 		const thinkingLevels = Array.isArray(item.thinking) ? item.thinking.length : 0;
 		models.push({
 			provider: item.provider,
 			id: item.id,
+			...(typeof item.kind === "string" ? { kind: item.kind } : {}),
+			...(typeof item.selector === "string" && item.selector ? { selector: item.selector } : {}),
 			name: typeof item.name === "string" && item.name ? item.name : `${item.provider}/${item.id}`,
 			...(typeof item.contextWindow === "number" ? { contextWindow: item.contextWindow } : {}),
 			// pi 用 reasoning 布尔声明是否可思考，thinking[] 是可选档位；两者取或。

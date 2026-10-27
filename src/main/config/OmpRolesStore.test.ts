@@ -145,4 +145,62 @@ describe("OmpRolesStore", () => {
 		await createStore().migrateLegacyDefaultThinkingLevel();
 		expect(existsSync(join(dir, "config.yml"))).toBe(true);
 	});
+
+	it("saveModelPreset snapshots roles and thinking, and apply restores them", async () => {
+		await writeConfigYaml(
+			"modelRoles:\n  default: openai/gpt-4o:high\n  vision: openai/gpt-4o-mini\ndefaultThinkingLevel: high\n",
+		);
+		const store = createStore();
+		expect((await store.saveModelPreset("fast")).valid).toBe(true);
+		expect(await store.readModelPresets()).toEqual({
+			fast: {
+				modelRoles: { default: "openai/gpt-4o:high", vision: "openai/gpt-4o-mini" },
+				defaultThinkingLevel: "high",
+			},
+		});
+
+		// 改变当前角色后应用预设，应整块替换 modelRoles 并恢复档位。
+		await store.applyRole("default", "anthropic/claude", "low");
+		expect((await store.applyModelPreset("fast")).valid).toBe(true);
+		const roles = await store.readRolesState();
+		expect(roles.default.selector).toBe("openai/gpt-4o:high");
+		expect(roles.vision.selector).toBe("openai/gpt-4o-mini");
+		expect(roles.smol.selector).toBe("");
+		expect(await store.readDefaultThinkingLevel()).toBe("high");
+	});
+
+	it("applyModelPreset rejects unknown names without touching the file", async () => {
+		await writeConfigYaml("modelRoles:\n  default: openai/gpt-4o\n");
+		const result = await createStore().applyModelPreset("missing");
+		expect(result.valid).toBe(false);
+		expect((await createStore().readRolesState()).default.selector).toBe("openai/gpt-4o");
+	});
+
+	it("setCycleOrder dedupes and removes the key when the list is empty", async () => {
+		const store = createStore();
+		expect((await store.setCycleOrder([" smol ", "default", "smol"])).valid).toBe(true);
+		expect(await store.readCycleOrder()).toEqual(["smol", "default"]);
+		expect((await store.setCycleOrder([])).valid).toBe(true);
+		expect(await store.readCycleOrder()).toEqual([]);
+	});
+
+	it("setFallbackChains normalizes selectors and prunes an empty retry mapping", async () => {
+		const store = createStore();
+		expect(
+			(
+				await store.setFallbackChains({
+					default: [" openrouter/a ", "", "openrouter/b:high"],
+					"openai/gpt-4o": ["anthropic/claude"],
+					empty: [" "],
+				})
+			).valid,
+		).toBe(true);
+		expect(await store.readFallbackChains()).toEqual({
+			default: ["openrouter/a", "openrouter/b:high"],
+			"openai/gpt-4o": ["anthropic/claude"],
+		});
+
+		expect((await store.setFallbackChains({})).valid).toBe(true);
+		expect(await store.readFallbackChains()).toEqual({});
+	});
 });

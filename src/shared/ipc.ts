@@ -376,6 +376,22 @@ export const ipcTable = {
 		},
 		/** 清除 omp 某个模型角色（config.yml 的 modelRoles.<role>） */
 		clearOmpRole: { channel: "config:clear-omp-role", kind: "invoke" },
+		/** 读取 config.yml 的 modelPresets */
+		getOmpModelPresets: { channel: "config:get-omp-model-presets", kind: "invoke" },
+		/** 保存当前角色快照为命名预设 */
+		saveOmpModelPreset: { channel: "config:save-omp-model-preset", kind: "invoke" },
+		/** 应用命名预设 */
+		applyOmpModelPreset: { channel: "config:apply-omp-model-preset", kind: "invoke" },
+		/** 删除命名预设 */
+		deleteOmpModelPreset: { channel: "config:delete-omp-model-preset", kind: "invoke" },
+		/** 读取模型循环顺序 */
+		getOmpCycleOrder: { channel: "config:get-omp-cycle-order", kind: "invoke" },
+		/** 写入模型循环顺序 */
+		setOmpCycleOrder: { channel: "config:set-omp-cycle-order", kind: "invoke" },
+		/** 读取 retry.fallbackChains */
+		getOmpFallbackChains: { channel: "config:get-omp-fallback-chains", kind: "invoke" },
+		/** 写入 retry.fallbackChains */
+		setOmpFallbackChains: { channel: "config:set-omp-fallback-chains", kind: "invoke" },
 		saveRaw: { channel: "config:save-raw", kind: "invoke" },
 		export: { channel: "config:export", kind: "invoke" },
 		import: { channel: "config:import", kind: "invoke" },
@@ -446,6 +462,14 @@ export const ipcTable = {
 		subagentMessages: { channel: "agents:subagent-messages", kind: "invoke" },
 		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true },
 		availableModels: { channel: "agents:available-models", kind: "invoke", web: true },
+		// OAuth 登录依赖本机浏览器回跳与系统浏览器进程，LAN-web 无对应 REST 实现，
+		// 因此不标 web（浏览器端沿用 desktop-only 空实现，AuthTab 据此隐藏入口）。
+		/** omp 原生 OAuth 登录 */
+		getLoginProviders: { channel: "agents:get-login-providers", kind: "invoke" },
+		login: { channel: "agents:login", kind: "invoke" },
+		/** omp 原生凭据登出 */
+		getLogoutAccounts: { channel: "agents:get-logout-accounts", kind: "invoke" },
+		logout: { channel: "agents:logout", kind: "invoke" },
 		setModel: { channel: "agents:set-model", kind: "invoke", web: true },
 		refreshModels: { channel: "agents:refresh-models", kind: "invoke", web: true },
 		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
