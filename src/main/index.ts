@@ -1177,7 +1177,6 @@ function registerIpc() {
 			settingsStore,
 			agentManager,
 			terminalManager,
-			piLocator,
 			updateManager,
 			getMainWindow: () => mainWindow,
 			setIsQuitting: (value: boolean) => {

@@ -151,7 +151,7 @@ src/
 
 - 全局样式在 `src/renderer/src/styles.css`，所有语义 token 定义在文件顶部 `:root`。
 - 新增样式优先复用已有 class（如 `config-btn`、`config-icon-btn`、`config-toolbar`、`config-empty`、`config-loading`、`config-error`、`modal-backdrop` 等），避免散落的内联 style。
-- 设置、配置管理、反馈等全屏页面式弹层需要适配自定义标题栏，内容不能被顶部窗口控制栏遮挡。
+- 设置、配置管理、会话管理等全屏页面式弹层需要适配自定义标题栏，内容不能被顶部窗口控制栏遮挡。
 
 ### 弹框尺寸规范
 

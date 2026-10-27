@@ -256,20 +256,6 @@ const previewOverrides: NamespaceOverrides = {
 			filePath: asset.name,
 			assetName: asset.name,
 		}),
-		feedbackEnvironment: async () => ({
-			appVersion: "preview",
-			platform: "win32",
-			arch: "x64",
-			electronVersion: "preview",
-			chromeVersion: "preview",
-			nodeVersion: "preview",
-			pi: {
-				installed: true,
-				command: "omp",
-				version: "preview",
-				searchedDirs: [],
-			},
-		}),
 		rendererLog: async (level, scope, message, detail) => {
 			console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
 				`[${scope}] ${message}`,

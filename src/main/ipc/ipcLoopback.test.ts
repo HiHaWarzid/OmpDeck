@@ -200,7 +200,6 @@ registerIpcHandlers(
 		settingsStore,
 		agentManager: stubs,
 		terminalManager: stubs,
-		piLocator: stubs,
 		updateManager: stubs,
 		getMainWindow,
 		setIsQuitting: stubs,

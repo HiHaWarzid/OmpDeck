@@ -13,8 +13,6 @@ import {
 } from "lucide-react";
 import { t } from "../../i18n";
 
-const DEFAULT_HOME = "https://github.com/HiHaWarzid/OmpDeck";
-
 type DeviceType = "pc" | "mobile" | "tablet";
 
 interface TabEntry {
@@ -53,11 +51,7 @@ function genTabId(): string {
 // ── 订阅机制：替代轮询 ──────────────────────────────────
 // navigateTo / subscribeNavigate / consumePendingUrl 抽到 browserNavigation.ts：
 // 纯模块无 React/DOM 依赖，可被单测覆盖（本文件导入 react/i18n，测试环境为 node）。
-import {
-	consumePendingUrl,
-	navigateTo,
-	subscribeNavigate,
-} from "./browserNavigation";
+import { BROWSER_HOME_URL, consumePendingUrl, navigateTo, subscribeNavigate } from "./browserNavigation";
 
 // 外部（App.tsx）继续从本模块导入 navigateTo，保持既有调用点不变。
 export { navigateTo };
@@ -74,7 +68,7 @@ interface BrowserState {
 function ensureInitialTabs(state: BrowserState): void {
 	if (state.tabs.length > 0) return;
 	const id = genTabId();
-	state.tabs = [{ id, title: "OmpDeck", url: DEFAULT_HOME }];
+	state.tabs = [{ id, title: "OmpDeck", url: BROWSER_HOME_URL }];
 	state.activeTabId = id;
 }
 
@@ -319,9 +313,9 @@ export function BrowserPanel(props: {
 
 	const addTab = useCallback(() => {
 		const id = genTabId();
-		const newTab = { id, title: t("browser.newTab"), url: DEFAULT_HOME };
+		const newTab = { id, title: t("browser.newTab"), url: BROWSER_HOME_URL };
 		syncTabs([...stateRef.current.tabs, newTab], id);
-		loadUrl(DEFAULT_HOME);
+		loadUrl(BROWSER_HOME_URL);
 	}, [loadUrl, syncTabs]);
 
 	const closeTab = useCallback(
@@ -353,7 +347,7 @@ export function BrowserPanel(props: {
 			setDevice(nextDevice);
 			setDeviceMenuOpen(false);
 			// 仅改 UA 不会触发布局变化；同时切换 browser-panel 的 device class 限制 webview 视口宽度。
-			loadUrl(url || DEFAULT_HOME, nextDevice);
+			loadUrl(url || BROWSER_HOME_URL, nextDevice);
 		},
 		[loadUrl, url],
 	);
@@ -425,7 +419,7 @@ export function BrowserPanel(props: {
 				<button className="browser-nav-btn" onClick={() => webviewRef.current?.reload()} title={t("browser.reload")}>
 					<RefreshCw size={15} />
 				</button>
-				<button className="browser-nav-btn" onClick={() => loadUrl(DEFAULT_HOME)} title={t("browser.home")}>
+				<button className="browser-nav-btn" onClick={() => loadUrl(BROWSER_HOME_URL)} title={t("browser.home")}>
 					<Home size={15} />
 				</button>
 				<div className="browser-url-bar">

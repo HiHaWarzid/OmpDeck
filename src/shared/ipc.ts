@@ -273,7 +273,6 @@ export const ipcTable = {
 		downloadUpdate: { channel: "app:download-update", kind: "invoke" },
 		installUpdate: { channel: "app:install-update", kind: "invoke" },
 		onUpdateProgress: { channel: "app:update-progress", kind: "subscribe", pushFrom: "update-manager" },
-		feedbackEnvironment: { channel: "app:feedback-environment", kind: "invoke" },
 		openExternal: { channel: "app:open-external", kind: "invoke" },
 		onOpenInBrowser: { channel: "app:open-in-browser", kind: "subscribe", pushFrom: "link-opener" },
 		restart: { channel: "app:restart", kind: "invoke" },

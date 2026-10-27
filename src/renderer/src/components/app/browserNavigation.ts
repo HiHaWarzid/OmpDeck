@@ -10,6 +10,9 @@
 
 type NavigateListener = (url: string) => void;
 
+/** 内置浏览器首页；侧栏 Globe 入口与面板 Home 按钮共用，避免两处地址漂移。 */
+export const BROWSER_HOME_URL = "https://github.com/HiHaWarzid/OmpDeck";
+
 const navigateListeners = new Set<NavigateListener>();
 let pendingUrl: string | null = null;
 

@@ -45,7 +45,6 @@ import type {
 	ExternalEditor,
 	ExternalEditorId,
 	ExternalEditorSetting,
-	FeedbackEnvironment,
 	FeishuBotConfig,
 	FeishuBridgeStatus,
 	FeishuChatBinding,
@@ -301,7 +300,6 @@ export interface AppApi {
 	downloadUpdate: (asset: AppUpdateAsset) => Promise<AppUpdateDownloadResult>;
 	installUpdate: (filePath: string) => Promise<void>;
 	onUpdateProgress: (callback: (progress: AppUpdateDownloadProgress) => void) => () => void;
-	feedbackEnvironment: () => Promise<FeedbackEnvironment>;
 	openExternal: (url: string, forceSystem?: boolean) => Promise<void>;
 	onOpenInBrowser: (callback: (url: string) => void) => () => void;
 	restart: () => Promise<void>;

@@ -1,6 +1,6 @@
 /**
  * App/Settings IPC handler：应用信息、窗口控制、更新检查/下载/安装、
- * 设置读写、RPC 日志开关、外部链接打开、反馈环境收集。
+ * 设置读写、RPC 日志开关、外部链接打开。
  *
  * 从 index.ts 的 registerIpc() 迁移而来。
  * 依赖较多顶层函数和可变状态，全部通过 dep 显式传递：
@@ -24,7 +24,6 @@ import type { TerminalSessionManager } from "../terminal/TerminalSessionManager"
 import type { AppLogger } from "../logging/AppLogger";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { WebServiceManager } from "../web/WebServiceManager";
-import type { PiLocator } from "../pi/PiLocator";
 import type { PetSystem } from "../pet";
 import type { AfkOrchestrator } from "../afk/AfkOrchestrator";
 import type { WslEnvironment } from "../wsl/WslPaths";
@@ -38,7 +37,6 @@ interface AppHandlerDeps {
 	settingsStore: SettingsStore;
 	agentManager: AgentManager;
 	terminalManager: TerminalSessionManager;
-	piLocator: PiLocator;
 	updateManager: UpdateManager;
 	// 可变状态 getter/setter
 	getMainWindow: () => BrowserWindow | null;
@@ -70,7 +68,6 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 		appLogger,
 		settingsStore,
 		agentManager,
-		piLocator,
 		updateManager,
 		getMainWindow,
 		getPetSystem,
@@ -103,19 +100,6 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				updateManager.checkForAppUpdate(settingsStore.get().installationType),
 			downloadUpdate: async (_event, asset: AppUpdateAsset) => updateManager.downloadUpdateAsset(asset),
 			installUpdate: async (_event, filePath: string) => updateManager.installDownloadedUpdate(filePath),
-			feedbackEnvironment: async () => {
-				// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
-				const pi = await piLocator.check();
-				return {
-					appVersion: app.getVersion(),
-					platform: process.platform,
-					arch: process.arch,
-					electronVersion: process.versions.electron ?? "",
-					chromeVersion: process.versions.chrome ?? "",
-					nodeVersion: process.versions.node,
-					pi,
-				};
-			},
 			openExternal: async (_event, url: string, forceSystem?: boolean) => {
 				// 外部链接统一经主进程打开，避免 renderer 直接依赖 shell 权限，并遵守用户设置的打开方式。
 				// forceSystem 为 true 时绕过 linkOpenMode 检查，始终用系统默认浏览器。

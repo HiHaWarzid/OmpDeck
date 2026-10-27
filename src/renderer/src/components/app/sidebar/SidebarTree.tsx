@@ -17,7 +17,6 @@ import {
 	GitBranch,
 	Globe,
 	HatGlasses,
-	MessageSquare,
 	PanelLeft,
 	Play,
 	Plus,
@@ -163,8 +162,9 @@ export interface SidebarTreeProps {
 	setActiveAgentId: Dispatch<SetStateAction<string | undefined>>;
 	setSettingsOpen: Dispatch<SetStateAction<boolean>>;
 	setConfigOpen: Dispatch<SetStateAction<boolean>>;
-	setFeedbackOpen: Dispatch<SetStateAction<boolean>>;
 	setAfkOpen: Dispatch<SetStateAction<boolean>>;
+	/** 官网入口：在应用内置浏览器面板中打开，避免跳到系统默认浏览器。 */
+	openHomepageInBrowser: () => void;
 	/** 拉取项目会话；silent 时失败不弹通知。 */
 	refreshProjectSessions: (projectId: string, silent?: boolean) => Promise<SessionSummary[] | undefined>;
 	/** 确保 agent 的 transcript 条目已加载（打开会话前调用）。 */
@@ -240,8 +240,8 @@ function SidebarTreeView({
 	setActiveAgentId,
 	setSettingsOpen,
 	setConfigOpen,
-	setFeedbackOpen,
 	setAfkOpen,
+	openHomepageInBrowser,
 	refreshProjectSessions,
 	ensureAgentMessagesLoaded,
 	openSidebarSession,
@@ -1187,13 +1187,6 @@ function SidebarTreeView({
 							<Sliders size={17} />
 						</button>
 						<button
-							className="icon-button feedback-icon"
-							title={t("feedback.title")}
-							onClick={() => setFeedbackOpen(true)}
-						>
-							<MessageSquare size={17} />
-						</button>
-						<button
 							className="icon-button afk-icon"
 							title={t("afk.openCenter")}
 							aria-label={t("afk.openCenter")}
@@ -1204,7 +1197,7 @@ function SidebarTreeView({
 						<button
 							className="icon-button homepage-icon"
 							title={t("app.homepage")}
-							onClick={() => api.app.openExternal("https://github.com/HiHaWarzid/OmpDeck/")}
+							onClick={openHomepageInBrowser}
 						>
 							<Globe size={17} />
 						</button>

@@ -131,7 +131,6 @@ const moduleRegistrations = [
 			settingsStore: stubs,
 			agentManager: stubs,
 			terminalManager: stubs,
-			piLocator: stubs,
 			updateManager: stubs,
 			getMainWindow: () => null,
 			setIsQuitting: stubs,

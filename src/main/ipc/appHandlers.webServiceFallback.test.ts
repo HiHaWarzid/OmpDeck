@@ -56,7 +56,6 @@ function register(webServiceManager: { applySettings: () => Promise<void>; isRun
 		settingsStore: settingsStore.store,
 		agentManager: stubs,
 		terminalManager: stubs,
-		piLocator: stubs,
 		updateManager: stubs,
 		getMainWindow: () => null,
 		setIsQuitting: stubs,

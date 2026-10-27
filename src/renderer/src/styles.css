@@ -1124,10 +1124,6 @@ body.is-resizing .wechat-shell {
   color: var(--color-accent);
 }
 
-.toolbar-actions .feedback-icon:hover {
-  background: color-mix(in srgb, var(--color-info) 10%, var(--color-bg-panel));
-  color: var(--color-info);
-}
 .sidebar-bottom-actions {
   margin-top: auto;
   padding: 8px 12px 12px;
@@ -10095,7 +10091,6 @@ body.is-composer-resizing .composer-resize-handle::after {
   inset: var(--window-drag-height) 0 0 0;
   z-index: 940;
 }
-.custom-titlebar-enabled .feedback-modal,
 .custom-titlebar-enabled .settings-modal,
 .custom-titlebar-enabled .config-modal {
   max-height: calc(100vh - 56px);
@@ -10176,159 +10171,6 @@ body.is-composer-resizing .composer-resize-handle::after {
     opacity: 1;
     transform: translate(-50%, -50%) scale(1);
   }
-}
-.feedback-modal {
-  width: min(1300px, calc(100vw - 48px));
-  height: min(850px, calc(100vh - 48px));
-  display: flex;
-  flex-direction: column;
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-panel);
-  box-shadow: var(--shadow-xl);
-  overflow: hidden;
-}
-.modal-header.feedback-header {
-  height: auto;
-  min-height: 68px;
-  align-items: flex-start;
-  padding-top: 16px;
-  padding-bottom: 16px;
-}
-.feedback-header small {
-  display: block;
-  margin-top: 3px;
-  color: var(--color-text-tertiary);
-  font-size: var(--font-size-caption);
-  font-weight: 400;
-}
-.feedback-email {
-  color: var(--color-text-primary);
-  font-weight: 800;
-}
-.feedback-qq {
-  margin-top: 6px;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-caption);
-}
-.feedback-qq strong {
-  color: var(--color-accent);
-  font-weight: 600;
-  cursor: pointer;
-  user-select: all;
-}
-.feedback-body {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-5);
-  min-height: 0;
-  padding: var(--space-5);
-  overflow: auto;
-  background: var(--color-bg-muted);
-}
-.feedback-form-section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-height: 0;
-}
-.feedback-environment-section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  min-height: 0;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-panel);
-  padding: var(--space-4);
-  overflow: hidden;
-}
-.feedback-section-header {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.feedback-section-header strong {
-  color: var(--color-text-primary);
-  font-size: var(--font-size-body);
-  font-weight: 600;
-}
-.feedback-section-header small {
-  color: var(--color-text-tertiary);
-  font-size: var(--font-size-caption);
-  font-weight: 400;
-  line-height: 1.4;
-}
-.feedback-textarea {
-  min-height: 120px;
-  resize: vertical;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-panel);
-  color: var(--color-text-primary);
-  padding: 12px var(--space-3);
-  font-size: var(--font-size-control);
-  line-height: 1.5;
-  outline: none;
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s;
-}
-.feedback-textarea:focus {
-  border-color: var(--color-accent);
-  box-shadow: var(--focus-ring);
-}
-.feedback-textarea::placeholder {
-  color: var(--color-text-tertiary);
-}
-.feedback-environment-content {
-  flex: 1;
-  margin: 0;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  border-radius: var(--radius-md);
-  background: var(--color-code-bg);
-  color: var(--color-code-text);
-  padding: 12px;
-  font-family: var(--font-family-mono);
-  font-size: var(--font-size-caption);
-  line-height: 1.6;
-}
-.feedback-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  padding: 16px 20px;
-  border-top: 1px solid var(--color-border-subtle);
-  background: var(--color-bg-panel);
-}
-.feedback-actions button {
-  height: 36px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-panel);
-  color: var(--color-text-secondary);
-  padding: 0 16px;
-  font-size: var(--font-size-control);
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-.feedback-actions button:hover:not(:disabled) {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-.feedback-actions button.primary {
-  border-color: var(--color-accent);
-  background: var(--color-accent);
-  color: var(--color-text-inverse);
-}
-.feedback-actions button.primary:hover:not(:disabled) {
-  background: var(--color-accent-strong);
-}
-.feedback-actions button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 .context-menu {
   position: fixed;
@@ -13877,7 +13719,6 @@ a.config-btn {
 
 :root[data-theme="dark"] .search-box,
 :root[data-theme="dark"] .composer-box,
-:root[data-theme="dark"] .feedback-body textarea,
 :root[data-theme="dark"] .setting-field input,
 :root[data-theme="dark"] .ui-select-control,
 :root[data-theme="dark"] .config-add-provider-row input,
@@ -13892,7 +13733,6 @@ a.config-btn {
 :root[data-theme="dark"] .codex-session-row,
 :root[data-theme="dark"] .settings-layout,
 :root[data-theme="dark"] .settings-panel,
-:root[data-theme="dark"] .feedback-body,
 :root[data-theme="dark"] .codex-import-toolbar,
 :root[data-theme="dark"] .config-provider-body {
   background: var(--color-bg-muted);
@@ -13903,7 +13743,6 @@ a.config-btn {
 :root[data-theme="dark"] .setting-proxy-panel,
 :root[data-theme="dark"] .setting-pi-path-panel,
 :root[data-theme="dark"] .web-endpoint-panel,
-:root[data-theme="dark"] .feedback-report-block,
 :root[data-theme="dark"] .codex-import-modal,
 :root[data-theme="dark"] .picker-palette,
 :root[data-theme="dark"] .context-menu,
@@ -13916,13 +13755,11 @@ a.config-btn {
 :root[data-theme="dark"] .modal-header,
 :root[data-theme="dark"] .config-primary-tabs,
 :root[data-theme="dark"] .config-tabs,
-:root[data-theme="dark"] .settings-tabs,
-:root[data-theme="dark"] .feedback-actions {
+:root[data-theme="dark"] .settings-tabs {
   background: var(--color-bg-panel);
   border-color: var(--color-border-subtle);
 }
 
-:root[data-theme="dark"] .feedback-report-block pre,
 :root[data-theme="dark"] .update-notes,
 :root[data-theme="dark"] pre,
 :root[data-theme="dark"] code {
@@ -17215,7 +17052,6 @@ a.config-btn {
 
 :root[data-theme="dark"] .config-btn,
 :root[data-theme="dark"] .session-rename-button,
-:root[data-theme="dark"] .feedback-actions button,
 :root[data-theme="dark"] .update-actions button,
 :root[data-theme="dark"] .codex-import-actions button {
   background: var(--color-bg-panel);
@@ -17225,7 +17061,6 @@ a.config-btn {
 
 :root[data-theme="dark"] .config-btn:hover:not(:disabled),
 :root[data-theme="dark"] .session-rename-button:hover:not(:disabled),
-:root[data-theme="dark"] .feedback-actions button:hover,
 :root[data-theme="dark"] .update-actions button:hover,
 :root[data-theme="dark"] .codex-import-actions button:hover {
   background: var(--color-bg-hover);
@@ -17233,7 +17068,6 @@ a.config-btn {
 }
 
 :root[data-theme="dark"] .config-btn.primary,
-:root[data-theme="dark"] .feedback-actions button.primary,
 :root[data-theme="dark"] .update-actions button.primary,
 :root[data-theme="dark"] .codex-import-actions .primary-action {
   background: var(--color-accent);
@@ -22379,8 +22213,9 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
  * 全屏 Modal 内 3 tab 套件（总览/任务/PR 待合并）+ 详情抽屉。
  * 全部颜色走语义 token，暗色模式自然适配；状态色与 agent-status-* 同一套语义。
  */
+/* 注意：本类挂在 Dialog.Content 上，Modal 依赖 `position: fixed` 居中；
+ * 这里不要声明 position，否则会覆盖弹框定位（表现为面板沉到视口底部、上层只剩灰色遮罩）。 */
 .afk-panel {
-  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;

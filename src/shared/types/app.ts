@@ -1,5 +1,3 @@
-import type { PiInstallStatus } from "./pi";
-
 export type AppInfo = {
 	version: string;
 	releasesUrl: string;
@@ -7,16 +5,6 @@ export type AppInfo = {
 	platform: NodeJS.Platform;
 	/** 用户 home 目录，供扩展读取本地文件（如 memory-store.json） */
 	homeDir: string;
-};
-
-export type FeedbackEnvironment = {
-	appVersion: string;
-	platform: NodeJS.Platform;
-	arch: string;
-	electronVersion: string;
-	chromeVersion: string;
-	nodeVersion: string;
-	pi: PiInstallStatus;
 };
 
 export type AppUpdateAsset = {

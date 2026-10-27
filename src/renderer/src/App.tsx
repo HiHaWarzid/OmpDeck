@@ -25,7 +25,6 @@ import {
   ChevronDown,
   Code,
   MessageCircle,
-  MessageSquare,
   Search,
   Play,
   Plus,
@@ -173,7 +172,7 @@ import {
   TODO_WIDGET_KEY,
 } from "./components/app/widgets/widgetKeys";
 import type { DrawerPanel, WidgetLine } from "./components/app/types";
-import { navigateTo } from "./components/app/browserNavigation";
+import { BROWSER_HOME_URL, navigateTo } from "./components/app/browserNavigation";
 import { ConversationOutlineHost, ConversationPane, type ConversationPaneHandle } from "./components/app/ConversationPane";
 import { SidebarTree } from "./components/app/sidebar/SidebarTree";
 import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
@@ -235,7 +234,6 @@ import type {
   AvailableModel,
   PiCliUpdateResult,
   ExternalEditor,
-  FeedbackEnvironment,
   ChatMessage,
   FileTreeNode,
   GitBranchInfo,
@@ -1338,7 +1336,6 @@ export function App() {
   const [piUpdateCheck, setPiUpdateCheck] = useState<PiUpdateCheckResult | null>(null);
   const [piUpdateResult, setPiUpdateResult] = useState<PiCliUpdateResult | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(false);
   const [_debugOpen, _setDebugOpen] = useState(false);
 
@@ -5879,6 +5876,14 @@ export function App() {
     setDrawerCollapsed(false);
   };
 
+  /** 侧栏官网入口：走内置浏览器面板，不再把用户甩到系统默认浏览器 */
+  const handleOpenHomepageInBrowser = () => {
+    navigateTo(BROWSER_HOME_URL);
+    lastToolDrawerRef.current = "browser";
+    setDrawer("browser");
+    setDrawerCollapsed(false);
+  };
+
   // SidebarTree 是 memo 边界，但这些处理函数每次 App 渲染都会重新声明；
   // 直接把函数传进去会让浅比较恒失败，流式/输入等无关更新都会重算整棵侧栏。
   // 通过 ref 转发到最新实现，保持传入引用的恒定（与 GitPanel 的 stable* 同策略）。
@@ -5899,6 +5904,7 @@ export function App() {
     requestRemoveWorktree,
     toggleSubagentGroup,
     adjustMenuPos,
+    openHomepageInBrowser: handleOpenHomepageInBrowser,
   });
   latestSidebarHandlersRef.current = {
     addProject,
@@ -5917,6 +5923,7 @@ export function App() {
     requestRemoveWorktree,
     toggleSubagentGroup,
     adjustMenuPos,
+    openHomepageInBrowser: handleOpenHomepageInBrowser,
   };
   const stableSidebarHandlers = useMemo(
     () => ({
@@ -5967,6 +5974,7 @@ export function App() {
         latestSidebarHandlersRef.current.toggleSubagentGroup(key),
       adjustMenuPos: (x: number, y: number, width?: number, height?: number) =>
         latestSidebarHandlersRef.current.adjustMenuPos(x, y, width, height),
+      openHomepageInBrowser: () => latestSidebarHandlersRef.current.openHomepageInBrowser(),
     }),
     [],
   );
@@ -6098,7 +6106,6 @@ export function App() {
         setActiveAgentId={setActiveAgentId}
         setSettingsOpen={setSettingsOpen}
         setConfigOpen={setConfigOpen}
-        setFeedbackOpen={setFeedbackOpen}
         setAfkOpen={setAfkOpen}
       />
 
@@ -8383,16 +8390,6 @@ export function App() {
           />
         </Suspense>
       )}
-      {feedbackOpen && (
-        <FeedbackModal
-          project={activeProject}
-          appInfo={appInfo}
-          onClose={() => setFeedbackOpen(false)}
-          onCopy={() => showToast(t("app.feedbackCopied"))}
-          onOpenExternal={handleOpenExternal}
-          loadEnvironment={api.app.feedbackEnvironment}
-        />
-      )}
       {updateInfo && (
         <UpdateModal
           info={updateInfo}
@@ -8683,202 +8680,6 @@ filePath={gitDrawerDiff.filePath}
 
     </div>
   );
-}
-
-function FeedbackModal({
-  project,
-  appInfo,
-  onClose,
-  onCopy,
-  onOpenExternal,
-  loadEnvironment,
-}: {
-  project?: Project;
-  appInfo: AppInfo;
-  onClose: () => void;
-  onCopy: () => void;
-  onOpenExternal: (url: string) => Promise<void>;
-  loadEnvironment: () => Promise<FeedbackEnvironment>;
-}) {
-  const [description, setDescription] = useState("");
-  const [steps, setSteps] = useState("");
-  const [environment, setEnvironment] = useState<FeedbackEnvironment | null>(
-    null,
-  );
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    loadEnvironment()
-      .then((next) => {
-        if (!cancelled) setEnvironment(next);
-      })
-      .catch((reason) => {
-        if (!cancelled)
-          setError(reason instanceof Error ? reason.message : String(reason));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [loadEnvironment]);
-
-  const report = buildFeedbackReport({
-    description,
-    steps,
-    project,
-    environment,
-    fallbackVersion: appInfo.version,
-    environmentError: error,
-  });
-
-  // 从用户描述中提取简短摘要作为 issue 标题的一部分
-  const descriptionSummary = description.trim().split('\n')[0].slice(0, 60);
-  const issueTitle = descriptionSummary
-    ? `${t("feedback.issueTitle")}${descriptionSummary}`
-    : t("feedback.issueTitle") + t("feedback.issueTitleEmpty");
-  const issueUrl = `https://github.com/HiHaWarzid/OmpDeck/issues/new?title=${encodeURIComponent(issueTitle)}&body=${encodeURIComponent(report)}`;
-  const authorUrl = "https://github.com/ayuayue";
-
-  async function copyReport() {
-    await writeClipboard(report);
-    onCopy();
-  }
-
-  return (
-    <div className="modal-backdrop feedback-backdrop" onClick={onClose}>
-      <section
-        className="feedback-modal"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="modal-header feedback-header">
-          <div>
-            <strong>{t("feedback.title")}</strong>
-            <small>
-              {t("feedback.intro")}{" "}
-              <strong className="feedback-email">chat@caoayu.eu.org</strong>
-            </small>
-            <small className="feedback-qq">
-              QQ 群：<strong>1026218644</strong>
-            </small>
-          </div>
-          <CloseIconButton label={t("common.close")} onClick={onClose} />
-        </div>
-        <div className="feedback-body">
-          <div className="feedback-form-section">
-            <div className="feedback-section-header">
-              <strong>{t("feedback.descriptionLabel")}</strong>
-              <small>{t("feedback.descriptionHint")}</small>
-            </div>
-            <textarea
-              className="feedback-textarea"
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder={t("feedback.descriptionPlaceholder")}
-            />
-            <div className="feedback-section-header">
-              <strong>{t("feedback.stepsLabel")}</strong>
-              <small>{t("feedback.stepsHint")}</small>
-            </div>
-            <textarea
-              className="feedback-textarea"
-              value={steps}
-              onChange={(event) => setSteps(event.target.value)}
-              placeholder={t("feedback.stepsPlaceholder")}
-            />
-          </div>
-          <div className="feedback-environment-section">
-            <div className="feedback-section-header">
-              <strong>{t("feedback.environmentTitle")}</strong>
-              <small>
-                {loading
-                  ? t("feedback.reportLoading")
-                  : t("feedback.environmentHint")}
-              </small>
-            </div>
-            <pre className="feedback-environment-content">{report}</pre>
-          </div>
-        </div>
-        <div className="feedback-actions">
-          <button onClick={copyReport}>{t("feedback.copyReport")}</button>
-          <button onClick={() => onOpenExternal(authorUrl)}>
-            {t("feedback.authorGithub")}
-          </button>
-          <button className="primary" onClick={() => onOpenExternal(issueUrl)}>
-            {t("feedback.openIssue")}
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function buildFeedbackReport(input: {
-  description: string;
-  steps: string;
-  project?: Project;
-  environment: FeedbackEnvironment | null;
-  fallbackVersion: string;
-  environmentError: string;
-}) {
-  const pi = input.environment?.pi;
-  const projectPath = input.project?.path
-    ? maskHomePath(input.project.path)
-    : t("feedback.report.projectNone");
-  // 反馈报告刻意只展示脱敏路径和运行时版本,避免把用户 home 目录、API key 或会话内容默认发出去。
-  return [
-    t("feedback.report.description"),
-    input.description.trim() || t("feedback.report.descriptionEmpty"),
-    "",
-    t("feedback.report.steps"),
-    input.steps.trim() || t("feedback.report.stepsEmpty"),
-    "",
-    t("feedback.report.environment"),
-    t("feedback.report.piDesktop", {
-      value: input.environment?.appVersion ?? input.fallbackVersion,
-    }),
-    t("feedback.report.system", {
-      value: input.environment
-        ? `${input.environment.platform} ${input.environment.arch}`
-        : t("feedback.report.readFailed"),
-    }),
-    t("feedback.report.electron", {
-      value: input.environment?.electronVersion ?? "-",
-    }),
-    t("feedback.report.chrome", {
-      value: input.environment?.chromeVersion ?? "-",
-    }),
-    t("feedback.report.node", { value: input.environment?.nodeVersion ?? "-" }),
-    t("feedback.report.project", { value: projectPath }),
-    t("feedback.report.piStatus", {
-      value: pi
-        ? pi.installed
-          ? t("feedback.report.piDetected")
-          : t("feedback.report.piMissing")
-        : t("feedback.report.readFailed"),
-    }),
-    t("feedback.report.piCommand", {
-      value: pi?.command ? maskHomePath(pi.command) : "-",
-    }),
-    t("feedback.report.piVersion", { value: pi?.version || "-" }),
-    ...(pi?.error ? [t("feedback.report.piError", { value: pi.error })] : []),
-    ...(input.environmentError
-      ? [
-          t("feedback.report.environmentError", {
-            value: input.environmentError,
-          }),
-        ]
-      : []),
-  ].join("\n");
-}
-
-function maskHomePath(value: string) {
-  return value
-    .replace(/([A-Z]:\\Users\\)[^\\/]+/gi, "$1<user>")
-    .replace(/(\/Users\/)[^/]+/g, "$1<user>");
 }
 
 function formatUpdateBytes(bytes?: number) {
