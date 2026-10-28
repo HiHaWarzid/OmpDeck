@@ -286,6 +286,42 @@ export class ConfigManager {
 	// 本类只保留有加工的逻辑（getTrustConfig 的读结果整形、export/import 打包）。
 
 
+	/**
+	 * 自愈：上游明确拒绝 OpenAI 的 `developer` 角色时，把指定 provider 的
+	 * `compat.supportsDeveloperRole` 显式写成 false（json + yml 一起），
+	 * 让下一次进程启动不再发送该角色。
+	 *
+	 * 只在该 provider 存在且当前值不是 false 时写盘；yml 解析有诊断时拒绝写，
+	 * 避免用一份不完整的数据覆盖用户手写配置。
+	 */
+	async disableDeveloperRole(providerName: string): Promise<boolean> {
+		if (!providerName) return false;
+		const models = await this.readAuthoritativeModels();
+		if (models.diagnostic) return false;
+		const provider = models.parsed.providers?.[providerName];
+		if (!provider || typeof provider !== "object") return false;
+		const compat =
+			provider.compat && typeof provider.compat === "object"
+				? (provider.compat as Record<string, unknown>)
+				: {};
+		if (compat.supportsDeveloperRole === false) return false;
+
+		const result = await this.saveModelsConfig({
+			...models.parsed,
+			providers: {
+				...models.parsed.providers,
+				[providerName]: {
+					...provider,
+					compat: { ...compat, supportsDeveloperRole: false },
+				},
+			},
+		});
+		if (!result.valid) {
+			throw new Error(result.error ?? "保存 supportsDeveloperRole=false 失败");
+		}
+		return true;
+	}
+
 	// ── 保存（可视化表单） ────────────────────────────────
 	async saveModelsConfig(data: PiModelsFile): Promise<ConfigValidationResult> {
 		const validation = this.validateModels(data);

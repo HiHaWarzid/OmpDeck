@@ -14,6 +14,11 @@ interface ConfigHandlerDeps {
 	/** config.yml 的模型角色读写（ConfigManager 不再逐方法转发）。 */
 	rolesStore: OmpRolesStore;
 	appLogger: AppLogger;
+	/**
+	 * 模型/鉴权配置落盘后的通知：omp 进程只在启动时读取这些文件，
+	 * AgentManager 据此安排空闲会话在下次 prompt 前重连。
+	 */
+	onModelConfigChanged?: () => void;
 }
 
 type ConfigHandlerMaps = {
@@ -21,7 +26,7 @@ type ConfigHandlerMaps = {
 };
 
 export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMaps {
-	const { configManager, rolesStore, appLogger } = deps;
+	const { configManager, rolesStore, appLogger, onModelConfigChanged } = deps;
 
 	return {
 		config: {
@@ -40,6 +45,8 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 						? Object.keys(dataObj.providers).length
 						: 0;
 				void appLogger.info("config", "Models config saved", { providerCount });
+				// models.yml 不会热加载：运行中的 omp 进程必须重连后才能用上新配置
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
 			saveAuth: async (_event, data) => {
@@ -47,6 +54,7 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				const result = await configManager.saveAuthConfig(data as PiAuthFile);
 				const authCount = data && typeof data === "object" ? Object.keys(data).length : 0;
 				void appLogger.info("config", "Auth config saved", { authCount });
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
 			saveOmpConfigRaw: async (_event, raw) => {
@@ -238,6 +246,8 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 					bytes: Buffer.byteLength(packageJson, "utf8"),
 					valid: result.valid,
 				});
+				// 导入会整体替换 models/auth：必须让运行中的旧进程在下次发送前重连
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
 			// 远程拉取 provider 模型列表（pack 成员：payload 类型由通道表 pack 派生）

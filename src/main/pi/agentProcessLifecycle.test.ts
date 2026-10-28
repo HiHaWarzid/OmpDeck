@@ -34,15 +34,21 @@ class FakeChild extends EventEmitter {
 	running = false;
 	/** start() 内同步触发，用于模拟 spawn/协议错误在 start 尚未返回时到达。 */
 	onStart?: () => void;
+	/** 所有 RPC 请求流水，供断言重连后的恢复动作（set_model / set_thinking_level）。 */
+	requests: Array<Record<string, unknown>> = [];
+	/** get_state 返回的会话/模型状态；重连恢复测试依赖这里的 model/thinkingLevel。 */
+	stateData: Record<string, unknown> = {
+		sessionId: "s1",
+		sessionFile: SESSION_PATH,
+		sessionName: "会话",
+	};
 
 	constructor() {
 		super();
 		const respond = async (command: { type?: string }) => {
+			this.requests.push(command);
 			if (command.type === "get_state") {
-				return {
-					success: true,
-					data: { sessionId: "s1", sessionFile: SESSION_PATH, sessionName: "会话" },
-				};
+				return { success: true, data: this.stateData };
 			}
 			if (command.type === "get_messages") return { success: true, data: { messages: [] } };
 			if (command.type === "get_entries") return { success: true, data: { entries: [] } };
@@ -89,7 +95,10 @@ type Harness = {
 	children: FakeChild[];
 };
 
-function makeHarness(configureChild?: (child: FakeChild) => void): Harness {
+function makeHarness(
+	configureChild?: (child: FakeChild) => void,
+	extraDeps?: Partial<AgentConfigDeps>,
+): Harness {
 	const children: FakeChild[] = [];
 	const factory: AgentProcessFactory = () => {
 		const child = new FakeChild();
@@ -104,6 +113,7 @@ function makeHarness(configureChild?: (child: FakeChild) => void): Harness {
 		{
 			readOmpDefaultThinkingLevel: async () => undefined,
 			trustStore: { decide: async () => undefined },
+			...extraDeps,
 		} as unknown as AgentConfigDeps,
 		undefined,
 		undefined,
@@ -188,4 +198,109 @@ test("生命周期监听在 child.start 之前挂载：start 期间同步 error 
 		failure.message,
 		"监听器应在 start 期间就记录进程错误，失败不能被丢失",
 	);
+});
+
+test("模型配置保存后，空闲会话在下次发送前重连并恢复模型/思考档", async () => {
+	const { manager, agents, children } = makeHarness((child) => {
+		child.stateData = {
+			sessionId: "s1",
+			sessionFile: SESSION_PATH,
+			sessionName: "会话",
+			model: { provider: "commandcode", id: "deepseek/deepseek-v4.1-flash" },
+			thinkingLevel: "high",
+		};
+	});
+	const tab = await manager.create({ projectId: "p1" });
+	const runtime = agents.get(tab.id) as unknown as {
+		appliedConfigEpoch: number;
+		tab: AgentTab;
+	};
+	assert.equal(runtime.appliedConfigEpoch, 0, "create 启动的进程应记录当时的配置版本");
+
+	manager.markConfigChanged();
+	await (manager as unknown as {
+		applyPendingConfig: (agentId: string, rt: unknown) => Promise<void>;
+	}).applyPendingConfig(tab.id, runtime);
+
+	assert.equal(children.length, 2, "配置版本落后应拉起新 child");
+	assert.equal(children[0].stopCalls, 1, "必须确认旧 child 退出，避免两个进程抢同一会话");
+	const restoreRequests = children[1].requests;
+	assert(
+		restoreRequests.some(
+			(request) =>
+				request.type === "set_model" &&
+				request.provider === "commandcode" &&
+				request.modelId === "deepseek/deepseek-v4.1-flash",
+		),
+		"重连后应恢复会话原来选中的模型，而不是静默回到默认角色",
+	);
+	assert(
+		restoreRequests.some(
+			(request) => request.type === "set_thinking_level" && request.level === "high",
+		),
+		"重连后应恢复思考档",
+	);
+	assert.equal(runtime.appliedConfigEpoch, 1);
+	assert.equal(runtime.tab.status, "idle");
+});
+
+test("上游拒绝 developer 角色时自动关闭该 provider 兼容项并重连", async () => {
+	let disabledProvider: string | undefined;
+	const { manager, agents, children } = makeHarness(
+		(child) => {
+			child.stateData = {
+				sessionId: "s1",
+				sessionFile: SESSION_PATH,
+				sessionName: "会话",
+				model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+				thinkingLevel: "max",
+			};
+		},
+		{
+			disableDeveloperRole: async (providerName) => {
+				disabledProvider = providerName;
+				return true;
+			},
+		},
+	);
+	const tab = await manager.create({ projectId: "p1" });
+	const runtime = agents.get(tab.id) as unknown as {
+		tab: AgentTab;
+		transcript: { messages: ChatMessage[] };
+	};
+	runtime.tab.status = "error";
+
+	(manager as unknown as {
+		maybeRecoverDeveloperRole: (agentId: string, rt: unknown, text: string) => void;
+	}).maybeRecoverDeveloperRole(
+		tab.id,
+		runtime,
+		"422 Upstream request failed: unknown variant `developer`, expected one of `system`, `user`",
+	);
+
+	await vi.waitFor(() => assert.equal(children.length, 2, "应自动重连以重读配置"));
+	assert.equal(disabledProvider, "opencode-go", "只关闭报错 provider 的 developer 角色");
+	assert.equal(children[0].stopCalls, 1);
+	assert.equal(runtime.tab.status, "idle");
+	assert.equal(runtime.tab.lastError, undefined);
+	const texts = runtime.transcript.messages.map((message) => message.text);
+	assert(
+		texts.some((text) => text.includes("developer 角色")),
+		"应在时间线说明自愈动作，避免用户不知道配置被改",
+	);
+});
+
+test("无关错误不触发 developer-role 自愈", async () => {
+	const { manager, agents, children } = makeHarness(undefined, {
+		disableDeveloperRole: async () => true,
+	});
+	const tab = await manager.create({ projectId: "p1" });
+	const runtime = agents.get(tab.id) as unknown as { tab: AgentTab };
+
+	(manager as unknown as {
+		maybeRecoverDeveloperRole: (agentId: string, rt: unknown, text: string) => void;
+	}).maybeRecoverDeveloperRole(tab.id, runtime, "422 Upstream request failed: rate limit");
+
+	await Promise.resolve();
+	assert.equal(children.length, 1, "其他上游错误不应重启会话");
 });

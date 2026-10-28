@@ -189,6 +189,12 @@ export type AgentConfigDeps = {
 	readOmpDefaultThinkingLevel: () => Promise<string | undefined>;
 	/** 项目信任决策存储（探测/decide 注入 ask）。 */
 	trustStore: TrustStore;
+	/**
+	 * 上游明确拒绝 developer 角色时的自愈写入：关闭该 provider 的
+	 * compat.supportsDeveloperRole（models.json + models.yml）。
+	 * 返回 true 表示配置确实被改写；未注入时跳过写配置，仅重启进程。
+	 */
+	disableDeveloperRole?: (providerName: string) => Promise<boolean>;
 };
 
 /** 项目信任确认弹窗的用户选择 */
@@ -327,6 +333,14 @@ export class AgentManager {
 	 */
 	private static readonly SESSION_END_NOTIFY_DELAY_MS = 2_500;
 	private readonly sessionEndNotifyTimers = new Map<string, NodeJS.Timeout>();
+	/**
+	 * 模型/鉴权配置版本号。omp 只在进程启动时读取 models.yml / auth.json，
+	 * 也没有 reload_config RPC（dist 内无该命令），因此配置保存后运行中的会话
+	 * 会一直用旧配置，直到手动重启——本次 422 developer-role 事故正是保存后
+	 * 旧进程继续发 developer。保存配置时递增版本号，进程在下一次发 prompt 前
+	 * 若版本号落后则先重连（保留会话/模型/思考档），避免「改完配置还是报错」。
+	 */
+	private configEpoch = 0;
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -380,6 +394,19 @@ export class AgentManager {
 
 	configureWsl(environment: WslEnvironment | null): void {
 		this.wslEnvironment = environment;
+	}
+
+	/**
+	 * 模型/鉴权配置被保存后调用。omp 进程不监听配置文件，只有重启才会重新读取
+	 * models.yml / auth.json；这里只登记版本，避免在用户保存配置的瞬间打断运行中的会话。
+	 * 运行中的会话在本轮结束后、下一次发 prompt 前由 applyPendingConfig 重连。
+	 */
+	markConfigChanged(): void {
+		this.configEpoch += 1;
+		void this.appLogger?.info("agent", "Model/auth config changed; live agents will reattach before next prompt", {
+			epoch: this.configEpoch,
+			agents: this.agents.size,
+		});
 	}
 
 	/** Windows 主进程文件操作必须使用可由 host 访问的路径。 */
@@ -949,6 +976,9 @@ export class AgentManager {
 		});
 
 		let client: PiRpcClient;
+		// 必须在 child.start 之前取版本：start 返回后配置若已被保存，进程可能仍读的是旧文件，
+		// 用启动后的版本号会误判为「已应用」。
+		const startEpoch = this.configEpoch;
 		try {
 			client = await child.start(input.sessionPath, trustOverride, input.noSession);
 		} catch (error) {
@@ -1048,6 +1078,7 @@ export class AgentManager {
 					? `${project.name} 历史会话`
 					: `${project.name} agent`);
 			tab.status = "idle";
+			runtime.appliedConfigEpoch = startEpoch;
 			// 若因桌面兼容性自动跳过了 codeisland 等扩展，给用户一条系统说明，避免「扩展在却不生效」困惑。
 			const blockedOnStart = child.getDiagnostics()?.blockedExtensions;
 			if (blockedOnStart && blockedOnStart.length > 0) {
@@ -1268,6 +1299,9 @@ export class AgentManager {
 
 		// 判断 agent 是否已在忙碌中；运行中继续发送时必须带 streamingBehavior，
 		// 否则 pi RPC 会拒绝请求。该值也用于给用户消息打上投递语义标记。
+		// 配置保存后运行中的旧进程仍用旧 models.yml/auth.json：空闲时先重连再发送，
+		// 否则用户会看到「配置已改，却仍然是同一个错误」。
+		await this.applyPendingConfig(input.agentId, runtime);
 		const alreadyBusy = runtime.tab.status === "running";
 		const statusBeforePrompt = runtime.tab.status;
 		const promptDeliveryBehavior = input.streamingBehavior ?? (alreadyBusy ? "steer" : undefined);
@@ -1860,6 +1894,8 @@ export class AgentManager {
 		// 非 AFK 路径（崩溃恢复/压缩重启）：不携带 CreateAgentInput.cwd，固定使用项目根目录；
 		// 若未来需要按 worktree 重连，需与 createUnlocked 的 cwd 解析保持一致。
 		const child = this.createAgentProcess(project.path);
+		// 与 createUnlocked 同理：start 之前的版本号才代表新 child 可能读到的配置。
+		const startEpoch = this.configEpoch;
 		// 先装配新租约再挂监听：旧 child 的租约此刻失权，它的迟到 exit 不会再被当成当前进程退出。
 		const lease = runtime.slot.install(child);
 		// 与 createUnlocked 一致：先挂生命周期监听，再 start，避免 error 事件无 listener。
@@ -1887,6 +1923,7 @@ export class AgentManager {
 			runtime.tab.sessionPath = data?.sessionFile ?? sessionPath;
 			runtime.tab.title = data?.sessionName ?? runtime.tab.title;
 			runtime.tab.status = "idle";
+			runtime.appliedConfigEpoch = startEpoch;
 			// 进程退出型压缩可能来不及发 compaction_end；重连成功即表示 Pi 已可继续接收消息。
 			runtime.rpcCompacting = false;
 
@@ -1907,6 +1944,233 @@ export class AgentManager {
 				error: error instanceof Error ? error.message : String(error),
 			});
 			throw error;
+		}
+	}
+
+	/**
+	 * 配置版本落后时重连会话（保留 session 文件、当前模型与思考档）。
+	 *
+	 * 只允许在会话空闲时执行：omp 进程不会热加载 models.yml / auth.json，
+	 * 而旧 child 与潜在的新 child 不能同时持有同一个 session 文件。
+	 * 失败会把状态落到 error 并给出可操作提示，绝不静默继续用旧配置发请求。
+	 */
+	private async applyPendingConfig(agentId: string, runtime: AgentRuntime): Promise<void> {
+		if (runtime.configApplyPromise) {
+			await runtime.configApplyPromise;
+			return;
+		}
+		if (runtime.appliedConfigEpoch === this.configEpoch) return;
+		if (runtime.tab.status !== "idle" && runtime.tab.status !== "error") return;
+		if (!runtime.tab.sessionPath) return;
+
+		runtime.configApplyPromise = (async () => {
+			const selection = await this.readRuntimeSelection(runtime);
+			runtime.tab.status = "starting";
+			this.emitState();
+			try {
+				await this.replaceRuntimeProcess(agentId, runtime);
+				await this.restoreRuntimeSelection(runtime, selection);
+				runtime.tab.status = "idle";
+				delete runtime.tab.lastError;
+				this.addMessage(runtime, "system", "模型配置已更新，会话已自动重连");
+				void this.appLogger?.info("agent", "Config applied via process reattach", {
+					agentId,
+					epoch: runtime.appliedConfigEpoch,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				runtime.tab.status = "error";
+				runtime.tab.lastError = message;
+				this.addMessage(
+					runtime,
+					"error",
+					`应用最新模型配置失败（${message}）。请手动重启 Agent。`,
+				);
+				void this.appLogger?.error("agent", "Config reattach failed", {
+					agentId,
+					error: message,
+				});
+			} finally {
+				runtime.configApplyPromise = undefined;
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
+		})();
+		await runtime.configApplyPromise;
+	}
+
+	/**
+	 * 上游返回 422「unknown variant `developer`」：provider 明确不支持 OpenAI 的
+	 * developer 角色，但 omp 已按旧配置（或内置 catalog 默认 true）把 system prompt
+	 * 发成了 developer。仅重启不一定够——配置若仍为 true 会再次失败，所以先尝试把
+	 * 该 provider 的 compat 显式关闭，再重连进程让其重新读取。
+	 *
+	 * 不自动重发上一轮 prompt：失败可能发生在工具执行后的后续请求，重发会重复副作用。
+	 */
+	private maybeRecoverDeveloperRole(agentId: string, runtime: AgentRuntime, errorText: string): void {
+		if (!errorText.includes("unknown variant `developer`")) return;
+		if (runtime.healingDeveloperRole) return;
+		runtime.healingDeveloperRole = true;
+		const task = (async () => {
+			// willRetry=true 时自动重试卡片还停在「正在自动重试」；进程即将被替换，
+			// 不会再有 auto_retry_end，先把它收口成失败态，避免 UI 永久显示重试中。
+			if (runtime.transcript.retryStatusMessageId !== undefined) {
+				this.upsertRetryStatusMessage(runtime, { errorMessage: errorText }, "error");
+			}
+			const liveSelection = await this.readRuntimeSelection(runtime);
+			// 进程可能已在 422 后退出：get_state 拿不到时退回本会话最近一次已知模型，
+			// 否则无法关闭该 provider 的 developer 角色。
+			const selection = liveSelection.provider
+				? liveSelection
+				: (runtime.lastModelSelection ?? liveSelection);
+			let configChanged = false;
+			if (selection.provider && this.config.disableDeveloperRole) {
+				try {
+					configChanged = await this.config.disableDeveloperRole(selection.provider);
+				} catch (error) {
+					void this.appLogger?.error("agent", "Disable developer role failed", {
+						agentId,
+						provider: selection.provider,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				if (configChanged) this.markConfigChanged();
+			}
+
+			const sessionPath = runtime.tab.sessionPath;
+			if (!sessionPath) {
+				runtime.healingDeveloperRole = false;
+				runtime.configApplyPromise = undefined;
+				return;
+			}
+			runtime.tab.status = "starting";
+			this.emitState();
+			try {
+				await this.replaceRuntimeProcess(agentId, runtime);
+				await this.restoreRuntimeSelection(runtime, selection);
+				runtime.tab.status = "idle";
+				delete runtime.tab.lastError;
+				this.addMessage(
+					runtime,
+					"system",
+					configChanged
+						? `上游不支持 developer 角色，已自动关闭 ${selection.provider} 的该兼容项并重连会话。请重新发送上一条消息。`
+						: "上游不支持 developer 角色，已重连会话以应用最新模型配置。请重新发送上一条消息。",
+				);
+				void this.appLogger?.info("agent", "Recovered from developer-role rejection", {
+					agentId,
+					provider: selection.provider,
+					configChanged,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				runtime.tab.status = "error";
+				runtime.tab.lastError = message;
+				this.addMessage(
+					runtime,
+					"error",
+					`检测到上游拒绝 developer 角色，但自动重连失败（${message}）。请手动重启 Agent。`,
+				);
+			} finally {
+				runtime.healingDeveloperRole = false;
+				runtime.configApplyPromise = undefined;
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
+		})();
+		// 自愈期间若有新 prompt 到达，sendPrompt 会先 await 这次重连，
+		// 避免把消息发给即将被替换的旧进程。
+		runtime.configApplyPromise = task;
+	}
+
+	/** 停掉旧 child 再按同一 session 重连，避免两个 omp 同时持有会话文件。 */
+	private async replaceRuntimeProcess(agentId: string, runtime: AgentRuntime): Promise<void> {
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) throw new Error("会话尚未落盘，无法重连");
+		const oldProcess = runtime.slot.retire();
+		try {
+			await oldProcess.stop();
+		} catch (error) {
+			void this.appLogger?.warn("agent", "Old process stop failed before reattach", {
+				agentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		await this.reattachProcess(agentId, sessionPath);
+	}
+
+	/** 读取当前会话实际使用的模型与思考档；进程已退出时返回空对象。 */
+	private async readRuntimeSelection(runtime: AgentRuntime): Promise<{
+		provider?: string;
+		modelId?: string;
+		thinkingLevel?: string;
+	}> {
+		const response = await runtime.slot.process.client
+			.request({ type: "get_state" }, 10_000)
+			.catch(() => undefined);
+		const data = response?.data as
+			| {
+					model?: { provider?: unknown; id?: unknown } | string;
+					thinkingLevel?: unknown;
+					thinking_level?: unknown;
+			  }
+			| undefined;
+		const model = typeof data?.model === "string" ? undefined : data?.model;
+		const thinkingLevel = data?.thinkingLevel ?? data?.thinking_level;
+		const selection = {
+			provider: typeof model?.provider === "string" ? model.provider : undefined,
+			modelId: typeof model?.id === "string" ? model.id : undefined,
+			thinkingLevel: typeof thinkingLevel === "string" ? thinkingLevel : undefined,
+		};
+		if (selection.provider && selection.modelId) {
+			runtime.lastModelSelection = {
+				provider: selection.provider,
+				modelId: selection.modelId,
+				thinkingLevel: selection.thinkingLevel,
+			};
+		}
+		return selection;
+	}
+
+	/**
+	 * 重连后的进程按默认角色选模型；恢复用户在本会话里显式选过的模型和思考档，
+	 * 避免「只是保存了配置，会话却悄悄换模型」。
+	 */
+	private async restoreRuntimeSelection(
+		runtime: AgentRuntime,
+		selection: { provider?: string; modelId?: string; thinkingLevel?: string },
+	): Promise<void> {
+		const client = runtime.slot.process.client;
+		if (selection.provider && selection.modelId) {
+			const response = await client
+				.request(
+					{ type: "set_model", provider: selection.provider, modelId: selection.modelId },
+					20_000,
+				)
+				.catch((error: unknown) => ({ success: false, error: String(error) }));
+			if (!response.success) {
+				void this.appLogger?.warn("agent", "Restore model after reattach failed", {
+					agentId: runtime.tab.id,
+					provider: selection.provider,
+					modelId: selection.modelId,
+					error: response.error,
+				});
+			}
+		}
+		if (selection.thinkingLevel) {
+			const response = await client
+				.request(
+					{ type: "set_thinking_level", level: selection.thinkingLevel },
+					20_000,
+				)
+				.catch((error: unknown) => ({ success: false, error: String(error) }));
+			if (!response.success) {
+				void this.appLogger?.warn("agent", "Restore thinking level after reattach failed", {
+					agentId: runtime.tab.id,
+					level: selection.thinkingLevel,
+					error: response.error,
+				});
+			}
 		}
 	}
 
@@ -2501,6 +2765,9 @@ export class AgentManager {
 			{ type: "set_model", provider, modelId },
 			60_000,
 		);
+		// 记录用户显式选择：若之后进程在 developer-role 失败中退出，
+		// 自愈仍能定位到该 provider 并关闭不兼容项。
+		runtime.lastModelSelection = { provider, modelId };
 		return this.getRuntimeState(agentId);
 	}
 
@@ -4134,6 +4401,7 @@ export class AgentManager {
 				const failureText = `请求失败：${String(reason)}`;
 				runtime.tab.lastError = failureText;
 				this.addMessage(runtime, "error", failureText);
+				this.maybeRecoverDeveloperRole(agentId, runtime, String(reason));
 				this.emitState();
 			}
 		}
@@ -4244,12 +4512,18 @@ export class AgentManager {
 					// 进入自动重试即恢复：清掉上次 error 的 lastError。
 					delete runtime.tab.lastError;
 				}
+				// developer 角色错误是确定性的：重试多少次都不会变。放在重试卡片创建之后
+				// 再自愈，才能把「正在自动重试」收口成失败态。
+				if (typeof errorMsg === "string") {
+					this.maybeRecoverDeveloperRole(agentId, runtime, errorMsg);
+				}
 			} else if (errorMsg) {
 				this.addDetailedErrorMessage(runtime, String(errorMsg));
 				// 有错误且不会重试 → Agent 进入 error 态，宠物聚合为 failed（行5），
 				// 否则会被误置为 idle 触发"所有任务完成"通知
 				runtime.tab.status = "error";
 				runtime.tab.lastError = String(errorMsg);
+				this.maybeRecoverDeveloperRole(agentId, runtime, String(errorMsg));
 			} else if (
 				typed.stopReason === "error" ||
 				errorMessages.length > 0
@@ -5587,6 +5861,20 @@ type AgentRuntime = {
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
 	/**
+	 * 本进程启动时读取到的模型/鉴权配置版本（= AgentManager.configEpoch）。
+	 * 与全局版本不一致说明配置在进程启动后被保存过，下一次空闲发 prompt 前需要重连。
+	 */
+	appliedConfigEpoch: number;
+	/** 配置过期后的重连任务；并发 prompt 必须共用同一次重连，避免两个 child 抢同一会话。 */
+	configApplyPromise?: Promise<void>;
+	/** developer-role 自愈进行中：防止旧进程迟到的 agent_end 反复触发重连。 */
+	healingDeveloperRole?: boolean;
+	/**
+	 * 本会话最近一次确认过的模型/思考档（来自 set_model、get_state 或 prompt 发送前读取）。
+	 * 用于进程意外退出后仍能定位 provider，例如 developer-role 自愈需要改对配置。
+	 */
+	lastModelSelection?: { provider: string; modelId: string; thinkingLevel?: string };
+	/**
 	 * 最近一次 cache_warming_start/end 的本地投影。
 	 * omp get_state 不返回预热状态/模式，只能由事件维护；进程重启即丢弃。
 	 */
@@ -5662,5 +5950,6 @@ function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRunt
 		runtimeStateSeq: 0,
 		modelRefreshing: false,
 		autoRestartAttempted: false,
+		appliedConfigEpoch: 0,
 	};
 }

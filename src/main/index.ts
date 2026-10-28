@@ -1160,7 +1160,12 @@ function registerIpc() {
 		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
 		registerSessionHandlers({ projectStore, sessionScanner, sessionFileOps: sessionScanner.fileOps, importPipeline, agentManager, appLogger }),
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
-		registerConfigHandlers({ configManager, rolesStore: configManager.rolesStore, appLogger }),
+		registerConfigHandlers({
+			configManager,
+			rolesStore: configManager.rolesStore,
+			appLogger,
+			onModelConfigChanged: () => agentManager.markConfigChanged(),
+		}),
 		registerClipboardHandlers(),
 		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger }),
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
@@ -1304,6 +1309,7 @@ app.whenReady().then(async () => {
 		{
 			readOmpDefaultThinkingLevel: () => configManager.rolesStore.readDefaultThinkingLevel(),
 			trustStore: configManager.trustStore,
+			disableDeveloperRole: (providerName) => configManager.disableDeveloperRole(providerName),
 		},
 		rpcLogger,
 		appLogger,
