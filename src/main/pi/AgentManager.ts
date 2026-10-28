@@ -14,6 +14,11 @@ import type {
 	AgentStatus,
 	AgentSubagent,
 	AgentTab,
+	AgentTodoItem,
+	AgentTodoPhase,
+	AgentTodoStatus,
+	AgentUsageLimitState,
+	AgentCacheWarmingState,
 	AgentUiAskAnswer,
 	AgentUiAskOption,
 	AgentUiAskQuestion,
@@ -195,6 +200,15 @@ export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
  * 调用都 warn，日志会在几秒内被同一条记录刷爆，反而掩盖真正的问题。
  */
 const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
+
+/** omp todo 任务的可接受状态；用于把 RPC unknown 收窄为 AgentTodoStatus。 */
+const AGENT_TODO_STATUSES: Record<AgentTodoStatus, true> = {
+	pending: true,
+	in_progress: true,
+	completed: true,
+	abandoned: true,
+	blocked: true,
+};
 
 /** 子代理已收口状态：到达后不再被迟到的 progress("running") 覆盖。 */
 const SUBAGENT_TERMINAL_STATUSES = new Set([
@@ -2010,6 +2024,13 @@ export class AgentManager {
 			// omp 的待投递队列是 chip 的唯一事实来源：renderer 直接渲染它，
 			// 撤回/提升都回服务端执行，本地不再维护第二份 pending 队列。
 			queuedMessages: this.normalizeQueuedMessages(state?.queuedMessages),
+			// todo 的权威快照来自 get_state；工具时间线只保留历史卡片，不再充当面板数据源。
+			todoPhases: this.normalizeTodoPhases(state?.todoPhases),
+			tokensPerSecond: this.pickNumber(state?.tokensPerSecond),
+			autoCompactionEnabled: normalizePiBoolean(state?.autoCompactionEnabled),
+			usageLimit: this.normalizeUsageLimit(state?.usageLimit),
+			// get_state 不暴露 cache warming；用事件投影，避免为只为展示而多读 config.yml。
+			...(runtime.cacheWarming ? { cacheWarming: runtime.cacheWarming } : {}),
 		};
 	}
 
@@ -2025,6 +2046,66 @@ export class AgentManager {
 			steering: readList(record.steering),
 			followUp: readList(record.followUp),
 		};
+	}
+
+	/**
+	 * get_state.todoPhases / set_todos 入参共用的五态归一化。
+	 * omp 的 TodoItem 还带 blocker/details/notes；这里完整保留，避免用户点击
+	 * 切换状态后再次下发时把 blocked 任务的等待原因丢掉。
+	 */
+	private normalizeTodoPhases(value: unknown): AgentTodoPhase[] {
+		if (!Array.isArray(value)) return [];
+		const phases: AgentTodoPhase[] = [];
+		for (const rawPhase of value) {
+			if (!rawPhase || typeof rawPhase !== "object") continue;
+			const phase = rawPhase as Record<string, unknown>;
+			if (typeof phase.name !== "string") continue;
+			const tasks: AgentTodoItem[] = [];
+			if (Array.isArray(phase.tasks)) {
+				for (const rawTask of phase.tasks) {
+					if (!rawTask || typeof rawTask !== "object") continue;
+					const task = rawTask as Record<string, unknown>;
+					if (typeof task.content !== "string" || !task.content) continue;
+					if (typeof task.status !== "string") continue;
+					if (AGENT_TODO_STATUSES[task.status as AgentTodoStatus] !== true) continue;
+					const notes = Array.isArray(task.notes)
+						? task.notes.filter((note): note is string => typeof note === "string")
+						: undefined;
+					tasks.push({
+						content: task.content,
+						status: task.status as AgentTodoStatus,
+						...(typeof task.blocker === "string" ? { blocker: task.blocker } : {}),
+						...(typeof task.details === "string" ? { details: task.details } : {}),
+						...(notes && notes.length > 0 ? { notes } : {}),
+					});
+				}
+			}
+			phases.push({ name: phase.name, tasks });
+		}
+		return phases;
+	}
+
+	/** get_state.usageLimit 容错：字段缺失/类型非法时视为无限制状态，不猜 stage。 */
+	private normalizeUsageLimit(value: unknown): AgentUsageLimitState | undefined {
+		if (!value || typeof value !== "object") return undefined;
+		const source = value as Record<string, unknown>;
+		const resetsAtSec = this.pickNumber(source.resetsAtSec);
+		if (source.stage === "low_priority") {
+			const allowanceLeftPercent = this.pickNumber(source.allowanceLeftPercent);
+			return {
+				stage: "low_priority",
+				...(resetsAtSec != null ? { resetsAtSec } : {}),
+				...(allowanceLeftPercent != null ? { allowanceLeftPercent } : {}),
+			};
+		}
+		if (source.stage === "wrap_up") {
+			return {
+				stage: "wrap_up",
+				extraUsage: source.extraUsage === true,
+				...(resetsAtSec != null ? { resetsAtSec } : {}),
+			};
+		}
+		return undefined;
 	}
 
 	/** 子代理快照按 omp registry 的 index 排序（无 index 的按 id 稳定排序）。 */
@@ -2550,6 +2631,43 @@ export class AgentManager {
 		);
 		if (!response.success) {
 			throw new Error(response.error?.trim() || "set_slow_mode failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 切换会话自动压缩（omp `set_auto_compaction`）。
+	 * 该开关只影响后续上下文溢出时的自动压缩，不立即触发压缩；omp 响应无 data，
+	 * 生效值统一回读 get_state.autoCompactionEnabled。
+	 */
+	async setAutoCompaction(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_auto_compaction", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_auto_compaction failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 下发会话 todo（omp `set_todos`）。宿主 UI 的勾选/推进走这里，
+	 * 而不是只把 todo 当 tool 结果只读展示；omp 会同步给模型并广播 todo 更新。
+	 * 入参经过五态归一化，防止渲染层脏数据把非法状态写进会话。
+	 */
+	async setTodos(agentId: string, phases: AgentTodoPhase[]): Promise<AgentRuntimeState> {
+		if (!Array.isArray(phases)) {
+			throw new Error("set_todos: phases must be an array");
+		}
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_todos", phases: this.normalizeTodoPhases(phases) },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_todos failed");
 		}
 		return this.getRuntimeState(agentId);
 	}
@@ -3895,6 +4013,57 @@ export class AgentManager {
 			return;
 		}
 
+		// 模型被切换（/model、set_model、模型角色预设等都可能触发）。运行态条里的
+		// provider/model 是渲染层唯一来源，必须立即重拉 get_state，不能等下一次工具边沿。
+		if (typed.type === "model_changed") {
+			void this.emitRuntimeState(agentId);
+			return;
+		}
+
+		// config.yml 的警告集合变化（设置页保存、/config 重载等）。
+		// omp 不在 get_state 里暴露警告文本，桌面端只提示用户去 /config 查看并刷新状态。
+		if (typed.type === "config_warnings_changed") {
+			this.emit(ipcChannels.agentsNotice, {
+				agentId,
+				message: "Config warnings changed",
+				i18nKey: "app.configWarningsChanged",
+				kind: "warning",
+				duration: 4500,
+			});
+			void this.emitRuntimeState(agentId);
+			return;
+		}
+
+		// 缓存预热是 omp 在请求前后主动刷 prompt cache 的后台动作：
+		// 没有 get_state 字段可读，只能把事件投影到 runtime state。
+		// hit/miss 是正常结果，不弹提示；warming 与失败在状态条展示。
+		if (typed.type === "cache_warming_start" || typed.type === "cache_warming_end") {
+			const isEnd = typed.type === "cache_warming_end";
+			const rawOutcome = typed.outcome;
+			const outcome: AgentCacheWarmingState["outcome"] =
+				isEnd && (rawOutcome === "hit" || rawOutcome === "miss" || rawOutcome === "error" || rawOutcome === "aborted")
+					? rawOutcome
+					: undefined;
+			runtime.cacheWarming = {
+				phase: isEnd ? "done" : "warming",
+				...(outcome ? { outcome } : {}),
+				...(typeof typed.provider === "string" && typed.provider ? { provider: typed.provider } : {}),
+				...(typeof typed.model === "string" && typed.model ? { model: typed.model } : {}),
+				updatedAt: Date.now(),
+			};
+			void this.emitRuntimeState(agentId);
+			if (outcome === "error" || outcome === "aborted") {
+				void this.appLogger?.warn("agent", "Cache warming ended without a hit", {
+					agentId,
+					outcome,
+					provider: typed.provider,
+					model: typed.model,
+					stopReason: typed.warmingStopReason,
+				});
+			}
+			return;
+		}
+
 		if (typed.type === "agent_start") {
 			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知。
 			this.cancelSessionEndNotification(agentId);
@@ -4103,6 +4272,12 @@ export class AgentManager {
 		if (typed.type === "queue_update") {
 			// 待投递队列的 chip 文本以 get_state.queuedMessages 为准（事件快照同源）。
 			// 这里只触发一次完整状态刷新：节流合并天然吸收连续增删，renderer 不维护第二份队列。
+			void this.emitRuntimeState(agentId);
+		}
+
+		if (typed.type === "todo_auto_clear") {
+			// 会话空闲后 omp 会主动清空 todo；事件本身不带残留数据，
+			// 拉一次 get_state 让 composer 上方的原生 todo 面板同步消失。
 			void this.emitRuntimeState(agentId);
 		}
 
@@ -5411,6 +5586,11 @@ type AgentRuntime = {
 	modelRefreshing: boolean;
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
+	/**
+	 * 最近一次 cache_warming_start/end 的本地投影。
+	 * omp get_state 不返回预热状态/模式，只能由事件维护；进程重启即丢弃。
+	 */
+	cacheWarming?: AgentCacheWarmingState;
 };
 
 /**

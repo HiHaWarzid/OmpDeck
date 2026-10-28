@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import type {
 	AgentTab,
+	AgentTodoPhase,
 	AppSettings,
 	ChatMessage,
 	CreateAgentInput,
@@ -39,6 +40,8 @@ type WebServiceAgentDeps = Pick<
 	| "availableThinkingLevels"
 	| "setFastMode"
 	| "setSlowMode"
+	| "setAutoCompaction"
+	| "setTodos"
 	| "abortAndRestoreQueue"
 	| "removeQueuedMessage"
 	| "promoteQueuedMessage"
@@ -77,6 +80,8 @@ type _WebAgentDepsDriftGuard = {
 	availableThinkingLevels: AgentsNamespace["availableThinkingLevels"];
 	setFastMode: AgentsNamespace["setFastMode"];
 	setSlowMode: AgentsNamespace["setSlowMode"];
+	setAutoCompaction: AgentsNamespace["setAutoCompaction"];
+	setTodos: AgentsNamespace["setTodos"];
 	abortAndRestoreQueue: AgentsNamespace["abortAndRestoreQueue"];
 	removeQueuedMessage: AgentsNamespace["removeQueuedMessage"];
 	promoteQueuedMessage: AgentsNamespace["promoteQueuedMessage"];
@@ -401,6 +406,36 @@ export class WebServiceManager {
 				const state = await this.deps.setSlowMode(
 					decodeURIComponent(slowModeMatch[1]),
 					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const autoCompactionMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/auto-compaction$/);
+			if (autoCompactionMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setAutoCompaction(
+					decodeURIComponent(autoCompactionMatch[1]),
+					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const todosMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/todos$/);
+			if (todosMatch && request.method === "POST") {
+				const body = await this.readJson<{ phases?: unknown }>(request);
+				if (!Array.isArray(body.phases)) {
+					this.sendError(response, 400, "phases 必须是数组");
+					return;
+				}
+				const state = await this.deps.setTodos(
+					decodeURIComponent(todosMatch[1]),
+					body.phases as AgentTodoPhase[],
 				);
 				this.invalidateStateCache();
 				this.sendJson(response, { state });

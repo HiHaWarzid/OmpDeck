@@ -34,6 +34,8 @@ const deps: WebDeps = {
 	availableThinkingLevels: async () => [],
 	setFastMode: stubRuntimeState,
 	setSlowMode: stubRuntimeState,
+	setAutoCompaction: stubRuntimeState,
+	setTodos: stubRuntimeState,
 	abortAndRestoreQueue: async () => ({ steering: [], followUp: [] }),
 	removeQueuedMessage: async () => ({ removed: false }),
 	promoteQueuedMessage: async () => ({ promoted: false }),

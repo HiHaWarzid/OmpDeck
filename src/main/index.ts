@@ -1333,6 +1333,8 @@ app.whenReady().then(async () => {
 		availableThinkingLevels: (agentId) => agentManager.getAvailableThinkingLevels(agentId),
 		setFastMode: (agentId, enabled) => agentManager.setFastMode(agentId, enabled),
 		setSlowMode: (agentId, enabled) => agentManager.setSlowMode(agentId, enabled),
+		setAutoCompaction: (agentId, enabled) => agentManager.setAutoCompaction(agentId, enabled),
+		setTodos: (agentId, phases) => agentManager.setTodos(agentId, phases),
 		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
 		removeQueuedMessage: (agentId, message, queue) =>
 			agentManager.removeQueuedMessage(agentId, message, queue),

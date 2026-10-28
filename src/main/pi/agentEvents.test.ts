@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test, vi } from "vitest";
 
 import type {
+	AgentCacheWarmingState,
 	AgentManagerEvent,
 	AgentStatus,
 	AgentSubagent,
@@ -66,6 +67,8 @@ type TestRuntime = {
 	rpcCompacting: boolean;
 	modelRefreshing: boolean;
 	autoRestartAttempted: boolean;
+	/** cache_warming_start/end 的本地投影（get_state 不返回）。 */
+	cacheWarming?: AgentCacheWarmingState;
 };
 
 /** 构造带全部默认字段的最小 runtime；client.request 默认抛错（RPC 路径由各测试按需覆盖）。 */
@@ -506,6 +509,115 @@ test("已收口 idle/error 后 runtime state 不再上报 pi 的陈旧 isStreami
 	const runningState = await manager.getRuntimeState("a1");
 	assert.equal(runningState.isStreaming, true);
 	assert.equal(runningState.isCompacting, true);
+});
+
+// ── omp 原生会话状态投影（todo / usage / 吞吐 / 自动压缩） ─────
+
+test("get_state 投影 todo 五态、usageLimit 与吞吐，保留 blocker 供回写", async () => {
+	const manager = makeManager();
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({
+			success: true,
+			data: {
+				todoPhases: [
+					{
+						name: "实现",
+						tasks: [
+							{ content: "A", status: "in_progress", details: "d", notes: ["n", 3] },
+							{ content: "B", status: "blocked", blocker: "等待 review" },
+							{ content: "非法状态", status: "unknown" },
+							{ content: "", status: "pending" },
+						],
+					},
+					{ name: 2, tasks: [] },
+				],
+				usageLimit: {
+					stage: "low_priority",
+					resetsAtSec: 1_700_000_000,
+					allowanceLeftPercent: 42,
+				},
+				tokensPerSecond: 12.6,
+				autoCompactionEnabled: true,
+			},
+		}),
+	});
+	inner.agents.set("a1", runtime);
+
+	const state = await manager.getRuntimeState("a1");
+	assert.deepEqual(state.todoPhases, [
+		{
+			name: "实现",
+			tasks: [
+				{ content: "A", status: "in_progress", details: "d", notes: ["n"] },
+				{ content: "B", status: "blocked", blocker: "等待 review" },
+			],
+		},
+	]);
+	assert.deepEqual(state.usageLimit, {
+		stage: "low_priority",
+		resetsAtSec: 1_700_000_000,
+		allowanceLeftPercent: 42,
+	});
+	assert.equal(state.tokensPerSecond, 12.6);
+	assert.equal(state.autoCompactionEnabled, true);
+});
+
+test("setTodos 下发前过滤非法状态，再从 get_state 回读生效值", async () => {
+	const manager = makeManager();
+	const requests: Array<Record<string, unknown>> = [];
+	const runtime = makeRuntime(makeTab("a1", "idle"), {
+		request: async (req) => {
+			requests.push(req as Record<string, unknown>);
+			return req && (req as Record<string, unknown>).type === "get_state"
+				? { success: true, data: { todoPhases: [] } }
+				: { success: true, data: {} };
+		},
+	});
+	internals(manager).agents.set("a1", runtime);
+
+	const state = await manager.setTodos("a1", [
+		{
+			name: "P",
+			tasks: [
+				{ content: "X", status: "pending" },
+				{ content: "Y", status: "bogus" as never },
+			],
+		},
+	]);
+
+	assert.deepEqual(requests[0], {
+		type: "set_todos",
+		phases: [{ name: "P", tasks: [{ content: "X", status: "pending" }] }],
+	});
+	assert.deepEqual(state.todoPhases, []);
+});
+
+test("cache_warming 事件投影：start 标记 warming，end 单独保留 outcome", () => {
+	const manager = makeManager();
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+	});
+	inner.agents.set("a1", runtime);
+
+	inner.handlePiEvent("a1", {
+		type: "cache_warming_start",
+		provider: "anthropic",
+		model: "claude",
+	});
+	assert.equal(runtime.cacheWarming?.phase, "warming");
+	assert.equal(runtime.cacheWarming?.provider, "anthropic");
+
+	inner.handlePiEvent("a1", {
+		type: "cache_warming_end",
+		outcome: "error",
+		provider: "anthropic",
+		model: "claude",
+		warmingStopReason: "aborted",
+	});
+	assert.equal(runtime.cacheWarming?.phase, "done");
+	assert.equal(runtime.cacheWarming?.outcome, "error");
 });
 
 // ── isRpcLogWorthy（RPC 日志默认落盘过滤）──────────────

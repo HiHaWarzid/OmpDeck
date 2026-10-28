@@ -43,6 +43,10 @@ export function ModelPicker(props: {
 	};
 	serviceTierBusy?: boolean;
 	onToggleServiceTier?: (kind: "fast" | "slow", enabled: boolean) => void;
+	/** 会话级开关（目前只有自动压缩）；无 agent 时省略。 */
+	sessionControls?: { autoCompactionEnabled?: boolean };
+	sessionControlBusy?: boolean;
+	onToggleAutoCompaction?: (enabled: boolean) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => {
@@ -342,6 +346,31 @@ export function ModelPicker(props: {
 							}
 						>
 							{t("app.serviceSlowChip")}
+						</button>
+					</div>
+				)}
+				{props.sessionControls && props.onToggleAutoCompaction && (
+					<div className="model-picker-tier-footer">
+						<span className="model-picker-tier-label">
+							{t("app.autoCompactionSection")}
+						</span>
+						<button
+							type="button"
+							className={`model-picker-tier-btn${props.sessionControls.autoCompactionEnabled ? " on" : ""}`}
+							aria-pressed={!!props.sessionControls.autoCompactionEnabled}
+							disabled={props.sessionControlBusy}
+							onClick={() =>
+								props.onToggleAutoCompaction?.(
+									!props.sessionControls?.autoCompactionEnabled,
+								)
+							}
+							title={
+								props.sessionControls.autoCompactionEnabled
+									? t("app.autoCompactionOn")
+									: t("app.autoCompactionOff")
+							}
+						>
+							{t("app.autoCompactionChip")}
 						</button>
 					</div>
 				)}

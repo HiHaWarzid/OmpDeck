@@ -14,6 +14,7 @@ import type {
 	AgentRuntimeState,
 	AgentSubagent,
 	AgentTab,
+	AgentTodoPhase,
 	AgentUiAskAnswer,
 	AgentUiRequest,
 	AfkState,
@@ -536,19 +537,20 @@ export interface AgentsApi {
 	reload: (agentId: string) => Promise<void>;
 	restart: (agentId: string) => Promise<AgentTab>;
 	/**
-	 * 运行态变更家族（compact/cycleModel/setModel/refreshModels/cycleThinking/setThinking）：
-	 * 每个成员独立保留，不收敛为 agents.runtimeCommand(agentId, cmd, arg?) 动作表（W6-7 决策，
-	 * 证据见下）。六个通道会随 AgentManager 一起变，但合并成动作表会用 union 参数换来
-	 * 更糟的调用面：
+	 * 运行态变更家族（compact/cycleModel/setModel/refreshModels/cycleThinking/setThinking/
+	 * setTodos/setAutoCompaction）：每个成员独立保留，不收敛为
+	 * agents.runtimeCommand(agentId, cmd, arg?) 动作表（W6-7 决策，证据见下）。
+	 * 这些通道会随 AgentManager 一起变，但合并成动作表会用 union 参数换来更糟的调用面：
 	 *  - 参数形态各异：无参（cycle/refresh）、双参（setModel(provider, modelId)）、
-	 *    单参（setThinking(level)）、可选参（compact(prompt?)）——union 动作对象在每个
-	 *    调用点都要构造 payload 对象，丢失按成员命名的可发现性与每个调用点的精确参数类型；
+	 *    单参（setThinking(level)/setAutoCompaction(enabled)）、数组参（setTodos(phases)）、
+	 *    可选参（compact(prompt?)）——union 动作对象在每个调用点都要构造 payload 对象，
+	 *    丢失按成员命名的可发现性与每个调用点的精确参数类型；
 	 *  - browserApi（内置浏览器模式）把每个成员一一映射到独立 REST 端点
 	 *    （/cycle-model、/model、/refresh-models、/cycle-thinking、/thinking，payload 各异），
 	 *    收敛会让 web 客户端从「成员→端点 一对一」退化成动作 switch，且违反 W6-18
 	 *    「不改 web HTTP 行为」约束；
-	 *  - 六者返回值都是 AgentRuntimeState，合并无返回类型收益。
-	 * 已评估，SKIP 收敛 — 保持六成员，改 API 面时与 AgentManager/WebServiceManager 同步。
+	 *  - 返回值统一是 AgentRuntimeState，合并无返回类型收益。
+	 * 已评估，SKIP 收敛 — 保持独立成员，改 API 面时与 AgentManager/WebServiceManager 同步。
 	 */
 	compact: (agentId: string, prompt?: string) => Promise<AgentRuntimeState>;
 	runtimeState: (agentId: string) => Promise<AgentRuntimeState>;
@@ -590,6 +592,10 @@ export interface AgentsApi {
 	setFastMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
 	/** 切换 slow/thinking 服务档。 */
 	setSlowMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 切换会话自动压缩（omp set_auto_compaction）。 */
+	setAutoCompaction: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 下发会话 todo（omp set_todos）；传空数组清空。 */
+	setTodos: (agentId: string, phases: AgentTodoPhase[]) => Promise<AgentRuntimeState>;
 	commands: (agentId: string) => Promise<PiCommand[]>;
 	/**
 	 * omp 的 `available_commands_update` 推送：命令目录以 runtime 为唯一事实源。

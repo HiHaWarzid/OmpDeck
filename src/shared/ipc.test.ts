@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 295（294 + 1 新增 agents:get-history-page 历史分页；294 = 287 + 7 新增模型供应商顺序/角色存储 4 个 config 通道 + 思考档位与 fast/slow 3 个 agents 通道；287 = 275 + 12 新增模型预设/循环/回退链 8 个 config 通道 + OAuth 登录 4 个 agents 通道；275 = 276 - 1 删 app:feedback-environment；276 = 272 + 4 新增子代理能力 agents:cancel-subagent / steer-subagent / subagents / subagents-messages；272 = 269 + 3 新增 agents:remove-queued-message / promote-queued-message / abort-and-restore-queue；269 = 268 + 1 新增 config:patch-omp-config 键级补丁；268 = 267 + 1 新增 agents:command-catalog 命令目录推送；267 = 266 + 1 新增 sessions:changed 冷扫描完成推送；266 = 265 + 1 新增 sessions:read-archived-messages 归档按需读取；265 = 264 + 1 新增 git:probe 能力探测；264 = 262 - 1 删 vision:test + 3 config 角色通道）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(295);
+	test("总通道数 = 297（295 + 2 新增 agents:set-auto-compaction / set-todos 会话开关；295 = 294 + 1 新增 agents:get-history-page 历史分页；294 = 287 + 7 新增模型供应商顺序/角色存储 4 个 config 通道 + 思考档位与 fast/slow 3 个 agents 通道；287 = 275 + 12 新增模型预设/循环/回退链 8 个 config 通道 + OAuth 登录 4 个 agents 通道；275 = 276 - 1 删 app:feedback-environment；276 = 272 + 4 新增子代理能力 agents:cancel-subagent / steer-subagent / subagents / subagents-messages；272 = 269 + 3 新增 agents:remove-queued-message / promote-queued-message / abort-and-restore-queue；269 = 268 + 1 新增 config:patch-omp-config 键级补丁；268 = 267 + 1 新增 agents:command-catalog 命令目录推送；267 = 266 + 1 新增 sessions:changed 冷扫描完成推送；266 = 265 + 1 新增 sessions:read-archived-messages 归档按需读取；265 = 264 + 1 新增 git:probe 能力探测；264 = 262 - 1 删 vision:test + 3 config 角色通道）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(297);
 	});
 });

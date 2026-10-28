@@ -9,7 +9,7 @@
 import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentTodoPhase, AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult } from "../../shared/types";
 import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
@@ -38,7 +38,7 @@ type AgentHandlerMaps = {
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
 		| "cancelSubagent" | "steerSubagent" | "subagentMessages" | "subagents"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
-		| "setThinking" | "availableThinkingLevels" | "setFastMode" | "setSlowMode" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "setThinking" | "availableThinkingLevels" | "setFastMode" | "setSlowMode" | "setAutoCompaction" | "setTodos" | "commands" | "sendUiResponse" | "notifyAsk"
 		| "getLoginProviders" | "login" | "getLogoutAccounts" | "logout"
 		| "respondTrustRequest">;
 };
@@ -385,6 +385,22 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
 				const result = await agentManager.setSlowMode(agentId, enabled);
 				void appLogger.info("agent", "Agent slow mode changed", { agentId, enabled });
+				return result;
+			},
+			setAutoCompaction: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setAutoCompaction(agentId, enabled);
+				void appLogger.info("agent", "Agent auto compaction changed", { agentId, enabled });
+				return result;
+			},
+			setTodos: async (_event, agentId: string, phases: AgentTodoPhase[]) => {
+				if (!Array.isArray(phases)) throw new Error("phases must be an array");
+				const result = await agentManager.setTodos(agentId, phases);
+				// 不记录任务正文：todo 内容属于用户会话数据，只记数量便于排查。
+				void appLogger.info("agent", "Agent todos updated from host", {
+					agentId,
+					phases: phases.length,
+				});
 				return result;
 			},
 			commands: async (_event, agentId: string) => {

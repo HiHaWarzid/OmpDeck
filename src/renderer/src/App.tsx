@@ -163,6 +163,7 @@ import {
   ThinkingPicker,
 } from "./components/app/composer/ComposerPickers";
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
+import { NativeTodoPanel } from "./components/app/composer/NativeTodoPanel";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
 import { BatchAskInlineBar, NativeAskInlineBar } from "./components/app/tools/AskQuestionCard";
 import { SubagentBar } from "./components/app/subagents/SubagentBar";
@@ -251,6 +252,7 @@ import type {
   Project,
   SessionSummary,
   ComposerAgentMode,
+  AgentTodoPhase,
   AgentUiRequest,
   RestoredQueuedMessage,
   ThinkingUpdate,
@@ -667,6 +669,8 @@ export function App() {
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
   const [availableThinkingLevels, setAvailableThinkingLevels] = useState<string[]>([]);
   const [serviceTierBusy, setServiceTierBusy] = useState(false);
+  const [autoCompactionBusy, setAutoCompactionBusy] = useState(false);
+  const [todoBusy, setTodoBusy] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 大会话历史分页：App 持有旧页，切换会话/文件时按 key 自动失效。
@@ -4250,6 +4254,48 @@ export function App() {
     }
   }
 
+  /**
+   * 会话自动压缩开关。omp 没有独立的“设置页”入口，且该开关是会话级状态，
+   * 因此和 fast/slow 一起放在模型选择器 footer，由 get_state 回读生效值。
+   */
+  async function toggleAutoCompaction(enabled: boolean) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setAutoCompactionBusy(true);
+    try {
+      const state = await api.agents.setAutoCompaction(activeAgentId, enabled);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.autoCompactionFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setAutoCompactionBusy(false);
+    }
+  }
+
+  /**
+   * 宿主侧 todo 操作：点击原生 TODO 面板推进状态后整份回写 omp。
+   * 使用服务端返回的状态覆盖本地，避免连续点击时基于旧快照拼出错误状态。
+   */
+  async function updateTodos(phases: AgentTodoPhase[]) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setTodoBusy(true);
+    try {
+      const state = await api.agents.setTodos(activeAgentId, phases);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.todoPanelUpdateFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setTodoBusy(false);
+    }
+  }
+
   async function compactAgent(compactPrompt?: string, agentId = activeAgentId) {
     if (!agentId || isPendingAgentId(agentId)) return;
     // 按 agent 维度锁 compacting：避免全局 boolean 在切换会话时错绑状态，
@@ -6605,6 +6651,21 @@ export function App() {
               </div>
             );
           })()}
+          {/* omp 会话 todo 的权威快照（get_state.todoPhases）；与扩展 widget 独立，
+              避免用户扩展产出的 TODO 卡片和模型真实 todo 被混成一份。 */}
+          {activeAgentId &&
+            activeRuntimeState?.todoPhases?.some((phase) => phase.tasks.length > 0) && (
+              <NativeTodoPanel
+                phases={activeRuntimeState.todoPhases}
+                busy={todoBusy}
+                disabled={
+                  isAgentBusy ||
+                  agentStarting ||
+                  Boolean(activeRuntimeState.isCompacting)
+                }
+                onSetTodos={(phases) => void updateTodos(phases)}
+              />
+            )}
           {/* 图片预览作为输入框上方的附件栏,避免占用 textarea 的可输入区域。 */}
           {attachedImages.length > 0 && (
             <div className="image-preview-area">
@@ -8479,6 +8540,15 @@ export function App() {
           }
           serviceTierBusy={serviceTierBusy}
           onToggleServiceTier={(kind, enabled) => void toggleServiceTier(kind, enabled)}
+          sessionControls={
+            activeAgentId && !isPendingAgentId(activeAgentId)
+              ? {
+                  autoCompactionEnabled: activeRuntimeState?.autoCompactionEnabled,
+                }
+              : undefined
+          }
+          sessionControlBusy={autoCompactionBusy}
+          onToggleAutoCompaction={(enabled) => void toggleAutoCompaction(enabled)}
         />
       )}
       {composerModePickerOpen && (

@@ -20,9 +20,19 @@ All notable changes to PiDeck are documented here.
 - **Model presets / cycle order / fallback chains** — Snapshot every role plus
   the default thinking level into `modelPresets.<name>`, set `cycleOrder`, and
   configure `retry.fallbackChains`; all three are written to global `config.yml`.
+- **Native session TODO panel** — The composer shows omp's live session
+  `todoPhases`; click a task to advance pending → in progress → completed, and
+  the whole list is written back with `set_todos`. Blocked/abandoned tasks return
+  to pending, and `todo_auto_clear` hides the panel.
+- **Auto compaction & service tiers** — The model picker footer can toggle the
+  session's auto-compaction and Fast/Slow service tiers; unsupported tiers report
+  the model limitation instead of failing silently.
 
 ### ✨ Improvements
 
+- **Quota, throughput and cache-warming indicators** — The session status bar
+  now surfaces the usage-limit stage (low-priority lane / wrap-up allowance),
+  reset time, tokens per second, and cache warming/failure from omp's events.
 - **Auth tab edits the authoritative model file** — API keys are written to
   `providers.<name>.apiKey` in `models.yml`, preserving comments and hand-written
   fields; clearing a key deletes just that field. The obsolete `type` field and

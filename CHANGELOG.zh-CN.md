@@ -17,9 +17,16 @@
 - **模型预设 / 循环顺序 / 回退链** — 模型角色页可把当前全部角色与默认思考档保存为
   命名预设（`modelPresets.<name>`），并可设置 `cycleOrder` 与 `retry.fallbackChains`，
   均写入全局 `config.yml`。
+- **omp 原生 TODO 面板** — composer 上方直接展示会话实时 `todoPhases`；点击任务可在
+  待处理 → 进行中 → 已完成之间推进，整份列表经 `set_todos` 回写。阻塞/已放弃任务点击
+  回到待处理；`todo_auto_clear` 到达时面板自动隐藏。
+- **自动压缩与 Fast/Slow 服务档** — 模型选择器 footer 可切换会话自动压缩与 Fast/Slow
+  服务档；模型不支持的档位会提示具体限制，而不是静默失败。
 
 ### ✨ 交互优化
 
+- **额度、吞吐与缓存预热指示** — 会话状态条新增限流档位（低优先级通道 / 收尾额度）、
+  重置时间、每秒 token 数，以及来自 omp 事件的缓存预热/失败状态。
 - **Auth 页改为编辑模型权威文件** — API Key 直接写 `models.yml` 的
   `providers.<name>.apiKey`，保留文件注释与其它手工字段；清空某个 key 即删除该字段。
   移除已废弃的 `type` 字段与「复制凭据」操作。

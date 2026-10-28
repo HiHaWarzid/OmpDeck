@@ -10,6 +10,9 @@
 - 🚀 **omp 原生 OAuth 登录** — Auth 页浏览器授权、回跳地址复制、授权码回填与凭据登出
 - 🚀 **Kind 模型角色** — 新增 image / web / speech / dictation / judge，按 kind 过滤候选模型
 - 🚀 **模型预设 / 循环顺序 / 回退链** — `modelPresets`、`cycleOrder`、`retry.fallbackChains` 可视化编辑
+- 🚀 **omp 原生 TODO 面板** — 会话实时 `todoPhases` 展示，点击推进状态并经 `set_todos` 回写
+- 🚀 **自动压缩与 Fast/Slow 服务档** — 模型选择器 footer 直接切换，模型不支持时给出提示
+- ✨ **额度 / 吞吐 / 缓存预热指示** — 状态条显示限流档位、重置时间、tok/s 与预热失败
 - ✨ **Auth 页写 models.yml** — API Key 落在 `providers.<name>.apiKey`，保留注释与手工字段
 - ✨ **导出/导入不含凭据** — 导出包不带 `apiKey`，导入保留本机已有 Key
 - 🐛 **models.yml 损坏时拒绝保存** — 提示先到源文件页修复，不再写出半份配置

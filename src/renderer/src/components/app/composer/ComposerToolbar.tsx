@@ -14,6 +14,48 @@ export const SessionStatus = memo(function SessionStatus(props: {
 	if (!state) return null;
 	// 会话头部状态用轻量 Badge，与左右分栏/新会话按钮同一套素雅边框语言，
 	// 避免各 chip 自定义高度/圆角造成头部控件参差。
+	const usageLimit = state.usageLimit;
+	const usageText =
+		usageLimit?.stage === "low_priority"
+			? [
+					t("app.usageLimitLowPriority"),
+					usageLimit.allowanceLeftPercent != null
+						? t("app.usageLimitAllowance", {
+								percent: Math.round(usageLimit.allowanceLeftPercent),
+							})
+						: null,
+				]
+					.filter(Boolean)
+					.join(" · ")
+			: usageLimit?.stage === "wrap_up"
+				? [
+						t("app.usageLimitWrapUp"),
+						usageLimit.extraUsage ? t("app.usageLimitExtraUsage") : null,
+					]
+						.filter(Boolean)
+						.join(" · ")
+				: "";
+	const usageTitle = usageLimit
+		? [
+				usageText,
+				usageLimit.resetsAtSec != null
+					? t("app.usageLimitResetAt", {
+							time: new Date(usageLimit.resetsAtSec * 1000).toLocaleTimeString(
+								undefined,
+								{ hour: "2-digit", minute: "2-digit" },
+							),
+						})
+					: null,
+			]
+				.filter(Boolean)
+				.join("\n")
+		: undefined;
+	const cacheWarming = state.cacheWarming;
+	const cacheWarmingFailed =
+		cacheWarming?.outcome === "error" || cacheWarming?.outcome === "aborted";
+	const cacheWarmingTitle = cacheWarming
+		? [cacheWarming.provider, cacheWarming.model].filter(Boolean).join("/")
+		: undefined;
 	return (
 		<div className="session-status">
 			{state.contextPercent != null && (
@@ -30,6 +72,37 @@ export const SessionStatus = memo(function SessionStatus(props: {
 					)}
 				</Badge>
 			)}
+			{state.tokensPerSecond != null && (
+				<Badge variant="outline" badgeSize="sm" className="throughput-chip">
+					{t("app.tokensPerSecond", {
+						value:
+							state.tokensPerSecond < 10
+								? state.tokensPerSecond.toFixed(1)
+								: Math.round(state.tokensPerSecond),
+					})}
+				</Badge>
+			)}
+			{usageLimit && (
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className={`usage-chip${usageLimit.stage === "wrap_up" ? " critical" : ""}`}
+					title={usageTitle}
+				>
+					{usageText}
+				</Badge>
+			)}
+			{cacheWarming?.phase === "warming" ||
+			(cacheWarming?.phase === "done" && cacheWarmingFailed) ? (
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className={`warming-chip${cacheWarmingFailed ? " failed" : ""}`}
+					title={cacheWarmingTitle}
+				>
+					{cacheWarmingFailed ? t("app.cacheWarmingFailed") : t("app.cacheWarming")}
+				</Badge>
+			) : null}
 			{(state.cacheHitPercent != null || state.cacheTotal != null) && (
 				<Badge variant="outline" badgeSize="sm" className="cache-chip">
 					{state.cacheHitPercent != null && (

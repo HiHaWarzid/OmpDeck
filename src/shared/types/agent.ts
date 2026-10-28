@@ -113,6 +113,67 @@ export type AgentRuntimeState = {
 	 * 渲染层必须以它作为队列唯一事实来源；本地只保留投递结果未知的提示。
 	 */
 	queuedMessages?: AgentQueuedMessages;
+	/** `get_state.todoPhases`：会话 todo 的权威快照（不只是 todo 工具的最后一次结果）。 */
+	todoPhases?: AgentTodoPhase[];
+	/** `get_state.tokensPerSecond`：omp 侧统计的当前输出速度。 */
+	tokensPerSecond?: number;
+	/** `get_state.autoCompactionEnabled`：会话自动压缩开关。 */
+	autoCompactionEnabled?: boolean;
+	/** `get_state.usageLimit`：限流/额度收口阶段（低优先级或 wrap-up）。 */
+	usageLimit?: AgentUsageLimitState;
+	/**
+	 * cache warming 状态。omp 的 get_state 不暴露该字段，只能由
+	 * cache_warming_start/end 事件维护；hit/miss 不展示，只有 warming/失败展示。
+	 */
+	cacheWarming?: AgentCacheWarmingState;
+};
+
+/** omp todo 单项的五态（set_todos/get_state 使用的原生状态集）。 */
+export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+
+export type AgentTodoItem = {
+	content: string;
+	status: AgentTodoStatus;
+	/** blocked 任务等待的对象。 */
+	blocker?: string;
+	details?: string;
+	notes?: string[];
+};
+
+export type AgentTodoPhase = {
+	name: string;
+	tasks: AgentTodoItem[];
+};
+
+/**
+ * omp `get_state.usageLimit` 的投影。
+ * low_priority 会带 low-priority 额度余量；wrap_up 会带是否已启用付费附加额度。
+ */
+export type AgentUsageLimitState =
+	| {
+			stage: "low_priority";
+			/** 限制重置的 epoch 秒（omp 上报时才有）。 */
+			resetsAtSec?: number;
+			/** 低优先级额度剩余百分比（omp 上报时才有）。 */
+			allowanceLeftPercent?: number;
+	  }
+	| {
+			stage: "wrap_up";
+			/** 若上报，为限制重置的 epoch 秒。 */
+			resetsAtSec?: number;
+			/** 额度耗尽后是否由付费附加额度继续服务。 */
+			extraUsage: boolean;
+	  };
+
+/** omp `cache_warming_start/end` 事件投影。 */
+export type AgentCacheWarmingState = {
+	/** warming = 后台预热进行中；done = 本轮结束（结果见 outcome）。 */
+	phase: "warming" | "done";
+	outcome?: "hit" | "miss" | "error" | "aborted";
+	provider?: string;
+	model?: string;
+	/** 事件到达时刻（毫秒），用于诊断与避免把旧结果当当前状态。 */
+	updatedAt: number;
 };
 
 /** omp `get_state.queuedMessages` / `queue_update` 的投影。 */

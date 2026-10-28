@@ -486,6 +486,8 @@ export const ipcTable = {
 		availableThinkingLevels: { channel: "agents:available-thinking-levels", kind: "invoke", web: true },
 		setFastMode: { channel: "agents:set-fast-mode", kind: "invoke", web: true },
 		setSlowMode: { channel: "agents:set-slow-mode", kind: "invoke", web: true },
+		setAutoCompaction: { channel: "agents:set-auto-compaction", kind: "invoke", web: true },
+		setTodos: { channel: "agents:set-todos", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
 		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
 		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-manager" },
