@@ -451,6 +451,63 @@ export class AgentManager {
 	}
 
 	/**
+	 * 向前读取一页更早的会话历史，供活动会话突破 30 轮尾窗限制。
+	 * 只读会话文件并按 cursor 反向翻页；消息带 `meta.historyPage`，渲染层据此
+	 * 把这些只读旧页与可编辑的尾窗消息区分开（编辑/删除仍按 entryId 定位）。
+	 */
+	async readHistoryPage(
+		agentId: string,
+		beforeOffset?: number,
+	): Promise<{ messages: ChatMessage[]; cursor: number; hasMore: boolean }> {
+		const runtime = this.requireRuntime(agentId);
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) return { messages: [], cursor: 0, hasMore: false };
+		let cursor = typeof beforeOffset === "number" && Number.isFinite(beforeOffset)
+			? Math.max(0, Math.trunc(beforeOffset))
+			: undefined;
+		// 首次加载没有 cursor：优先用文件基线自己记录的窗口起点（精确到字节），
+		// 否则以当前时间线最旧一条消息的 entryId 作为上界。两条路都只返回基线之前
+		// 的内容，否则会先返回一页与基线重叠的最近 30 轮，用户点一次却看不到新消息。
+		if (cursor === undefined) {
+			if (typeof runtime.historyCursor === "number" && runtime.historyCursor >= 0) {
+				cursor = runtime.historyCursor;
+			} else {
+				const oldestEntryId = runtime.transcript.messages
+					.map((message) => message.meta?.entryId)
+					.find((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
+				if (oldestEntryId) {
+					const offset = await this.sessionJsonl.findEntryOffset(sessionPath, oldestEntryId);
+					if (offset === undefined) {
+						return { messages: [], cursor: 0, hasMore: false };
+					}
+					cursor = offset;
+				}
+			}
+		}
+		const page = await this.sessionJsonl.readOlderMessages(
+			sessionPath,
+			cursor,
+			AgentManager.MAX_HISTORY_LOAD_TURNS,
+		);
+		if (page.messages.length === 0) {
+			return { messages: [], cursor: page.cursor, hasMore: page.hasMore };
+		}
+		const messages = convertAgentMessages(agentId, page.messages, page.entryIds, false);
+		for (const message of messages) {
+			message.meta = { ...message.meta, historyPage: true };
+		}
+		void this.appLogger?.info("agent", "Older history page loaded", {
+			agentId,
+			sessionPath,
+			beforeOffset: cursor,
+			cursor: page.cursor,
+			hasMore: page.hasMore,
+			messages: messages.length,
+		});
+		return { messages, cursor: page.cursor, hasMore: page.hasMore };
+	}
+
+	/**
 	 * 不启动 pi 进程，直接从 JSONL 构造与运行态相同的时间线数据。
 	 * 转换规则（活动分支回溯 + 压缩归档参与）在 SessionJsonl.readDisplayMessages；
 	 * 本方法只负责把协议路径交给 sessionJsonl 的宿主路径解析。
@@ -529,7 +586,25 @@ export class AgentManager {
 		]);
 		const t1 = Date.now();
 
-		let rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+		// 文件基线（readRecentMessages）会额外带 entryIds / cursor / hasOlder；
+		// 普通 get_messages 只有 messages。两者都从 response.data 读，create 路径把
+		// readRecentMessages 的 Promise 直接作为 earlyMessagesPromise 传进来，不能只认兜底分支。
+		type HistoryResponseData = {
+			messages?: unknown[];
+			entryIds?: unknown[];
+			cursor?: unknown;
+			hasOlder?: unknown;
+		};
+		const responseData = response.data as HistoryResponseData | undefined;
+		let rawMessages = responseData?.messages ?? [];
+		let baselineEntryIds = Array.isArray(responseData?.entryIds)
+			&& responseData.entryIds.length === rawMessages.length
+			? responseData.entryIds.map((id) => String(id))
+			: undefined;
+		let baselineCursor = typeof responseData?.cursor === "number" && Number.isFinite(responseData.cursor)
+			? Math.max(0, Math.trunc(responseData.cursor))
+			: undefined;
+		let baselineHasOlder = responseData?.hasOlder === true;
 		const failureKind = response.success ? undefined : classifyPiFailure(response);
 
 		// 兜底：get_messages 失败（大会话撞 RPC 传输上限最常见）时任何加载都回退文件直读；
@@ -553,10 +628,20 @@ export class AgentManager {
 						runtime.tab.sessionPath,
 						AgentManager.MAX_HISTORY_LOAD_TURNS,
 					).catch(() => undefined);
-					const fallbackMessages =
-						(fileFallback?.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+					const fallbackData = fileFallback?.data as HistoryResponseData | undefined;
+					const fallbackMessages = fallbackData?.messages ?? [];
 					if (fallbackMessages.length > 0) {
 						rawMessages = fallbackMessages;
+						// entryIds 必须与文件兜底消息一一对应；get_entries 对大会话同样会撞
+						// 传输上限，拿不到它时文件内 id 是唯一稳定的历史定位键。
+						const ids = fallbackData?.entryIds;
+						if (Array.isArray(ids) && ids.length === fallbackMessages.length) {
+							baselineEntryIds = ids.map((id) => String(id));
+						}
+						if (typeof fallbackData?.cursor === "number" && Number.isFinite(fallbackData.cursor)) {
+							baselineCursor = Math.max(0, Math.trunc(fallbackData.cursor));
+						}
+						baselineHasOlder = fallbackData?.hasOlder === true;
 						void this.appLogger?.warn("agent", "get_messages unusable; fell back to session file read", {
 							agentId,
 							sessionPath: runtime.tab.sessionPath,
@@ -582,8 +667,10 @@ export class AgentManager {
 		}
 
 		// 解析 entryId 列表（需要先于 convertAgentMessages，用于把消息关联到 pi 的会话分支）。
-		let activeEntryIds: string[] | undefined;
-		if (entriesResult) {
+		// 文件基线已经返回与消息严格对齐的 id 时优先使用：此时 get_entries 往往也失败了，
+		// 即使返回了空分支，也不能覆盖文件内稳定的 entry id。
+		let activeEntryIds = baselineEntryIds;
+		if (!activeEntryIds && entriesResult) {
 			const entriesData = entriesResult.data as
 				| { entries?: Array<{ id: string; parentId: string | null; type?: string; message?: { role?: string } }>; leafId?: string }
 				| undefined;
@@ -595,6 +682,15 @@ export class AgentManager {
 		// 按对话轮次截断（保留最近若干轮 user 消息）。压缩摘要不是 user 消息，会被此逻辑保留在尾部，
 		// 因此下方会单独把它插到最前面，确保不被按 user 轮次切掉。
 		const trimmed = trimHistoryMessages(rawMessages);
+		// 文件基线把窗口起点留给「加载更早」用；RPC 基线没有该值，回退 entryId 查找。
+		runtime.historyCursor = baselineCursor;
+		// 文件窗口本身已裁剪过，trimmed 与 raw 等长，因此还要看 readRecentMessages 的 hasOlder。
+		// 只有真的有更早历史才让渲染层显示入口，避免每个小会话都出现一个空按钮。
+		const historyHasOlder = baselineHasOlder || trimmed.length < rawMessages.length;
+		if (rawMessages.length > 0 && runtime.tab.historyHasOlder !== historyHasOlder) {
+			runtime.tab.historyHasOlder = historyHasOlder;
+			this.emitState();
+		}
 
 		// 解析会话文件里的压缩记录：拿到所有压缩段摘要 + 归档消息。
 		// pi 的 get_messages 对压缩会话只返回压缩后的消息，通常不带压缩摘要；
@@ -5263,6 +5359,11 @@ type AgentRuntime = {
 	 * 进程重启即清空（registry 属于单个 omp 进程）。
 	 */
 	subagents: Map<string, AgentSubagent>;
+	/**
+	 * 文件尾部窗口第一条消息的绝对字节偏移。大会话基线来自 readRecentMessages 时，
+	 * 「加载更早」直接从这里向前翻，避免再扫尾窗找 entryId；RPC 基线没有该值。
+	 */
+	historyCursor?: number;
 	/** 「IPC 基线截断」告警上次输出的时刻（毫秒）：getMessages 被高频调用，告警据此限频。 */
 	lastTranscriptTruncationWarnAt?: number;
 

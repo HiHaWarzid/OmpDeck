@@ -500,9 +500,18 @@ export interface ConfigApi {
 	}>;
 }
 
+export type AgentHistoryPage = {
+	messages: ChatMessage[];
+	/** 下一页的字节 cursor；0 表示已到文件头 */
+	cursor: number;
+	hasMore: boolean;
+};
+
 export interface AgentsApi {
 	list: () => Promise<AgentTab[]>;
 	getMessages: (agentId: string) => Promise<ChatMessage[]>;
+	/** 向前读取一页更早的会话历史（大会话 30 轮尾窗之外）。 */
+	getHistoryPage: (agentId: string, beforeOffset?: number) => Promise<AgentHistoryPage>;
 	create: (input: CreateAgentInput) => Promise<AgentTab>;
 	rename: (agentId: string, name: string) => Promise<AgentTab>;
 	stop: (agentId: string) => Promise<void>;

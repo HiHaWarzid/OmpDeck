@@ -165,10 +165,13 @@ export class SessionJsonl {
 	): Promise<RpcResponse> {
 		const t0 = Date.now();
 		const hostPath = this.resolve(sessionPath);
-		let lines: string[];
+		let tail: Awaited<ReturnType<typeof readTailEntries>>;
 		try {
 			// 每轮对话至少需要 user + assistant 两行；按 8 行/轮预留工具消息余量
-			lines = await this.readTailLines(hostPath, maxTurns * 8 + 8, TAIL_READ_MAX_BYTES);
+			tail = await readTailEntries(this.io, hostPath, {
+				minLines: maxTurns * 8 + 8,
+				maxBytes: TAIL_READ_MAX_BYTES,
+			});
 		} catch (error) {
 			void this.deps.logger?.warn("agent", "Failed to read session file for recent messages", {
 				sessionPath,
@@ -177,14 +180,16 @@ export class SessionJsonl {
 			throw error;
 		}
 
-		const messageEntries: unknown[] = [];
-
-		for (const line of lines) {
+		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
+		let offset = tail.startOffset;
+		for (const line of tail.raw.split("\n")) {
+			const lineOffset = offset;
+			offset += Buffer.byteLength(line, "utf8") + 1;
 			if (!line.trim()) continue;
 			try {
-				const entry = JSON.parse(line);
-				if (entry.type === "message" && entry.message) {
-					messageEntries.push(entry.message);
+				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
+				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
+					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
 				}
 			} catch {
 				// 跳过单行解析失败，不影响后续行
@@ -192,16 +197,24 @@ export class SessionJsonl {
 		}
 
 		// 只保留最近 maxTurns 轮对话；先裁剪再还原 blob，避免为已丢弃的历史图片读盘
-		const trimmed = trimHistoryMessages(messageEntries, maxTurns);
+		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), maxTurns);
+		const trimStart = trimmed.length > 0
+			? Math.max(0, messageEntries.findIndex((item) => item.message === trimmed[0]))
+			: messageEntries.length;
+		const kept = messageEntries.slice(trimStart);
 		resolveBlobImagesInMessages(trimmed, this.blobsDir());
 		const t1 = Date.now();
+		// 尾部窗口已经读不到文件头（truncated）时，窗口之前仍可能有更早消息；
+		// 不能只用 trimStart 判断，否则工具调用密集、248 行尚未覆盖 30 轮时会误报「没有更早历史」。
+		const hasOlder = trimStart > 0 || (tail.truncated && kept.length > 0);
 
 		void this.deps.logger?.info("agent", "Recent messages read from session file", {
 			sessionPath,
-			windowLines: lines.length,
+			windowLines: tail.raw ? tail.raw.split("\n").length : 0,
 			messageEntries: messageEntries.length,
 			trimmedTurns: maxTurns,
 			trimmedMessages: trimmed.length,
+			hasOlder,
 			readMs: t1 - t0,
 		});
 
@@ -209,7 +222,110 @@ export class SessionJsonl {
 			type: "response" as const,
 			command: "get_messages",
 			success: true,
-			data: { messages: trimmed },
+			// entryIds / cursor 与 messages 一一对应：大会话 get_entries 和分页 RPC 都不可用，
+			// 文件内 id 与首行字节偏移就是编辑定位和「加载更早」的唯一稳定锚点。
+			data: {
+				messages: trimmed,
+				entryIds: kept.map((item) => item.entryId),
+				cursor: kept[0]?.startOffset ?? 0,
+				hasOlder,
+			},
+		};
+	}
+
+	/**
+	 * 从文件尾部向头部扫描，返回指定 entryId 所在行的绝对字节偏移。
+	 * 仅用于历史分页的 `beforeOffset` 起点：当前时间线最旧一条消息的 entryId
+	 * 通常就在尾部几十轮内，找到它即可只加载它之前的消息，避免第一页与基线重叠。
+	 * 文件极大且 entry 不在尾部扫描预算内时返回 undefined（调用方降级）。
+	 */
+	async findEntryOffset(sessionPath: string, entryId: string): Promise<number | undefined> {
+		const hostPath = this.resolve(sessionPath);
+		let endOffset: number | undefined;
+		// 最多向前扫 4 个尾窗（默认最多 64MB）；当前基线最旧消息应在第一页内命中。
+		for (let page = 0; page < 4; page++) {
+			const tail = await readTailEntries(this.io, hostPath, {
+				minLines: 200,
+				maxBytes: TAIL_READ_MAX_BYTES,
+				endOffset,
+			});
+			if (!tail.raw) return undefined;
+			let offset = tail.startOffset;
+			for (const line of tail.raw.split("\n")) {
+				const lineOffset = offset;
+				offset += Buffer.byteLength(line, "utf8") + 1;
+				if (!line.trim()) continue;
+				try {
+					const entry = JSON.parse(line) as { id?: unknown };
+					if (entry.id === entryId) return lineOffset;
+				} catch {
+					// 损坏行跳过，继续扫描
+				}
+			}
+			if (tail.startOffset <= 0) return undefined;
+			endOffset = tail.startOffset;
+		}
+		return undefined;
+	}
+
+	/**
+	 * 从 `beforeOffset` 向前读取一页历史消息（返回更早的 maxTurns 轮）。
+	 *
+	 * 为什么按字节偏移翻页而不是复用 readTailEntries 每次都读尾部：40MB 会话要看到
+	 * 最早消息，只能一页页向文件头部推进；cursor 取「本页保留的第一行起始偏移」，
+	 * 下一页以它为 endOffset，保证连续、无重叠、无 gap。
+	 *
+	 * 页内消息先裁剪到最近 maxTurns 轮，避免一次返回过多；`hasMore` 只表示文件头方向
+	 * 是否还有内容，渲染层据此停止显示「加载更早」。
+	 */
+	async readOlderMessages(
+		sessionPath: string,
+		beforeOffset: number | undefined,
+		maxTurns: number,
+	): Promise<{ messages: unknown[]; entryIds: string[]; cursor: number; hasMore: boolean }> {
+		const hostPath = this.resolve(sessionPath);
+		const turns = Math.min(Math.max(1, Math.trunc(maxTurns) || 1), 200);
+		const tail = await readTailEntries(this.io, hostPath, {
+			// 每轮至少 user + assistant 两行；按 8 行/轮预留工具消息余量
+			minLines: turns * 8 + 8,
+			maxBytes: TAIL_READ_MAX_BYTES,
+			endOffset: beforeOffset,
+		});
+		if (!tail.raw) return { messages: [], entryIds: [], cursor: 0, hasMore: false };
+
+		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
+		let offset = tail.startOffset;
+		for (const line of tail.raw.split("\n")) {
+			const lineOffset = offset;
+			// +1 为换行符；最后一行即使没有换行，也不会被当作下一页 cursor 的起点。
+			offset += Buffer.byteLength(line, "utf8") + 1;
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
+				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
+					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
+				}
+			} catch {
+				// 损坏行跳过；cursor 仍按字节推进，避免分页卡死
+			}
+		}
+
+		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), turns);
+		const trimStart = trimmed.length > 0
+			? Math.max(0, messageEntries.findIndex((item) => item.message === trimmed[0]))
+			: messageEntries.length;
+		const kept = messageEntries.slice(trimStart);
+		const messagesOut = kept.map((item) => item.message);
+		resolveBlobImagesInMessages(messagesOut, this.blobsDir());
+
+		// 没有消息条目时继续以上的窗口起点为 cursor；有消息则从本页第一条开始，
+		// 这样下一次读取严格只包含更早的行。
+		const cursor = kept.length > 0 ? kept[0].startOffset : tail.startOffset;
+		return {
+			messages: messagesOut,
+			entryIds: kept.map((item) => item.entryId),
+			cursor,
+			hasMore: cursor > 0,
 		};
 	}
 

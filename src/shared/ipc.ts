@@ -427,6 +427,7 @@ export const ipcTable = {
 	agents: {
 		list: { channel: "agents:list", kind: "invoke", web: true },
 		getMessages: { channel: "agents:get-messages", kind: "invoke" },
+		getHistoryPage: { channel: "agents:get-history-page", kind: "invoke" },
 		create: { channel: "agents:create", kind: "invoke", web: true },
 		rename: { channel: "agents:rename", kind: "invoke" },
 		stop: { channel: "agents:stop", kind: "invoke", web: true },

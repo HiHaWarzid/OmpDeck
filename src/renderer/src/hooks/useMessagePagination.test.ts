@@ -56,6 +56,28 @@ describe("nextWindowAfterCountChange", () => {
 		expect(next).toBe(prev);
 	});
 
+	it("历史分页头部插入时保留阅读位置并从顶部纳入新页", () => {
+		const atTop = nextWindowAfterCountChange({
+			...base,
+			prev: { start: 0, size: 50 },
+			prevLen: 50,
+			len: 90,
+			followTail: false,
+			prependCount: 40,
+		});
+		expect(atTop).toEqual({ start: 0, size: 90 });
+
+		const midHistory = nextWindowAfterCountChange({
+			...base,
+			prev: { start: 100, size: 50 },
+			prevLen: 300,
+			len: 340,
+			followTail: false,
+			prependCount: 40,
+		});
+		expect(midHistory).toEqual({ start: 140, size: 90 });
+	});
+
 	it("到上限后自动从顶部上收，窗口条数恒定", () => {
 		let win = { start: 0, size: 200 };
 		for (let len = 200; len < 260; len++) {

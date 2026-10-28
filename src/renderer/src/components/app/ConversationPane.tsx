@@ -69,6 +69,11 @@ export type ConversationPaneProps = {
 	hasProject: boolean;
 	terminalRowHeight: number;
 	composerOffsetHeight: number;
+	/** 从会话文件向前加载的旧页（App 持有，跨滚动/流式稳定）。 */
+	olderHistoryMessages?: ChatMessage[];
+	hasOlderHistory?: boolean;
+	loadingOlderHistory?: boolean;
+	onLoadOlderHistory?: () => void | Promise<void>;
 
 	onCreateAgent: () => void;
 	onPreviewImage: (image: ImageContent) => void;
@@ -101,6 +106,10 @@ function ConversationPaneImpl(
 		hasProject,
 		terminalRowHeight,
 		composerOffsetHeight,
+		olderHistoryMessages,
+		hasOlderHistory = false,
+		loadingOlderHistory = false,
+		onLoadOlderHistory,
 		onCreateAgent,
 		onPreviewImage,
 		onOpenFile,
@@ -114,7 +123,15 @@ function ConversationPaneImpl(
 
 	// 当前会话消息：订阅留在本组件，根不再跟进 50ms 流式增量。
 	const transcript = useWorkspaceSlice(activeAgentId, "transcript");
-	const activeMessages = transcript?.messages ?? EMPTY_MESSAGES;
+	const transcriptMessages = transcript?.messages ?? EMPTY_MESSAGES;
+	// 旧页来自 App（不在 transcript 分片里）。首屏旧页可能与基线最后 30 轮重叠，
+	// 这里按稳定消息 id 去重后再拼到最前面，避免重复渲染同一条消息。
+	const activeMessages = useMemo(() => {
+		if (!olderHistoryMessages?.length) return transcriptMessages;
+		const known = new Set(transcriptMessages.map((message) => message.id));
+		const older = olderHistoryMessages.filter((message) => !known.has(message.id));
+		return older.length > 0 ? [...older, ...transcriptMessages] : transcriptMessages;
+	}, [olderHistoryMessages, transcriptMessages]);
 
 	const [multiSelectOpen, setMultiSelectOpen] = useState(false);
 	const [autoScroll, setAutoScroll] = useState(true);
@@ -262,6 +279,13 @@ function ConversationPaneImpl(
 		loadMoreMessages();
 	}
 
+	/** 旧页来自磁盘：同样先记录锚点，等分页窗口把新页拼进顶部后恢复滚动位置。 */
+	async function handleLoadOlderHistory() {
+		if (!onLoadOlderHistory || loadingOlderHistory) return;
+		loadMoreAnchorRef.current = captureTimelineAnchor();
+		await onLoadOlderHistory();
+	}
+
 	// 会话定位跳转：若目标消息已在当前分页内则直接滚动定位；
 	// 否则先扩展分页窗口把它包含进来，交给 pendingJumpId effect 在渲染后定位。
 	const jumpToMessage = useCallback(
@@ -405,7 +429,7 @@ function ConversationPaneImpl(
 		if (!target) return;
 		const delta = target.getBoundingClientRect().top - anchor.top;
 		if (delta !== 0) el.scrollTop += delta;
-	}, [paginatedMessages]);
+	}, [paginatedMessages, olderHistoryMessages]);
 
 	// 会话定位跳转到尚未加载的消息时，先通过 loadMessagesUntilIncluded 扩展分页窗口；
 	// 该消息被渲染进 DOM 后，在此 effect 中真正滚动定位并短暂高亮，提示用户落点。
@@ -499,16 +523,20 @@ function ConversationPaneImpl(
 	return (
 		<>
 			<section className="message-timeline" ref={timelineRef}>
-				{/* 加载更多历史消息按钮：计数取"窗口上方未渲染的条数"，滑窗后仍准确。 */}
-				{hasMoreMessages && activeAgent && activeAgent.status !== "starting" && (
+				{/* 加载更多历史消息按钮：计数取"窗口上方未渲染的条数"，滑窗后仍准确。
+				    窗口已到数组顶部但仍可能被 30 轮尾窗截断，此时继续从会话文件向前翻页。 */}
+				{(hasMoreMessages || (hasOlderHistory && onLoadOlderHistory))
+					&& activeAgent && activeAgent.status !== "starting" && (
 					<div className="timeline-load-more">
 						<Button
 							buttonSize="sm"
 							variant="secondary"
-							onClick={handleLoadMoreMessages}
-							loading={isLoadingMoreMessages}
+							onClick={hasMoreMessages ? handleLoadMoreMessages : () => void handleLoadOlderHistory()}
+							loading={hasMoreMessages ? isLoadingMoreMessages : loadingOlderHistory}
 						>
-							{t("app.loadMoreHistory", { count: messagesAboveWindow })}
+							{hasMoreMessages
+								? t("app.loadMoreHistory", { count: messagesAboveWindow })
+								: t("app.loadOlderHistory")}
 						</Button>
 					</div>
 				)}
@@ -622,7 +650,11 @@ export const ConversationPane = memo(
 		previous.validFilePaths === next.validFilePaths &&
 		previous.hasProject === next.hasProject &&
 		previous.terminalRowHeight === next.terminalRowHeight &&
-		previous.composerOffsetHeight === next.composerOffsetHeight,
+		previous.composerOffsetHeight === next.composerOffsetHeight &&
+		previous.olderHistoryMessages === next.olderHistoryMessages &&
+		previous.hasOlderHistory === next.hasOlderHistory &&
+		previous.loadingOlderHistory === next.loadingOlderHistory &&
+		previous.onLoadOlderHistory === next.onLoadOlderHistory,
 );
 
 /** 会话大纲宿主：自己订阅 transcript，避免 App 根因消息增量重渲染。 */

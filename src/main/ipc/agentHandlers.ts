@@ -31,7 +31,7 @@ interface AgentHandlerDeps {
 
 type AgentHandlerMaps = {
 	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>,
-		| "list" | "getMessages" | "create" | "rename" | "stop" | "prompt" | "abort"
+		| "list" | "getMessages" | "getHistoryPage" | "create" | "rename" | "stop" | "prompt" | "abort"
 		| "abortAndRestoreQueue" | "removeQueuedMessage" | "promoteQueuedMessage"
 		| "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
@@ -63,6 +63,18 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			list: async () => agentManager.list(),
 			getMessages: async (_event, agentId: string) =>
 				agentManager.getMessages(agentId),
+			getHistoryPage: async (_event, agentId: string, beforeOffset?: number) => {
+				if (typeof agentId !== "string" || !agentId) {
+					throw new Error("getHistoryPage: agentId is required");
+				}
+				if (
+					beforeOffset !== undefined
+					&& (typeof beforeOffset !== "number" || !Number.isFinite(beforeOffset) || beforeOffset < 0)
+				) {
+					throw new Error("getHistoryPage: beforeOffset must be a non-negative finite number");
+				}
+				return agentManager.readHistoryPage(agentId, beforeOffset);
+			},
 			create: async (_event, input: CreateAgentInput) => {
 				void appLogger.info("agent", "Agent create IPC received", {
 					projectId: input.projectId,

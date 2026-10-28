@@ -327,6 +327,21 @@ test("尾窗读只读窗口字节，不整文件读", async () => {
   assert.equal(whole.bytesRead(), size);
 });
 
+test("尾窗覆盖文件头且文件无结尾换行时保留第一行", async () => {
+  const home = await createHome();
+  const raw = [
+    JSON.stringify({ id: "m0", type: "message", message: { role: "user", content: [{ type: "text", text: "first" }] } }),
+    JSON.stringify({ id: "m1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "last" }] } }),
+  ].join("\n");
+  const filePath = await writeSessionFile(home, "no-trailing-newline.jsonl", raw);
+
+  // start === 0 时窗口已经覆盖文件头，第一行不是跨窗口残行，不能被丢弃；
+  // 否则整文件读取路径会静默漏掉首条消息。
+  const tail = await readTailEntries(createCountingIo().io, filePath, { minLines: 100, maxBytes: 1024 * 1024 });
+  assert.deepEqual(tail.entries.map((entry) => (entry as { id?: string }).id), ["m0", "m1"]);
+  assert.equal(tail.startOffset, 0);
+});
+
 // ── 摘要事实提取与 worker 路径 ─────────────────────────
 
 test("摘要事实提取保留标题优先级、来源标记与损坏行计数", () => {

@@ -13,6 +13,12 @@ export type AgentTab = {
 	createdAt: number;
 	/** 会话累计压缩次数，由主进程解析会话文件得到，用于前端展示"已压缩 N 次"。 */
 	compactionCount?: number;
+	/**
+	 * 当前消息基线是否只是会话文件的尾部窗口（还有更早历史未下发）。
+	 * 渲染层据此决定是否显示「加载更早的会话历史」；不能用 sessionPath 代替，
+	 * 否则每个有文件的小会话都会出现一个点了才知道是空的按钮。
+	 */
+	historyHasOlder?: boolean;
 	/** 瞬时会话（--no-session），不保存记录，关闭即丢失 */
 	noSession?: boolean;
 	/** 最近一次失败原因（error 状态填充，AFK 详情与列表展示用；见 ADR-0005） */

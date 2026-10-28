@@ -460,6 +460,7 @@ const previewOverrides: NamespaceOverrides = {
 	agents: {
 		list: async () => getAgents(),
 		getMessages: async () => getMessages(),
+		getHistoryPage: async () => ({ messages: [], cursor: 0, hasMore: false }),
 		create: async () => getAgents()[0],
 		rename: async (agentId, name) => {
 			const agent =
