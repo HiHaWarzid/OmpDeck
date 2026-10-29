@@ -319,8 +319,10 @@ const api =
     : isLanWeb
       ? createBrowserApi()
       : createPreviewApi());
-// 输入框默认高度增加,提供更好的输入体验,适合多行输入和代码片段
-const COMPOSER_MIN_HEIGHT = 175;
+// 输入框高度：151px = 4 行正文（--line-height-input 22px）+ 输入框上下 padding 20px
+// + 底部工具条 41px + 边框 2px，刚好放下四行；输入框本身固定高度（不再随内容长高，
+// 超出滚动），用户可向上拖动放大。CSS .composer-box 的 min-height 112px 是最后兜底。
+const COMPOSER_MIN_HEIGHT = 151;
 const COMPOSER_DEFAULT_TERMINAL_HEIGHT = 220;
 const COMPOSER_MIN_TIMELINE_HEIGHT = 160;
 // composer dock 常驻的 chip 行：26px chip + 8px 与展开块的间距（见 styles.css .composer-dock）。
