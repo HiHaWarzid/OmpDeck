@@ -31,6 +31,8 @@ import {
   Wrench,
   FileText,
   ListChecks,
+  ListTodo,
+  SendHorizontal,
   Paperclip,
   Minus,
   FolderCog,
@@ -113,7 +115,6 @@ import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
   buildQueueRows,
-  QUEUED_PROMPT_VISIBLE,
   type QueuePanelRow,
   type UncertainPrompt,
 } from "./utils/queueChips";
@@ -163,10 +164,14 @@ import {
   ThinkingPicker,
 } from "./components/app/composer/ComposerPickers";
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
-import { NativeTodoPanel } from "./components/app/composer/NativeTodoPanel";
+import { ComposerDock, DockSection } from "./components/app/composer/ComposerDock";
+import {
+	NativeTodoPanel,
+	summarizeTodoPhases,
+} from "./components/app/composer/NativeTodoPanel";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
 import { BatchAskInlineBar, NativeAskInlineBar } from "./components/app/tools/AskQuestionCard";
-import { SubagentBar } from "./components/app/subagents/SubagentBar";
+import { SubagentDockSection } from "./components/app/subagents/SubagentDockSection";
 import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
 import {
   MERGED_TASK_WIDGET_KEY,
@@ -318,6 +323,12 @@ const api =
 const COMPOSER_MIN_HEIGHT = 175;
 const COMPOSER_DEFAULT_TERMINAL_HEIGHT = 220;
 const COMPOSER_MIN_TIMELINE_HEIGHT = 160;
+// composer dock 常驻的 chip 行：26px chip + 8px 与展开块的间距（见 styles.css .composer-dock）。
+// dock 展开块的高度预算必须扣掉它，否则展开到上限时总高仍会超出。
+const COMPOSER_DOCK_CHIP_ROW_HEIGHT = 34;
+// dock 展开块的可用性下限；与 chip 行一起构成终端高度预算里给 dock 预留的空间。
+const COMPOSER_DOCK_MIN_BODY_HEIGHT = 120;
+const COMPOSER_DOCK_MIN_HEIGHT = COMPOSER_DOCK_CHIP_ROW_HEIGHT + COMPOSER_DOCK_MIN_BODY_HEIGHT;
 const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
@@ -1562,8 +1573,10 @@ export function App() {
   /** composer 外壳高度（footer.offsetHeight - 编辑区.offsetHeight），rAF 中更新；
    *  渲染路径用它计算 maxHeight，避免每次渲染同步读 DOM 触发强制布局。 */
   const [composerChrome, setComposerChrome] = useState(0);
+  /** composer dock 的实际高度；从 chrome 里扣掉后得到“其它面板”占用的空间。 */
+  const [dockHeight, setDockHeight] = useState(0);
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLElement | null>(null);
-  const queuedTrackRef = useRef<HTMLDivElement | null>(null);
   const composerBoxRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
   // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
@@ -1810,7 +1823,15 @@ export function App() {
     ? drawerPinnedByProject[activeProjectId]
     : undefined;
   const drawerPinned = Boolean(drawerPinnedPanel);
+  // dock chip 的 TODO 进度；任务列表本体仍由 NativeTodoPanel 渲染，计数与“上一轮”判定
+  // 走同一个 helper，避免 chip 标签和列表里的来源提示各算一套。
   const activeRuntimeState = agentRuntimeState;
+  const todoPhases = activeRuntimeState?.todoPhases ?? [];
+  const {
+    total: todoTotal,
+    done: todoDone,
+    settled: todoSettled,
+  } = summarizeTodoPhases(todoPhases);
   // 活跃项目是否还有忙碌 agent：来自跨条目运行态订阅（subscribeSliceChange），
   // 只在布尔翻转时 setState——运行态热路径（工具循环 ≤150ms）不再唤醒根渲染。
   const [activeProjectHasBusyAgent, setActiveProjectHasBusyAgent] = useState(false);
@@ -1867,22 +1888,21 @@ export function App() {
         ? 34
         : activeTerminalHeight;
   const chatPaneHeight = chatLayoutHeight;
+  // dock 常驻 chip 行 + 展开块下限：终端拖到最高时也要给 dock 留出这块空间，
+  // 否则展开块的下限会把时间线挤没。用常量而不是实测 dockHeight——实测值会随
+  // 终端变矮而变大，形成“dock 越长终端越矮”的正反馈。
+  const dockFloorHeight = activeAgentId ? COMPOSER_DOCK_MIN_HEIGHT : 0;
   const fixedChatHeight =
     chatHeaderHeight +
     COMPOSER_MIN_TIMELINE_HEIGHT +
     COMPOSER_MIN_HEIGHT +
-    28;
-  // Queue chrome includes the track gap, panel padding/header/border, and complete rows.
-  // Keep this in sync with .queued-list so the third row is never clipped by the composer.
-  const queuedChromeBudget =
-    activeQueueRows.length > 0
-      ? 38 + Math.min(activeQueueRows.length, QUEUED_PROMPT_VISIBLE) * 34
-      : 0;
+    28 +
+    dockFloorHeight;
   const terminalRowHeight = terminalCollapsed
     ? requestedTerminalRowHeight
     : Math.min(
         requestedTerminalRowHeight,
-        Math.max(0, chatPaneHeight - fixedChatHeight - queuedChromeBudget),
+        Math.max(0, chatPaneHeight - fixedChatHeight),
       );
   // 渲染路径的输入框最大高度：全部由 state 派生（chatLayoutHeight/chatHeaderHeight/
   // composerChrome 由 ResizeObserver + rAF 更新），避免每次 App 重渲染（流式 ~20Hz）
@@ -1898,6 +1918,25 @@ export function App() {
   const resolvedComposerHeight = Math.min(
     composerMaxHeight,
     Math.max(composerHeight, composerAutoHeight),
+  );
+  // dock 展开块的高度上限：先扣掉时间线与输入框的最小高度，再扣掉其它 chrome
+  // （扩展 widget / 图片预览等 = composerChrome - dockHeight）和常驻的 chip 行，
+  // 否则展开到上限时总高仍会超出预算、把时间线吃掉。下限由终端预算里的
+  // COMPOSER_DOCK_MIN_HEIGHT 兜住，终端拖到最高时也不会把时间线挤没。
+  // 变量在渲染路径算，避免在 ResizeObserver 里读闭包中的终端高度（会过期）。
+  const dockMaxHeight = Math.min(
+    260,
+    Math.max(
+      COMPOSER_DOCK_MIN_BODY_HEIGHT,
+      chatPaneHeight -
+        chatHeaderHeight -
+        COMPOSER_MIN_TIMELINE_HEIGHT -
+        COMPOSER_MIN_HEIGHT -
+        terminalRowHeight -
+        28 -
+        COMPOSER_DOCK_CHIP_ROW_HEIGHT -
+        Math.max(0, composerChrome - dockHeight),
+    ),
   );
   // composerMode 基于 composerBangMode（state）而非 prompt（ref），避免每键触发重渲染。
   // composerBangMode 仅在 ! / !! 前缀真正变化时更新。
@@ -2833,7 +2872,7 @@ export function App() {
     ensureComposerTailVisible();
   }
 
-  // 待发送轨道高度变化会改变 composer 的 chrome 高度；队列增删后重新 clamp，
+  // 待发送队列在 dock 里，队列增删会改变 chip 行/展开块的高度；重新 clamp 输入框，
   // 保证大量卡片出现时输入框仍留在可视区域，撤回后也不会保留过高尺寸。
   useLayoutEffect(() => {
     const maxHeight = getComposerMaxHeight();
@@ -2865,6 +2904,12 @@ export function App() {
           const next = Math.max(0, footerEl.offsetHeight - boxEl.offsetHeight);
           setComposerChrome((current) => (current === next ? current : next));
         }
+        // dock 高度单独测量：展开块的高度上限要扣掉“其它 chrome”（扩展 widget 等），
+        // 否则 dock + 其它面板会一起把时间线挤到 0。dock 不存在时归零，
+        // 避免切换/关闭 Agent 后残留旧值把“其它 chrome”算少。
+        const dockEl = dockRef.current;
+        const nextDockHeight = dockEl?.offsetHeight ?? 0;
+        setDockHeight((current) => (current === nextDockHeight ? current : nextDockHeight));
       });
     };
 
@@ -2883,6 +2928,8 @@ export function App() {
     if (footer) observer?.observe(footer);
     if (chatPane) observer?.observe(chatPane);
     if (header) observer?.observe(header);
+    const dockEl = dockRef.current;
+    if (dockEl) observer?.observe(dockEl);
 
     window.addEventListener("resize", scheduleSync);
     scheduleSync();
@@ -6747,62 +6794,51 @@ export function App() {
             );
           })()}
           {/* omp 会话 todo 的权威快照（get_state.todoPhases）；与扩展 widget 独立，
-              避免用户扩展产出的 TODO 卡片和模型真实 todo 被混成一份。 */}
-          {activeAgentId &&
-            activeRuntimeState?.todoPhases?.some((phase) => phase.tasks.length > 0) && (
-              <NativeTodoPanel
-                phases={activeRuntimeState.todoPhases}
-                busy={todoBusy}
-                disabled={
-                  isAgentBusy ||
-                  agentStarting ||
-                  Boolean(activeRuntimeState.isCompacting)
-                }
-                onSetTodos={(phases) => void updateTodos(phases)}
-              />
-            )}
-          {/* 图片预览作为输入框上方的附件栏,避免占用 textarea 的可输入区域。 */}
-          {attachedImages.length > 0 && (
-            <div className="image-preview-area">
-              {attachedImages.map((img, index) => (
-                <div key={index} className="image-preview-item">
-                  <img
-                    src={`data:${img.mimeType};base64,${img.data}`}
-                    alt={t("app.imageAlt", { index: index + 1 })}
-                    onClick={() => setPreviewImage(img)}
-                    style={{ cursor: "pointer" }}
-                  />
-                  <button
-                    className="image-remove-btn"
-                    onClick={() => removeImage(index)}
-                    title={t("app.imageRemove")}
-                  >
-                    <X size={12} strokeWidth={2.4} />
-                  </button>
-                </div>
-              ))}
-              <button
-                className="image-clear-btn"
-                onClick={clearImages}
-                title={t("app.clearImagesTitle")}
-              >
-                {t("app.clearImages")}
-              </button>
-            </div>
-          )}
-          {activeQueueRows.length > 0 && activeAgentId && (
-            <div
-              ref={queuedTrackRef}
-              className="queued-track"
-              aria-label={t("app.queuedMessagesLabel")}
+              避免用户扩展产出的 TODO 卡片和模型真实 todo 被混成一份。
+              dock：TODO / 子代理 / 待发送共享一行 chip，手风琴展开一块——三块各自撑高
+              最坏叠加 ~700px 会把时间线压没，统一收口后时间线始终保有最小高度。 */}
+          {activeAgentId && (
+            <ComposerDock
+              maxBodyHeight={dockMaxHeight}
+              containerRef={dockRef}
             >
-              <div className="queued-panel">
-                <div className="queued-panel-header">
-                  <span>{t("app.queuedMessagesLabel")}</span>
-                  <span className="queued-panel-count">
-                    {activeQueueRows.length}
-                  </span>
-                </div>
+              <DockSection
+                id="todo"
+                icon={<ListTodo size={13} strokeWidth={1.8} />}
+                label={t("app.widgetTodo")}
+                meta={
+                  todoTotal > 0
+                    ? todoSettled
+                      ? `${t("app.todoChipLastRound")} ${todoDone}/${todoTotal}`
+                      : `${todoDone}/${todoTotal}`
+                    : undefined
+                }
+                hidden={todoTotal === 0}
+              >
+                <NativeTodoPanel
+                  phases={todoPhases}
+                  busy={todoBusy}
+                  disabled={
+                    isAgentBusy ||
+                    agentStarting ||
+                    Boolean(activeRuntimeState?.isCompacting)
+                  }
+                  onSetTodos={(phases) => void updateTodos(phases)}
+                />
+              </DockSection>
+              <SubagentDockSection
+                key={activeAgentId}
+                agentId={activeAgentId}
+                agents={api.agents}
+              />
+              <DockSection
+                id="queue"
+                icon={<SendHorizontal size={13} strokeWidth={1.8} />}
+                label={t("app.queuedMessagesLabel")}
+                meta={String(activeQueueRows.length)}
+                tone={activeQueueRows.some((row) => row.kind === "uncertain") ? "danger" : "neutral"}
+                hidden={activeQueueRows.length === 0}
+              >
                 <div className="queued-list">
                   {activeQueueRows.map((row, index) => {
                     if (row.kind === "uncertain") {
@@ -6897,7 +6933,36 @@ export function App() {
                     );
                   })}
                 </div>
-              </div>
+              </DockSection>
+            </ComposerDock>
+          )}
+          {/* 图片预览作为输入框上方的附件栏,避免占用 textarea 的可输入区域。 */}
+          {attachedImages.length > 0 && (
+            <div className="image-preview-area">
+              {attachedImages.map((img, index) => (
+                <div key={index} className="image-preview-item">
+                  <img
+                    src={`data:${img.mimeType};base64,${img.data}`}
+                    alt={t("app.imageAlt", { index: index + 1 })}
+                    onClick={() => setPreviewImage(img)}
+                    style={{ cursor: "pointer" }}
+                  />
+                  <button
+                    className="image-remove-btn"
+                    onClick={() => removeImage(index)}
+                    title={t("app.imageRemove")}
+                  >
+                    <X size={12} strokeWidth={2.4} />
+                  </button>
+                </div>
+              ))}
+              <button
+                className="image-clear-btn"
+                onClick={clearImages}
+                title={t("app.clearImagesTitle")}
+              >
+                {t("app.clearImages")}
+              </button>
             </div>
           )}
           {/* omp 原生 ask：结构化问题 + answers 数组，工作区常驻内联条 */}
@@ -7267,12 +7332,6 @@ export function App() {
             </div>
             );
           })()}
-
-          {/* 子代理实时面板贴近输入框：待发送队列在其上方，子代理状态在发送前最后一层。
-              key 绑定 agent：切 Agent 即重挂载，隐藏列表/草稿/弹框状态一并归零。 */}
-          {activeAgentId && (
-            <SubagentBar key={activeAgentId} agentId={activeAgentId} agents={api.agents} />
-          )}
 
           <div
             ref={composerBoxRef}
@@ -7661,8 +7720,7 @@ export function App() {
                   chatHeaderHeight -
                   COMPOSER_MIN_TIMELINE_HEIGHT -
                   COMPOSER_MIN_HEIGHT -
-                  28 -
-                  queuedChromeBudget,
+                  28,
               );
               updateTerminalHeight(Math.min(height, maxHeight));
             }}

@@ -2906,12 +2906,12 @@ body.is-terminal-resizing {
 .chat-pane[style*="--content-max-width"] .composer-box,
 .chat-pane[style*="--content-max-width"] .image-preview-area,
 .chat-pane[style*="--content-max-width"] .extension-widgets-container,
-.chat-pane[style*="--content-max-width"] .queued-track {
+.chat-pane[style*="--content-max-width"] .composer-dock {
   width: min(100%, var(--content-max-width));
   max-width: var(--content-max-width);
   margin-inline: auto;
 }
-/* queued-track 与 composer 同宽容器；内部 .queued-panel 再缩成右上角小面板 */
+/* composer-dock 与 composer 同宽，chips 左对齐、展开块整行铺满 */
 .chat-header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -5672,54 +5672,13 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   color: var(--color-info);
 }
 
-/* ── 待发送：输入框上方右侧紧凑面板（内部行同宽，整体不拉满对话框） ── */
-.queued-track {
-  width: 100%;
-  display: flex;
-  justify-content: flex-end;
-  padding: 0 0 8px;
-  min-width: 0;
-}
-.queued-panel {
-  /* 随 content/composer 宽度比例变化，并夹在好看的固定区间 */
-  width: clamp(13.5rem, 36%, 22.5rem);
-  max-width: 100%;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 7px 8px 8px;
-  border: 1px solid color-mix(in srgb, var(--color-border-subtle) 82%, transparent);
-  border-radius: calc(var(--radius-md) + 1px);
-  background: color-mix(in srgb, var(--color-bg-panel) 95%, var(--color-chat-card-bg));
-  box-shadow:
-    var(--shadow-border),
-    0 6px 18px color-mix(in srgb, #000 5%, transparent);
-}
-.queued-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  padding: 0 3px 3px;
-  color: var(--color-text-tertiary);
-  font-family: var(--font-family-business);
-  font-size: var(--font-size-micro);
-  font-weight: 600;
-  line-height: var(--line-height-micro);
-  letter-spacing: 0.02em;
-}
-.queued-panel-count {
-  font-variant-numeric: tabular-nums;
-  color: var(--color-text-secondary);
-}
+/* ── 待发送：composer dock 内的一块，行数与高度由 dock body 统一约束 ── */
 .queued-list {
   display: flex;
   flex-direction: column;
   gap: 3px;
   min-width: 0;
-  /* 3 × 32px rows + 2 × 3px gaps: exactly three complete rows. */
-  max-height: 102px;
+  padding: 4px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8551,6 +8510,13 @@ body.is-composer-resizing .composer-resize-handle::after {
 
 /* omp 原生会话 todo（get_state.todoPhases）：复用扩展 widget 卡片外壳，
    但任务行必须可点击，因此单独一套更紧凑的列表样式。 */
+.native-todo-round-hint {
+  padding: 2px 4px 4px;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  line-height: 15px;
+}
 .native-todo-content {
   gap: 1px;
 }
@@ -8632,12 +8598,6 @@ body.is-composer-resizing .composer-resize-handle::after {
 .native-todo-item:hover:not(:disabled) .native-todo-status,
 .native-todo-item:focus-visible .native-todo-status {
   opacity: 1;
-}
-.native-todo-busy {
-  margin-left: 6px;
-  font-family: var(--font-family-business);
-  font-size: var(--font-size-micro);
-  color: var(--color-text-tertiary);
 }
 
 /* 合并卡内部 Tab 条（TODO | Plan），类似 sidebar drawer-tab 风格 */
@@ -23155,61 +23115,199 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   margin: 0;
 }
 
-/* ── 子代理实时面板（composer 上方，和扩展 widget 同层） ─────────────────── */
-.subagent-bar {
+/* ── composer dock：TODO / 子代理 / 待发送共用一行 chip，手风琴展开 ──────
+   常驻高度 = 一行 chip；展开块共享同一个高度上限，保证时间线不被挤出视口。
+   section 用 display:contents 打散，body 以 order:-1 整行排在 chips 上方。 */
+.composer-dock {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 8px;
   width: 100%;
   min-width: 0;
+}
+.composer-dock:empty {
+  display: none;
+}
+.composer-dock-section {
+  display: contents;
+}
+.composer-dock-body {
+  order: -1;
+  flex: 0 0 100%;
+  min-width: 0;
+  /* 上限由 App 注入（--dock-max-height）：扣掉时间线/输入框最小高度和其它 chrome 后的余额，
+     兜底值只在首帧未测量时生效。 */
+  max-height: var(--dock-max-height, min(260px, 45vh));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-md);
   background: var(--color-bg-panel);
-  overflow: hidden;
+  /* 从 chip 一侧轻微展开，和手风琴的收起/展开对应；全局 reduced-motion 会压掉时长。 */
+  animation: composer-dock-body-in 0.14s ease-out;
 }
-.subagent-bar-head {
+@keyframes composer-dock-body-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* body 内边距与行内 padding 叠加，保持卡片内文字不贴边框。 */
+.composer-dock-body .native-todo-content {
+  padding: 5px 6px 7px;
+}
+.composer-dock-body .queued-list {
+  padding: 5px 6px 7px;
+}
+/* 各块自带滚动：dock body 只负责定高，内容再多也不把输入框顶下去。 */
+.composer-dock-body .native-todo-card.is-bare {
   display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.composer-dock-body .native-todo-content,
+.composer-dock-body .subagent-list,
+.composer-dock-body .queued-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+  /* 滚到底不再把滚动链传给时间线。 */
+  overscroll-behavior: contain;
+}
+.composer-dock-chip {
+  order: 0;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  min-width: 0;
-  padding: 5px 8px;
-  border: 0;
-  background: transparent;
+  max-width: 100%;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-bg-panel) 94%, var(--color-bg-hover));
   color: var(--color-text-secondary);
   font-family: var(--font-family-base);
   font-size: var(--font-size-caption);
-  line-height: var(--line-height-control);
-  text-align: left;
+  line-height: 1;
   cursor: pointer;
-  transition: background-color 0.12s ease;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease,
+    box-shadow 0.12s ease;
 }
-.subagent-bar-head:hover {
+.composer-dock-chip:hover {
+  border-color: var(--color-border-default);
   background: var(--color-bg-hover);
-}
-.subagent-bar-head:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
-.subagent-bar-title {
-  font-weight: 600;
   color: var(--color-text-primary);
 }
-.subagent-bar-meta {
+.composer-dock-chip:active {
+  background: var(--color-bg-active);
+}
+.composer-dock-chip:focus-visible {
+  /* --focus-ring 是 box-shadow 值，不能拿来当 outline 的颜色。 */
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.composer-dock-chip[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-bg-panel));
+  color: var(--color-text-primary);
+}
+.composer-dock-chip-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  transition: color 0.12s ease;
+}
+.composer-dock-chip:hover .composer-dock-chip-icon,
+.composer-dock-chip[aria-expanded="true"] .composer-dock-chip-icon {
+  color: var(--color-accent);
+}
+.composer-dock-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.composer-dock-chip-meta {
+  /* flex 子项默认 min-width:auto，不置 0 则 nowrap 文本不会收缩，ellipsis 永远不触发。 */
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-family-business);
   font-size: var(--font-size-micro);
+  font-variant-numeric: tabular-nums;
   color: var(--color-text-tertiary);
+}
+.composer-dock-chip-chevron {
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  transition: transform 0.15s ease;
+}
+.composer-dock-chip-chevron.is-open {
+  transform: rotate(180deg);
+}
+.composer-dock-chip.tone-info .composer-dock-chip-icon,
+.composer-dock-chip.tone-info .composer-dock-chip-meta {
+  color: var(--color-info);
+}
+.composer-dock-chip.tone-danger {
+  border-color: color-mix(in srgb, var(--color-danger) 38%, transparent);
+}
+.composer-dock-chip.tone-danger .composer-dock-chip-icon,
+.composer-dock-chip.tone-danger .composer-dock-chip-meta {
+  color: var(--color-danger);
+}
+.composer-dock-spin {
+  animation: composer-dock-spin 1s linear infinite;
+}
+@keyframes composer-dock-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .subagent-list {
   display: flex;
   flex-direction: column;
-  max-height: min(220px, 30vh);
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+.subagent-settled-toggle {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  border: 0;
   border-top: 1px solid var(--color-border-subtle);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-micro);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+.subagent-settled-toggle:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+}
+.subagent-settled-toggle:focus-visible {
+  /* --focus-ring 是 box-shadow 值，不能拿来当 outline 的颜色。 */
+  outline: none;
+  box-shadow: inset var(--focus-ring);
 }
 .subagent-row {
   display: flex;

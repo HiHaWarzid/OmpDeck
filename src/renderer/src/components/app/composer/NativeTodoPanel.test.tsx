@@ -32,12 +32,11 @@ const phases: AgentTodoPhase[] = [
 	},
 ];
 
-it("渲染原生 todo 的进度与任务行", () => {
+it("渲染原生 todo 的阶段与任务行", () => {
 	act(() => {
 		root.render(<NativeTodoPanel phases={phases} onSetTodos={() => undefined} />);
 	});
 
-	expect(container.querySelector(".extension-widget-card-meta")?.textContent).toBe("1/3");
 	expect(container.querySelector(".native-todo-phase-name")?.textContent).toBe("实现");
 	const items = Array.from(container.querySelectorAll(".native-todo-item"));
 	expect(items.map((item) => item.textContent)).toEqual([
@@ -76,5 +75,36 @@ it("busy 或 disabled 时禁止再改 todo", () => {
 
 	const items = Array.from(container.querySelectorAll<HTMLButtonElement>(".native-todo-item"));
 	expect(items.every((item) => item.disabled)).toBe(true);
-	expect(container.querySelector(".native-todo-busy")?.textContent).toBe("保存中…");
+	expect(container.querySelector(".native-todo-round-hint")?.textContent).toBe("保存中…");
+});
+
+it("上一轮全部完成时标注来源，避免被当成本轮计划", () => {
+	const allDone: AgentTodoPhase[] = [
+		{ name: "审计", tasks: [{ content: "聚合日志", status: "completed" }] },
+	];
+	act(() => {
+		root.render(<NativeTodoPanel phases={allDone} onSetTodos={() => undefined} />);
+	});
+
+	expect(container.querySelector(".native-todo-round-hint")?.textContent).toContain(
+		"上一轮待办已全部完成",
+	);
+});
+
+it("空阶段被过滤后，点击仍写回正确的阶段", () => {
+	const withEmptyPhase: AgentTodoPhase[] = [
+		{ name: "空", tasks: [] },
+		{ name: "实现", tasks: [{ content: "写测试", status: "pending" }] },
+	];
+	const calls: AgentTodoPhase[][] = [];
+	act(() => {
+		root.render(
+			<NativeTodoPanel phases={withEmptyPhase} onSetTodos={(next) => calls.push(next)} />,
+		);
+	});
+
+	act(() => container.querySelector<HTMLButtonElement>(".native-todo-item")?.click());
+
+	expect(calls[0]?.[0]?.tasks).toHaveLength(0);
+	expect(calls[0]?.[1]?.tasks[0]).toMatchObject({ content: "写测试", status: "in_progress" });
 });

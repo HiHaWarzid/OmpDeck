@@ -7,13 +7,10 @@ export type UncertainPrompt = {
 	error: string;
 };
 
-/** 待发送轨道的一行：服务端队列 chip，或本地未知投递提示。 */
+/** 待发送区的一行：服务端队列 chip，或本地未知投递提示。 */
 export type QueuePanelRow =
 	| { kind: "queued"; key: string; queue: "steering" | "followUp"; text: string }
 	| { kind: "uncertain"; key: string; id: string; text: string; error: string };
-
-/** 待发送轨道最多展示的行数；超出靠面板滚动，不挤占输入框。 */
-export const QUEUED_PROMPT_VISIBLE = 3;
 
 /**
  * 面板行 = omp 队列（steering 在前、followUp 在后，各自保序）+ 本地未知投递提示。
