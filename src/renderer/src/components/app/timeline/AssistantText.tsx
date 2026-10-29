@@ -6,16 +6,17 @@
  *  动态加载：基础管线 MarkdownBody（无 KaTeX）；仅当消息里探测到公式时才加载 MarkdownMath
  *  （追加 remark-math / rehype-katex / katex.min.css）。
  */
-import { lazy, memo, Suspense, useMemo } from "react";
+import { memo, Suspense, useMemo } from "react";
 import { sameImageListForRender } from "../AppUtils";
 import type { ImageContent } from "../../../../../shared/types";
 import { stripAnsi, stripThinkingTags } from "../format";
 import { MessageImages } from "./MessageImages";
+import { lazyWithReload } from "../../../utils/lazyWithReload";
 
-const LazyMarkdownBody = lazy(() =>
+const LazyMarkdownBody = lazyWithReload(() =>
 	import("./MarkdownBody").then((m) => ({ default: m.MarkdownBody })),
 );
-const LazyMarkdownMath = lazy(() =>
+const LazyMarkdownMath = lazyWithReload(() =>
 	import("./MarkdownMath").then((m) => ({ default: m.MarkdownMath })),
 );
 

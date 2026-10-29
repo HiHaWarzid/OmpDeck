@@ -2,6 +2,7 @@ import { app, shell } from "electron";
 import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AppLogEntry, AppLogLevel, AppLogQuery } from "../../shared/types";
+import { serializeLogDetail } from "./logDetail";
 
 const MAX_LOG_FILES = 14;
 const MAX_READ_LINES = 5000;
@@ -16,10 +17,9 @@ function formatDate(value: Date) {
 }
 
 function normalizeDetail(detail: unknown) {
-	if (detail instanceof Error) {
-		return { name: detail.name, message: detail.message, stack: detail.stack };
-	}
-	return detail;
+	// 深度序列化：调用方常把 Error 塞进对象（{ projectId, error }），
+	// 只处理顶层 Error 会让 JSON.stringify 把嵌套 Error 写成 {}，根因丢失。
+	return serializeLogDetail(detail);
 }
 
 /**

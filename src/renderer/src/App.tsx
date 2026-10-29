@@ -1,6 +1,5 @@
 import {
   Fragment,
-  lazy,
   Suspense,
   useEffect,
   useLayoutEffect,
@@ -54,25 +53,26 @@ import {
   PanelRight,
 } from "lucide-react";
 import { showNotice } from "./utils/notice";
+import { lazyWithReload } from "./utils/lazyWithReload";
 import { createPreviewApi } from "./previewApi";
 import { createBrowserApi } from "./browserApi";
-const ConfigModal = lazy(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
+const ConfigModal = lazyWithReload(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
 import { isTextFile } from "./utils/isTextFile";
 import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
 import { NativeLoginModal } from "./components/app/modals/NativeLoginModal";
 // 懒加载：@xterm/xterm（含 FitAddon + 主题 CSS）约数百 KB，终端 Dock 按需打开，
 // 不应在首屏解析执行（此前 xterm 完整打进 1.8MB 入口 chunk）。
-const TerminalDock = lazy(() =>
+const TerminalDock = lazyWithReload(() =>
   import("./components/terminal/TerminalDock").then((m) => ({
     default: m.TerminalDock,
   })),
 );
 // Markdown/KaTeX 栈（react-markdown + remark + katex CSS）不应进入首屏 modulepreload：
 // 只有真正打开更新说明或会话消息时才加载。ScratchPad 同样只在草稿本打开时加载。
-const LazyMarkdownText = lazy(() =>
+const LazyMarkdownText = lazyWithReload(() =>
   import("./components/app/timeline/MarkdownBody").then((m) => ({ default: m.MarkdownText })),
 );
-const ScratchPadPanel = lazy(() =>
+const ScratchPadPanel = lazyWithReload(() =>
   import("./components/scratchPad/ScratchPadPanel").then((m) => ({ default: m.ScratchPadPanel })),
 );
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
@@ -205,25 +205,25 @@ import {
 	type RichInputChip,
 } from "./components/app/RichInput";
 // 懒加载：Monaco Editor（~17.6MB Web Worker）仅在用户打开 diff 时才加载
-const FileDiffViewer = lazy(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
+const FileDiffViewer = lazyWithReload(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
 // 懒加载模态框，减少首屏 JS 体积
-const SettingsModal = lazy(() => import("./components/app/SettingsModal").then((m) => ({ default: m.SettingsModal })));
+const SettingsModal = lazyWithReload(() => import("./components/app/SettingsModal").then((m) => ({ default: m.SettingsModal })));
 // AFK 中心：按需懒加载（与 SettingsModal 同策略，减少首屏 JS）
-const AfkPanel = lazy(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
+const AfkPanel = lazyWithReload(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
 
-const SessionImportModal = lazy(() => import("./components/app/SessionImportModal").then((m) => ({ default: m.SessionImportModal })));
-const ProjectResourcesModal = lazy(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
-const UpdateErrorModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
-const UpToDateModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
+const SessionImportModal = lazyWithReload(() => import("./components/app/SessionImportModal").then((m) => ({ default: m.SessionImportModal })));
+const ProjectResourcesModal = lazyWithReload(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
+const UpdateErrorModalLazy = lazyWithReload(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
+const UpToDateModalLazy = lazyWithReload(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
 // 右侧抽屉面板与低频弹框：默认不挂载，静态导入会把 GitPanel/图标表/面板样式
 // 整块拖进首屏。改为 lazy 后由抽屉/弹框的打开状态触发加载。
-const GitPanel = lazy(() => import("./components/app/GitPanel").then((m) => ({ default: m.GitPanel })));
-const BrowserPanel = lazy(() => import("./components/app/BrowserPanel").then((m) => ({ default: m.BrowserPanel })));
-const FilesDrawer = lazy(() => import("./components/app/drawers/FilesDrawer").then((m) => ({ default: m.FilesDrawer })));
-const SessionsDrawer = lazy(() => import("./components/app/drawers/SessionsDrawer").then((m) => ({ default: m.SessionsDrawer })));
-const EnvironmentDialog = lazy(() => import("./components/app/modals/EnvironmentDialog").then((m) => ({ default: m.EnvironmentDialog })));
-const SessionManagerModal = lazy(() => import("./components/app/modals/SessionManagerModal").then((m) => ({ default: m.SessionManagerModal })));
-const WorktreeCreateDialog = lazy(() => import("./components/app/modals/WorktreeCreateDialog").then((m) => ({ default: m.WorktreeCreateDialog })));
+const GitPanel = lazyWithReload(() => import("./components/app/GitPanel").then((m) => ({ default: m.GitPanel })));
+const BrowserPanel = lazyWithReload(() => import("./components/app/BrowserPanel").then((m) => ({ default: m.BrowserPanel })));
+const FilesDrawer = lazyWithReload(() => import("./components/app/drawers/FilesDrawer").then((m) => ({ default: m.FilesDrawer })));
+const SessionsDrawer = lazyWithReload(() => import("./components/app/drawers/SessionsDrawer").then((m) => ({ default: m.SessionsDrawer })));
+const EnvironmentDialog = lazyWithReload(() => import("./components/app/modals/EnvironmentDialog").then((m) => ({ default: m.EnvironmentDialog })));
+const SessionManagerModal = lazyWithReload(() => import("./components/app/modals/SessionManagerModal").then((m) => ({ default: m.SessionManagerModal })));
+const WorktreeCreateDialog = lazyWithReload(() => import("./components/app/modals/WorktreeCreateDialog").then((m) => ({ default: m.WorktreeCreateDialog })));
 const LazyPanelFallback = <div className="drawer-panel-loading">{t("common.loading")}</div>;
 import { createDefaultExternalEditorSettings } from "../../shared/types";
 import type {

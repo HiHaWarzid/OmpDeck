@@ -55,6 +55,14 @@ All notable changes to PiDeck are documented here.
   diagnostics, so repairable content is not discarded before being overwritten.
 - **Mirror warning code** — With `auth.json` sync removed, model mirror failures
   report `models-json-mirror-failed` instead of "auth.json sync failed".
+- **Stale lazy chunks reload instead of breaking the window** — When the renderer
+  bundle is replaced underneath a running window, opening Settings or another
+  lazy panel used to 404 its chunk and replace the whole app with an error page.
+  Chunk-load failures now trigger one automatic reload (rate-limited to once per
+  10s, logged); genuine module errors still surface normally.
+- **Log details keep the real error** — Nested `Error` objects inside log details
+  are serialized with name/message/stack, so failures such as "Failed to list
+  sessions" no longer land in the log as `{"error":{}}`.
 
 ## v0.6.7 - 2026-07-29
 

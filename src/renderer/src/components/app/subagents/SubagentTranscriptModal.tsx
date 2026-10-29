@@ -4,14 +4,15 @@
  * 运行中的子代理每 2s 刷新一次快照；读取有在途守卫，避免 progress 高频更新叠加整文件读取。
  * transcript 只读，不提供编辑/重发——父会话才是可写的入口。
  */
-import { lazy, Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import type { PiDesktopApi } from "../../../../../shared/api";
 import type { AgentSubagent, ChatMessage } from "../../../../../shared/types";
 import { t } from "../../../i18n";
 import { Modal } from "../../ui/Modal";
 import { isSubagentRunning } from "./subagentStatus";
+import { lazyWithReload } from "../../../utils/lazyWithReload";
 
-const LazyMarkdownText = lazy(() =>
+const LazyMarkdownText = lazyWithReload(() =>
 	import("../timeline/MarkdownBody").then((module) => ({ default: module.MarkdownText })),
 );
 
