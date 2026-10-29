@@ -37,6 +37,7 @@ import type {
 	CodexSessionSummary,
 	CommitDetail,
 	CommitEntry,
+	CrashedRun,
 	ConfigFileDiagnostic,
 	ConfigSaveWarning,
 	CreateAgentInput,
@@ -318,6 +319,11 @@ export interface AppApi {
 	windowControl: (action: "minimize" | "toggle-maximize" | "close") => Promise<void>;
 	toggleAlwaysOnTopWindow: () => Promise<boolean>;
 	toggleDevTools: () => Promise<boolean>;
+	/**
+	 * 取出「上次非正常退出时仍打开的会话」，每次进程启动只交付一次（主进程内一次性消费）。
+	 * 正常退出后返回 null；渲染层据此静默恢复会话并提示，而不是让用户去历史里翻。
+	 */
+	takeCrashedSessions: () => Promise<CrashedRun | null>;
 }
 
 export interface SkillsApi {

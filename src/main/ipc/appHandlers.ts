@@ -18,6 +18,7 @@ import type { PiDesktopApi } from "../../shared/api";
 import type {
 	AppSettings,
 	AppUpdateAsset,
+	CrashedRun,
 } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
@@ -49,6 +50,8 @@ interface AppHandlerDeps {
 	getWebServiceManager: () => WebServiceManager | undefined;
 	/** AFK 编排器（settings-save 时热更新 afk 启停/目标/间隔） */
 	getAfkOrchestrator?: () => AfkOrchestrator | undefined;
+	/** 取走「上次非正常退出时打开的会话」快照；一次性消费，重复取返回 null */
+	takeCrashedSessions: () => CrashedRun | null;
 	// 顶层函数 dep（定义留在 index.ts）
 	openExternalUrl: (url: string, forceSystem?: boolean) => Promise<void>;
 	syncWslEnvironment: (settings: AppSettings) => Promise<WslEnvironment | null>;
@@ -76,6 +79,7 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 		syncWslEnvironment,
 		applyNativeThemeSource,
 		restartApp,
+		takeCrashedSessions,
 	} = deps;
 
 	return {
@@ -143,6 +147,8 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				win.webContents.openDevTools({ mode: "detach" });
 				return true;
 			},
+			// 崩溃恢复：主进程持有一次性快照，渲染层取走后就置空，重复调用返回 null。
+			takeCrashedSessions: async () => takeCrashedSessions(),
 		},
 		rpcLogs: {
 			/** 开关某 agent 的 RPC 日志记录 */

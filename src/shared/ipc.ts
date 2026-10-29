@@ -281,6 +281,8 @@ export const ipcTable = {
 		windowControl: { channel: "app:window-control", kind: "invoke" },
 		toggleAlwaysOnTopWindow: { channel: "app:window-toggle-always-on-top", kind: "invoke" },
 		toggleDevTools: { channel: "app:toggle-devtools", kind: "invoke" },
+		// 崩溃/强杀后的一次性会话恢复快照（见 main/sessions/OpenSessionSnapshot.ts）
+		takeCrashedSessions: { channel: "app:take-crashed-sessions", kind: "invoke" },
 	},
 	skills: {
 		list: { channel: "skills:list", kind: "invoke" },

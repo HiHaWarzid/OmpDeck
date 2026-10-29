@@ -25,6 +25,28 @@ export type AgentTab = {
 	lastError?: string;
 };
 
+/**
+ * 崩溃恢复用的会话身份：只记定位信息，不记消息正文。
+ * 正文由 omp `--resume <sessionPath>` 从会话 JSONL 重建。
+ */
+export type RecoverableSession = {
+	projectId: string;
+	sessionPath: string;
+	title?: string;
+};
+
+/**
+ * 上一次「非正常退出」时仍然打开的会话快照（见 main/sessions/OpenSessionSnapshot.ts）。
+ * cleanExit 为真的正常退出不会产生该快照。
+ */
+export type CrashedRun = {
+	/** 上一次运行的启动时间（ms epoch），用于日志与「崩溃前」提示。 */
+	startedAt: number;
+	/** 上一次运行的主进程 PID。 */
+	pid: number;
+	sessions: RecoverableSession[];
+};
+
 /** 斜线命令的子命令（omp `available_commands_update` 的 subcommands 投影）。 */
 export type PiCommandSubcommand = {
 	name: string;

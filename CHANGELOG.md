@@ -43,6 +43,11 @@ All notable changes to PiDeck are documented here.
 
 ### 🐛 Bug Fixes
 
+- **Open sessions survive a crash** — OmpDeck now keeps a synchronous snapshot of
+  the open session tabs (`open-sessions.json`). When the previous run was killed
+  (task manager, terminal Ctrl-C, GPU/utility process restart) the next launch
+  reopens those sessions itself instead of leaving an empty workspace; a normal
+  quit marks the snapshot clean so nothing is resurrected.
 - **Refuse to save a broken `models.yml`** — The Auth tab no longer rewrites an
   unparsable `models.yml` into a half-empty file and points at the raw-file tab
   instead; empty declarations like `providers: null` or `openai:` no longer fail.

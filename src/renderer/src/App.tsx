@@ -254,6 +254,7 @@ import type {
   ComposerAgentMode,
   AgentTodoPhase,
   AgentUiRequest,
+  CrashedRun,
   RestoredQueuedMessage,
   ThinkingUpdate,
   WidgetLineItem,
@@ -510,6 +511,10 @@ export function App() {
   }
 
   const [projects, setProjects] = useState<Project[]>([]);
+  // createAgent 等异步路径需要「最新项目列表」：崩溃恢复会在 refreshProjects 之后
+  // 立刻打开会话，那时闭包里的 projects state 还是空数组，按 state 查项目会直接返回。
+  const projectsRef = useRef<Project[]>([]);
+  projectsRef.current = projects;
   // 项目的 git worktree 列表：{ parentId -> WorktreeEntry[] }
   const [worktreesByProject, setWorktreesByProject] = useState<
     Record<string, WorktreeEntry[]>
@@ -2184,7 +2189,24 @@ export function App() {
   const canReorderProjects = search.trim().length === 0;
 
   useEffect(() => {
-    window.setTimeout(() => void refreshProjects(), 0);
+    void (async () => {
+      // 快照只能取一次，必须最先取走；但主进程是在窗口显示后才异步 load projects.json，
+      // 挂载瞬间 projects.list() 可能仍是空的，所以取到快照后再等首次非空的项目推送。
+      const crashed = await api.app.takeCrashedSessions().catch(() => null);
+      const loadedProjects = await refreshProjects().catch(() => null);
+      if (!crashed || crashed.sessions.length === 0) return;
+      const readyProjects =
+        loadedProjects && loadedProjects.length > 0
+          ? loadedProjects
+          : await waitForProjectsLoaded();
+      if (!readyProjects) {
+        void api.app.rendererLog("warn", "renderer", "Crash recovery gave up: projects never loaded", {
+          requested: crashed.sessions.length,
+        });
+        return;
+      }
+      await restoreCrashedSessions(crashed, readyProjects);
+    })();
     window.setTimeout(() => void api.agents.list().then(setAgents), 0);
     void api.editors.list().then(setExternalEditors).catch(() => undefined);
     void api.app
@@ -3316,8 +3338,9 @@ export function App() {
     }
   }
 
-  async function refreshProjects() {
+  async function refreshProjects(): Promise<Project[]> {
     const next = await api.projects.list();
+    projectsRef.current = next;
     setProjects(next);
     if (!activeProjectId && next.length > 0) setActiveProjectId(next[0].id);
     // 启动时刷新所有 worktree 项目的分支列表
@@ -3326,6 +3349,7 @@ export function App() {
         void refreshWorktrees(p.id);
       }
     }
+    return next;
   }
 
   async function refreshWorktrees(projectId: string) {
@@ -3892,9 +3916,11 @@ export function App() {
     sessionPath?: string,
     title?: string,
     noSession?: boolean,
+    options?: { silent?: boolean },
   ): Promise<AgentTab | undefined> {
     if (!projectId) return;
-    const project = projects.find((item) => item.id === projectId);
+    // 走 ref 而不是闭包里的 projects：崩溃恢复在项目列表刚落库时就要打开会话。
+    const project = projectsRef.current.find((item) => item.id === projectId);
     if (!project) return;
     const existing = sessionPath
       ? [...displayAgents, ...pendingAgentsRef.current].find(
@@ -3980,8 +4006,8 @@ export function App() {
       // 全新创建的会话需要刷新历史列表以显示新文件；从已有历史会话打开的 agent 跳过刷新，避免文件 mtime 被不必要地读/写导致排序提前
       if (!sessionPath) {
         void refreshProjectSessions(projectId).catch(() => undefined);
-        showToast(t("app.agentCreated"), 2000);
-      } else {
+        if (!options?.silent) showToast(t("app.agentCreated"), 2000);
+      } else if (!options?.silent) {
         showToast(t("app.sessionOpened"), 2000);
       }
       void refreshRuntimeState(tab.id);
@@ -4015,6 +4041,75 @@ export function App() {
       // 创建失败或超时时回退乐观占位，避免停留在不存在的 pending agent。
       return undefined;
     }
+  }
+
+  /**
+   * 等主进程项目库首次加载完成（`projects:changed` 推送非空列表）。
+   * 主进程为缩短白屏把 `projectStore.load()` 放在窗口显示之后，所以挂载早期 `projects.list()`
+   * 是空数组；崩溃恢复必须等到真实列表，否则会把有效快照误判成「项目已删除」。
+   * 先查一次当前列表再订阅，覆盖「推送已经发生过」的先后顺序；超时返回 null。
+   */
+  function waitForProjectsLoaded(): Promise<Project[] | null> {
+    const { promise, resolve } = Promise.withResolvers<Project[] | null>();
+    let settled = false;
+    let timer: number | undefined;
+    let off: () => void = () => undefined;
+    const finish = (value: Project[] | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      off();
+      resolve(value);
+    };
+    off = api.projects.onChanged((next) => {
+      if (next.length > 0) finish(next);
+    });
+    timer = window.setTimeout(() => finish(null), 10000);
+    void api.projects
+      .list()
+      .then((current) => {
+        if (current.length > 0) finish(current);
+      })
+      .catch(() => undefined);
+    return promise;
+  }
+
+  /**
+   * 崩溃/强杀后的会话恢复。
+   * 主进程只交付一次快照（app.takeCrashedSessions），所以这里不需要额外的去重状态；
+   * 恢复出来的 tab 静默打开（不逐个弹「会话已打开」），末尾只给一条汇总提示。
+   */
+  async function restoreCrashedSessions(crashed: CrashedRun, availableProjects: Project[]) {
+    if (crashed.sessions.length === 0) return;
+    // projectsRef 每次渲染都会被 projects state 覆盖，恢复期间以启动时这次加载结果为准，
+    // 否则 createAgent 里的项目查表可能读到尚未刷新的空列表。
+    projectsRef.current = availableProjects;
+    // 项目可能已被删除 / 当前 WSL 环境不可见：只恢复仍在列表里的项目会话。
+    const available = new Set(availableProjects.map((project) => project.id));
+    const targets = crashed.sessions.filter((session) => available.has(session.projectId));
+    if (targets.length === 0) {
+      void api.app.rendererLog("warn", "renderer", "Crash recovery skipped: projects missing", {
+        requested: crashed.sessions.length,
+        projectIds: [...new Set(crashed.sessions.map((session) => session.projectId))],
+      });
+      return;
+    }
+    let restored = 0;
+    for (const session of targets) {
+      // 顺序恢复：并发 create 会互相抢 activeAgentId，且模型/配置探测本身要排队。
+      const tab = await createAgent(session.projectId, session.sessionPath, session.title, false, {
+        silent: true,
+      });
+      if (tab) restored += 1;
+    }
+    if (restored === 0) return;
+    showToast(t("app.sessionsRestored", { count: restored }), 4000);
+    void api.app.rendererLog("info", "renderer", "Restored sessions after unclean exit", {
+      restored,
+      requested: crashed.sessions.length,
+      previousPid: crashed.pid,
+      previousStartedAt: crashed.startedAt,
+    });
   }
 
   function getProjectFilter(projectId: string) {

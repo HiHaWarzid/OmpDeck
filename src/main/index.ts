@@ -193,6 +193,7 @@ import type {
 	CreatePiPromptTemplateInput,
 	CreatePiSkillInput,
 	CreateProjectSkillInput,
+	CrashedRun,
 	PiPromptTemplateSummary,
 	PromptStoreSearchResult,
 	PromptStoreSearchResponse,
@@ -215,6 +216,7 @@ import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
 import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
 import { CodexImportAdapter } from "./sessions/adapters/codexImportAdapter";
+import { OpenSessionSnapshot } from "./sessions/OpenSessionSnapshot";
 import { SettingsStore } from "./settings/SettingsStore";
 import { applyDesktopProxy } from "./settings/DesktopProxy";
 import { GitService } from "./git/GitService";
@@ -338,6 +340,7 @@ let worktreeService: WorktreeService;
 let gitService: GitService;
 let piLocator: PiLocator;
 let agentManager: AgentManager;
+let openSessionSnapshot: OpenSessionSnapshot | null = null;
 let afkOrchestrator: AfkOrchestrator;
 let configManager: ConfigManager;
 let promptManager: PromptManager;
@@ -581,6 +584,9 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
 	]);
 	const stop = () => {
+		// 正常退出必须先落盘「干净退出」标记：漏了这一步，下次启动会把上次的会话当成崩溃恢复。
+		// 同步写在这里是必要的——before-quit 之后进程随时可能被系统收走。
+		openSessionSnapshot?.markCleanExit();
 		void webServiceManager?.stop();
 		// 关闭会话目录 watcher，避免进程退出前仍持有目录句柄。
 		void sessionScanner?.close();
@@ -1194,6 +1200,8 @@ function registerIpc() {
 			getPetSystem: () => petSystem,
 			getWebServiceManager: () => webServiceManager,
 			getAfkOrchestrator: () => afkOrchestrator,
+			// 崩溃恢复快照在渲染层挂载后一次性取走（主进程内只剩这一个消费者）
+			takeCrashedSessions: () => openSessionSnapshot?.takeCrashedRun() ?? null,
 			openExternalUrl,
 			syncWslEnvironment,
 			applyNativeThemeSource,
@@ -1318,6 +1326,21 @@ app.whenReady().then(async () => {
 		createSessionArchiveWorker,
 		notificationIcon,
 	);
+	// 崩溃恢复：先把上次运行的快照读出来（必须在 beginRun 覆盖文件之前），
+	// 再登记「每次 emitState 同步落盘已打开会话」，最后由渲染层在挂载后一次性取走恢复。
+	// 读取失败/首次运行都只是空快照，不影响启动。
+	openSessionSnapshot = new OpenSessionSnapshot(app.getPath("userData"));
+	const crashedRun = openSessionSnapshot.readCrashedRun();
+	openSessionSnapshot.beginRun();
+	agentManager.addStateListener((tabs) => openSessionSnapshot?.recordAgents(tabs));
+	if (crashedRun) {
+		void appLogger.info("app", "Previous run ended without clean shutdown", {
+			previousPid: crashedRun.pid,
+			previousStartedAt: crashedRun.startedAt,
+			openSessions: crashedRun.sessions.length,
+			projectIds: [...new Set(crashedRun.sessions.map((session) => session.projectId))],
+		});
+	}
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),
 		listAgents: () => agentManager.list(),

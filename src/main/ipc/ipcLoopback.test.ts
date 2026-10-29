@@ -205,6 +205,7 @@ registerIpcHandlers(
 		setIsQuitting: stubs,
 		releaseSingleInstanceLock: stubs,
 		restartApp: stubs,
+		takeCrashedSessions: () => null,
 		getPetSystem: () => null,
 		getWebServiceManager: () => undefined,
 		openExternalUrl: stubs,
