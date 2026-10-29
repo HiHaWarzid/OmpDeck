@@ -40,8 +40,13 @@ export const AssistantText = memo(
 		 *  跑 remark 解析（O(n²) 卡顿源）。取舍：流式中无行内格式，结束瞬间切换。 */
 		isStreaming?: boolean;
 	}) {
-		// 清理 ANSI 转义码与 <thinking> 标签，thinking 由调用方通过 ThinkingBlock 渲染
-		const cleanText = stripThinkingTags(stripAnsi(props.text));
+		// 清理 ANSI 转义码与 <thinking> 标签，thinking 由调用方通过 ThinkingBlock 渲染。
+		// 长回答（几 MB 的正文）每次父级状态推送都会重渲染；按 text 引用缓存结果，
+		// 避免对同一份未变化的长文本反复做整串 replace。流式期间 text 每 delta 变一次，必然重算。
+		const cleanText = useMemo(
+			() => stripThinkingTags(stripAnsi(props.text)),
+			[props.text],
+		);
 		// 流式期间用纯文本近似渲染，回答结束后切回含数学/图表的完整渲染。
 		const streaming = Boolean(props.isStreaming);
 		// 普通消息不加载 KaTeX 栈；探测本身只扫一遍文本，成本远低于 markdown 解析。

@@ -161,6 +161,16 @@ export class SessionScanner {
     private readonly options: {
       /** 冷扫描完整结束后通知渲染层刷新（只在本次调用返回过部分结果时触发）。 */
       onScanSettled?: () => void;
+      /**
+       * watchdog 超时降级（扫描给部分结果 / 过滤退回同步判定）时的诊断回调。
+       * 降级后 IPC 会成功，若不在这里留痕，「列表偶尔缺会话」在日志里没有锚点。
+       */
+      logScanDegraded?: (detail: {
+        stage: "scan" | "filter";
+        error: string;
+        partialCount: number;
+        elapsedMs: number;
+      }) => void;
       /** 测试注入用：部分结果等待窗口，默认 1.2s。 */
       partialWaitMs?: number;
       /** 生产注入：创建摘要解析 worker；缺省时在调用线程解析（测试/无 worker 环境）。 */
@@ -310,6 +320,9 @@ export class SessionScanner {
     const partial: SessionSummary[] = [];
     const startedAt = Date.now();
     let job!: ScanJob;
+    // 降级标记：走「部分结果 + 后续重扫」的路径不再触发 onScanSettled（见下），
+    // 否则会变成「18s 超时 → 通知刷新 → 立刻再扫 → 再超时」的循环。
+    let degraded = false;
     // 整个 scanOnce 也纳入 watchdog：本地 fs 调用不可中断，若只依赖 signal 传递，
     // 卡在 readFile/stat 上的扫描会让共享 promise 永远 pending，后续 list() 全部挂死。
     let scan: Promise<SessionSummary[]>;
@@ -318,7 +331,20 @@ export class SessionScanner {
       (signal) => this.scanOnce(scanRoots, signal, (summary) => {
         if (summary) partial.push(summary);
       }),
-    ).finally(() => {
+    ).catch((error: unknown) => {
+      // 失败/超时都不该把整个会话列表判为失败：已经解析出的摘要对用户仍然可用，
+      // 而旧行为是 reject → 侧栏显示「加载会话失败」，已解析的会话一条都拿不到。
+      // 完全没有任何结果时才继续上抛（此时返回空列表会掩盖磁盘异常）。
+      if (partial.length === 0) throw error;
+      degraded = true;
+      this.options.logScanDegraded?.({
+        stage: "scan",
+        error: error instanceof Error ? error.message : String(error),
+        partialCount: partial.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return [...partial].sort((a, b) => b.updatedAt - a.updatedAt);
+    }).finally(() => {
       job.done = true;
       if (process.env.PIDECK_PERF === "1") {
         const elapsed = Date.now() - startedAt;
@@ -332,10 +358,12 @@ export class SessionScanner {
     job = { promise: scan, partial, done: false, deliveredPartial: false };
     this.scanJobs.set(key, job);
     // 部分结果已经返回过，就必须在完整扫描成功后唤醒渲染层；
-    // 否则 UI 会长期停留在首屏截断的列表上。失败不通知，避免磁盘持续异常时
+    // 否则 UI 会长期停留在首屏截断的列表上。降级结果不通知，避免磁盘持续异常时
     // 18s 超时 → 重扫 → 再超时的无限循环（保留部分列表，用户可手动刷新）。
     void scan.then(
-      () => this.notifyScanSettled(job),
+      () => {
+        if (!degraded) this.notifyScanSettled(job);
+      },
       () => undefined,
     );
     return job;
@@ -357,7 +385,11 @@ export class SessionScanner {
    */
   private async withScanWatchdog<T>(label: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
-    const timeoutError = new Error(`${label} timed out`);
+    // 打标记，调用方才能把「真的超时」与其他失败区分开并走降级路径；
+    // 只比对 message 会被文件名/路径里的 "timed out" 字样误伤。
+    const timeoutError = Object.assign(new Error(`${label} timed out`), {
+      code: "SCAN_TIMEOUT",
+    });
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -427,17 +459,33 @@ export class SessionScanner {
   /**
    * 在共享扫描结果上按项目归属过滤；同样受 watchdog 约束，
    * 避免过滤阶段的文件读取（父目录会话内容校验）无界等待。
+   *
+   * 超时不能把整份列表判为失败：过滤里唯一慢的是「父目录会话内容校验」（要整读文件），
+   * 而 cwd / 自定义 sessionDir / 路径 token 这些判定是同步且确定的。降级为同步判定后，
+   * 确定属于本项目的会话照常返回，只有父目录内容命中那一小类会晚一轮出现。
    */
   private async filterByProject(summaries: SessionSummary[], projectPath: string): Promise<boolean[]> {
-    return this.withScanWatchdog("Session filter", async (signal) => {
-      const matched = await mapWithConcurrency(
-        summaries,
-        this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
-        (summary) => this.isSameProject(summary, projectPath, signal),
-      );
-      signal.throwIfAborted();
-      return matched;
-    });
+    const startedAt = Date.now();
+    try {
+      return await this.withScanWatchdog("Session filter", async (signal) => {
+        const matched = await mapWithConcurrency(
+          summaries,
+          this.wslConfig ? SCAN_CONCURRENCY_WSL : SCAN_CONCURRENCY_LOCAL,
+          (summary) => this.isSameProject(summary, projectPath, signal),
+        );
+        signal.throwIfAborted();
+        return matched;
+      });
+    } catch (error) {
+      if ((error as { code?: unknown })?.code !== "SCAN_TIMEOUT") throw error;
+      this.options.logScanDegraded?.({
+        stage: "filter",
+        error: error instanceof Error ? error.message : String(error),
+        partialCount: summaries.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return summaries.map((summary) => this.matchesProjectByPath(summary, projectPath));
+    }
   }
 
   /**
@@ -995,17 +1043,24 @@ export class SessionScanner {
   private async isSameProject(summary: SessionSummary, projectPath: string, signal?: AbortSignal) {
     const normalizedProject = this.normalize(projectPath);
     const normalizedSessionProject = summary.projectPath ? this.normalize(summary.projectPath) : "";
-    if (normalizedSessionProject === normalizedProject) return true;
     if (await this.isParentSessionForProject(normalizedSessionProject, normalizedProject, summary.filePath, signal)) return true;
+    return this.matchesProjectByPath(summary, projectPath);
+  }
+
+  /**
+   * 不需要读文件的归属判定（同步）：cwd 精确相等、自定义 sessionDir 之下、路径 token 命中。
+   * 过滤超时降级时只靠这一层，保证「确定属于本项目」的会话不会被超时一并吞掉。
+   */
+  private matchesProjectByPath(summary: SessionSummary, projectPath: string): boolean {
+    const normalizedProject = this.normalize(projectPath);
+    const normalizedSessionProject = summary.projectPath ? this.normalize(summary.projectPath) : "";
+    if (normalizedSessionProject === normalizedProject) return true;
 
     // 项目级自定义 sessionDir（如 <project>/.omp/sessions）下的文件默认归属该项目。
     // 该布局不再使用 encoded-cwd 子目录，safePathToken 无法从路径反推项目。
     if (this.isUnderProjectSessionDir(summary.filePath, projectPath)) return true;
 
-    const filePathMatch = this.normalize(summary.filePath).includes(this.safePathToken(projectPath));
-    if (!filePathMatch && summary.parentSessionPath) {
-    }
-    return filePathMatch;
+    return this.normalize(summary.filePath).includes(this.safePathToken(projectPath));
   }
 
   /**

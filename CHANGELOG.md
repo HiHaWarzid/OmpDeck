@@ -43,6 +43,17 @@ All notable changes to PiDeck are documented here.
 
 ### 🐛 Bug Fixes
 
+- **Large sessions no longer freeze the window** — Sessions above 5 MB now load
+  their history straight from the JSONL tail instead of round-tripping the whole
+  file through pi's RPC, which always hit the transport limit and left a failed
+  `get_messages`/`get_entries` pair per open. Tool-card details are only built
+  when a card is expanded and cleaned assistant text is memoized, removing the
+  20 s input stalls that preceded renderer crashes on multi-megabyte sessions.
+- **Session list degrades instead of failing** — When the cold scan watchdog
+  fires, the sessions parsed so far are returned; when the project filter times
+  out, matching falls back to path/cwd rules. Both degradations are logged under
+  the `session` scope instead of surfacing a list error that made sessions look
+  lost.
 - **Open sessions survive a crash** — OmpDeck now keeps a synchronous snapshot of
   the open session tabs (`open-sessions.json`). When the previous run was killed
   (task manager, terminal Ctrl-C, GPU/utility process restart) the next launch

@@ -1,5 +1,5 @@
 /** 工具调用卡片：ToolCard 与按轮聚合的 ToolGroupCard，以及工具名/参数的展示推导。 */
-import { memo, useState, type ReactNode } from "react";
+import { memo, useMemo, useState, type ReactNode } from "react";
 import {
 	type ToolGroupItem,
 	parseToolArgs,
@@ -331,7 +331,15 @@ export const ToolCard = memo(function ToolCard(props: {
 		() => props.defaultOpen ?? isTodoWriteToolName(toolName),
 	);
 	const status = getToolStatus(props.message);
-	const detailText = getToolDetailText(props.message);
+	/**
+	 * 详情只在展开时计算：getToolDetailText 会把整份 meta pretty-print 成 JSON 再扫 ANSI，
+	 * 一个读大文件/跑长命令的工具结果就是几 MB。卡片默认折叠，而时间线一次挂载上百张，
+	 * 旧的「无条件计算」在打开大会话时白白串行化几十 MB 文本（主线程纯 CPU 卡顿源之一）。
+	 */
+	const detailText = useMemo(
+		() => (expanded ? getToolDetailText(props.message) : ""),
+		[expanded, props.message],
+	);
 	const tone = getToolTone(props.message);
 	const kindLabel = getToolKindLabel(toolName);
 	const diffTarget = getToolDiffTarget(props.message);

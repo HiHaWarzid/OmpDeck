@@ -8,7 +8,8 @@
       content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data: blob: https://cloudcache.tencent-cloud.com https://skillhub-1388575217.cos.accelerate.myqcloud.com; font-src 'self' data:; connect-src 'self' ws: http://127.0.0.1:* http://localhost:* https://api.skillhub.cn"
     />
     <title></title>
-    <link rel="preload" href="./src/assets/fonts/PlantinNowVariable-Upright.woff2" as="font" type="font/woff2" crossorigin />
+    <!-- 品牌衬线仅在启动画面之后的标题/字标按需使用：预加载既不在首屏关键路径上，
+         还会在每次启动触发「preloaded but not used」控制台告警（线上日志每天数十条）。 -->
     <!-- Italic 仅用于空状态/飞书样式，避免首屏多下载 92KB；字体本身仍按需加载。 -->
     <style>
       /* 启动画面：独立于 #root，React 挂载后淡出移除。

@@ -588,15 +588,30 @@ export class AgentManager {
 	) {
 		const t0 = Date.now();
 		const runtime = this.requireRuntime(agentId);
+		/**
+		 * 大会话预检：get_messages/get_entries 都会把整份 JSONL 序列化进一个响应，超过
+		 * MAX_AUTO_HISTORY_LOAD_BYTES 后必然撞 pi 的 RPC 传输上限（线上 27MB 会话每次
+		 * 打开都白跑 0.3~2s，并在日志里各留一条失败记录）。这类会话直接走文件尾部读取，
+		 * 与失败后的兜底路径完全等价，但不再让 pi 做无谓的整文件序列化。
+		 */
+		const oversizedSession = runtime.tab.sessionPath
+			? !this.getHistoryAutoLoadDecision(runtime.tab.sessionPath).shouldLoad
+			: false;
 
 		// 并行请求：get_messages 和 get_entries 互不依赖，可以同时发起
 		// 如果已有提前发出的请求（earlyMessagesPromise），直接复用，避免重复发送
-		const messagesPromise = earlyMessagesPromise ?? runtime.slot.process.client.request({
-			type: "get_messages",
-		});
+		const messagesPromise = earlyMessagesPromise ?? (oversizedSession
+			? this.sessionJsonl.readRecentMessages(
+				runtime.tab.sessionPath as string,
+				AgentManager.MAX_HISTORY_LOAD_TURNS,
+			).catch(() => runtime.slot.process.client.request({ type: "get_messages" }))
+			: runtime.slot.process.client.request({
+				type: "get_messages",
+			}));
 
 		let entriesPromise: Promise<RpcResponse | undefined> | undefined;
-		if (!skipEntries) {
+		// 大会话的 entryId 映射同样因传输上限不可用；文件基线自带 entryIds，够编辑/删除定位。
+		if (!skipEntries && !oversizedSession) {
 			entriesPromise = runtime.slot.process.client.request({
 				type: "get_entries",
 			}, 15_000)

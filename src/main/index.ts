@@ -1263,6 +1263,11 @@ app.whenReady().then(async () => {
 				mainWindow.webContents.send(ipcChannels.sessionsChanged);
 			}
 		},
+		// 扫描在 appLogger 就绪前注册，但超时只可能发生在用户调用 sessions:list 之后，
+		// 因此这里延迟取 appLogger，避免为日志调整主进程初始化顺序。
+		logScanDegraded: (detail) => {
+			void appLogger?.warn("session", "Session listing degraded", detail);
+		},
 		createParseWorker: createSessionParseWorker,
 	});
 	importPipeline = new ImportPipeline(join(app.getPath("home"), ".omp", "agent", "sessions"));
