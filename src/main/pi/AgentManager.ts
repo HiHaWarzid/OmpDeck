@@ -1336,16 +1336,24 @@ export class AgentManager {
 		delete runtime.tab.lastError;
 		this.emitState();
 
+		// 结束后排队：显式 followUp 的消息可能先躺在 omp 的服务端队列里，本轮上下文并不包含它。
+		// 这时不能往时间线插乐观气泡——否则当前一轮回答被切成「回答 → 用户消息 → 继续回答」，
+		// 看起来就像排队消息已经发送并打断了这一轮。只在「结束后排队」dock 里展示；
+		// 真正投递（或确认 omp 立即开跑）后再补气泡，见 admitQueuedFollowUp。
+		const queueAsFollowUp = promptDeliveryBehavior === "followUp";
+		const userText = trimmed || "[图片]";
+		const userMeta = promptDeliveryBehavior
+			? { streamingBehavior: promptDeliveryBehavior }
+			: undefined;
+
 		// 乐观更新：在等待 RPC 返回前先把用户消息写入会话，让用户立即看到自己的消息。
 		// 只展示用户原文；agentMessage 里的宿主指令不进 UI 气泡。
 		// 如果后续 RPC 失败，再追加错误消息；用户消息本身仍保留在聊天中（用户确已发送）。
-		this.addMessage(
-			runtime,
-			"user",
-			trimmed || "[图片]",
-			promptDeliveryBehavior ? { streamingBehavior: promptDeliveryBehavior } : undefined,
-			input.images,
-		);
+		// follow-up 例外：它还没进入本轮上下文，见上方注释，等投递后由
+		// reconcileFollowUpAdmission / flushDeliveredFollowUps 补写同样的气泡。
+		if (!queueAsFollowUp) {
+			this.addMessage(runtime, "user", userText, userMeta, input.images);
+		}
 
 		// streamingBehavior 只在 agent 忙碌时需要；UI 可以显式传 steer/followUp 以复用 pi 队列语义。
 		// 当前端排队 flush 连续发送多条消息时，第一条会触发 agent_start 使 agent 变忙碌，
@@ -1368,6 +1376,8 @@ export class AgentManager {
 			if (promptDeliveryBehavior) {
 				requestPayload.streamingBehavior = promptDeliveryBehavior;
 			}
+			// 记下发出时刻：排队对账要判断这之后到达的 queue_update 是否已包含本次消息。
+			const promptSentAt = Date.now();
 			// 使用用户配置的 RPC 超时时间，因为用户提示词可能触发长时间运行的命令或复杂操作
 			const response = await runtime.slot.process.client.request(
 				requestPayload,
@@ -1382,6 +1392,22 @@ export class AgentManager {
 				this.addMessage(runtime, "error", errorMessage);
 				this.emitState();
 				return { accepted: false, error: errorMessage };
+			}
+
+			// 排队 follow-up 的落气泡时机：omp 收下后仍可能因为本地 busy 快照过期而立即开跑，
+			// 用一次 get_state 对账队列——队列里没有它说明已投递，这里补气泡；
+			// 队列里还有就记到 deferredFollowUps，等 queue_update 报告离队时再补。
+			if (queueAsFollowUp && userMeta) {
+				await this.reconcileFollowUpAdmission(
+					runtime,
+					{
+						text: userText,
+						queueText: agentMessage,
+						...(input.images ? { images: input.images } : {}),
+						meta: userMeta,
+					},
+					promptSentAt,
+				);
 			}
 
 			// agentInvoked:false 表示 omp 把这个 prompt 当本地命令就地执行完了：
@@ -1421,6 +1447,11 @@ export class AgentManager {
 			// preflight 响应未到达，无法证明 pi 没有接收。返回 unknown，renderer 会永久禁用
 			// 该快照的重试/编辑/取消，防止用户把同一条消息提交两次。
 			runtime.tab.status = statusBeforePrompt === "running" ? "running" : "error";
+			// follow-up 没有乐观气泡：结果未知时 omp 可能已收下并投递，
+			// 按「可能已提交」补一条，与 reconcileFollowUpAdmission 的降级方向一致。
+			if (queueAsFollowUp && userMeta) {
+				this.addMessage(runtime, "user", userText, userMeta, input.images);
+			}
 			this.addMessage(
 				runtime,
 				"error",
@@ -1554,6 +1585,20 @@ export class AgentManager {
 	 * 这些消息仍会继续执行；这里拿回草稿后再停止，保证停止就是真的停止。
 	 */
 	async abortAndRestoreQueue(agentId: string): Promise<AbortAndRestoreQueueResult> {
+		const runtime = this.requireRuntime(agentId);
+		// 中止会清空服务端队列并推 queue_update：先给已知在队的文案立墓碑，这次离队
+		// （以及仍在途的准入对账）都不能当成「已投递」。恢复结果回来后再按名单反转。
+		const markedTexts = new Set<string>();
+		for (const text of queuedTexts(runtime.lastQueuedSnapshot ?? { steering: [], followUp: [] })) {
+			markedTexts.add(text);
+			this.markFollowUpWithdrawn(runtime, text);
+		}
+		for (const entry of runtime.deferredFollowUps ?? []) {
+			for (const text of [entry.text, entry.queueText]) {
+				markedTexts.add(text);
+				this.markFollowUpWithdrawn(runtime, text);
+			}
+		}
 		const data = await this.abortWithCommand(agentId, { type: "abort_and_restore_queue" }, true);
 		const readMessages = (value: unknown): RestoredQueuedMessage[] => {
 			if (!Array.isArray(value)) return [];
@@ -1573,8 +1618,33 @@ export class AgentManager {
 			...(data?.imagesDropped === true ? { imagesDropped: true } : {}),
 			...(data?.truncated === true ? { truncated: true } : {}),
 		};
-		if (data) {
-			const runtime = this.requireRuntime(agentId);
+		if (!data) {
+			// 请求失败说明队列没被清空、墓碑的前提不成立：全部撤销，别压住后续正常投递。
+			for (const text of markedTexts) this.clearFollowUpWithdrawn(runtime, text);
+		} else {
+			// 撤回到输入框的排队 follow-up 从未落气泡（只存在 deferredFollowUps）：
+			// 在恢复到名单里的直接丢快照；不在名单里的说明中止前已经被投递，补上气泡。
+			// truncated 表示恢复的文本本身不完整，无法判断哪些已投递，只能全部丢弃，
+			// 宁可少一条气泡，也不要在时间线里塞进用户没看到执行的消息。
+			const restoredTexts = [...result.steering, ...result.followUp].map(
+				(item) => item.text,
+			);
+			const stillWithdrawn = new Set(restoredTexts);
+			for (const entry of runtime.deferredFollowUps ?? []) {
+				if (result.truncated) continue;
+				if (restoredTexts.some((text) => deferredMatchesText(entry, text))) continue;
+				this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+				stillWithdrawn.add(entry.text);
+				stillWithdrawn.add(entry.queueText);
+			}
+			runtime.deferredFollowUps = [];
+			if (!result.truncated) {
+				// 恢复名单外的文案 = 已投递/已不在队列，墓碑要撤掉，否则在途对账会把
+				// 已经投递的消息当成撤回而漏掉气泡。
+				for (const text of markedTexts) {
+					if (!stillWithdrawn.has(text)) this.clearFollowUpWithdrawn(runtime, text);
+				}
+			}
 			// abort 路径已取消节流中的消息推送，撤回气泡后必须立刻全量对齐 renderer，
 			// 否则本地仍会显示一条不会再执行的消息（getMessages 已无此条）。
 			if (this.dropWithdrawnUserBubbles(runtime, result)) {
@@ -1620,6 +1690,142 @@ export class AgentManager {
 		return true;
 	}
 
+	/**
+	 * 排队 follow-up 的落气泡时机：omp 收下消息后仍可能因为本地 busy 快照过期而立即开跑，
+	 * 用一次 get_state 队列快照对账——快照里没有它说明已投递，立刻补气泡；
+	 * 还在队列里就记到 deferredFollowUps，等 queue_update 报告它离队时再补。
+	 * 快照读不到（RPC 失败/超时）时退回旧的乐观行为：宁可早显示一条，也不能让
+	 * 已投递的消息永远不出现在时间线。
+	 */
+	private async reconcileFollowUpAdmission(
+		runtime: AgentRuntime,
+		entry: DeferredFollowUp,
+		promptSentAt: number,
+	): Promise<void> {
+		const snapshot = await this.readQueuedMessagesSnapshot(runtime);
+		const stillQueued =
+			snapshot !== undefined &&
+			queuedTexts(snapshot).some((chipText) => deferredMatchesText(entry, chipText));
+		if (!stillQueued) {
+			// 离队不等于投递：对账窗口内用户可能已经撤回/中止并把它拿回输入框。
+			if (this.isFollowUpWithdrawn(runtime, entry)) return;
+			this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+			return;
+		}
+		(runtime.deferredFollowUps ??= []).push(entry);
+		// 竞态兜底：对账期间 omp 可能已经把它投递出去（那次 queue_update 早于本条目入表，
+		// 什么都没 flush 到）。用「发送之后到达的最新队列快照」再对账一次，避免气泡永久丢失。
+		if (runtime.lastQueuedSnapshot && (runtime.lastQueueUpdateAt ?? 0) >= promptSentAt) {
+			this.flushDeliveredFollowUps(runtime, runtime.lastQueuedSnapshot);
+		}
+	}
+
+	/** 只为队列对账读一次 get_state；失败返回 undefined，由调用方决定降级方向。 */
+	private async readQueuedMessagesSnapshot(
+		runtime: AgentRuntime,
+	): Promise<AgentQueuedMessages | undefined> {
+		try {
+			const response = await runtime.slot.process.client.request({ type: "get_state" }, 10_000);
+			if (!response.success) return undefined;
+			const data = response.data;
+			const queuedMessages =
+				data && typeof data === "object" && "queuedMessages" in data
+					? data.queuedMessages
+					: undefined;
+			return this.normalizeQueuedMessages(queuedMessages);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * omp 投递或撤回排队消息时会推 queue_update。按「剩余排队条数」对账：
+	 * 队列里该文案的剩余条数少于本地 deferred 条数的部分就是已投递，补上对应气泡。
+	 * omp 是 FIFO 投递，所以从尾部倒着保留仍在队列里的条目——同文案连发多条时
+	 * 先投递的是靠前那条，倒序保留才能让图片/meta 与真实投递内容对齐。
+	 */
+	private flushDeliveredFollowUps(runtime: AgentRuntime, snapshot: AgentQueuedMessages): void {
+		const deferred = runtime.deferredFollowUps;
+		if (!deferred || deferred.length === 0) return;
+		const remaining = new Map<string, number>();
+		for (const text of queuedTexts(snapshot)) {
+			remaining.set(text, (remaining.get(text) ?? 0) + 1);
+		}
+		const keep = new Array<boolean>(deferred.length).fill(false);
+		for (let index = deferred.length - 1; index >= 0; index -= 1) {
+			const entry = deferred[index];
+			if (!entry) continue;
+			// 本进程正在/已经撤回这条消息：它离队是撤回造成的，不是投递。
+			if (this.isFollowUpWithdrawn(runtime, entry)) {
+				keep[index] = true;
+				continue;
+			}
+			// plan 模式下 chip 文案带隐藏标记，两个候选里命中一个就算还在队列。
+			const queuedKey = [entry.queueText, entry.text].find(
+				(text) => (remaining.get(text) ?? 0) > 0,
+			);
+			if (queuedKey === undefined) continue;
+			remaining.set(queuedKey, (remaining.get(queuedKey) ?? 0) - 1);
+			keep[index] = true;
+		}
+		deferred.forEach((entry, index) => {
+			if (keep[index]) return;
+			this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+		});
+		runtime.deferredFollowUps = deferred.filter((_, index) => keep[index]);
+	}
+
+	/**
+	 * 用户主动撤回排队 follow-up：气泡从未写入时间线，只需丢掉本地快照，
+	 * 否则下一次 queue_update 会把它当成「已投递」补一条不该出现的用户消息。
+	 * 按首条匹配丢弃（同文案连发时撤回的正是服务端队列里的第一条）。
+	 */
+	private withdrawDeferredFollowUp(
+		runtime: AgentRuntime,
+		text: string,
+	): DeferredFollowUp | undefined {
+		const deferred = runtime.deferredFollowUps;
+		if (!deferred || deferred.length === 0) return undefined;
+		const index = deferred.findIndex((entry) => deferredMatchesText(entry, text));
+		if (index === -1) return undefined;
+		const [entry] = deferred.splice(index, 1);
+		return entry;
+	}
+
+	/**
+	 * 记下「这条 follow-up 是我们撤走的」：离队事件/准入对账只看得到「不在队列里」，
+	 * 分不清投递还是撤回。墓碑只覆盖在途对账窗口，TTL 过期自动清理。
+	 */
+	private markFollowUpWithdrawn(runtime: AgentRuntime, text: string): void {
+		const tombstones = (runtime.withdrawnFollowUps ??= new Map());
+		const now = Date.now();
+		for (const [key, expiry] of tombstones) {
+			if (expiry <= now) tombstones.delete(key);
+		}
+		tombstones.set(text, now + WITHDRAWN_FOLLOW_UP_TTL_MS);
+	}
+
+	/** 这条 follow-up 是否刚被本进程撤回（撤回留下的墓碑命中即视为未投递）。 */
+	private isFollowUpWithdrawn(runtime: AgentRuntime, entry: DeferredFollowUp): boolean {
+		const tombstones = runtime.withdrawnFollowUps;
+		if (!tombstones || tombstones.size === 0) return false;
+		const now = Date.now();
+		let hit = false;
+		for (const [text, expiry] of tombstones) {
+			if (expiry <= now) {
+				tombstones.delete(text);
+				continue;
+			}
+			if (deferredMatchesText(entry, text)) hit = true;
+		}
+		return hit;
+	}
+
+	/** 撤回请求回执证明这条其实是「已投递」时，清掉墓碑让投递路径继续补气泡。 */
+	private clearFollowUpWithdrawn(runtime: AgentRuntime, text: string): void {
+		runtime.withdrawnFollowUps?.delete(text);
+	}
+
 	/** 服务端返回的图片条目按 ImageContent 逐项校验，坏条目直接丢弃而不是让整次撤回失败。 */
 	private normalizeRestoredImages(value: unknown): ImageContent[] | undefined {
 		if (!Array.isArray(value)) return undefined;
@@ -1644,11 +1850,17 @@ export class AgentManager {
 		queue: "steering" | "followUp",
 	): Promise<RemoveQueuedMessageResult> {
 		const runtime = this.requireRuntime(agentId);
+		// 撤回命令自己会让消息离队并推 queue_update；先立墓碑，让那次事件/在途对账
+		// 都不把它误判为「已投递」。steering 撤回不涉及 follow-up 快照，无需墓碑。
+		if (queue === "followUp") this.markFollowUpWithdrawn(runtime, message);
 		const response = await runtime.slot.process.client.request(
 			{ type: "remove_queued_message", message, queue },
 			15_000,
 		);
-		if (!response.success) throw new Error(response.error ?? "撤回排队消息失败");
+		if (!response.success) {
+			this.clearFollowUpWithdrawn(runtime, message);
+			throw new Error(response.error ?? "撤回排队消息失败");
+		}
 		const data = (response.data ?? {}) as Record<string, unknown>;
 		const images = this.normalizeRestoredImages(data.images);
 		const result: RemoveQueuedMessageResult = {
@@ -1656,6 +1868,22 @@ export class AgentManager {
 			...(images ? { images } : {}),
 			...(data.imagesDropped === true ? { imagesDropped: true } : {}),
 		};
+		// 撤回成功的 follow-up 从未写入时间线（只存在 deferredFollowUps）：丢快照即可，
+		// 否则下一次 queue_update 会把它误判成「已投递」补出气泡。
+		// removed:false 说明 omp 说它已不在队列——那就是刚被投递，必须清墓碑并补气泡，
+		// 否则这条已经进入本轮上下文的消息在时间线里彻底消失。
+		// 只摘 follow-up 的快照：steering 撤回不能动同文案的 follow-up。
+		const withdrawn =
+			queue === "followUp" ? this.withdrawDeferredFollowUp(runtime, message) : undefined;
+		if (result.removed) {
+			// 撤回成功后墓碑继续保留到 TTL 结束：准入对账可能还在途，不能让它补出气泡。
+			void this.emitRuntimeState(agentId);
+			return result;
+		}
+		this.clearFollowUpWithdrawn(runtime, message);
+		if (withdrawn) {
+			this.addMessage(runtime, "user", withdrawn.text, withdrawn.meta, withdrawn.images);
+		}
 		void this.emitRuntimeState(agentId);
 		return result;
 	}
@@ -4022,6 +4250,15 @@ export class AgentManager {
 				// 退役/换代 child 的迟到 exit 必须整体 no-op：此刻 runtime 可能已被 stop 摘除，
 				// 继续走退出分支会把 status 拉回 starting、往已退役的 transcript 写错误卡。
 				if (!owns()) return;
+				// 进程退出即服务端队列整体消失：本地 follow-up 快照/墓碑随之作废，
+				// 否则重连后的第一个 queue_update（空队列）会把从未投递的消息误放成气泡。
+				const rt = this.agents.get(agentId);
+				if (rt) {
+					rt.deferredFollowUps = undefined;
+					rt.withdrawnFollowUps = undefined;
+					rt.lastQueuedSnapshot = undefined;
+					rt.lastQueueUpdateAt = undefined;
+				}
 				options.onExit(payload);
 			} catch (error) {
 				void this.appLogger?.error("agent", "Pi process exit handler failed", {
@@ -4559,6 +4796,11 @@ export class AgentManager {
 		}
 
 		if (typed.type === "queue_update") {
+			// 排队中的 follow-up 投递（或被撤回）后会离队：此刻补上用户气泡，
+			// 顺序天然落在新一轮 agent_start 之前，不会把上一轮回答切成两段。
+			runtime.lastQueuedSnapshot = this.normalizeQueuedMessages(typed);
+			runtime.lastQueueUpdateAt = Date.now();
+			this.flushDeliveredFollowUps(runtime, runtime.lastQueuedSnapshot);
 			// 待投递队列的 chip 文本以 get_state.queuedMessages 为准（事件快照同源）。
 			// 这里只触发一次完整状态刷新：节流合并天然吸收连续增删，renderer 不维护第二份队列。
 			void this.emitRuntimeState(agentId);
@@ -5894,7 +6136,62 @@ type AgentRuntime = {
 	 * omp get_state 不返回预热状态/模式，只能由事件维护；进程重启即丢弃。
 	 */
 	cacheWarming?: AgentCacheWarmingState;
+
+	/**
+	 * 已提交给 omp、但还在服务端队列里没投递的 follow-up 用户消息。
+	 *
+	 * 队列里的消息尚未进入本轮上下文，若此刻就往时间线插用户气泡，当前这一轮回答
+	 * 会被切成「上一轮 + 新冒出的用户消息 + 剩余回答」两段，用户看到的就是
+	 * 「结束后排队」的消息已经发出去了。这里只留快照，等 omp 真正投递
+	 * （queue_update 报告它离开队列）后再落气泡。
+	 */
+	deferredFollowUps?: DeferredFollowUp[];
+
+	/**
+	 * 本进程主动撤回（或中止恢复）的 follow-up 文案墓碑，值为过期时刻。
+	 *
+	 * 消息离队有两种原因：omp 投递，或被我们撤回。队列事件与准入对账只看得到
+	 * 「它不在队列里」，墓碑补上「是我们拿走的」这层信息，避免把撤回误判成投递
+	 * 而在时间线上补出幽灵气泡。带 TTL：只需覆盖在途对账窗口，过期自动清理。
+	 */
+	withdrawnFollowUps?: Map<string, number>;
+
+	/** 最近一次 queue_update 带下来的队列快照与到达时刻（与 deferredFollowUps 对账用）。 */
+	lastQueuedSnapshot?: AgentQueuedMessages;
+	lastQueueUpdateAt?: number;
 };
+
+/**
+ * 撤回墓碑的有效期。只需覆盖「撤回请求发出 → 在途准入对账返回」这段窗口
+ * （get_state 上限 10s），过期即失效，避免长期压制同文案的新消息。
+ */
+const WITHDRAWN_FOLLOW_UP_TTL_MS = 30_000;
+
+/** follow-up 排队消息的本地快照：与真实投递时的气泡内容一一对应。 */
+type DeferredFollowUp = {
+	/** 时间线气泡文案：用户可见原文，不含宿主注入的隐藏标记。 */
+	text: string;
+	/**
+	 * 对账用的队列文案：omp 的 queue chip 是按实际收到的消息生成的。
+	 * plan 模式等场景下它会带上隐藏标记，与 `text` 不同，所以两个都留着做匹配。
+	 */
+	queueText: string;
+	images?: ImageContent[];
+	meta: Record<string, unknown>;
+};
+
+/** 队列快照里的全部 chip 文案（steering 在前，followUp 在后）。 */
+function queuedTexts(snapshot: AgentQueuedMessages): string[] {
+	return [...snapshot.steering, ...snapshot.followUp];
+}
+
+/**
+ * 本地快照与 chip 文案是否指同一条消息。两个候选都算：`text` 是气泡原文，
+ * `queueText` 是实际发出去、chip 据此生成的原文（plan 模式带隐藏标记）。
+ */
+function deferredMatchesText(entry: DeferredFollowUp, text: string): boolean {
+	return entry.queueText === text || entry.text === text;
+}
 
 /**
  * 清洗 omp ask 的 questions 载荷。pi 端已做类型校验，但 RPC 输入是 unknown：
