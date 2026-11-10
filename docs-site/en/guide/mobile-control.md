@@ -24,6 +24,18 @@ Mobile control focuses on chat and session control. Desktop-only surfaces — te
 
 After the first visit, the token is stored in that browser's local storage and the `?token=` query is removed from the address bar. Later visits can use the site URL directly.
 
+## Remote / Off-network Access (Built-in Tailscale)
+
+If you do not want to manage port forwarding, use the built-in Tailscale Serve integration:
+
+1. Install Tailscale on the computer and the phone, and sign both into the same tailnet.
+2. Open **Settings → Web Service → Remote Access (Tailscale)** on the desktop and enable it. OmpDeck turns on the web service and runs `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>`.
+3. The first use requires enabling **HTTPS certificates / Serve** in the Tailscale admin console. The settings page reports a retryable error until it is enabled; activation usually takes a few seconds.
+4. Once the state becomes “connected”, the settings page shows `https://<machine>.<tailnet>.ts.net:8443` and a QR code; scan it on the phone.
+5. Disabling remote access or quitting OmpDeck removes only the Serve rule pointing at its own local port; other Serve rules are untouched.
+
+Tailscale handles network encryption and device authentication; the OmpDeck access token is still required. Requests proxied through Serve are never treated as local loopback traffic, even though Serve connects back from `127.0.0.1`.
+
 ## Access Token
 
 - Non-loopback requests (phone, another computer, tunnel hostname) must carry the token; only loopback Hosts such as `127.0.0.1`, `localhost`, and `::1` are exempt.

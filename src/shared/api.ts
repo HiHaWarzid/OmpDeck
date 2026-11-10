@@ -97,6 +97,7 @@ import type {
 	TerminalTab,
 	ThinkingUpdate,
 	WebServiceStatus,
+	RemoteAccessStatus,
 	WorktreeEntry,
 	YaoPromptDetailResult,
 	YaoPromptListResult,
@@ -535,6 +536,15 @@ export interface WebApi {
 	rotateToken: () => Promise<WebServiceStatus>;
 }
 
+export interface RemoteAccessApi {
+	/** 当前 Tailscale Serve 远程访问状态（设置页展示/排障用） */
+	status: () => Promise<RemoteAccessStatus>;
+	/** 按当前设置启动或重新配置远程访问；失败时抛出带分类的错误 */
+	start: () => Promise<RemoteAccessStatus>;
+	/** 停止远程访问并移除 OmpDeck 自己的 Serve 处理器 */
+	stop: () => Promise<RemoteAccessStatus>;
+}
+
 export interface PetApi {
 	/** 宠物窗监听主进程推送的聚合状态 */
 	onState: (callback: (state: PetAggregateState) => void) => () => void;
@@ -670,6 +680,7 @@ export interface PiDesktopApi {
 	config: ConfigApi;
 	agents: AgentsApi;
 	web: WebApi;
+	remoteAccess: RemoteAccessApi;
 	pet: PetApi;
 	terminal: TerminalApi;
 	feishu: FeishuApi;

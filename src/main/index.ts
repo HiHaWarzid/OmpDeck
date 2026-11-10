@@ -197,6 +197,8 @@ import { ExtensionManager } from "./extensions/ExtensionManager";
 import { restoreAllParkedExtensions } from "./pi/piExtensionFilter";
 import { ProjectResourceManager } from "./projects/ProjectResourceManager";
 import { WebServiceManager } from "./web/WebServiceManager";
+import { RemoteAccessManager } from "./remote/RemoteAccessManager";
+import { createCommandRunner } from "./utils/CommandRunner";
 import { preparePreloadPath } from "./preloadPath";
 import { AppLogger } from "./logging/AppLogger";
 import { registerLogHandlers } from "./ipc/logHandlers";
@@ -313,6 +315,7 @@ let skillManager: SkillManager;
 let extensionManager: ExtensionManager;
 let projectResourceManager: ProjectResourceManager;
 let webServiceManager: WebServiceManager;
+let remoteAccessManager: RemoteAccessManager;
 let terminalManager: TerminalSessionManager;
 let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
@@ -548,6 +551,9 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
 	]);
 	const stop = () => {
+		// 先撤掉 Tailscale Serve，再停 Web 服务，避免短暂留下指向死端口的入口。
+		// 退出路径不 await：off 命令由独立进程完成，新实例启动时会重新配置。
+		void remoteAccessManager?.dispose();
 		void webServiceManager?.stop();
 		terminalManager?.closeAll();
 		void agentManager?.stopAll();
@@ -1153,6 +1159,7 @@ function registerIpc() {
 			restartApp,
 			getPetSystem: () => petSystem,
 			getWebServiceManager: () => webServiceManager,
+			getRemoteAccessManager: () => remoteAccessManager,
 			getAfkOrchestrator: () => afkOrchestrator,
 			openExternalUrl,
 			syncWslEnvironment,
@@ -1285,6 +1292,13 @@ app.whenReady().then(async () => {
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
 	});
+	// 远程访问只配置 Tailscale Serve，转发目标始终是回环 Web 服务。
+	remoteAccessManager = new RemoteAccessManager({
+		runCommand: createCommandRunner().runCommand,
+		getWebPort: () => webServiceManager.getStatus(false).port,
+		isWebRunning: () => webServiceManager.isRunning(),
+		logger: appLogger,
+	});
 	// AFK 编排器：消费 AgentManager 语义事件（settled/statusChanged error）驱动
 	// ticket→worktree→agent→PR 链路；启动自动恢复在 runPostWindowStartupTasks。
 	afkOrchestrator = new AfkOrchestrator({
@@ -1406,10 +1420,23 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	}
 
 
-	void webServiceManager.applySettings(settingsStore.get()).catch((error) => {
-		console.error("Failed to start web service:", error);
-		void settingsStore.update({ webServiceEnabled: false });
-	});
+	void (async () => {
+		const settings = settingsStore.get();
+		try {
+			await webServiceManager.applySettings(settings);
+		} catch (error) {
+			console.error("Failed to start web service:", error);
+			void settingsStore.update({ webServiceEnabled: false, remoteAccessEnabled: false });
+			return;
+		}
+		try {
+			await remoteAccessManager.applySettings(settingsStore.get());
+		} catch (error) {
+			// 远程访问启动失败不应影响桌面端；关闭开关，设置页会显示具体原因。
+			console.error("Failed to start remote access:", error);
+			void settingsStore.update({ remoteAccessEnabled: false });
+		}
+	})();
 
 	// 自动连接：如果已有 Bot 配置，自动启动飞书连接
 	autoConnectFeishu();

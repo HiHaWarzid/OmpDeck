@@ -117,6 +117,61 @@ describe("WebServiceManager 生命周期", () => {
 		}
 	});
 
+	test("带转发头的回环请求必须校验令牌（Tailscale Serve 回源）", async () => {
+		const port = await freePort();
+		const manager = new WebServiceManager(deps, 50);
+		try {
+			await manager.applySettings({
+				webServiceEnabled: true,
+				webServiceHost: HOST,
+				webServicePort: port,
+			});
+			const token = manager.getStatus(true).token;
+			expect(token).toBeTruthy();
+
+			const direct = await fetch(`http://${HOST}:${port}/api/state`);
+			expect(direct.status).toBe(200);
+
+			// Serve 从 127.0.0.1 回源并附加 X-Forwarded-For；即使 Host 被伪造成回环也不能免令牌。
+			const tunneled = await fetch(`http://${HOST}:${port}/api/state`, {
+				headers: { "x-forwarded-for": "100.64.0.2" },
+			});
+			expect(tunneled.status).toBe(401);
+
+			const authorized = await fetch(`http://${HOST}:${port}/api/state`, {
+				headers: { "x-forwarded-for": "100.64.0.2", "x-omp-token": token ?? "" },
+			});
+			expect(authorized.status).toBe(200);
+		} finally {
+			await manager.stop();
+		}
+	});
+
+	test("回环连接伪造任意 IP Host 也必须校验令牌", async () => {
+		const port = await freePort();
+		const manager = new WebServiceManager(deps, 50);
+		try {
+			await manager.applySettings({
+				webServiceEnabled: true,
+				webServiceHost: HOST,
+				webServicePort: port,
+			});
+			const status = await new Promise<number>((resolve, reject) => {
+				const request = httpGet(
+					{ host: HOST, port, path: "/api/state", headers: { Host: "10.0.0.5" } },
+					(response) => {
+						response.resume();
+						resolve(response.statusCode ?? 0);
+					},
+				);
+				request.on("error", reject);
+			});
+			expect(status).toBe(401);
+		} finally {
+			await manager.stop();
+		}
+	});
+
 	test("keep-alive 空闲连接挂着时 stop 在有界时间内 settle", { timeout: 2000 }, async () => {
 		const port = await freePort();
 		const manager = new WebServiceManager(deps, 100);

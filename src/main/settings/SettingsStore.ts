@@ -196,6 +196,7 @@ Gitmoji 对应关系：
   // 避免安装后无意中把 Agent 控制面暴露给同一网络。
   webServiceHost: "127.0.0.1",
   webServicePort: 8765,
+  remoteAccessEnabled: false,
   webServiceTokenTtlDays: 30,
   rpcTimeout: 600_000,
   linkOpenMode: "external",

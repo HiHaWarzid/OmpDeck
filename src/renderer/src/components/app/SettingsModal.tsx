@@ -23,7 +23,7 @@ import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import { ModelRolesTab } from "./ModelRolesTab";
-import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest, WebServiceStatus } from "../../../shared/types";
+import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest, RemoteAccessStatus, WebServiceStatus } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
 const ZOOM_FACTOR_MIN = 0.8;
@@ -339,12 +339,24 @@ function SettingsModalContent(props: SettingsModalProps) {
 	const [webQr, setWebQr] = useState("");
 	const [webTokenVisible, setWebTokenVisible] = useState(false);
 	const [webTokenBusy, setWebTokenBusy] = useState(false);
+	const [remoteStatus, setRemoteStatus] = useState<RemoteAccessStatus | null>(null);
+	const [remoteQr, setRemoteQr] = useState("");
+	const [remoteBusy, setRemoteBusy] = useState(false);
+	const [remoteActionError, setRemoteActionError] = useState("");
 
 	const refreshWebStatus = async () => {
 		try {
 			setWebStatus(await window.piDesktop.web.status());
 		} catch {
 			setWebStatus(null);
+		}
+	};
+
+	const refreshRemoteStatus = async () => {
+		try {
+			setRemoteStatus(await window.piDesktop.remoteAccess.status());
+		} catch {
+			setRemoteStatus(null);
 		}
 	};
 
@@ -375,6 +387,24 @@ function SettingsModalContent(props: SettingsModalProps) {
 			.catch(() => setWebQr(""));
 	}, [webStatus]);
 
+	useEffect(() => {
+		void refreshRemoteStatus();
+		// 保存后的开关/端口变化要重新拉取状态；关闭态也会返回 installed 信息。
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [props.settings.remoteAccessEnabled, props.settings.webServiceEnabled, props.settings.webServicePort]);
+
+	useEffect(() => {
+		const token = webStatus?.token;
+		if (!token || !remoteStatus?.url) {
+			setRemoteQr("");
+			return;
+		}
+		const url = `${remoteStatus.url}/?token=${encodeURIComponent(token)}`;
+		void QRCode.toDataURL(url, { margin: 1, width: 220 })
+			.then(setRemoteQr)
+			.catch(() => setRemoteQr(""));
+	}, [remoteStatus, webStatus?.token]);
+
 	const rotateWebToken = async () => {
 		setWebTokenBusy(true);
 		try {
@@ -391,6 +421,42 @@ function SettingsModalContent(props: SettingsModalProps) {
 		if (!token || !webStatus.url) return;
 		await navigator.clipboard.writeText(`${webStatus.url}/?token=${encodeURIComponent(token)}`);
 	};
+
+	const copyRemoteUrl = async () => {
+		const token = webStatus?.token;
+		if (!token || !remoteStatus?.url) return;
+		await navigator.clipboard.writeText(`${remoteStatus.url}/?token=${encodeURIComponent(token)}`);
+	};
+
+	const retryRemoteAccess = async () => {
+		setRemoteBusy(true);
+		setRemoteActionError("");
+		try {
+			const status = await window.piDesktop.remoteAccess.start();
+			setRemoteStatus(status);
+			// start 成功后主进程已持久化开关；同步到 App 的 settings，否则关闭再打开设置页
+			// 会看到「状态已连接、开关却是关」的矛盾。
+			props.onChange({ remoteAccessEnabled: true });
+		} catch (error) {
+			setRemoteActionError(error instanceof Error ? error.message : String(error));
+			await refreshRemoteStatus();
+		} finally {
+			setRemoteBusy(false);
+		}
+	};
+
+	const remoteErrorCode = remoteStatus?.errorCode ?? null;
+	const remoteErrorText = remoteErrorCode
+		? t(`settings.remoteAccessError.${remoteErrorCode}`)
+		: remoteActionError || remoteStatus?.error || "";
+	const remoteStateText =
+		remoteStatus?.state === "running"
+			? t("settings.remoteAccessRunning")
+			: remoteStatus?.state === "starting"
+				? t("settings.remoteAccessStarting")
+				: remoteStatus?.state === "error"
+					? t("settings.remoteAccessError")
+					: t("settings.remoteAccessStopped");
 	const piPath = props.settings.customPiPath || props.piStatus?.command || "";
 	const changeZoomFactor = (delta: number) => {
 		const next = Math.min(
@@ -1488,7 +1554,12 @@ function SettingsModalContent(props: SettingsModalProps) {
 										checked={draftSettings.webServiceEnabled}
 										disabled={props.webServiceChanging}
 										onChange={(checked) =>
-											updateDraft({ webServiceEnabled: checked })
+											updateDraft({
+												webServiceEnabled: checked,
+												// 与后端一致：关闭 Web 服务会级联关闭远程访问，
+												// 草稿也要同步，避免重新打开 Web 时远程开关“复活”。
+												...(checked ? {} : { remoteAccessEnabled: false }),
+											})
 										}
 									/>
 									<div className="web-endpoint-panel">
@@ -1621,6 +1692,91 @@ function SettingsModalContent(props: SettingsModalProps) {
 										)}
 									</div>
 								</SettingsSection>
+								{!isWebRuntime && (
+								<SettingsSection
+									title={t("settings.remoteAccess")}
+									description={t("settings.remoteAccessDesc")}
+								>
+									<SettingSwitch
+										title={t("settings.remoteAccessEnable")}
+										description={
+											draftSettings.remoteAccessEnabled
+												? t("settings.remoteAccessOnDesc")
+												: t("settings.remoteAccessOffDesc")
+										}
+										checked={draftSettings.remoteAccessEnabled === true}
+										disabled={props.webServiceChanging || remoteBusy}
+										onChange={(checked) =>
+											updateDraft({
+												remoteAccessEnabled: checked,
+												// 远程访问依赖 Web 服务：勾选时同步打开，避免保存后 Serve 指向未监听端口。
+												...(checked && !draftSettings.webServiceEnabled
+													? { webServiceEnabled: true }
+													: {}),
+											})
+										}
+									/>
+									<div className="web-endpoint-panel">
+										<div className="web-endpoint-summary">
+											<span className={remoteStatus?.state === "running" ? "online" : ""} />
+											<div>
+												<strong>
+													{remoteStatus?.url || t("settings.remoteAccessNotRunning")}
+												</strong>
+												<small>{remoteStateText}</small>
+											</div>
+											<div className="web-endpoint-actions">
+												{remoteStatus?.url && (
+													<IconButton
+														label={t("settings.remoteAccessCopy")}
+														onClick={() => void copyRemoteUrl()}
+													>
+														<Copy size={15} />
+													</IconButton>
+												)}
+												{remoteStatus?.state !== "running" && draftSettings.remoteAccessEnabled && (
+													<Button
+														buttonSize="sm"
+														disabled={remoteBusy}
+														onClick={() => void retryRemoteAccess()}
+													>
+														{remoteBusy
+															? t("settings.remoteAccessStarting")
+															: t("settings.remoteAccessRetry")}
+													</Button>
+												)}
+											</div>
+										</div>
+										{remoteErrorText && (
+											<small className="web-token-warning">{remoteErrorText}</small>
+										)}
+										{remoteStatus?.state === "running" && !webStatus?.token && (
+											<small className="web-token-warning">
+												{t("settings.remoteAccessTokenMissing")}
+											</small>
+										)}
+										{remoteQr && webStatus?.token && (
+											<div className="web-token-qr">
+												<img
+													src={remoteQr}
+													alt={t("settings.remoteAccessQrAlt")}
+													width={180}
+													height={180}
+												/>
+												<div>
+													<strong>{t("settings.remoteAccessScan")}</strong>
+													<small>
+														{remoteStatus?.url} · {t("settings.remoteAccessScanHint")}
+													</small>
+												</div>
+											</div>
+										)}
+										<small className="web-token-warning">
+											{t("settings.remoteAccessSecurity")}
+										</small>
+									</div>
+								</SettingsSection>
+								)}
 								<SettingsSection title={t("settings.privacy")}>
 									<SettingSwitch
 										title={t("settings.telemetry")}

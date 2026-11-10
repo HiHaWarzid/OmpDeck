@@ -1,5 +1,6 @@
 import { createServer, request as httpRequest } from "node:http";
 import { networkInterfaces } from "node:os";
+import { gunzipSync } from "node:zlib";
 import { describe, expect, test } from "vitest";
 import type { AgentRuntimeState, AgentTab, CreateAgentInput, SendPromptResult } from "../../shared/types";
 import { WebServiceManager } from "./WebServiceManager";
@@ -230,6 +231,101 @@ describe.skipIf(!lan)("web service token gate", () => {
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as { messages: Array<{ content?: string }> };
 			expect(body.messages[0]?.content).toBe("hello agent-1");
+		} finally {
+			await manager.stop();
+		}
+	});
+
+	test("light state omits message bodies for the mobile shell", async () => {
+		const manager = createManager({
+			listProjects: () => [{ id: "p1" } as never],
+			listAgents: () => [{ id: "agent-1", projectId: "p1" } as never],
+			getMessages: () => [{ id: "m1", text: "x".repeat(4096) } as never],
+		});
+		const port = await freePort();
+		await manager.applySettings({
+			webServiceEnabled: true,
+			webServiceHost: "0.0.0.0",
+			webServicePort: port,
+			webServiceToken: "omp_light_token",
+			webServiceTokenGeneratedAt: Date.now(),
+			webServiceTokenExpiresAt: null,
+			webServiceTokenTtlDays: 0,
+		});
+		try {
+			const response = await fetch(`http://${lan}:${port}/api/state?light=1`, {
+				headers: { authorization: "Bearer omp_light_token" },
+			});
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as Record<string, unknown>;
+			expect(Object.keys(body).sort()).toEqual(["agents", "projects"]);
+		} finally {
+			await manager.stop();
+		}
+	});
+
+	test("messages tail window is gzipped for slow mobile links", async () => {
+		const allMessages = Array.from({ length: 50 }, (_, index) => ({
+			id: `m${index}`,
+			agentId: "agent-1",
+			role: "user",
+			text: "x".repeat(120),
+			timestamp: index,
+		}));
+		const manager = createManager({ getMessages: () => allMessages as never });
+		const port = await freePort();
+		await manager.applySettings({
+			webServiceEnabled: true,
+			webServiceHost: "0.0.0.0",
+			webServicePort: port,
+			webServiceToken: "omp_tail_token",
+			webServiceTokenGeneratedAt: Date.now(),
+			webServiceTokenExpiresAt: null,
+			webServiceTokenTtlDays: 0,
+		});
+		try {
+			const result = await new Promise<{
+				status: number;
+				headers: Record<string, string | string[] | undefined>;
+				body: Buffer;
+			}>((resolve, reject) => {
+				const request = httpRequest(
+					{
+						hostname: lan,
+						port,
+						path: "/api/agents/agent-1/messages?tail=10",
+						headers: {
+							authorization: "Bearer omp_tail_token",
+							"accept-encoding": "gzip",
+						},
+					},
+					(response) => {
+						const chunks: Buffer[] = [];
+						response.on("data", (chunk: Buffer) => chunks.push(chunk));
+						response.on("end", () =>
+							resolve({
+								status: response.statusCode ?? 0,
+								headers: response.headers,
+								body: Buffer.concat(chunks),
+							}),
+						);
+					},
+				);
+				request.on("error", reject);
+				request.end();
+			});
+			expect(result.status).toBe(200);
+			expect(result.headers["content-encoding"]).toBe("gzip");
+			const body = JSON.parse(gunzipSync(result.body).toString("utf8")) as {
+				messages: Array<{ id: string }>;
+				total: number;
+				tail: number;
+			};
+			expect(body.total).toBe(50);
+			expect(body.tail).toBe(10);
+			expect(body.messages.map((message) => message.id)).toEqual(
+				Array.from({ length: 10 }, (_, index) => `m${index + 40}`),
+			);
 		} finally {
 			await manager.stop();
 		}

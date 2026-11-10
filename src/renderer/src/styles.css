@@ -12457,6 +12457,12 @@ body.is-composer-resizing .composer-resize-handle::after {
 .web-endpoint-summary .ui-button {
   justify-self: end;
 }
+.web-endpoint-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-self: end;
+}
 .web-token-panel {
   display: grid;
   gap: 10px;

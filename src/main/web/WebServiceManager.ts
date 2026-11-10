@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { isIP, type AddressInfo } from "node:net";
+import type { AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { extname, isAbsolute, join, normalize, relative } from "node:path";
+import { gzipSync } from "node:zlib";
+import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import type {
 	AgentHistoryPage,
 	AgentTab,
@@ -28,6 +29,24 @@ import {
 	type WebTokenSettings,
 	type WebTokenState,
 } from "./WebTokenAuth";
+
+/** 隧道/反向代理注入的转发头；存在即视为非本机直连，不能走回环免令牌。 */
+function hasForwardedHeaders(request: IncomingMessage): boolean {
+	const headers = request.headers;
+	return Boolean(
+		headers.forwarded ||
+			headers["x-forwarded-for"] ||
+			headers["x-forwarded-host"] ||
+			headers["x-forwarded-proto"] ||
+			headers["x-forwarded-port"] ||
+			headers["x-real-ip"] ||
+			headers["cf-connecting-ip"] ||
+			headers["true-client-ip"] ||
+			headers.via ||
+			headers["tailscale-user-login"] ||
+			headers["tailscale-ingress-target"],
+	);
+}
 
 type WebServiceSettings = Pick<
 	AppSettings,
@@ -294,7 +313,7 @@ export class WebServiceManager {
 			}
 
 			if (url.pathname === "/api/health") {
-				this.sendJson(response, {
+				this.sendJson(request, response, {
 					ok: true,
 					service: "OmpDeck",
 					host,
@@ -315,10 +334,18 @@ export class WebServiceManager {
 			if (url.pathname === "/api/web/status") {
 				const loopback = this.isLoopbackRequest(request);
 				const status = this.getStatus(loopback);
-				this.sendJson(response, { ...status, loopback });
+				this.sendJson(request, response, { ...status, loopback });
 				return;
 			}
 			if (url.pathname === "/api/state") {
+				// 手机端只依赖项目/Agent 列表；不传大会话消息，首屏从 1MB 降到几 KB。
+				if (url.searchParams.get("light") === "1") {
+					this.sendJson(request, response, {
+						projects: this.deps.listProjects(),
+						agents: this.deps.listAgents(),
+					});
+					return;
+				}
 				// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
 				// 的双重序列化（web UI 每 600ms 轮询，命中缓存时零 stringify 开销）
 				const payload = this.getStatePayload();
@@ -334,7 +361,7 @@ export class WebServiceManager {
 				const projectId = decodeURIComponent(sessionsMatch[1]);
 				this.assertProjectExists(projectId);
 				const sessions = await this.deps.listSessions(projectId);
-				this.sendJson(response, { sessions });
+				this.sendJson(request, response, { sessions });
 				return;
 			}
 			if (url.pathname === "/api/agents" && request.method === "POST") {
@@ -352,13 +379,21 @@ export class WebServiceManager {
 					sessionPath: body.sessionPath,
 					noSession: body.noSession,
 				});
-				this.sendJson(response, { agent });
+				this.sendJson(request, response, { agent });
 				return;
 			}
 			const messagesMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages$/);
 			if (messagesMatch && request.method === "GET") {
 				const messages = this.deps.getMessages(decodeURIComponent(messagesMatch[1]));
-				this.sendJson(response, { messages });
+				// 手机端只轮询最近窗口，避免大会话每 2s 重传整段消息。
+				const tailParam = url.searchParams.get("tail");
+				const tail = tailParam === null ? null : Math.min(200, Math.max(1, Number(tailParam) || 40));
+				const window = tail === null ? messages : messages.slice(-tail);
+				this.sendJson(request, response, {
+					messages: window,
+					total: messages.length,
+					...(tail === null ? {} : { tail }),
+				});
 				return;
 			}
 			const historyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/history-page$/);
@@ -369,7 +404,7 @@ export class WebServiceManager {
 					url.searchParams.get("before") ?? undefined,
 					Number.isFinite(limit) ? limit : 40,
 				);
-				this.sendJson(response, page);
+				this.sendJson(request, response, page);
 				return;
 			}
 			const uiResponseMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/ui-response$/);
@@ -389,7 +424,7 @@ export class WebServiceManager {
 					cancelled: body.cancelled,
 					confirmed: body.confirmed,
 				});
-				this.sendJson(response, { ok: true });
+				this.sendJson(request, response, { ok: true });
 				return;
 			}
 			const trustMatch = url.pathname.match(/^\/api\/trust\/([^/]+)$/);
@@ -400,7 +435,7 @@ export class WebServiceManager {
 					return;
 				}
 				await this.deps.respondTrustRequest(decodeURIComponent(trustMatch[1]), body.choice);
-				this.sendJson(response, { ok: true });
+				this.sendJson(request, response, { ok: true });
 				return;
 			}
 			const promptMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/prompt$/);
@@ -419,31 +454,31 @@ export class WebServiceManager {
 				// prompt endpoint is a transport for SendPromptResult. Semantic rejection is still
 				// a successful HTTP exchange so browser clients can distinguish rejected from
 				// post-write unknown instead of collapsing both into a thrown fetch error.
-				this.sendJson(response, { result });
+				this.sendJson(request, response, { result });
 				return;
 			}
 			const stopMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/stop$/);
 			if (stopMatch && request.method === "POST") {
 				await this.deps.stopAgent(decodeURIComponent(stopMatch[1]));
-				this.sendJson(response, { ok: true });
+				this.sendJson(request, response, { ok: true });
 				return;
 			}
 			const runtimeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/runtime$/);
 			if (runtimeMatch && request.method === "GET") {
 				const state = await this.deps.runtimeState(decodeURIComponent(runtimeMatch[1]));
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			const cycleModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-model$/);
 			if (cycleModelMatch && request.method === "POST") {
 				const state = await this.deps.cycleModel(decodeURIComponent(cycleModelMatch[1]));
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			const modelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/models$/);
 			if (modelsMatch && request.method === "GET") {
 				const models = await this.deps.availableModels(decodeURIComponent(modelsMatch[1]));
-				this.sendJson(response, { models });
+				this.sendJson(request, response, { models });
 				return;
 			}
 			const setModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/model$/);
@@ -454,26 +489,26 @@ export class WebServiceManager {
 					body.provider ?? "",
 					body.modelId ?? "",
 				);
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			const refreshModelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/refresh-models$/);
 			if (refreshModelsMatch && request.method === "POST") {
 				const state = await this.deps.refreshModels(decodeURIComponent(refreshModelsMatch[1]));
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			const cycleThinkingMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-thinking$/);
 			if (cycleThinkingMatch && request.method === "POST") {
 				const state = await this.deps.cycleThinking(decodeURIComponent(cycleThinkingMatch[1]));
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			const setThinkingMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/thinking$/);
 			if (setThinkingMatch && request.method === "POST") {
 				const body = await this.readJson<{ level?: string }>(request);
 				const state = await this.deps.setThinking(decodeURIComponent(setThinkingMatch[1]), body.level ?? "");
-				this.sendJson(response, { state });
+				this.sendJson(request, response, { state });
 				return;
 			}
 			if (url.pathname.startsWith("/api/")) {
@@ -481,12 +516,15 @@ export class WebServiceManager {
 				return;
 			}
 
-			await this.serveRenderer(url.pathname, response);
+			await this.serveRenderer(url.pathname, response, request);
 	}
 
 	private isLoopbackRequest(request: IncomingMessage): boolean {
 		// 回环连接本身不够：DNS rebinding 会让攻击者页面的 Host 指向 127.0.0.1，
-		// socket 同样是回环。只有 Host 也是 IP/localhost/实际绑定主机时才免令牌。
+		// socket 同样是回环。只有 Host 也是回环地址/实际绑定主机时才免令牌。
+		// 反向代理（Tailscale Serve / Cloudflare Tunnel）从本机回源，socket 一定是回环，
+		// 但 Host 可能被客户端伪造；带转发头说明请求来自隧道，必须继续校验令牌。
+		if (hasForwardedHeaders(request)) return false;
 		return (
 			!this.requireAuth &&
 			isLoopbackAddress(request.socket.remoteAddress) &&
@@ -495,9 +533,10 @@ export class WebServiceManager {
 	}
 
 	/**
-	 * 可信 Host：IP 字面量、localhost 或实际绑定的主机名。
-	 * 其他主机名（如 Tailscale/Cloudflare 隧道域名）不放行免令牌，但也不拒绝——
-	 * 它们必须带令牌，既保留隧道用法，又挡住 DNS rebinding 的无凭据访问。
+	 * 可信 Host：回环地址、localhost 或实际绑定的主机名。
+	 * 不能放行任意 IP 字面量：本机反向代理若把 Host 改写成 127.0.0.1（nginx 默认
+	 * `$proxy_host`）且不带转发头，会让远端请求被误判成本机直连。其他主机名
+	 * （如 Tailscale/Cloudflare 隧道域名）不放行免令牌，但也不拒绝——它们必须带令牌。
 	 */
 	private isTrustedHost(request: IncomingMessage): boolean {
 		const hostHeader = request.headers.host;
@@ -515,7 +554,7 @@ export class WebServiceManager {
 			configuredHost !== "0.0.0.0" &&
 			configuredHost !== "::" &&
 			configuredHost.toLowerCase() === bareHost.toLowerCase();
-		return bareHost === "localhost" || isIP(bareHost) !== 0 || matchesConfiguredHost;
+		return isLoopbackAddress(bareHost) || matchesConfiguredHost;
 	}
 
 	/**
@@ -595,6 +634,13 @@ export class WebServiceManager {
 	private assertRateLimit(request: IncomingMessage): void {
 		const key = request.socket.remoteAddress ?? "unknown";
 		const now = this.now();
+		// 隧道/反代会让所有客户端共享一个回环 key，桶数量本身不大；但公网直连时
+		// 每个源 IP 一个桶，长时间运行需要清理过期窗口，避免 map 无界增长。
+		if (this.rateBuckets.size > 2048) {
+			for (const [bucketKey, bucket] of this.rateBuckets) {
+				if (now - bucket.windowStart >= 60_000) this.rateBuckets.delete(bucketKey);
+			}
+		}
 		const bucket = this.rateBuckets.get(key);
 		if (!bucket || now - bucket.windowStart >= 60_000) {
 			this.rateBuckets.set(key, { windowStart: now, count: 1 });
@@ -856,8 +902,17 @@ export class WebServiceManager {
 </html>`;
 	}
 
-	private async serveRenderer(pathname: string, response: ServerResponse) {
+	private async serveRenderer(pathname: string, response: ServerResponse, request: IncomingMessage) {
 		const requestedPath = decodeURIComponent(pathname);
+		// 手机默认进轻量页面：桌面 bundle 首屏 4MB，经 Tailscale DERP 基本不可用。
+		// 需要桌面版时显式访问 /index.html 或加 ?desktop=1。
+		const mobilePage = join(this.rendererRoot, "mobile.html");
+		const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(request.headers["user-agent"] ?? "");
+		const wantsDesktop = request.url?.includes("desktop=1") ?? false;
+		if (requestedPath === "/" && isMobile && !wantsDesktop && existsSync(mobilePage)) {
+			await this.sendFile(mobilePage, response);
+			return;
+		}
 		const relativePath = requestedPath === "/" || !extname(requestedPath)
 			? "index.html"
 			: requestedPath.replace(/^\/+/, "");
@@ -876,10 +931,13 @@ export class WebServiceManager {
 
 	private async sendFile(filePath: string, response: ServerResponse) {
 		const body = await readFile(filePath);
+		// 只有 Vite 产出的 /assets/ 带内容哈希，可以长缓存；public 下的
+		// mobile.* / boot-diagnostics.js 等文件名固定，必须每次回源。
 		const noStore =
 			filePath.endsWith("index.html") ||
 			filePath.endsWith("sw.js") ||
-			filePath.endsWith(".webmanifest");
+			filePath.endsWith(".webmanifest") ||
+			!filePath.includes(`${sep}assets${sep}`);
 		response.writeHead(200, {
 			...this.baseHeaders(),
 			"content-type": this.contentType(filePath),
@@ -932,12 +990,25 @@ export class WebServiceManager {
 		};
 	}
 
-	private sendJson(response: ServerResponse, body: unknown) {
+	private sendJson(request: IncomingMessage, response: ServerResponse, body: unknown) {
+		const payload = JSON.stringify(body);
+		// 手机通过 Tailscale DERP 访问时带宽只有几百 KB/s；大会话状态 JSON 压缩后
+		// 通常只剩 10%，这是远程可用性的关键路径。
+		if (payload.length > 1024 && /\bgzip\b/.test(request.headers["accept-encoding"] ?? "")) {
+			response.writeHead(200, {
+				...this.baseHeaders(),
+				"content-type": "application/json; charset=utf-8",
+				"content-encoding": "gzip",
+				vary: "accept-encoding",
+			});
+			response.end(gzipSync(payload));
+			return;
+		}
 		response.writeHead(200, {
 			...this.baseHeaders(),
 			"content-type": "application/json; charset=utf-8",
 		});
-		response.end(JSON.stringify(body));
+		response.end(payload);
 	}
 
 	private sendError(response: ServerResponse, statusCode: number, error: string, code?: string) {

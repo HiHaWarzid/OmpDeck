@@ -349,6 +349,11 @@ export const ipcTable = {
 		status: { channel: "web:status", kind: "invoke" },
 		rotateToken: { channel: "web:rotate-token", kind: "invoke" },
 	},
+	remoteAccess: {
+		status: { channel: "remote-access:status", kind: "invoke" },
+		start: { channel: "remote-access:start", kind: "invoke" },
+		stop: { channel: "remote-access:stop", kind: "invoke" },
+	},
 	config: {
 		getModels: { channel: "config:get-models", kind: "invoke" },
 		getAuth: { channel: "config:get-auth", kind: "invoke" },

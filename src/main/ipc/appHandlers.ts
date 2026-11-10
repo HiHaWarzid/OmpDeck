@@ -18,12 +18,14 @@ import type { PiDesktopApi } from "../../shared/api";
 import type {
 	AppSettings,
 	AppUpdateAsset,
+	RemoteAccessStatus,
 } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { WebServiceManager } from "../web/WebServiceManager";
+import type { RemoteAccessManager } from "../remote/RemoteAccessManager";
 import type { PiLocator } from "../pi/PiLocator";
 import type { PetSystem } from "../pet";
 import type { AfkOrchestrator } from "../afk/AfkOrchestrator";
@@ -54,6 +56,8 @@ interface AppHandlerDeps {
 	restartApp: () => void;
 	getPetSystem: () => PetSystem | null;
 	getWebServiceManager: () => WebServiceManager | undefined;
+	/** Tailscale Serve 远程访问管理器；未初始化时设置页仍可读取关闭态 */
+	getRemoteAccessManager?: () => RemoteAccessManager | undefined;
 	/** AFK 编排器（settings-save 时热更新 afk 启停/目标/间隔） */
 	getAfkOrchestrator?: () => AfkOrchestrator | undefined;
 	// 顶层函数 dep（定义留在 index.ts）
@@ -69,6 +73,7 @@ type AppHandlerMaps = {
 	// onApplyWindow 是 subscribe（主进程推送），不注册 handler
 	settings: Omit<IpcHandlerMap<typeof ipcTable.settings, PiDesktopApi["settings"]>, "onApplyWindow">;
 	web: IpcHandlerMap<typeof ipcTable.web, PiDesktopApi["web"]>;
+	remoteAccess: IpcHandlerMap<typeof ipcTable.remoteAccess, PiDesktopApi["remoteAccess"]>;
 };
 
 export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
@@ -81,6 +86,7 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 		getMainWindow,
 		getPetSystem,
 		getWebServiceManager,
+		getRemoteAccessManager,
 		openExternalUrl,
 		syncWslEnvironment,
 		applyNativeThemeSource,
@@ -180,8 +186,19 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 			update: async (_event, patch: Partial<AppSettings>) => {
 				// 记录更新前的设置，用于驱动桌面宠物对 pet 字段变化的反应
 				const prevSettings = settingsStore.get();
-				let settings = await settingsStore.update(patch);
-				void appLogger.info("settings", "Settings updated", { keys: Object.keys(patch) });
+				// 远程访问依赖 Web 服务；用户只打开远程访问时自动把 Web 服务一起启用，
+				// 避免出现「开关是开、Serve 指向未监听端口」的半配置状态。
+				const effectivePatch: Partial<AppSettings> = { ...patch };
+				if (effectivePatch.remoteAccessEnabled === true && !prevSettings.webServiceEnabled) {
+					effectivePatch.webServiceEnabled = true;
+				}
+				// 关闭 Web 服务会立刻让 Serve 指向一个未监听的端口；远程访问必须同步关闭，
+				// 否则设置页会停在「远程已启用但不可用」的矛盾状态。
+				if (effectivePatch.webServiceEnabled === false && prevSettings.remoteAccessEnabled) {
+					effectivePatch.remoteAccessEnabled = false;
+				}
+				let settings = await settingsStore.update(effectivePatch);
+				void appLogger.info("settings", "Settings updated", { keys: Object.keys(effectivePatch) });
 				// 桌面宠物：设置面板走 settings.update，这里统一驱动开窗/切换/置顶
 				await getPetSystem()?.reactToSettings(prevSettings, settings);
 				if (
@@ -211,10 +228,11 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 					});
 				}
 				if (
-					"webServiceEnabled" in patch ||
-					"webServiceHost" in patch ||
-					"webServicePort" in patch ||
-					"webServiceTokenTtlDays" in patch
+					"webServiceEnabled" in effectivePatch ||
+					"webServiceHost" in effectivePatch ||
+					"webServicePort" in effectivePatch ||
+					"webServiceTokenTtlDays" in effectivePatch ||
+					"remoteAccessEnabled" in effectivePatch
 				) {
 					const webServiceManager = getWebServiceManager();
 					try {
@@ -224,14 +242,17 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 						// 正常服务。失败意味着这三个键没有生效，必须回滚到应用前的值——否则设置
 						// 面板会显示一个并未在服务的端口，用户以为已切换而实际仍在旧端口。
 						const rollback: Partial<AppSettings> = {};
-						if ("webServiceEnabled" in patch) {
+						if ("webServiceEnabled" in effectivePatch) {
 							rollback.webServiceEnabled = prevSettings.webServiceEnabled;
 						}
-						if ("webServiceHost" in patch) {
+						if ("webServiceHost" in effectivePatch) {
 							rollback.webServiceHost = prevSettings.webServiceHost;
 						}
-						if ("webServicePort" in patch) {
+						if ("webServicePort" in effectivePatch) {
 							rollback.webServicePort = prevSettings.webServicePort;
+						}
+						if ("remoteAccessEnabled" in effectivePatch) {
+							rollback.remoteAccessEnabled = prevSettings.remoteAccessEnabled ?? false;
 						}
 						// 启动失败且当前确无实例在跑（此前也没有服务）：明确关掉开关，
 						// 避免停在「开关是开、后端没有服务」的状态。
@@ -240,6 +261,47 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 						}
 						if (Object.keys(rollback).length > 0) await settingsStore.update(rollback);
 						throw error;
+					}
+				}
+				// 远程访问必须在 Web 服务绑定成功后配置；Web 端口变化时也要把 Serve
+				// 目标改到新端口，否则隧道会指向旧端口。
+				if (
+					"remoteAccessEnabled" in effectivePatch ||
+					"webServicePort" in effectivePatch ||
+					"webServiceEnabled" in effectivePatch
+				) {
+					const remoteAccessManager = getRemoteAccessManager?.();
+					if (remoteAccessManager) {
+						try {
+							await remoteAccessManager.applySettings(settings);
+						} catch (error) {
+							// 远程访问启用/关闭失败时回滚开关，避免 UI 显示已开启但 Serve 未生效。
+							// Web 服务是否保留启用由上面的 Web 服务分支决定（自动启用是合理的）。
+							const rollback: Partial<AppSettings> = {};
+							if ("remoteAccessEnabled" in effectivePatch) {
+								rollback.remoteAccessEnabled = prevSettings.remoteAccessEnabled ?? false;
+							}
+							// 同一次保存若还关闭了 Web 服务，而 Serve 关闭失败，远程开关必须保持
+							// 开启；此时必须把 Web 服务一并恢复，否则开关为开但目标端口未监听。
+							if (effectivePatch.webServiceEnabled === false && prevSettings.webServiceEnabled) {
+								rollback.webServiceEnabled = true;
+								rollback.webServiceHost = prevSettings.webServiceHost;
+								rollback.webServicePort = prevSettings.webServicePort;
+							}
+							if (Object.keys(rollback).length > 0) {
+								settings = await settingsStore.update(rollback);
+								if (rollback.webServiceEnabled) {
+									try {
+										await getWebServiceManager()?.applySettings(settings);
+									} catch (restoreError) {
+										void appLogger.warn("settings", "Failed to restore web service after remote stop failure", {
+											error: restoreError instanceof Error ? restoreError.message : String(restoreError),
+										});
+									}
+								}
+							}
+							throw error;
+						}
 					}
 				}
 				// WSL 设置变更时同步更新会话扫描器和配置管理器
@@ -307,6 +369,43 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				};
 			},
 		},
+		remoteAccess: {
+			status: async () => getRemoteAccessManager?.()?.getStatus() ?? disabledRemoteAccessStatus(),
+			start: async () => {
+				const manager = getRemoteAccessManager?.();
+				if (!manager) return disabledRemoteAccessStatus();
+				// 重试入口：以「启用」语义启动，成功后持久化开关；失败不改设置。
+				const status = await manager.applySettings({
+					...settingsStore.get(),
+					remoteAccessEnabled: true,
+				});
+				await settingsStore.update({ remoteAccessEnabled: true });
+				return status;
+			},
+			stop: async () => {
+				const manager = getRemoteAccessManager?.();
+				const status = manager ? await manager.stop() : disabledRemoteAccessStatus();
+				await settingsStore.update({ remoteAccessEnabled: false });
+				return status;
+			},
+		},
+	};
+}
+
+/** 管理器尚未初始化（例如启动早期）时返回关闭态，避免设置页拿到 undefined。 */
+function disabledRemoteAccessStatus(): RemoteAccessStatus {
+	return {
+		enabled: false,
+		state: "off",
+		provider: "tailscale",
+		installed: false,
+		loggedIn: false,
+		url: null,
+		hostname: null,
+		httpsPort: 8443,
+		binaryPath: null,
+		errorCode: null,
+		error: null,
 	};
 }
 

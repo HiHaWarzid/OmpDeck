@@ -11,11 +11,12 @@
 - **手机 / 局域网 Web 控制** — 手机浏览器可查看项目与会话、打开历史会话、新建会话、继续对话、停止 Agent，并处理模型/思考级别切换、UI 确认和项目信任确认。
 - **二维码配对与令牌管理** — 设置页展示带令牌的访问地址和二维码，支持复制、显示/隐藏、轮换令牌，以及 1 天 / 7 天 / 30 天 / 永不过期有效期。
 - **手机端布局与 PWA** — 窄屏侧栏改为抽屉、详情抽屉覆盖、输入框适配安全区；支持添加到主屏幕，Service Worker 仅缓存静态资源且网络优先。
+- **Tailscale Serve 远程访问** — 设置页可启用远程访问，把回环 Web 服务通过 HTTPS 发布到 tailnet，提供状态、二维码、复制与重试；只撤销指向 OmpDeck 本机端口的 Serve 配置。
 
 ### 🔒 安全
 
 - **默认仅监听回环地址** — `webServiceHost` 默认从 `0.0.0.0` 改为 `127.0.0.1`；局域网访问需要在设置中显式切换。
-- **非回环请求强制令牌** — 手机、其他设备和隧道域名访问 API 必须携带 `Authorization: Bearer`、`X-Omp-Token` 或 `?token=`；仅本机回环 Host 免令牌，非 IP Host 不能借 DNS rebinding 绕过鉴权。
+- **非回环请求强制令牌** — 手机、其他设备和隧道域名访问 API 必须携带 `Authorization: Bearer`、`X-Omp-Token` 或 `?token=`；仅本机回环地址或实际绑定主机免令牌，任意 IP 字面量 Host 不再免令牌，本机反向代理改写 Host 也不会被误判成本机直连。带反向代理转发头（Tailscale Serve、Cloudflare Tunnel、`Forwarded`、`X-Real-IP` 等）的请求即使从 `127.0.0.1` 回源也不会被当作本机直连。
 - **写请求防护** — 校验 Origin 与 Host 一致、拒绝非 JSON Content-Type，按 IP 限制写操作频率（120 次/分钟），请求体上限 2MB。
 - 局域网裸 HTTP 不加密，跨网络请使用 Tailscale Serve / Cloudflare Tunnel 等 HTTPS 入口，不要把服务端口直接暴露到公网。
 

@@ -82,6 +82,11 @@ export type AppSettings = {
 	/** Web 服务监听端口 */
 	webServicePort: number;
 	/**
+	 * 是否通过 Tailscale Serve 暴露远程访问。启用后主进程把 Serve 的 HTTPS
+	 * 端口转发到回环 Web 服务；不是第二个 Web 服务。
+	 */
+	remoteAccessEnabled?: boolean;
+	/**
 	 * Web 服务访问令牌。非回环地址请求必须携带，避免同一局域网内任意设备
 	 * 直接操作 Agent。缺失时由主进程在启动/首次启用时生成并持久化。
 	 */

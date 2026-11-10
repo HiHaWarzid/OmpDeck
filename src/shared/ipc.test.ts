@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 269（266 + 3 新增 web:status / web:rotate-token / agents:history-page）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(269);
+	test("总通道数 = 272（269 + 3 新增 remote-access:status / start / stop）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(272);
 	});
 });

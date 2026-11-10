@@ -11,11 +11,12 @@ All notable changes to PiDeck are documented here.
 - **Phone / LAN web control** — Browse projects and sessions, reopen historical sessions, create sessions, keep chatting, stop agents, switch models/thinking levels, answer UI prompts, and handle project trust confirmations from a phone browser.
 - **QR pairing and token management** — The settings page shows a tokenized URL and QR code, with copy, show/hide, token rotation, and 1-day / 7-day / 30-day / never-expires lifetimes.
 - **Mobile layout and PWA** — Narrow-screen sidebar becomes a drawer, the detail drawer overlays the chat, and the composer respects safe areas. Add to home screen is supported; the service worker caches static assets only and stays network-first.
+- **Remote access via Tailscale Serve** — Enable it in Settings to publish the loopback web service to your tailnet over HTTPS, with status, QR pairing, copy, and retry. OmpDeck only removes the Serve handler pointing at its own local port.
 
 ### 🔒 Security
 
 - **Loopback-only by default** — `webServiceHost` now defaults to `127.0.0.1` instead of `0.0.0.0`; LAN access requires an explicit opt-in in Settings.
-- **Token required for non-loopback requests** — Phones, other devices, and tunnel hostnames must send `Authorization: Bearer`, `X-Omp-Token`, or `?token=` on API calls; only loopback Hosts are exempt, so a non-IP Host cannot bypass auth via DNS rebinding.
+- **Token required for non-loopback requests** — Phones, other devices, and tunnel hostnames must send `Authorization: Bearer`, `X-Omp-Token`, or `?token=` on API calls; only loopback addresses or the explicitly configured host are exempt, so arbitrary IP-literal Hosts and local reverse proxies that rewrite Host cannot bypass auth via DNS rebinding. Requests carrying proxy forwarding headers (Tailscale Serve, Cloudflare Tunnel, `Forwarded`, `X-Real-IP`, etc.) are never treated as loopback, even when the proxy connects back from `127.0.0.1`.
 - **Write-request hardening** — Origin/Host matching, rejection of non-JSON Content-Type, per-IP write rate limiting (120 requests/minute), and a 2 MB request-body cap.
 - Plain LAN HTTP is unencrypted. Use an HTTPS entry point such as Tailscale Serve or Cloudflare Tunnel for remote access, and never expose the service port directly to the public internet.
 

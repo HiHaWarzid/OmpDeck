@@ -46,7 +46,9 @@ function readInitialToken(): string {
 }
 
 let authToken = readInitialToken();
-if (typeof document !== "undefined") {
+// 静态 import 在 Electron 里也会执行本模块；只有 preload 不存在时才是真正的 Web 运行时。
+// 无条件标记会让桌面端误判为手机页面，隐藏令牌轮换、远程访问等桌面专属设置。
+if (typeof document !== "undefined" && window.piDesktop === undefined) {
 	document.documentElement.dataset.runtime = "web";
 }
 
@@ -399,6 +401,20 @@ export function createBrowserApi(): PiDesktopApi {
 			// 轮换必须在桌面端设置页完成，避免手机端误操作后所有设备一起掉线。
 			rotateToken: async () => {
 				throw new Error(t("settings.webTokenRotateDesktopOnly"));
+			},
+		},
+		remoteAccess: {
+			...base.remoteAccess,
+			// Tailscale Serve 由桌面端主进程管理；手机端没有可用的真实状态接口，
+			// 不要回退到 preview 的假 installed/loggedIn，设置页会隐藏该区块。
+			status: async () => {
+				throw new Error(t("settings.remoteAccessDesktopOnly"));
+			},
+			start: async () => {
+				throw new Error(t("settings.remoteAccessDesktopOnly"));
+			},
+			stop: async () => {
+				throw new Error(t("settings.remoteAccessDesktopOnly"));
 			},
 		},
 		settings: {
