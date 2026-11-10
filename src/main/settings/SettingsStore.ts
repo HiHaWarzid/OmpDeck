@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createDefaultExternalEditorSettings, type AfkSettings, type AppSettings } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { ensureWebTokenState, webTokenPatch } from "../web/WebTokenAuth";
 
 /** 桌面端 settings.json（userData），与 pi agent settings 分离 */
 function desktopSettingsPath() {
@@ -191,8 +192,11 @@ Gitmoji 对应关系：
   wslUser: "root",
   telemetryEnabled: true,
   webServiceEnabled: false,
-  webServiceHost: "0.0.0.0",
+  // 默认只监听回环地址：局域网访问需要用户在设置里显式选择 0.0.0.0，
+  // 避免安装后无意中把 Agent 控制面暴露给同一网络。
+  webServiceHost: "127.0.0.1",
   webServicePort: 8765,
+  webServiceTokenTtlDays: 30,
   rpcTimeout: 600_000,
   linkOpenMode: "external",
   contentMaxWidth: 1400,
@@ -275,6 +279,13 @@ export class SettingsStore {
         ...(parsed.externalEditors ?? {}),
       },
     };
+    // Web 令牌在启动时补齐/轮换：缺失时生成，已过期时换新。写盘走防抖，
+    // 不阻塞启动；设置页读取的是内存快照，能立即看到新令牌。
+    const webToken = ensureWebTokenState(this.settings);
+    if (webToken.changed) {
+      this.settings = { ...this.settings, ...webTokenPatch(webToken.state) };
+      this.scheduleSave();
+    }
     // showThinking 不再作为可持久化的独立配置项，完全跟随 pi agent 的 hideThinkingBlock。
     // 启动时重新读取以确保每次启动都使用最新值，而非缓存的 defaultSettings。
     const computedShowThinking = readPiAgentShowThinking();
@@ -312,6 +323,11 @@ export class SettingsStore {
       // afk 块同样归一化：renderer/其他模块提交的 patch 不绕过旧字段迁移与非法值校验
       ...(afk !== undefined ? { afk: normalizeAfkSettings(afk) } : {}),
     };
+    // 令牌有效期变更后重算过期时间；已过期则轮换，避免设置页显示一个已失效的旧令牌。
+    const webToken = ensureWebTokenState(this.settings);
+    if (webToken.changed) {
+      this.settings = { ...this.settings, ...webTokenPatch(webToken.state) };
+    }
     this.lastGetResult = null;
     // 写盘防抖：连续操作（收藏模型切换、连续开关设置）合并为一次全量写。
     // 内存态立即生效，磁盘写入延迟 150ms；退出路径由 flushSave 兜底。

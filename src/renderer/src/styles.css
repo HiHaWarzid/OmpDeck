@@ -4730,7 +4730,7 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   padding: var(--space-2);
   border: 1px solid var(--color-accent);
   border-radius: var(--radius-sm);
-  background: var(--color-bg-input);
+  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-body);
@@ -4790,7 +4790,7 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   padding: var(--space-2);
   border: 1px solid var(--color-accent);
   border-radius: var(--radius-sm);
-  background: var(--color-bg-input);
+  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-body);
@@ -7287,7 +7287,7 @@ body.ask-bar-active .ask-inline-bar--timeline {
   padding: var(--space-3);
   border-radius: var(--radius-sm);
   border: 1px solid var(--color-border);
-  background: var(--color-bg-input);
+  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-size: var(--font-size-sm);
   font-family: var(--font-family-base);
@@ -10905,7 +10905,7 @@ body.is-composer-resizing .composer-resize-handle::after {
   padding: 0 10px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-md);
-  background: var(--color-bg-input);
+  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-size: var(--font-size-control);
   font-family: var(--font-family-base);
@@ -12456,6 +12456,131 @@ body.is-composer-resizing .composer-resize-handle::after {
 }
 .web-endpoint-summary .ui-button {
   justify-self: end;
+}
+.web-token-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-panel);
+}
+.web-token-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.web-token-head strong {
+  display: block;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+}
+.web-token-head small {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+}
+.web-token-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+.web-token-value {
+  display: block;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-muted);
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-business);
+  font-size: var(--font-size-caption);
+  overflow-wrap: anywhere;
+}
+.web-token-qr {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.web-token-qr img {
+  flex: none;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+.web-token-qr strong {
+  display: block;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+}
+.web-token-qr small {
+  display: block;
+  margin-top: 4px;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  overflow-wrap: anywhere;
+}
+.web-token-warning {
+  color: var(--color-warning);
+  font-size: var(--font-size-micro);
+  line-height: 1.5;
+}
+.spin {
+  animation: spin 0.85s linear infinite;
+}
+
+/* 令牌失效时的最小恢复入口；React 尚未接管时也要能渲染，故独立于共享组件。 */
+.web-auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--color-bg-app);
+}
+.web-auth-panel {
+  width: min(360px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-panel);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-xl);
+}
+.web-auth-panel small {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+}
+.web-auth-input {
+  padding: 8px 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-app);
+  color: var(--color-text-primary);
+  font: inherit;
+}
+.web-auth-input:focus-visible {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: var(--focus-ring);
+}
+.web-auth-submit {
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent);
+  color: var(--color-text-inverse);
+  font: inherit;
+  cursor: pointer;
+}
+.web-auth-submit:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 /* 代理面板 */
@@ -21308,7 +21433,7 @@ html[data-theme="dark"] .scratch-pad-md mark {
   padding: 0 8px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background: var(--color-bg-input);
+  background: var(--color-bg-app);
   color: var(--color-text-primary);
   font-size: var(--font-size-caption);
   outline: none;
@@ -22785,4 +22910,147 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
 .afk-project-option input[type="checkbox"] {
   accent-color: var(--color-accent);
   margin: 0;
+}
+
+/* ── 手机浏览器（Web 服务）布局 ───────────────────────────────────────
+   仅在手机浏览器运行时启用（browserApi 设置 data-runtime="web"）。
+   桌面 Electron 即使窗口变窄也不受影响：窗口缩放/分屏仍按桌面三栏处理。
+   目标是最小改动复用现有组件：侧栏变抽屉、右侧详情变覆盖层、主会话占满屏。 */
+:root[data-runtime="web"] .wechat-shell {
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.web-offline-banner {
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 8px);
+  left: 50%;
+  z-index: 1100;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--color-bg-panel);
+  color: var(--color-warning);
+  font-size: var(--font-size-micro);
+  box-shadow: var(--shadow-popover);
+  pointer-events: none;
+}
+
+@media (max-width: 820px) {
+  /* 单列只用于手机宽度：桌面浏览器（>820px）继续使用五列三栏布局。
+     侧栏在窄屏改为 fixed 抽屉，因此聊天区必须独占唯一一列。 */
+  :root[data-runtime="web"] .wechat-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  :root[data-runtime="web"] .chat-pane {
+    grid-column: 1;
+  }
+  :root[data-runtime="web"] .splitter {
+    display: none;
+  }
+  /* 抽屉遮罩：点击关闭，z-index 低于侧栏（1000）但高于消息区。 */
+  :root[data-runtime="web"] .mobile-sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+    border: 0;
+    padding: 0;
+    background: color-mix(in srgb, var(--color-bg-app) 55%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  :root[data-runtime="web"] .chat-list-pane {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(86vw, 340px);
+    z-index: 1000;
+    border-right: 1px solid var(--color-border-subtle);
+    box-shadow: var(--shadow-xl);
+    transform: translateX(0);
+    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .chat-list-pane {
+    width: 24px;
+    transform: none;
+    box-shadow: none;
+  }
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .chat-list-pane::before {
+    width: 4px;
+  }
+  /*
+   * 折叠侧条 fixed 覆盖在聊天区左侧，且展开按钮实际占 22–48px；
+   * header 需要让出 48px，否则标题首字会被按钮盖住。
+   */
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .chat-header {
+    padding-left: 56px;
+  }
+  /* 桌面端为品牌文案保持单行；手机宽度不足时允许换行，避免横向裁切 */
+  :root[data-runtime="web"] .empty-subtitle-line {
+    white-space: normal;
+  }
+  :root[data-runtime="web"] .empty-state .empty-subtitle {
+    max-width: 100%;
+    padding-inline: var(--space-3);
+  }
+  /*
+   * 手机宽度下 context/cache/cost chip 会撑爆 header，把标题挤成 0 宽并横向溢出。
+   * 这些是桌面诊断信息，手机端只保留会话标题与主要操作。
+   */
+  :root[data-runtime="web"] .chat-header .session-status {
+    display: none;
+  }
+  :root[data-runtime="web"] .list-collapse {
+    display: grid;
+  }
+  /* 折叠后只留 24px 侧条时，把展开按钮固定在条内可见位置 */
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .chat-list-pane > .list-collapse {
+    display: grid;
+    right: auto;
+    left: 0;
+    top: 12px;
+    bottom: auto;
+    width: 24px;
+    height: 32px;
+  }
+  :root[data-runtime="web"] .detail-drawer {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: min(92vw, 440px);
+    z-index: 1002;
+    border-left: 1px solid var(--color-border-subtle);
+    box-shadow: var(--shadow-popover);
+  }
+  /*
+   * 手机端抽屉改为 fixed 覆盖层后，桌面端靠 Grid 列宽为 0 隐藏的兜底失效：
+   * 未挂载内容时组件可能连 data-open 都没有，必须用 :not([data-open="true"])
+   * 隐藏，否则空白抽屉会盖住整个聊天区。
+   */
+  :root[data-runtime="web"] .detail-drawer:not([data-open="true"]) {
+    display: none;
+  }
+  :root[data-runtime="web"] .window-drag-layer,
+  :root[data-runtime="web"] .window-controls {
+    display: none;
+  }
+  /* 手机输入框 ≥16px 才能避免 iOS 聚焦时自动放大页面 */
+  :root[data-runtime="web"] textarea,
+  :root[data-runtime="web"] input,
+  :root[data-runtime="web"] .composer textarea {
+    /* iOS 聚焦时输入字号 <16px 会自动放大页面；--font-size-title 默认即 16px。 */
+    font-size: var(--font-size-title);
+  }
+  :root[data-runtime="web"] .message-list {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+  /* 24px 折叠侧条 fixed 覆盖在聊天区上方，消息与输入框需要整体右移让出该列 */
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .message-timeline {
+    padding-left: 24px;
+  }
+  :root[data-runtime="web"] .wechat-shell.list-collapsed .composer {
+    margin-left: 24px;
+  }
+  :root[data-runtime="web"] .composer {
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
 }

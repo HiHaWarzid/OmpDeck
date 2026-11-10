@@ -9,7 +9,7 @@
 import { Notification, type BrowserWindow } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentHistoryPageInput, CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
@@ -27,7 +27,7 @@ interface AgentHandlerDeps {
 
 type AgentHandlerMaps = {
 	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>,
-		| "list" | "getMessages" | "create" | "rename" | "stop" | "prompt" | "abort" | "exportHtml"
+		| "list" | "getMessages" | "create" | "historyPage" | "rename" | "stop" | "prompt" | "abort" | "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
@@ -99,6 +99,10 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 					});
 					throw error;
 				}
+			},
+			historyPage: async (_event, input: AgentHistoryPageInput) => {
+				if (!input?.agentId) throw new Error("agentId 不能为空");
+				return agentManager.getHistoryPage(input.agentId, input.before, input.limit);
 			},
 			rename: async (_event, agentId: string, name: string) => {
 				const result = await agentManager.rename(agentId, name);

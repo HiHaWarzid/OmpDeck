@@ -1,4 +1,4 @@
-import type { WidgetLineItem } from "./message";
+import type { ChatMessage, WidgetLineItem } from "./message";
 
 export type AgentStatus = "starting" | "idle" | "running" | "error" | "closed";
 
@@ -73,6 +73,23 @@ export type CreateAgentInput = {
 	 * 独立 worktree 时需要 cwd 指向 worktree；双穿 tab.cwd 与 PiProcess。
 	 */
 	cwd?: string;
+};
+
+/** 历史消息分页游标：指向下一页结束位置（从旧到新的数组下标）。 */
+export type AgentHistoryPageInput = {
+	agentId: string;
+	/** 上一页返回的 nextCursor；缺省表示从最新一页开始 */
+	before?: string;
+	/** 单页条数，默认 40，最大 100 */
+	limit?: number;
+};
+
+export type AgentHistoryPage = {
+	/** 按时间从旧到新排列 */
+	messages: ChatMessage[];
+	/** 继续向更早翻页时传回的游标；null 表示已经到会话开头 */
+	nextCursor: string | null;
+	hasMore: boolean;
 };
 
 export type ForkMessage = {

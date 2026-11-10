@@ -5,6 +5,14 @@
 - [中文 CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.zh-CN.md)
 - [English CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.md)
 
+## 未发布
+
+- 📱 **手机 / 局域网 Web 控制**：手机浏览器查看/打开历史会话、新建会话、继续对话、停止 Agent、切换模型与思考级别、处理确认和信任请求。
+- 🔑 **二维码配对与令牌管理**：访问地址 + 二维码、复制、显示/隐藏、轮换，有效期 1/7/30 天或永不过期。
+- 🔒 **默认仅监听 127.0.0.1**：局域网访问需显式切换；非回环 API 请求必须携带令牌；写请求校验 Origin、限流并限制请求体。
+- 📲 **手机布局与 PWA**：窄屏侧栏抽屉化、输入框适配安全区、支持添加到主屏幕；Service Worker 仅缓存静态资源。
+- ⚠️ 局域网裸 HTTP 不加密，跨网络建议使用 Tailscale Serve / Cloudflare Tunnel 等 HTTPS 入口，不要直接暴露端口到公网。
+
 ## v0.6.7
 
 发布时间：2026-07-29

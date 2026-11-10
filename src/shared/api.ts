@@ -9,6 +9,8 @@
  * 不要在此文件之外另起一份）。
  */
 import type {
+	AgentHistoryPage,
+	AgentHistoryPageInput,
 	AgentMessagesDelta,
 	AgentRuntimeState,
 	AgentTab,
@@ -94,6 +96,7 @@ import type {
 	TerminalExitEvent,
 	TerminalTab,
 	ThinkingUpdate,
+	WebServiceStatus,
 	WorktreeEntry,
 	YaoPromptDetailResult,
 	YaoPromptListResult,
@@ -461,6 +464,8 @@ export interface AgentsApi {
 	list: () => Promise<AgentTab[]>;
 	getMessages: (agentId: string) => Promise<ChatMessage[]>;
 	create: (input: CreateAgentInput) => Promise<AgentTab>;
+	/** 历史会话分页读取：大会话打开后按页向更早翻，避免一次把整份 JSONL 推到手机。 */
+	historyPage: (input: AgentHistoryPageInput) => Promise<AgentHistoryPage>;
 	rename: (agentId: string, name: string) => Promise<AgentTab>;
 	stop: (agentId: string) => Promise<void>;
 	prompt: (input: SendPromptInput) => Promise<SendPromptResult>;
@@ -521,6 +526,13 @@ export interface AgentsApi {
 	onTrustRequest: (callback: (request: { requestId: string; cwd: string; projectName: string }) => void) => () => void;
 	/** 回传用户对项目信任确认弹窗的选择（trust-remember/trust-session/deny） */
 	respondTrustRequest: (requestId: string, choice: "trust-remember" | "trust-session" | "deny") => Promise<void>;
+}
+
+export interface WebApi {
+	/** 当前 Web 服务监听状态与访问令牌（设置页展示二维码/复制地址用） */
+	status: () => Promise<WebServiceStatus>;
+	/** 立即轮换访问令牌；已连接的手机需要重新扫码 */
+	rotateToken: () => Promise<WebServiceStatus>;
 }
 
 export interface PetApi {
@@ -657,6 +669,7 @@ export interface PiDesktopApi {
 	settings: SettingsApi;
 	config: ConfigApi;
 	agents: AgentsApi;
+	web: WebApi;
 	pet: PetApi;
 	terminal: TerminalApi;
 	feishu: FeishuApi;

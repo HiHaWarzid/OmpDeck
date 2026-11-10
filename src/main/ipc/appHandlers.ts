@@ -32,6 +32,11 @@ import { resolveNativeThemeSource } from "../nativeThemeSource";
 import { applyDesktopProxy } from "../settings/DesktopProxy";
 import { testPiProxy } from "../pi/PiProxyTester";
 import { UpdateManager, RELEASES_URL } from "../update/UpdateManager";
+import {
+	generateWebToken,
+	normalizeTokenTtlDays,
+	tokenExpiresAt,
+} from "../web/WebTokenAuth";
 
 interface AppHandlerDeps {
 	appLogger: AppLogger;
@@ -63,6 +68,7 @@ type AppHandlerMaps = {
 	rpcLogs: Pick<IpcHandlerMap<typeof ipcTable.rpcLogs, PiDesktopApi["rpcLogs"]>, "setLogging" | "getLogging">;
 	// onApplyWindow 是 subscribe（主进程推送），不注册 handler
 	settings: Omit<IpcHandlerMap<typeof ipcTable.settings, PiDesktopApi["settings"]>, "onApplyWindow">;
+	web: IpcHandlerMap<typeof ipcTable.web, PiDesktopApi["web"]>;
 };
 
 export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
@@ -174,7 +180,7 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 			update: async (_event, patch: Partial<AppSettings>) => {
 				// 记录更新前的设置，用于驱动桌面宠物对 pet 字段变化的反应
 				const prevSettings = settingsStore.get();
-				const settings = await settingsStore.update(patch);
+				let settings = await settingsStore.update(patch);
 				void appLogger.info("settings", "Settings updated", { keys: Object.keys(patch) });
 				// 桌面宠物：设置面板走 settings.update，这里统一驱动开窗/切换/置顶
 				await getPetSystem()?.reactToSettings(prevSettings, settings);
@@ -194,10 +200,21 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 				if ("zoomFactor" in patch) {
 					getMainWindow()?.webContents.setZoomFactor(settings.zoomFactor);
 				}
+				if ("webServiceTokenTtlDays" in patch) {
+					// TTL 变更只改过期时间，不重新生成令牌：已扫码的手机不应因改设置掉线。
+					const ttl = normalizeTokenTtlDays(settings.webServiceTokenTtlDays);
+					settings = await settingsStore.update({
+						webServiceTokenExpiresAt: tokenExpiresAt(
+							settings.webServiceTokenGeneratedAt ?? Date.now(),
+							ttl,
+						),
+					});
+				}
 				if (
 					"webServiceEnabled" in patch ||
 					"webServiceHost" in patch ||
-					"webServicePort" in patch
+					"webServicePort" in patch ||
+					"webServiceTokenTtlDays" in patch
 				) {
 					const webServiceManager = getWebServiceManager();
 					try {
@@ -245,6 +262,49 @@ export function registerAppHandlers(deps: AppHandlerDeps): AppHandlerMaps {
 					error: result.error,
 				});
 				return result;
+			},
+		},
+		web: {
+			status: async () => {
+				const manager = getWebServiceManager();
+				return manager?.getStatus(true) ?? {
+					running: false,
+					host: settingsStore.get().webServiceHost,
+					port: settingsStore.get().webServicePort,
+					token: settingsStore.get().webServiceToken ?? null,
+					tokenGeneratedAt: settingsStore.get().webServiceTokenGeneratedAt ?? null,
+					tokenExpiresAt: settingsStore.get().webServiceTokenExpiresAt ?? null,
+					loopback: true,
+					url: "",
+					lanUrls: [],
+				};
+			},
+			rotateToken: async () => {
+				const manager = getWebServiceManager();
+				const current = settingsStore.get();
+				const now = Date.now();
+				const ttlDays = normalizeTokenTtlDays(current.webServiceTokenTtlDays);
+				const settings = await settingsStore.update({
+					webServiceToken: generateWebToken(),
+					webServiceTokenGeneratedAt: now,
+					webServiceTokenExpiresAt: tokenExpiresAt(now, ttlDays),
+					webServiceTokenTtlDays: ttlDays,
+				});
+				await manager?.applySettings(settings);
+				void appLogger.info("web", "Web access token rotated", {
+					expiresAt: settings.webServiceTokenExpiresAt,
+				});
+				return manager?.getStatus(true) ?? {
+					running: false,
+					host: settings.webServiceHost,
+					port: settings.webServicePort,
+					token: settings.webServiceToken ?? null,
+					tokenGeneratedAt: settings.webServiceTokenGeneratedAt ?? null,
+					tokenExpiresAt: settings.webServiceTokenExpiresAt ?? null,
+					loopback: true,
+					url: "",
+					lanUrls: [],
+				};
 			},
 		},
 	};

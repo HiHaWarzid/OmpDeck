@@ -10,15 +10,20 @@ import {
 	Minus,
 	Plus,
 	Eye,
+	EyeOff,
 	Bot,
+	Copy,
+	RefreshCw,
+	QrCode,
 } from "lucide-react";
+import QRCode from "qrcode";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import { ModelRolesTab } from "./ModelRolesTab";
-import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest } from "../../../shared/types";
+import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest, WebServiceStatus } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
 const ZOOM_FACTOR_MIN = 0.8;
@@ -330,6 +335,62 @@ function SettingsModalContent(props: SettingsModalProps) {
 			draftSettings.inputFontSize !== null,
 	);
 	const [webPortDraft, setWebPortDraft] = useState(String(draftSettings.webServicePort));
+	const [webStatus, setWebStatus] = useState<WebServiceStatus | null>(null);
+	const [webQr, setWebQr] = useState("");
+	const [webTokenVisible, setWebTokenVisible] = useState(false);
+	const [webTokenBusy, setWebTokenBusy] = useState(false);
+
+	const refreshWebStatus = async () => {
+		try {
+			setWebStatus(await window.piDesktop.web.status());
+		} catch {
+			setWebStatus(null);
+		}
+	};
+
+	useEffect(() => {
+		if (!props.settings.webServiceEnabled) {
+			setWebStatus(null);
+			return;
+		}
+		void refreshWebStatus();
+		// 端口草稿每次输入不请求；但保存后的 host/port/开关变化必须重新拉取，
+		// 否则二维码和访问地址会停留在保存前的监听信息。
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [
+		props.settings.webServiceEnabled,
+		props.settings.webServiceHost,
+		props.settings.webServicePort,
+	]);
+
+	useEffect(() => {
+		const token = webStatus?.token;
+		if (!token || !webStatus.url) {
+			setWebQr("");
+			return;
+		}
+		const url = `${webStatus.url}/?token=${encodeURIComponent(token)}`;
+		void QRCode.toDataURL(url, { margin: 1, width: 220 })
+			.then(setWebQr)
+			.catch(() => setWebQr(""));
+	}, [webStatus]);
+
+	const rotateWebToken = async () => {
+		setWebTokenBusy(true);
+		try {
+			setWebStatus(await window.piDesktop.web.rotateToken());
+		} catch {
+			// 失败保留旧状态；设置页会显示错误日志入口
+		} finally {
+			setWebTokenBusy(false);
+		}
+	};
+
+	const copyWebUrl = async () => {
+		const token = webStatus?.token;
+		if (!token || !webStatus.url) return;
+		await navigator.clipboard.writeText(`${webStatus.url}/?token=${encodeURIComponent(token)}`);
+	};
 	const piPath = props.settings.customPiPath || props.piStatus?.command || "";
 	const changeZoomFactor = (delta: number) => {
 		const next = Math.min(
@@ -541,6 +602,16 @@ function SettingsModalContent(props: SettingsModalProps) {
 	const hasDirtyChanges = dirtyFields.size > 0;
 	// 代理 tab 仍展示未保存提示；实际保存/取消统一走全局草稿，避免旧 proxyDirty 局部状态残留。
 	const proxyDirty = PROXY_FIELDS.some((field) => dirtyFields.has(field));
+	const isWebRuntime = document.documentElement.dataset.runtime === "web";
+	// 回环地址的二维码手机扫了也连不上，应改为提示用户切换监听地址。
+	const webUrlIsLoopback = (() => {
+		try {
+			const hostname = new URL(webStatus?.url ?? "").hostname;
+			return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+		} catch {
+			return false;
+		}
+	})();
 
 	return (
 		<div className="modal-backdrop" onClick={handleClose}>
@@ -1421,6 +1492,17 @@ function SettingsModalContent(props: SettingsModalProps) {
 										}
 									/>
 									<div className="web-endpoint-panel">
+										<SelectField
+											label={t("settings.webHost")}
+											value={draftSettings.webServiceHost}
+											disabled={props.webServiceChanging}
+											options={[
+												{ value: "127.0.0.1", label: t("settings.webHostLoopback") },
+												{ value: "0.0.0.0", label: t("settings.webHostLan") },
+											]}
+											onChange={(value) => updateDraft({ webServiceHost: value })}
+											description={t("settings.webHostDesc")}
+										/>
 										<div className="web-endpoint-grid">
 											<div className="web-endpoint-metric">
 												<span>{t("common.host")}</span>
@@ -1450,9 +1532,14 @@ function SettingsModalContent(props: SettingsModalProps) {
 											<span className={draftSettings.webServiceEnabled ? "online" : ""} />
 											<div>
 												<strong>
-													http://127.0.0.1:{webPortDraft || draftSettings.webServicePort}
+													{webStatus?.url ||
+														`http://127.0.0.1:${webPortDraft || draftSettings.webServicePort}`}
 												</strong>
-												<small>{t("settings.localWebHint")}</small>
+												<small>
+													{webStatus?.lanUrls && webStatus.lanUrls.length > 1
+														? webStatus.lanUrls.join(" · ")
+														: t("settings.localWebHint")}
+												</small>
 											</div>
 											<Button
 												buttonSize="sm"
@@ -1464,6 +1551,74 @@ function SettingsModalContent(props: SettingsModalProps) {
 												{t("common.open")}
 											</Button>
 										</div>
+										{draftSettings.webServiceEnabled && webStatus?.token && (
+											<div className="web-token-panel">
+												<div className="web-token-head">
+													<div>
+														<strong>{t("settings.webToken")}</strong>
+														<small>{t("settings.webTokenDesc")}</small>
+													</div>
+													<div className="web-token-actions">
+														<IconButton
+															label={webTokenVisible ? t("settings.webTokenHide") : t("settings.webTokenShow")}
+															onClick={() => setWebTokenVisible((value) => !value)}
+														>
+															{webTokenVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+														</IconButton>
+														<IconButton
+															label={t("settings.webTokenCopy")}
+															onClick={() => void copyWebUrl()}
+														>
+															<Copy size={15} />
+														</IconButton>
+														{!isWebRuntime && (
+															<IconButton
+																label={t("settings.webTokenRotate")}
+																disabled={webTokenBusy}
+																onClick={() => void rotateWebToken()}
+															>
+																<RefreshCw size={15} className={webTokenBusy ? "spin" : ""} />
+															</IconButton>
+														)}
+													</div>
+												</div>
+												<code className="web-token-value">
+													{webTokenVisible ? webStatus.token : "••••••••••••••••"}
+												</code>
+												{!isWebRuntime && (
+													<SelectField
+														label={t("settings.webTokenTtl")}
+														value={String(draftSettings.webServiceTokenTtlDays ?? 30)}
+														options={[
+															{ value: "1", label: t("settings.webTokenTtl1") },
+															{ value: "7", label: t("settings.webTokenTtl7") },
+															{ value: "30", label: t("settings.webTokenTtl30") },
+															{ value: "0", label: t("settings.webTokenTtlNever") },
+														]}
+														onChange={(value) =>
+															updateDraft({ webServiceTokenTtlDays: Number(value) })
+														}
+													/>
+												)}
+												{webQr && !webUrlIsLoopback && (
+													<div className="web-token-qr">
+														<img src={webQr} alt={t("settings.webTokenQrAlt")} width={180} height={180} />
+														<div>
+															<strong>{t("settings.webTokenScan")}</strong>
+															<small>
+																{webStatus.url} · {t("settings.webTokenScanHint")}
+															</small>
+														</div>
+													</div>
+												)}
+												{webUrlIsLoopback && (
+													<small className="web-token-warning">{t("settings.webTokenLoopbackWarning")}</small>
+												)}
+												{!webUrlIsLoopback && webStatus.url.startsWith("http://") && (
+													<small className="web-token-warning">{t("settings.webTokenHttpWarning")}</small>
+												)}
+											</div>
+										)}
 									</div>
 								</SettingsSection>
 								<SettingsSection title={t("settings.privacy")}>

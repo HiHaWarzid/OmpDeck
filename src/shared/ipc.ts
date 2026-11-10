@@ -345,6 +345,10 @@ export const ipcTable = {
 		testPiProxy: { channel: "settings:test-pi-proxy", kind: "invoke" },
 		onApplyWindow: { channel: "settings:apply-window", kind: "subscribe", pushFrom: "settings-store" },
 	},
+	web: {
+		status: { channel: "web:status", kind: "invoke" },
+		rotateToken: { channel: "web:rotate-token", kind: "invoke" },
+	},
 	config: {
 		getModels: { channel: "config:get-models", kind: "invoke" },
 		getAuth: { channel: "config:get-auth", kind: "invoke" },
@@ -399,6 +403,7 @@ export const ipcTable = {
 		list: { channel: "agents:list", kind: "invoke", web: true },
 		getMessages: { channel: "agents:get-messages", kind: "invoke" },
 		create: { channel: "agents:create", kind: "invoke", web: true },
+		historyPage: { channel: "agents:history-page", kind: "invoke", web: true },
 		rename: { channel: "agents:rename", kind: "invoke" },
 		stop: { channel: "agents:stop", kind: "invoke", web: true },
 		prompt: { channel: "agents:prompt", kind: "invoke", web: true },

@@ -416,6 +416,30 @@ const previewOverrides: NamespaceOverrides = {
 		detail: async () => null,
 		install: async (slug) => ({ success: true, slug, installDir: "", message: "Preview install" }),
 	},
+	web: {
+		status: async () => ({
+			running: false,
+			host: "127.0.0.1",
+			port: 8765,
+			token: "preview-token",
+			tokenGeneratedAt: Date.now(),
+			tokenExpiresAt: null,
+			loopback: true,
+			url: "http://127.0.0.1:8765",
+			lanUrls: [],
+		}),
+		rotateToken: async () => ({
+			running: false,
+			host: "127.0.0.1",
+			port: 8765,
+			token: "preview-token-rotated",
+			tokenGeneratedAt: Date.now(),
+			tokenExpiresAt: null,
+			loopback: true,
+			url: "http://127.0.0.1:8765",
+			lanUrls: [],
+		}),
+	},
 	settings: {
 		get: async (): Promise<AppSettings> => ({ ...previewSettings }),
 		update: async (patch): Promise<AppSettings> => {
@@ -473,6 +497,11 @@ const previewOverrides: NamespaceOverrides = {
 		list: async () => getAgents(),
 		getMessages: async () => getMessages(),
 		create: async () => getAgents()[0],
+		historyPage: async () => ({
+			messages: getMessages(),
+			nextCursor: null,
+			hasMore: false,
+		}),
 		rename: async (agentId, name) => {
 			const agent =
 				getAgents().find((item) => item.id === agentId) ?? getAgents()[0];

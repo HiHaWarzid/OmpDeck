@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
+import { networkInterfaces } from "node:os";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, isAbsolute, join, normalize, relative } from "node:path";
 import type {
+	AgentHistoryPage,
 	AgentTab,
 	AppSettings,
 	ChatMessage,
@@ -12,13 +14,30 @@ import type {
 	SendPromptInput,
 	SendPromptResult,
 	SessionSummary,
+	WebServiceStatus,
 } from "../../shared/types";
 import type { PiDesktopApi } from "../../shared/api";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
+import {
+	ensureWebTokenState,
+	extractRequestToken,
+	webTokenPatch,
+	isLoopbackAddress,
+	verifyWebToken,
+	type WebAuthFailureCode,
+	type WebTokenSettings,
+	type WebTokenState,
+} from "./WebTokenAuth";
 
 type WebServiceSettings = Pick<
 	AppSettings,
-	"webServiceEnabled" | "webServiceHost" | "webServicePort"
+	| "webServiceEnabled"
+	| "webServiceHost"
+	| "webServicePort"
+	| "webServiceToken"
+	| "webServiceTokenGeneratedAt"
+	| "webServiceTokenExpiresAt"
+	| "webServiceTokenTtlDays"
 >;
 
 /**
@@ -51,6 +70,16 @@ type WebServiceDependencies = {
 	createAgent: (input: CreateAgentInput) => Promise<AgentTab>;
 	sendPrompt: (input: SendPromptInput) => Promise<SendPromptResult>;
 	stopAgent: (agentId: string) => Promise<void>;
+	/** 扩展 UI 响应：手机端回答 select/confirm/input/editor。 */
+	sendUiResponse: PiDesktopApi["agents"]["sendUiResponse"];
+	/** 项目信任确认：手机端回传 trust-remember/trust-session/deny。 */
+	respondTrustRequest: PiDesktopApi["agents"]["respondTrustRequest"];
+	/** 历史分页（与桌面 IPC 同一实现）。 */
+	getHistoryPage: (agentId: string, before?: string, limit?: number) => Promise<AgentHistoryPage>;
+	/** 手机端轮询待确认的项目信任请求。 */
+	listTrustRequests: () => Array<{ requestId: string; cwd: string; projectName: string; createdAt: number }>;
+	/** 首次启动自动生成的令牌需要落盘，否则每次重启都会让已扫码设备掉线。 */
+	persistWebToken: (patch: WebTokenSettings) => Promise<void>;
 } & WebServiceAgentDeps;
 
 /**
@@ -78,24 +107,65 @@ const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
  * 永不 settle（上层表现为「关闭 web 服务卡住」）。
  */
 const DEFAULT_CLOSE_GRACE_MS = 1000;
+/** 请求体上限：prompt 可带图片 base64，但 2MB 足够覆盖手机端截图，避免无界内存。 */
+const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+/** prompt/停止等写操作按 IP 每分钟上限，避免误触或脚本刷屏。 */
+const MUTATION_RATE_LIMIT_PER_MINUTE = 120;
+
+class HttpError extends Error {
+	constructor(
+		readonly statusCode: number,
+		message: string,
+		readonly code?: string,
+	) {
+		super(message);
+	}
+}
+
+export type WebServiceManagerOptions = {
+	/** 测试注入时钟，验证令牌过期分支 */
+	now?: () => number;
+	/** 测试强制非回环请求也校验令牌（默认按 socket 地址判断） */
+	requireAuth?: boolean;
+};
 
 export class WebServiceManager {
 	private server: Server | null = null;
 	private current: { host: string; port: number } | null = null;
 	private readonly rendererRoot = join(__dirname, "../renderer");
+	private tokenState: WebTokenState = {
+		token: "",
+		generatedAt: 0,
+		expiresAt: null,
+		ttlDays: 30,
+	};
+	private readonly rateBuckets = new Map<string, { windowStart: number; count: number }>();
+	private readonly now: () => number;
+	private readonly requireAuth: boolean;
 
 	constructor(
 		private readonly deps: WebServiceDependencies,
 		private readonly closeGraceMs: number = DEFAULT_CLOSE_GRACE_MS,
-	) {}
+		options: WebServiceManagerOptions = {},
+	) {
+		this.now = options.now ?? Date.now;
+		this.requireAuth = options.requireAuth ?? false;
+	}
 
 	async applySettings(settings: WebServiceSettings) {
+		// 令牌先于启停更新：服务已运行时用户轮换令牌，不需要重启监听也能立即生效。
+		const tokenState = ensureWebTokenState(settings, this.now());
+		this.tokenState = tokenState.state;
+		if (tokenState.changed) {
+			// 写盘失败不阻塞服务启动：内存令牌仍可用，只是重启后会再生成一次。
+			void this.deps.persistWebToken(webTokenPatch(tokenState.state)).catch(() => undefined);
+		}
 		if (!settings.webServiceEnabled) {
 			await this.stop();
 			return;
 		}
 
-		const host = settings.webServiceHost.trim() || "0.0.0.0";
+		const host = settings.webServiceHost.trim() || "127.0.0.1";
 		const port = this.normalizePort(settings.webServicePort);
 		if (this.server && this.current?.host === host && this.current.port === port) return;
 		// 先绑定新端口，成功后才关旧 server：端口被占用/非法时 start 会 reject，
@@ -117,6 +187,38 @@ export class WebServiceManager {
 	isRunning(): boolean {
 		// applySettings 失败路径不会给 this.server 赋新值，因此旧 server 仍登记在此，返回 true
 		return this.server !== null;
+	}
+
+	/** 设置页/手机状态页共用的监听信息；令牌只回传给本机调用方。 */
+	getStatus(includeToken = true): WebServiceStatus {
+		const host = this.current?.host ?? "";
+		const port = this.current?.port ?? 0;
+		const lanAddresses = this.findLanAddresses();
+		const advertisedHost =
+			host === "0.0.0.0" || host === "::" ? lanAddresses[0] ?? "localhost" : host || "127.0.0.1";
+		return {
+			running: this.isRunning(),
+			host,
+			port,
+			token: includeToken ? this.tokenState.token : null,
+			tokenGeneratedAt: this.tokenState.generatedAt || null,
+			tokenExpiresAt: this.tokenState.expiresAt,
+			loopback: true,
+			url: `http://${advertisedHost}:${port}`,
+			// 多网卡主机只挑第一个地址可能不可达，设置页让用户选择实际可路由的网段。
+			lanUrls: lanAddresses.map((address) => `http://${address}:${port}`),
+		};
+	}
+
+	/** 枚举所有非内部 IPv4；0.0.0.0 时手机扫码/复制地址的候选来源。 */
+	private findLanAddresses(): string[] {
+		const addresses: string[] = [];
+		for (const entries of Object.values(networkInterfaces())) {
+			for (const entry of entries ?? []) {
+				if (entry.family === "IPv4" && !entry.internal) addresses.push(entry.address);
+			}
+		}
+		return addresses;
 	}
 
 	/**
@@ -146,6 +248,10 @@ export class WebServiceManager {
 			try {
 				await this.handleRequest(request, response, host, port, server);
 			} catch (error) {
+				if (error instanceof HttpError) {
+					this.sendError(response, error.statusCode, error.message, error.code);
+					return;
+				}
 				this.sendError(response, 500, error instanceof Error ? error.message : String(error));
 			}
 		});
@@ -193,7 +299,23 @@ export class WebServiceManager {
 					service: "OmpDeck",
 					host,
 					port: this.getPort(server, port),
+					authRequired: true,
 				});
+				return;
+			}
+			this.assertRequestAllowed(request, url);
+			// 写操作期间可能有并发轮询把旧快照重新写进缓存；响应结束时再清一次，
+			// 保证下一轮轮询看到 UI 请求已应答、消息已追加等中间字段变化。
+			if (request.method && request.method !== "GET" && request.method !== "HEAD") {
+				this.statePayloadCache = null;
+				response.once("finish", () => {
+					this.statePayloadCache = null;
+				});
+			}
+			if (url.pathname === "/api/web/status") {
+				const loopback = this.isLoopbackRequest(request);
+				const status = this.getStatus(loopback);
+				this.sendJson(response, { ...status, loopback });
 				return;
 			}
 			if (url.pathname === "/api/state") {
@@ -201,27 +323,84 @@ export class WebServiceManager {
 				// 的双重序列化（web UI 每 600ms 轮询，命中缓存时零 stringify 开销）
 				const payload = this.getStatePayload();
 				response.writeHead(200, {
+					...this.baseHeaders(),
 					"content-type": "application/json; charset=utf-8",
-					"cache-control": "no-store",
-					"access-control-allow-origin": "*",
 				});
 				response.end(payload);
 				return;
 			}
 			const sessionsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions$/);
 			if (sessionsMatch && request.method === "GET") {
-				const sessions = await this.deps.listSessions(decodeURIComponent(sessionsMatch[1]));
+				const projectId = decodeURIComponent(sessionsMatch[1]);
+				this.assertProjectExists(projectId);
+				const sessions = await this.deps.listSessions(projectId);
 				this.sendJson(response, { sessions });
 				return;
 			}
 			if (url.pathname === "/api/agents" && request.method === "POST") {
-				const body = await this.readJson<{ projectId?: string }>(request);
+				// 透传完整 CreateAgentInput：带 sessionPath 即「打开历史会话」，
+				// 不带则新建会话；title/noSession/cwd 与桌面端共用同一语义。
+				const body = await this.readJson<Partial<CreateAgentInput>>(request);
 				if (!body.projectId) {
 					this.sendError(response, 400, "projectId 不能为空");
 					return;
 				}
-				const agent = await this.deps.createAgent({ projectId: body.projectId });
+				await this.assertResumeTargetAllowed(body);
+				const agent = await this.deps.createAgent({
+					projectId: body.projectId,
+					title: body.title,
+					sessionPath: body.sessionPath,
+					noSession: body.noSession,
+				});
 				this.sendJson(response, { agent });
+				return;
+			}
+			const messagesMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages$/);
+			if (messagesMatch && request.method === "GET") {
+				const messages = this.deps.getMessages(decodeURIComponent(messagesMatch[1]));
+				this.sendJson(response, { messages });
+				return;
+			}
+			const historyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/history-page$/);
+			if (historyMatch && request.method === "GET") {
+				const limit = Number(url.searchParams.get("limit") ?? 40);
+				const page = await this.deps.getHistoryPage(
+					decodeURIComponent(historyMatch[1]),
+					url.searchParams.get("before") ?? undefined,
+					Number.isFinite(limit) ? limit : 40,
+				);
+				this.sendJson(response, page);
+				return;
+			}
+			const uiResponseMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/ui-response$/);
+			if (uiResponseMatch && request.method === "POST") {
+				const body = await this.readJson<{
+					requestId?: string;
+					value?: string | boolean | null;
+					cancelled?: boolean;
+					confirmed?: boolean;
+				}>(request);
+				if (!body.requestId) {
+					this.sendError(response, 400, "requestId 不能为空");
+					return;
+				}
+				await this.deps.sendUiResponse(decodeURIComponent(uiResponseMatch[1]), body.requestId, {
+					value: body.value,
+					cancelled: body.cancelled,
+					confirmed: body.confirmed,
+				});
+				this.sendJson(response, { ok: true });
+				return;
+			}
+			const trustMatch = url.pathname.match(/^\/api\/trust\/([^/]+)$/);
+			if (trustMatch && request.method === "POST") {
+				const body = await this.readJson<{ choice?: "trust-remember" | "trust-session" | "deny" }>(request);
+				if (!body.choice || !["trust-remember", "trust-session", "deny"].includes(body.choice)) {
+					this.sendError(response, 400, "choice 无效");
+					return;
+				}
+				await this.deps.respondTrustRequest(decodeURIComponent(trustMatch[1]), body.choice);
+				this.sendJson(response, { ok: true });
 				return;
 			}
 			const promptMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/prompt$/);
@@ -305,6 +484,128 @@ export class WebServiceManager {
 			await this.serveRenderer(url.pathname, response);
 	}
 
+	private isLoopbackRequest(request: IncomingMessage): boolean {
+		// 回环连接本身不够：DNS rebinding 会让攻击者页面的 Host 指向 127.0.0.1，
+		// socket 同样是回环。只有 Host 也是 IP/localhost/实际绑定主机时才免令牌。
+		return (
+			!this.requireAuth &&
+			isLoopbackAddress(request.socket.remoteAddress) &&
+			this.isTrustedHost(request)
+		);
+	}
+
+	/**
+	 * 可信 Host：IP 字面量、localhost 或实际绑定的主机名。
+	 * 其他主机名（如 Tailscale/Cloudflare 隧道域名）不放行免令牌，但也不拒绝——
+	 * 它们必须带令牌，既保留隧道用法，又挡住 DNS rebinding 的无凭据访问。
+	 */
+	private isTrustedHost(request: IncomingMessage): boolean {
+		const hostHeader = request.headers.host;
+		if (!hostHeader) return false;
+		let hostname: string;
+		try {
+			hostname = new URL(`http://${hostHeader}`).hostname;
+		} catch {
+			return false;
+		}
+		const bareHost = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+		const configuredHost = this.current?.host;
+		const matchesConfiguredHost =
+			!!configuredHost &&
+			configuredHost !== "0.0.0.0" &&
+			configuredHost !== "::" &&
+			configuredHost.toLowerCase() === bareHost.toLowerCase();
+		return bareHost === "localhost" || isIP(bareHost) !== 0 || matchesConfiguredHost;
+	}
+
+	/**
+	 * API 访问闸门：
+	 * - 回环地址（桌面本机）免令牌，保留排障/内置浏览器体验；
+	 * - 非回环请求必须带 Bearer / X-Omp-Token / ?token=；
+	 * - 写请求校验 Origin 与 Host 一致，挡住跨站页面直接 POST；
+	 * - 写请求按 IP 限流，避免手机误触或脚本刷屏。
+	 */
+	private assertRequestAllowed(request: IncomingMessage, url: URL): void {
+		if (!url.pathname.startsWith("/api/")) return;
+		const method = request.method ?? "GET";
+		const mutating = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+		if (mutating) this.assertSameOrigin(request);
+		if (this.isLoopbackRequest(request)) return;
+		if (mutating) this.assertRateLimit(request);
+		const failure = verifyWebToken(extractRequestToken(request), this.tokenState, this.now());
+		if (failure) {
+			throw new HttpError(
+				401,
+				failure === "token_missing" ? "缺少访问令牌" : failure === "token_expired" ? "访问令牌已过期" : "访问令牌无效",
+				failure,
+			);
+		}
+	}
+
+	private assertProjectExists(projectId: string): void {
+		if (!this.deps.listProjects().some((project) => project.id === projectId)) {
+			throw new HttpError(404, "项目不存在", "project_not_found");
+		}
+	}
+
+	/**
+	 * Web 端创建 Agent 的边界：
+	 * - 不接受 cwd，进程目录只能由项目/worktree 决定，避免令牌持有者把 pi 起在任意目录；
+	 * - 历史会话必须属于该项目，否则等于用一个项目的工作目录打开另一个项目的会话文件；
+	 * - 路径必须是绝对路径，且与 SessionSummary.filePath 归一化后一致。
+	 */
+	private async assertResumeTargetAllowed(body: Partial<CreateAgentInput>): Promise<void> {
+		const projectId = body.projectId as string;
+		this.assertProjectExists(projectId);
+		if (body.cwd !== undefined) {
+			throw new HttpError(400, "Web 端不接受 cwd", "cwd_not_allowed");
+		}
+		if (!body.sessionPath) return;
+		if (!isAbsolute(body.sessionPath)) {
+			throw new HttpError(400, "sessionPath 必须是绝对路径", "session_path_invalid");
+		}
+		const sessions = await this.deps.listSessions(projectId);
+		const target = this.normalizePathForCompare(body.sessionPath);
+		if (!sessions.some((session) => this.normalizePathForCompare(session.filePath) === target)) {
+			throw new HttpError(400, "sessionPath 不属于该项目", "session_path_not_found");
+		}
+	}
+
+	private normalizePathForCompare(value: string): string {
+		const normalized = normalize(value).replace(/[\\/]+$/, "");
+		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+	}
+
+	private assertSameOrigin(request: IncomingMessage): void {
+		const origin = request.headers.origin;
+		// 非浏览器客户端（curl/脚本）通常不带 Origin，不因此拒绝。
+		if (!origin) return;
+		let originHost: string;
+		try {
+			originHost = new URL(origin).host;
+		} catch {
+			throw new HttpError(403, "Origin 无效", "origin_invalid");
+		}
+		const expectedHost = request.headers.host;
+		if (!expectedHost || originHost !== expectedHost) {
+			throw new HttpError(403, "跨站请求已拒绝", "origin_mismatch");
+		}
+	}
+
+	private assertRateLimit(request: IncomingMessage): void {
+		const key = request.socket.remoteAddress ?? "unknown";
+		const now = this.now();
+		const bucket = this.rateBuckets.get(key);
+		if (!bucket || now - bucket.windowStart >= 60_000) {
+			this.rateBuckets.set(key, { windowStart: now, count: 1 });
+			return;
+		}
+		bucket.count += 1;
+		if (bucket.count > MUTATION_RATE_LIMIT_PER_MINUTE) {
+			throw new HttpError(429, "请求过于频繁，请稍后再试", "rate_limited");
+		}
+	}
+
 	/**
 	 * /api/state 序列化缓存：web UI 每 600ms 轮询一次，流式期间消息逐条增长，
 	 * 每次都全量 JSON.stringify 所有 agent 全部消息是主进程 CPU 大头。
@@ -317,12 +618,13 @@ export class WebServiceManager {
 
 	private getStatePayload(): string {
 		const agents = this.deps.listAgents();
-		const fingerprint = agents
+		const trustRequests = this.deps.listTrustRequests();
+		const fingerprint = `${agents
 			.map((agent) => {
 				const messages = this.deps.getMessages(agent.id);
 				return [agent.id, agent.status, agent.title, messageStreamVersion(messages)].join(":");
 			})
-			.join("|");
+			.join("|")}#${trustRequests.map((request) => request.requestId).join(",")}`;
 		if (this.statePayloadCache && this.statePayloadCache.fingerprint === fingerprint) {
 			return this.statePayloadCache.payload;
 		}
@@ -332,6 +634,7 @@ export class WebServiceManager {
 			messagesByAgent: Object.fromEntries(
 				agents.map((agent) => [agent.id, this.deps.getMessages(agent.id)]),
 			),
+			trustRequests,
 		};
 		const payload = JSON.stringify(state);
 		this.statePayloadCache = { fingerprint, payload };
@@ -559,7 +862,9 @@ export class WebServiceManager {
 			? "index.html"
 			: requestedPath.replace(/^\/+/, "");
 		const filePath = normalize(join(this.rendererRoot, relativePath));
-		if (!filePath.startsWith(normalize(this.rendererRoot)) || !existsSync(filePath)) {
+		const fromRoot = relative(normalize(this.rendererRoot), filePath);
+		// relative() 比 startsWith 前缀判断可靠：避免 renderer-evil/ 被误判在 renderer/ 内。
+		if (fromRoot.startsWith("..") || isAbsolute(fromRoot) || !existsSync(filePath)) {
 			if (relativePath !== "index.html" && existsSync(join(this.rendererRoot, "index.html"))) {
 				return this.sendFile(join(this.rendererRoot, "index.html"), response);
 			}
@@ -571,17 +876,22 @@ export class WebServiceManager {
 
 	private async sendFile(filePath: string, response: ServerResponse) {
 		const body = await readFile(filePath);
+		const noStore =
+			filePath.endsWith("index.html") ||
+			filePath.endsWith("sw.js") ||
+			filePath.endsWith(".webmanifest");
 		response.writeHead(200, {
+			...this.baseHeaders(),
 			"content-type": this.contentType(filePath),
-			"cache-control": filePath.endsWith("index.html") ? "no-store" : "public, max-age=31536000, immutable",
+			"cache-control": noStore ? "no-store" : "public, max-age=31536000, immutable",
 		});
 		response.end(body);
 	}
 
 	private sendHtml(response: ServerResponse, html: string) {
 		response.writeHead(200, {
+			...this.baseHeaders(),
 			"content-type": "text/html; charset=utf-8",
-			"cache-control": "no-store",
 		});
 		response.end(html);
 	}
@@ -600,45 +910,71 @@ export class WebServiceManager {
 				return "image/png";
 			case ".ico":
 				return "image/x-icon";
+			case ".webmanifest":
+				return "application/manifest+json; charset=utf-8";
+			case ".json":
+				return "application/json; charset=utf-8";
+			case ".woff2":
+				return "font/woff2";
 			default:
 				return "application/octet-stream";
 		}
 	}
 
+	/** 统一安全响应头；不发送 CORS 通配，避免任意站点借浏览器读走状态。 */
+	private baseHeaders(): Record<string, string> {
+		return {
+			"cache-control": "no-store",
+			"x-content-type-options": "nosniff",
+			"x-frame-options": "DENY",
+			"content-security-policy": "frame-ancestors 'none'",
+			"referrer-policy": "no-referrer",
+		};
+	}
+
 	private sendJson(response: ServerResponse, body: unknown) {
 		response.writeHead(200, {
+			...this.baseHeaders(),
 			"content-type": "application/json; charset=utf-8",
-			"cache-control": "no-store",
-			"access-control-allow-origin": "*",
 		});
 		response.end(JSON.stringify(body));
 	}
 
-	private sendError(response: ServerResponse, statusCode: number, error: string) {
+	private sendError(response: ServerResponse, statusCode: number, error: string, code?: string) {
 		response.writeHead(statusCode, {
+			...this.baseHeaders(),
 			"content-type": "application/json; charset=utf-8",
-			"cache-control": "no-store",
-			"access-control-allow-origin": "*",
 		});
-		response.end(JSON.stringify({ error }));
+		response.end(JSON.stringify(code ? { error, code } : { error }));
 	}
 
 	private sendNoContent(response: ServerResponse) {
-		response.writeHead(204, {
-			"access-control-allow-origin": "*",
-			"access-control-allow-methods": "GET,POST,OPTIONS",
-			"access-control-allow-headers": "content-type",
-		});
+		response.writeHead(204, this.baseHeaders());
 		response.end();
 	}
 
 	private async readJson<T>(request: IncomingMessage) {
+		// 强制 JSON：text/plain 表单跨站 POST 不触发 CORS 预检，必须在服务端拒绝。
+		const contentType = (request.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase();
+		if (contentType !== "application/json") {
+			throw new HttpError(415, "Content-Type 必须是 application/json", "unsupported_media_type");
+		}
 		const chunks: Buffer[] = [];
+		let total = 0;
 		for await (const chunk of request) {
-			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			total += buffer.length;
+			if (total > MAX_REQUEST_BODY_BYTES) {
+				throw new HttpError(413, "请求体过大", "payload_too_large");
+			}
+			chunks.push(buffer);
 		}
 		if (chunks.length === 0) return {} as T;
-		return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+		try {
+			return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+		} catch {
+			throw new HttpError(400, "请求体不是合法 JSON", "invalid_json");
+		}
 	}
 
 	private getPort(server: Server, fallback: number) {

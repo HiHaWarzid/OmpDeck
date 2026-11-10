@@ -1266,6 +1266,17 @@ app.whenReady().then(async () => {
 		createAgent: (input) => agentManager.create(input),
 		sendPrompt: (input) => agentManager.sendPrompt(input),
 		stopAgent: (agentId) => agentManager.stop(agentId),
+		sendUiResponse: async (agentId, requestId, response) => {
+			agentManager.sendUIResponse(agentId, requestId, response);
+		},
+		respondTrustRequest: async (requestId, choice) => {
+			agentManager.respondTrustRequest(requestId, choice);
+		},
+		getHistoryPage: (agentId, before, limit) => agentManager.getHistoryPage(agentId, before, limit),
+		listTrustRequests: () => agentManager.listPendingTrustRequests(),
+		persistWebToken: async (patch) => {
+			await settingsStore.update(patch);
+		},
 		runtimeState: (agentId) => agentManager.getRuntimeState(agentId),
 		cycleModel: (agentId) => agentManager.cycleModel(agentId),
 		availableModels: (agentId) => agentManager.getAvailableModels(agentId),

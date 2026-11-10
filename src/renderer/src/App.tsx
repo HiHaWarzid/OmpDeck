@@ -1378,7 +1378,7 @@ export function App() {
     wslUser: "root",
     telemetryEnabled: true,
     webServiceEnabled: false,
-    webServiceHost: "0.0.0.0",
+    webServiceHost: "127.0.0.1",
     webServicePort: 8765,
     rpcTimeout: 600_000,
     linkOpenMode: "external",
@@ -1515,6 +1515,90 @@ export function App() {
   const [terminalDockOwnerKey, setTerminalDockOwnerKey] = useState<string>();
   const terminalDockCloseTimerRef = useRef<number | null>(null);
   const [listCollapsed, setListCollapsed] = useState(false);
+  /**
+   * 手机浏览器断点。820px 而非 760px：iPad 竖屏 768px 仍在桌面三栏下过窄，
+   * 抽屉模式比强行三栏更可用；桌面 Electron 永不进入该状态。
+   */
+  const [isMobileWeb, setIsMobileWeb] = useState(false);
+  /** 浏览器轮询失败时显示离线提示，避免桌面端停止服务后手机仍显示过期状态。 */
+  const [webConnected, setWebConnected] = useState(true);
+  useEffect(() => {
+    if (!isLanWeb) return;
+    const onConnection = (event: Event) => {
+      setWebConnected((event as CustomEvent<boolean>).detail);
+    };
+    window.addEventListener("ompdeck:web-connection", onConnection);
+    return () => window.removeEventListener("ompdeck:web-connection", onConnection);
+  }, []);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 820px)");
+    const update = () => {
+      const mobile = document.documentElement.dataset.runtime === "web" && media.matches;
+      setIsMobileWeb(mobile);
+      if (mobile) setListCollapsed(true);
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  // 手机抽屉是覆盖层：打开时把焦点移入，Tab 循环限制在侧栏内，Esc 关闭；
+  // 关闭后焦点回到浮动恢复按钮，避免键盘用户迷失在消息区。
+  useEffect(() => {
+    if (!isMobileWeb) return;
+    if (listCollapsed) {
+      const frame = window.requestAnimationFrame(() =>
+        document.querySelector<HTMLElement>(".list-toggle-native.floating")?.focus(),
+      );
+      return () => window.cancelAnimationFrame(frame);
+    }
+    const pane = document.querySelector<HTMLElement>(".chat-list-pane");
+    if (!pane) return;
+    const focusables = () =>
+      [...pane.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )].filter((element) => element.getClientRects().length > 0);
+    const frame = window.requestAnimationFrame(() => focusables()[0]?.focus());
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setListCollapsed(true);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isMobileWeb, listCollapsed]);
+  /**
+   * 手机端侧栏是覆盖式抽屉：选中/新建会话后自动收起，避免抽屉一直盖住消息区。
+   * 但切换项目时 App 会自动选中该项目上次的 agent；这一步不能收起侧栏，
+   * 否则用户刚点开项目就看不到会话列表。用项目变化跳过一轮。
+   */
+  const lastCollapseProjectRef = useRef<string | undefined>(activeProjectId);
+  useEffect(() => {
+    if (!activeAgentId) return;
+    if (!isMobileWeb) return;
+    if (lastCollapseProjectRef.current !== activeProjectId) return;
+    setListCollapsed(true);
+  }, [activeAgentId, activeProjectId, isMobileWeb]);
+  // 必须在收起判断之后更新，保证「项目变化 + 自动选中 agent」这一轮被跳过。
+  useEffect(() => {
+    lastCollapseProjectRef.current = activeProjectId;
+  }, [activeProjectId]);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const chatPaneRef = useRef<HTMLElement | null>(null);
@@ -6391,6 +6475,19 @@ export function App() {
         >
           <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
         </IconButton>
+      )}
+      {isLanWeb && !webConnected && (
+        <div className="web-offline-banner" role="status">
+          {t("app.webOffline")}
+        </div>
+      )}
+      {isMobileWeb && !listCollapsed && (
+        <button
+          type="button"
+          className="mobile-sidebar-backdrop"
+          aria-label={t("app.collapseList")}
+          onClick={() => setListCollapsed(true)}
+        />
       )}
       {/* 侧栏树（批次 5c）：数据面走窄 props——项目列表 + 已 memo 的行投影 + 活动 id +
           展开集合 + 回调；组件内不再做 filter/find/分组，memo 边界让它不随 App 根
