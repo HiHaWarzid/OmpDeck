@@ -6,6 +6,7 @@ OmpDeck can be controlled from a phone browser: browse session history, reopen h
 
 - Browse sessions per project and reopen historical sessions.
 - Create sessions, send prompts, and stop a running agent.
+- Attach up to four photos (auto-compressed); while the agent is running, choose **steer into current turn** or **queue for next turn**.
 - Switch models and thinking levels.
 - Tool calls are grouped by turn; tap one for full arguments and results.
 - Load earlier messages on demand in long conversations.

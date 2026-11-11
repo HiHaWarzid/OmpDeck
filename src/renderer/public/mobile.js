@@ -5,6 +5,12 @@
 (() => {
 	const stateApi = globalThis.OmpMobileState;
 	const TAIL_LIMIT = 40;
+	const MAX_IMAGES = 4;
+	// 服务端请求体上限 2MB；base64 会膨胀约 33%，给文本和 JSON 留出余量。
+	const MAX_IMAGE_DATA_CHARS = 700_000;
+	const MAX_TOTAL_IMAGE_DATA_CHARS = 1_500_000;
+	const MAX_IMAGE_FILE_BYTES = 20 * 1024 * 1024;
+	const MAX_IMAGE_DIMENSION = 1600;
 	const HOME_CACHE_KEY = "omp-mobile-home-cache-v1";
 	const PROJECTS_CACHE_KEY = "omp-mobile-projects-cache-v1";
 	const $ = (id) => document.getElementById(id);
@@ -12,6 +18,11 @@
 	const composer = $("composer");
 	const input = $("input");
 	const sendButton = $("send");
+	const sendMoreButton = $("send-more");
+	const sendMenu = $("send-menu");
+	const attachButton = $("attach");
+	const imageInput = $("image-input");
+	const attachmentsEl = $("attachments");
 	const stopButton = $("stop");
 	const backButton = $("back");
 	const refreshButton = $("refresh");
@@ -67,6 +78,9 @@
 	let epoch = 0;
 	let supportsTail = null;
 	let sending = false;
+	let imageBusy = false;
+	let agentRunning = false;
+	let pendingImages = [];
 	let lastStatus = "";
 	let toastTimer = null;
 	let currentTab = "home";
@@ -95,6 +109,133 @@
 					return "&#39;";
 			}
 		});
+	}
+
+	function updateComposerState() {
+		const disabled = sending || imageBusy;
+		sendButton.disabled = disabled;
+		attachButton.disabled = disabled;
+		sendMoreButton.hidden = !agentRunning || disabled;
+		sendButton.textContent = agentRunning ? "加入" : "发送";
+		sendButton.setAttribute("aria-label", agentRunning ? "加入当前回合" : "发送消息");
+		if (!agentRunning || disabled) closeSendMenu();
+	}
+
+	function closeSendMenu() {
+		sendMenu.hidden = true;
+		sendMoreButton.setAttribute("aria-expanded", "false");
+	}
+
+	function renderAttachments() {
+		attachmentsEl.hidden = pendingImages.length === 0;
+		attachmentsEl.innerHTML = pendingImages
+			.map(
+				(image, index) =>
+					`<div class="attachment"><img src="data:${escapeHtml(image.mimeType)};base64,${escapeHtml(image.data)}" alt="图片 ${index + 1}" /><button type="button" data-remove-image="${index}" aria-label="移除图片 ${index + 1}">×</button></div>`,
+			)
+			.join("");
+	}
+
+	function loadImageElement(file) {
+		return new Promise((resolve, reject) => {
+			const url = URL.createObjectURL(file);
+			const image = new Image();
+			image.onload = () => {
+				URL.revokeObjectURL(url);
+				resolve(image);
+			};
+			image.onerror = () => {
+				URL.revokeObjectURL(url);
+				reject(new Error("无法读取这张图片"));
+			};
+			image.src = url;
+		});
+	}
+
+	async function loadImageSource(file) {
+		// createImageBitmap 能正确处理手机照片方向；Safari 旧版本没有该 API 时退回 Image。
+		if (typeof createImageBitmap === "function") {
+			try {
+				return await createImageBitmap(file, { imageOrientation: "from-image" });
+			} catch {
+				// 继续走 Image 解码兜底。
+			}
+		}
+		return loadImageElement(file);
+	}
+
+	async function encodeImage(file) {
+		if (!file.type.startsWith("image/")) throw new Error("只支持图片文件");
+		if (file.size > MAX_IMAGE_FILE_BYTES) throw new Error("图片不能超过 20MB");
+		const source = await loadImageSource(file);
+		const width = Number(source.width || source.naturalWidth || 0);
+		const height = Number(source.height || source.naturalHeight || 0);
+		if (!width || !height) {
+			source.close?.();
+			throw new Error("图片尺寸无效");
+		}
+		const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(width, height));
+		const canvas = document.createElement("canvas");
+		canvas.width = Math.max(1, Math.round(width * scale));
+		canvas.height = Math.max(1, Math.round(height * scale));
+		const context = canvas.getContext("2d");
+		if (!context) {
+			source.close?.();
+			throw new Error("浏览器无法处理图片");
+		}
+		// JPEG 不支持透明通道，先铺白底，避免 PNG 透明区域变成黑色。
+		context.fillStyle = "#fff";
+		context.fillRect(0, 0, canvas.width, canvas.height);
+		context.drawImage(source, 0, 0, canvas.width, canvas.height);
+		source.close?.();
+		let dataUrl = "";
+		for (const quality of [0.85, 0.7, 0.55]) {
+			dataUrl = canvas.toDataURL("image/jpeg", quality);
+			if (dataUrl.length <= MAX_IMAGE_DATA_CHARS) break;
+		}
+		const comma = dataUrl.indexOf(",");
+		const data = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+		if (!data || data.length > MAX_IMAGE_DATA_CHARS) throw new Error("图片压缩后仍然过大");
+		return { type: "image", mimeType: "image/jpeg", data };
+	}
+
+	async function addImages(files) {
+		if (sending || imageBusy) return;
+		const requestEpoch = epoch;
+		const requestAgentId = activeAgentId;
+		const remaining = MAX_IMAGES - pendingImages.length;
+		if (remaining <= 0) {
+			toast(`最多添加 ${MAX_IMAGES} 张图片`);
+			return;
+		}
+		if (files.length > remaining) toast(`最多添加 ${MAX_IMAGES} 张图片，已忽略多余的图片`);
+		imageBusy = true;
+		updateComposerState();
+		try {
+			for (const file of files.slice(0, remaining)) {
+				try {
+					const image = await encodeImage(file);
+					if (!isCurrentRequest(requestEpoch, requestAgentId)) return;
+					const total = pendingImages.reduce((sum, item) => sum + item.data.length, image.data.length);
+					if (total > MAX_TOTAL_IMAGE_DATA_CHARS) {
+						toast("图片总大小超出限制，请减少图片数量");
+						continue;
+					}
+					pendingImages.push(image);
+					renderAttachments();
+				} catch (error) {
+					if (isCurrentRequest(requestEpoch, requestAgentId)) {
+						toast(error?.message || "图片读取失败");
+					}
+				}
+			}
+		} finally {
+			// 切会话后旧图片编码结束不能解除新会话的发送状态。
+			if (requestEpoch === epoch) {
+				imageBusy = false;
+				updateComposerState();
+			}
+		}
 	}
 
 	function readHomeCache() {
@@ -712,7 +853,11 @@
 		messageVersion = "";
 		// 发送状态属于当前会话；切走时旧 prompt 可能仍在等 RPC，但不能让新会话的发送按钮一直禁用。
 		sending = false;
-		sendButton.disabled = false;
+		imageBusy = false;
+		agentRunning = false;
+		pendingImages = [];
+		renderAttachments();
+		updateComposerState();
 		stopButton.hidden = true;
 		setHeader(activeAgent?.title || "会话", statusLabel(activeAgent), { back: true, composer: true });
 		setConnection("connecting");
@@ -846,7 +991,8 @@
 			const thinkingName = $("thinking-level");
 			if (thinkingName) thinkingName.textContent = thinkingLabel(runtime.thinkingLevel);
 			stopButton.hidden = !running;
-			sendButton.disabled = sending;
+			agentRunning = running;
+			updateComposerState();
 			if (options.initial) {
 				await loadLatestHistoryCursor(requestEpoch, requestAgentId);
 			}
@@ -937,7 +1083,12 @@
 	}
 
 	function mergedMessages() {
-		return stateApi.mergeTimeline(olderMessages, chatMessages);
+		// 旧版 Service Worker/浏览器缓存可能只更新了 mobile.js 而没更新 mobile-state.js；
+		// 缺少 mergeTimeline 时退回按 id 合并，至少不让整个会话白屏。
+		if (typeof stateApi.mergeTimeline === "function") {
+			return stateApi.mergeTimeline(olderMessages, chatMessages);
+		}
+		return stateApi.mergeMessageLists(olderMessages, chatMessages);
 	}
 
 	function renderInline(value) {
@@ -1212,6 +1363,7 @@
 		const time = timeText(item.timestamp);
 		if (time) parts.push(`<time>${escapeHtml(time)}</time>`);
 		if (item.optimistic) parts.push('<span class="meta-pending">发送中…</span>');
+		if (item.delivery) parts.push(`<span class="meta-delivery">${escapeHtml(item.delivery)}</span>`);
 		if (item.duration) parts.push(`<span>${escapeHtml(item.duration)}</span>`);
 		return parts.length ? `<div class="msg-meta">${parts.join("")}</div>` : "";
 	}
@@ -1241,6 +1393,12 @@
 		const toolStatus =
 			meta.status === "running" || toolMatch?.[1] === "▶" ? "▶" : toolError ? "✗" : "✓";
 		const duration = durationText(meta.durationMs);
+		const delivery =
+			meta.streamingBehavior === "followUp"
+				? "排队到下一轮"
+				: meta.streamingBehavior === "steer"
+					? "已加入当前回合"
+					: "";
 		const toolDetail = role === "tool" ? toolSummary(meta) : "";
 		const text = role === "tool" ? toolLabel(body) : body;
 		const textRemaining = Number.isFinite(Number(meta.fullLength))
@@ -1277,6 +1435,7 @@
 			toolDetail,
 			toolError,
 			toolStatus,
+			delivery,
 			optimistic: Boolean(message.optimistic),
 		};
 	}
@@ -1745,27 +1904,38 @@
 		chatMessages = chatMessages.filter((message) => message.id !== id);
 	}
 
-	async function sendPrompt() {
+	async function sendPrompt(behaviorOverride) {
 		const text = input.value.trim();
-		if (!text || !activeAgentId || sending) return;
+		const images = pendingImages.slice();
+		if ((!text && images.length === 0) || !activeAgentId || sending || imageBusy) return;
 		const agentId = activeAgentId;
 		const requestEpoch = epoch;
+		const behavior = agentRunning
+			? behaviorOverride === "followUp"
+				? "followUp"
+				: "steer"
+			: undefined;
+		closeSendMenu();
 		const optimisticId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		const optimistic = {
 			id: optimisticId,
 			agentId,
 			role: "user",
-			text,
+			text: text || "[图片]",
 			timestamp: Date.now(),
 			optimistic: true,
+			...(images.length ? { images } : {}),
+			...(behavior ? { meta: { streamingBehavior: behavior } } : {}),
 		};
 		sending = true;
-		sendButton.disabled = true;
+		updateComposerState();
 		const previousHeight = view.scrollHeight;
 		const previousTop = view.scrollTop;
 		chatMessages = stateApi.appendTail(chatMessages, [optimistic], { limit: TAIL_LIMIT });
 		input.value = "";
 		input.style.height = "auto";
+		pendingImages = [];
+		renderAttachments();
 		saveDraft();
 		renderMessages({ mode: "auto", nearBottom: true, previousHeight, previousTop, newCount: 0 });
 		try {
@@ -1773,26 +1943,40 @@
 				method: "POST",
 				// prompt RPC 可能跑满主进程 rpcTimeout；客户端超时中断无法证明服务端未受理。
 				timeout: 0,
-				body: JSON.stringify({ message: text }),
+				body: JSON.stringify({
+					message: text,
+					...(images.length ? { images } : {}),
+					...(behavior ? { streamingBehavior: behavior } : {}),
+				}),
 			});
 			const result = data?.result;
 			if (!result?.accepted) {
 				if (!isCurrentRequest(requestEpoch, agentId)) return;
 				removeOptimistic(optimisticId);
 				if (!input.value) input.value = text;
+				if (!pendingImages.length && images.length) {
+					pendingImages = images;
+					renderAttachments();
+				}
 				saveDraft();
 				renderMessages({ mode: "preserve", previousHeight, previousTop });
 				toast(result?.error || "发送失败");
 				return;
 			}
+			if (behavior) toast(behavior === "followUp" ? "已排队到下一轮" : "已加入当前回合");
 			if (isCurrentRequest(requestEpoch, agentId)) {
-				await refreshChat({ initial: true });
+				// 已受理后刷新失败不能按发送失败回填输入框，否则会重复发送。
+				await refreshChat({ initial: true }).catch(() => undefined);
 			}
 		} catch (error) {
 			// 用户已经切走时，旧请求的失败不能写进新会话的输入框。
 			if (isCurrentRequest(requestEpoch, agentId)) {
 				removeOptimistic(optimisticId);
 				if (!input.value) input.value = text;
+				if (!pendingImages.length && images.length) {
+					pendingImages = images;
+					renderAttachments();
+				}
 				saveDraft();
 				renderMessages({ mode: "preserve", previousHeight, previousTop });
 				handleError(error);
@@ -1801,7 +1985,7 @@
 			// 旧会话的请求结束时不能解除新会话正在发送的禁用状态。
 			if (isCurrentRequest(requestEpoch, agentId)) {
 				sending = false;
-				sendButton.disabled = false;
+				updateComposerState();
 			}
 		}
 	}
@@ -2024,8 +2208,38 @@
 		});
 	});
 	newSessionButton.addEventListener("click", () => void newSession());
-	sendButton.addEventListener("click", sendPrompt);
+	sendButton.addEventListener("click", () => void sendPrompt());
 	stopButton.addEventListener("click", stopAgent);
+	attachButton.addEventListener("click", () => imageInput.click());
+	imageInput.addEventListener("change", () => {
+		const files = Array.from(imageInput.files || []);
+		imageInput.value = "";
+		void addImages(files);
+	});
+	attachmentsEl.addEventListener("click", (event) => {
+		const button = event.target.closest("[data-remove-image]");
+		if (!button || sending || imageBusy) return;
+		const index = Number(button.dataset.removeImage);
+		if (!Number.isInteger(index) || index < 0 || index >= pendingImages.length) return;
+		pendingImages.splice(index, 1);
+		renderAttachments();
+	});
+	sendMoreButton.addEventListener("click", (event) => {
+		event.stopPropagation();
+		if (!agentRunning || sending || imageBusy) return;
+		const open = sendMenu.hidden;
+		sendMenu.hidden = !open;
+		sendMoreButton.setAttribute("aria-expanded", String(open));
+	});
+	sendMenu.addEventListener("click", (event) => {
+		const button = event.target.closest("[data-send-behavior]");
+		if (!button) return;
+		closeSendMenu();
+		void sendPrompt(button.dataset.sendBehavior);
+	});
+	document.addEventListener("click", (event) => {
+		if (!event.target.closest(".send-stack")) closeSendMenu();
+	});
 	input.addEventListener("input", () => {
 		input.style.height = "auto";
 		input.style.height = `${Math.min(132, input.scrollHeight)}px`;
@@ -2050,6 +2264,10 @@
 	});
 	$("sheet-close").addEventListener("click", closeSheet);
 	document.addEventListener("keydown", (event) => {
+		if (event.key === "Escape" && !sendMenu.hidden) {
+			closeSendMenu();
+			return;
+		}
 		if (event.key === "Escape" && !sheetEl.hidden) closeSheet();
 	});
 	$("connection").addEventListener("click", () => {

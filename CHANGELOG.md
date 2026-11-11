@@ -13,6 +13,7 @@ All notable changes to PiDeck are documented here.
 - **Mobile layout and PWA** — Narrow-screen sidebar becomes a drawer, the detail drawer overlays the chat, and the composer respects safe areas. Add to home screen is supported; the service worker caches static assets only and stays network-first.
 - **Mobile message rendering** — Assistant replies render Markdown headings, lists, tables, quotes, and code blocks (with one-tap copy). Tool calls are grouped by turn with the command/path, status, and duration; tap one to see full arguments and results. Thinking blocks show a first-line preview, and long histories load earlier messages on demand.
 - **Large-session mobile polling** — Poll only the latest message window and collapsed previews, fetch full content by message id on expand, apply version-based incremental updates, and poll faster while an agent runs so streaming text and thinking appear without waiting for the next message.
+- **Mobile image attachments and send semantics** — Attach up to four photos, auto-resize/compress them to JPEG before upload, preview/remove before sending, and send image-only messages. While the agent is running, choose whether a message steers the current turn or queues for the next turn; the delivery state is shown on the message.
 - **Remote access via Tailscale Serve** — Enable it in Settings to publish the loopback web service to your tailnet over HTTPS, with status, QR pairing, copy, and retry. OmpDeck only removes the Serve handler pointing at its own local port.
 
 ### 🔒 Security

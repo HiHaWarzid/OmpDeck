@@ -187,7 +187,7 @@ npm run dev
 1. On the desktop app, open **Settings → Web Service** and enable it.
 2. Put the phone and computer on the same network; only for LAN access, switch the listen address from the default `127.0.0.1` to `0.0.0.0`.
 3. Scan the QR code in Settings, or open the copied token URL on the phone.
-4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop an agent; project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
+4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop an agent; the composer accepts photos (auto-compressed), and while an agent is running you can choose **steer into current turn** or **queue for next turn**. Project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
 
 ### Remote / Off-network Access
 

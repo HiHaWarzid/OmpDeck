@@ -10,7 +10,7 @@
 		<title>OmpDeck Mobile</title>
 		<link rel="manifest" href="./manifest.webmanifest" />
 		<link rel="apple-touch-icon" href="./icon-192.png" />
-		<link rel="stylesheet" href="./mobile.css?v=15" />
+		<link rel="stylesheet" href="./mobile.css?v=17" />
 	</head>
 	<body>
 		<div id="app">
@@ -42,9 +42,31 @@
 				</button>
 			</nav>
 			<footer id="composer" hidden>
-				<textarea id="input" rows="1" placeholder="输入消息…"></textarea>
-				<button id="send" class="primary" type="button">发送</button>
-				<button id="stop" class="danger" type="button" hidden>停止</button>
+				<div id="attachments" class="attachments" hidden></div>
+				<div class="composer-main">
+					<button id="attach" class="icon attach" type="button" aria-label="添加图片">
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.05l-8.49 8.49a6 6 0 01-8.49-8.49l8.49-8.49a4 4 0 015.66 5.66l-8.49 8.49a2 2 0 01-2.83-2.83l7.78-7.78" /></svg>
+					</button>
+					<input id="image-input" type="file" accept="image/*" multiple hidden />
+					<textarea id="input" rows="1" placeholder="输入消息…"></textarea>
+					<div class="send-stack">
+						<button id="send" class="primary" type="button">发送</button>
+						<button id="send-more" class="send-more" type="button" aria-label="选择发送方式" aria-haspopup="menu" aria-expanded="false" hidden>
+							<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" /></svg>
+						</button>
+						<div id="send-menu" class="send-menu" role="menu" hidden>
+							<button type="button" role="menuitem" data-send-behavior="steer">
+								<strong>加入当前回合</strong>
+								<span>当前工具结束后立即注入</span>
+							</button>
+							<button type="button" role="menuitem" data-send-behavior="followUp">
+								<strong>排队到下一轮</strong>
+								<span>当前回合结束后再发送</span>
+							</button>
+						</div>
+					</div>
+					<button id="stop" class="danger" type="button" hidden>停止</button>
+				</div>
 			</footer>
 			<div id="toast" role="status" hidden></div>
 			<div id="sheet" hidden>
@@ -60,7 +82,7 @@
 				</div>
 			</div>
 		</div>
-		<script src="./mobile-state.js?v=13"></script>
-		<script src="./mobile.js?v=30"></script>
+		<script src="./mobile-state.js?v=14"></script>
+		<script src="./mobile.js?v=33"></script>
 	</body>
 </html>

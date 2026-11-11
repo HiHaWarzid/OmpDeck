@@ -1,7 +1,13 @@
 import { createServer, get as httpGet } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import type { AgentRuntimeState, AgentTab, ChatMessage, SendPromptResult } from "../../shared/types";
+import type {
+	AgentRuntimeState,
+	AgentTab,
+	ChatMessage,
+	SendPromptInput,
+	SendPromptResult,
+} from "../../shared/types";
 import { WebServiceManager } from "./WebServiceManager";
 
 type WebDeps = ConstructorParameters<typeof WebServiceManager>[0];
@@ -228,6 +234,50 @@ describe("手机端消息增量契约", () => {
 
 		const missing = await getJson("/api/agents/agent-1/messages/m9/full-text");
 		expect(missing.response.status).toBe(404);
+	});
+
+	test("prompt 透传图片与排队语义", async () => {
+		const original = deps.sendPrompt;
+		let captured: SendPromptInput | undefined;
+		deps.sendPrompt = async (input) => {
+			captured = input;
+			return { accepted: true };
+		};
+		try {
+			const response = await fetch(`${baseUrl}/api/agents/agent-1/prompt`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					message: "看看这张图",
+					images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+					streamingBehavior: "followUp",
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ result: { accepted: true } });
+			expect(captured).toEqual({
+				agentId: "agent-1",
+				message: "看看这张图",
+				images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+				streamingBehavior: "followUp",
+			});
+			const imageOnly = await fetch(`${baseUrl}/api/agents/agent-1/prompt`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					message: "",
+					images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+				}),
+			});
+			expect(imageOnly.status).toBe(200);
+			expect(captured).toEqual({
+				agentId: "agent-1",
+				message: "",
+				images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+			});
+		} finally {
+			deps.sendPrompt = original;
+		}
 	});
 
 	test("大响应带 gzip 编码", async () => {
