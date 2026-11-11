@@ -626,6 +626,11 @@
 			updateNewMessagesButton();
 		});
 		$("messages").addEventListener("click", (event) => {
+			const copyButton = event.target.closest("[data-copy-code]");
+			if (copyButton) {
+				void copyCode(copyButton);
+				return;
+			}
 			const button = event.target.closest("[data-expand]");
 			if (button) void expandMessage(button.dataset.expand);
 		});
@@ -814,14 +819,23 @@
 		return stateApi.mergeMessageLists(olderMessages, chatMessages);
 	}
 
-	function renderInline(text) {
-		return text
-			.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+	function renderInline(value) {
+		// 先把行内代码抽成占位符，避免 ** 等标记在代码内容里被误解析。
+		const codes = [];
+		let text = String(value ?? "").replace(/`([^`\n]+)`/g, (_, code) => {
+			const token = `\u0000${codes.length}\u0000`;
+			codes.push(`<code>${escapeHtml(code)}</code>`);
+			return token;
+		});
+		text = escapeHtml(text)
 			.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+			.replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+			.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>")
 			.replace(
 				/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
 				'<a href="$2" target="_blank" rel="noreferrer">$1</a>',
 			);
+		return text.replace(/\u0000(\d+)\u0000/g, (_, index) => codes[Number(index)] || "");
 	}
 
 	function isTableSeparator(line) {
@@ -837,12 +851,55 @@
 			.map((cell) => cell.trim());
 	}
 
-	function renderMarkdown(text) {
-		const lines = text.split("\n");
+	function renderCodeBlock(code, language) {
+		const label = language ? escapeHtml(language) : "代码";
+		return `<div class="code-block"><div class="code-head"><span>${label}</span><button class="code-copy" type="button" data-copy-code>复制</button></div><pre><code>${escapeHtml(code)}</code></pre></div>`;
+	}
+
+	function renderMarkdown(value) {
+		const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
 		const output = [];
+		let paragraph = [];
+		let list = null;
+
+		const flushParagraph = () => {
+			if (!paragraph.length) return;
+			output.push(`<p>${paragraph.map(renderInline).join("<br>")}</p>`);
+			paragraph = [];
+		};
+		const flushList = () => {
+			if (!list) return;
+			const tag = list.type === "ol" ? "ol" : "ul";
+			output.push(
+				`<${tag}>${list.items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</${tag}>`,
+			);
+			list = null;
+		};
+		const flushBlocks = () => {
+			flushParagraph();
+			flushList();
+		};
+
 		for (let index = 0; index < lines.length; index += 1) {
 			const line = lines[index];
+			const fence = /^\s*```\s*([^\s`]*)\s*$/.exec(line);
+			if (fence) {
+				flushBlocks();
+				const code = [];
+				index += 1;
+				while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+					code.push(lines[index]);
+					index += 1;
+				}
+				output.push(renderCodeBlock(code.join("\n"), fence[1]));
+				continue;
+			}
+			if (!line.trim()) {
+				flushBlocks();
+				continue;
+			}
 			if (line.includes("|") && index + 1 < lines.length && isTableSeparator(lines[index + 1])) {
+				flushBlocks();
 				const headers = splitTableRow(line);
 				const rows = [];
 				index += 2;
@@ -865,40 +922,57 @@
 			}
 			const heading = /^(#{1,4})\s+(.*)$/.exec(line);
 			if (heading) {
-				output.push(`<div class="md-h">${renderInline(heading[2])}</div>`);
+				flushBlocks();
+				const level = heading[1].length;
+				output.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+				continue;
+			}
+			if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
+				flushBlocks();
+				output.push("<hr />");
 				continue;
 			}
 			const quote = /^>\s?(.*)$/.exec(line);
 			if (quote) {
-				output.push(`<div class="md-quote">${renderInline(quote[1])}</div>`);
+				flushBlocks();
+				const quoteLines = [quote[1]];
+				while (index + 1 < lines.length) {
+					const next = /^>\s?(.*)$/.exec(lines[index + 1]);
+					if (!next) break;
+					quoteLines.push(next[1]);
+					index += 1;
+				}
+				output.push(`<blockquote>${quoteLines.map(renderInline).join("<br>")}</blockquote>`);
 				continue;
 			}
-			const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+			const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
 			if (bullet) {
-				output.push(`<div class="md-li">• ${renderInline(bullet[1])}</div>`);
+				flushParagraph();
+				if (!list || list.type !== "ul") {
+					flushList();
+					list = { type: "ul", items: [] };
+				}
+				list.items.push(bullet[1]);
 				continue;
 			}
 			const numbered = /^\s*(\d+)\.\s+(.*)$/.exec(line);
 			if (numbered) {
-				output.push(`<div class="md-li">${numbered[1]}. ${renderInline(numbered[2])}</div>`);
+				flushParagraph();
+				if (!list || list.type !== "ol") {
+					flushList();
+					list = { type: "ol", items: [] };
+				}
+				list.items.push(numbered[2]);
 				continue;
 			}
-			output.push(renderInline(line));
+			paragraph.push(line);
 		}
-		return output.join("\n");
+		flushBlocks();
+		return output.join("");
 	}
 
 	function renderText(text) {
-		const escaped = escapeHtml(text);
-		if (!escaped.includes("```")) return renderMarkdown(escaped);
-		return escaped
-			.split("```")
-			.map((part, index) => {
-				if (index % 2 === 0) return renderMarkdown(part);
-				const body = part.replace(/^[^\n]*\n/, "");
-				return `<pre>${body}</pre>`;
-			})
-			.join("");
+		return `<div class="md-body">${renderMarkdown(text)}</div>`;
 	}
 
 	/** 历史消息里 text 可能带 <thinking> 标签，同时另有 thinking 字段；展示时只保留正文。 */
@@ -927,7 +1001,7 @@
 		return { body, thinking: found };
 	}
 
-	function toolLabel(text) {
+	function toolNameLabel(name) {
 		const names = {
 			read: "读取",
 			bash: "命令",
@@ -941,14 +1015,78 @@
 			todo: "任务",
 			web_search: "搜索网页",
 			lsp: "分析",
+			ask: "询问",
 		};
-		return String(text || "").replace(/^✓\s*([A-Za-z_]+)/, (_, name) => `✓ ${names[name] || name}`);
+		return names[name] || name || "工具";
+	}
+
+	function toolLabel(text) {
+		return String(text || "").replace(
+			/^([✓✗])\s*([A-Za-z_][\w-]*)/,
+			(_, mark, name) => `${mark} ${toolNameLabel(name)}`,
+		);
+	}
+
+	function durationText(value) {
+		const ms = Number(value);
+		if (!Number.isFinite(ms) || ms <= 0) return "";
+		return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+	}
+
+	function shortText(value, max = 120) {
+		const text = String(value ?? "").replace(/\s+/g, " ").trim();
+		return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+	}
+
+	/** 工具消息只带工具名；从 meta.args/detailText 里提取一行可读参数，
+	 *  让手机端能直接看到执行了什么命令、读了哪个文件，而不是只有“命令”。 */
+	function toolSummary(meta) {
+		let args = meta.args;
+		if (typeof args === "string") {
+			try {
+				args = JSON.parse(args);
+			} catch {
+				args = null;
+			}
+		}
+		if (args && typeof args === "object") {
+			for (const key of [
+				"command",
+				"cmd",
+				"path",
+				"file_path",
+				"filePath",
+				"pattern",
+				"query",
+				"url",
+				"description",
+				"title",
+			]) {
+				const value = args[key];
+				if (typeof value === "string" && value.trim()) return shortText(value);
+			}
+		}
+		const detailLine = String(meta.detailText || "")
+			.split("\n")
+			.map((line) => line.trim())
+			.find((line) => line && !/^(工具|状态|参数|结果|详情)：/.test(line));
+		if (detailLine) return shortText(detailLine);
+		return shortText(meta.result);
+	}
+
+	function messageMeta(item, options = {}) {
+		const parts = [];
+		if (options.agent) parts.push('<span class="meta-agent">omp</span>');
+		const time = timeText(item.timestamp);
+		if (time) parts.push(`<time>${escapeHtml(time)}</time>`);
+		if (item.optimistic) parts.push('<span class="meta-pending">发送中…</span>');
+		if (item.duration) parts.push(`<span>${escapeHtml(item.duration)}</span>`);
+		return parts.length ? `<div class="msg-meta">${parts.join("")}</div>` : "";
 	}
 
 	function messageView(message) {
 		const role = message.role || "assistant";
-		const label =
-			role === "user" ? "你" : role === "assistant" ? "助手" : role === "tool" ? "工具" : "系统";
+		const label = role === "system" ? "系统" : role === "error" ? "错误" : "助手";
 		const images = Array.isArray(message.images)
 			? message.images
 					.map(
@@ -959,11 +1097,19 @@
 			: "";
 		const { body, thinking } = splitThinking(message.text, message.thinking);
 		const thinkingOnly = !body && !!thinking;
+		const thinkingPreview = shortText(thinking, 48);
 		const thinkingBlock = thinking
-			? `<details data-detail="thinking"><summary>思考过程</summary><div class="thinking-body">${renderText(thinking)}</div></details>`
+			? `<details data-detail="thinking"><summary>思考过程${thinkingPreview ? ` · ${escapeHtml(thinkingPreview)}` : ""}</summary><div class="thinking-body">${renderText(thinking)}</div></details>`
 			: "";
-		const text = role === "tool" ? toolLabel(body) : body;
 		const meta = message.meta || {};
+		const toolMatch = /^([✓✗])\s*([^\s]+)/.exec(String(body || ""));
+		const toolName = toolNameLabel(String(meta.toolName || toolMatch?.[2] || "工具"));
+		const toolError =
+			meta.isError === true || meta.status === "error" || toolMatch?.[1] === "✗";
+		const toolStatus = meta.status === "running" ? "▶" : toolError ? "✗" : "✓";
+		const duration = durationText(meta.durationMs);
+		const toolDetail = role === "tool" ? toolSummary(meta) : "";
+		const text = role === "tool" ? toolLabel(body) : body;
 		const textRemaining = Number.isFinite(Number(meta.fullLength))
 			? Number(meta.fullLength) - String(body || "").length
 			: 0;
@@ -992,6 +1138,13 @@
 			text,
 			thinkingBlock,
 			expand,
+			timestamp: message.timestamp,
+			duration,
+			toolName,
+			toolDetail,
+			toolError,
+			toolStatus,
+			optimistic: Boolean(message.optimistic),
 		};
 	}
 
@@ -999,7 +1152,23 @@
 		const expand = item.expand
 			? `<button class="expand" type="button" data-expand="${escapeHtml(item.id)}">${escapeHtml(item.expand.label)}${item.expand.remaining ? ` · 还有 ${item.expand.remaining} 字` : ""}</button>`
 			: "";
-		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}" data-mid="${escapeHtml(item.id)}"><span class="role">${escapeHtml(item.label)}</span>${renderText(item.text)}${expand}${item.thinkingBlock}${item.images}</div>`;
+		const attrs = `data-mid="${escapeHtml(item.id)}"`;
+		if (item.role === "user") {
+			return `<div class="msg user" ${attrs}>${escapeHtml(item.body)}${expand}${item.images}${messageMeta(item)}</div>`;
+		}
+		if (item.role === "tool") {
+			const detail = item.toolDetail
+				? `<span class="tool-detail">${escapeHtml(item.toolDetail)}</span>`
+				: "";
+			return `<div class="msg tool${item.toolError ? " tool-error" : ""}" ${attrs}><span class="tool-status">${escapeHtml(item.toolStatus)}</span><span class="tool-main"><span class="tool-name">${escapeHtml(item.toolName)}</span>${detail}</span>${item.duration ? `<span class="tool-duration">${escapeHtml(item.duration)}</span>` : ""}</div>`;
+		}
+		const label =
+			item.role === "system" || item.role === "error"
+				? `<span class="role">${escapeHtml(item.label)}</span>`
+				: "";
+		const meta = item.role === "assistant" ? messageMeta(item, { agent: true }) : "";
+		const body = item.text ? renderText(item.text) : "";
+		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}" ${attrs}>${label}${meta}${item.thinkingBlock}${body}${expand}${item.images}</div>`;
 	}
 
 	function buildRenderItems() {
@@ -1018,11 +1187,13 @@
 					group.push(messages[index]);
 				}
 				if (group.length > 1) {
+					// 执行过程默认展开：手机端最需要看到 agent 实际跑了哪些命令，
+					// 折叠起来只剩“工具 · N 次”，等于把过程信息全部藏掉。
 					items.push({
 						key: `group:${group[0].id}`,
-						html: `<details class="tool-group" data-detail="group"><summary>工具 · ${group.length} 次</summary>${group
+						html: `<div class="tool-group"><div class="tool-group-title">执行过程 · ${group.length} 步</div>${group
 							.map(renderMessage)
-							.join("")}</details>`,
+							.join("")}</div>`,
 					});
 				} else {
 					items.push({ key: item.id, html: renderMessage(item) });
@@ -1116,6 +1287,43 @@
 			newMessageCount += Number(options.newCount) || 0;
 		}
 		updateNewMessagesButton();
+	}
+
+	async function copyText(text) {
+		try {
+			await navigator.clipboard.writeText(text);
+			return true;
+		} catch {
+			// 局域网 http 不是 secure context，clipboard API 可能不可用。
+			const area = document.createElement("textarea");
+			area.value = text;
+			area.setAttribute("readonly", "");
+			area.style.position = "fixed";
+			area.style.opacity = "0";
+			document.body.append(area);
+			area.select();
+			let ok = false;
+			try {
+				ok = document.execCommand("copy");
+			} catch {
+				ok = false;
+			}
+			area.remove();
+			return ok;
+		}
+	}
+
+	async function copyCode(button) {
+		const code = button.closest(".code-block")?.querySelector("pre code");
+		if (!code) return;
+		const ok = await copyText(code.textContent || "");
+		toast(ok ? "代码已复制" : "复制失败");
+		if (!ok) return;
+		const previous = button.textContent;
+		button.textContent = "已复制";
+		setTimeout(() => {
+			if (button.isConnected) button.textContent = previous;
+		}, 1200);
 	}
 
 	async function expandMessage(messageId) {

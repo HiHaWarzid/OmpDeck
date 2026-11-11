@@ -438,34 +438,47 @@ button:disabled {
 }
 #messages {
 	display: grid;
-	gap: 8px;
-	padding-bottom: 8px;
+	gap: 18px;
+	padding: 2px 0 12px;
 }
 .msg {
-	max-width: 92%;
-	padding: 9px 11px;
-	border-radius: 14px;
-	background: var(--bubble);
-	white-space: pre-wrap;
+	max-width: 100%;
+	min-width: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	white-space: normal;
+	overflow-wrap: anywhere;
 	word-break: break-word;
-	font-size: 14px;
+	color: var(--text);
+	font-size: 15px;
+	line-height: 1.65;
 }
 .msg.user {
 	justify-self: end;
+	max-width: 86%;
+	padding: 9px 13px;
+	border: 1px solid var(--line);
+	border-radius: 16px 16px 4px 16px;
 	background: var(--bubble-user);
+	box-shadow: var(--shadow);
+	white-space: pre-wrap;
+	line-height: 1.55;
 }
 .msg.assistant {
-	justify-self: start;
+	justify-self: stretch;
+	padding: 0 2px;
 }
-.msg.tool,
 .msg.system,
 .msg.error {
 	justify-self: stretch;
-	max-width: 100%;
-	font-size: 12px;
-	color: var(--muted);
-	background: transparent;
+	padding: 8px 10px;
 	border: 1px dashed var(--line);
+	border-radius: 10px;
+	background: var(--panel);
+	color: var(--muted);
+	font-size: 12px;
 }
 .msg.error {
 	color: var(--danger);
@@ -473,38 +486,65 @@ button:disabled {
 }
 .msg .role {
 	display: block;
+	margin-bottom: 4px;
+	color: var(--muted);
 	font-size: 10px;
 	font-weight: 700;
 	letter-spacing: 0.05em;
 	text-transform: uppercase;
+}
+.msg-meta {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 5px;
 	color: var(--muted);
-	margin-bottom: 3px;
+	font-size: 10.5px;
+	line-height: 1.2;
+	font-variant-numeric: tabular-nums;
+}
+.msg.user .msg-meta {
+	justify-content: flex-end;
+	margin: 5px 0 0;
+}
+.msg-meta time {
+	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+.meta-agent {
+	color: var(--text);
+	font-weight: 700;
+}
+.meta-pending {
+	color: var(--accent);
 }
 .msg details {
-	margin-top: 6px;
-	padding-top: 6px;
+	margin-top: 8px;
+	padding-top: 7px;
 	border-top: 1px dashed var(--line);
-	font-size: 12px;
 	color: var(--muted);
+	font-size: 12px;
 }
 .msg details summary {
+	overflow: hidden;
 	cursor: pointer;
-	font-size: 11px;
 	color: var(--muted);
+	font-size: 11px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 	user-select: none;
 }
 .msg details[open] summary {
-	margin-bottom: 4px;
+	margin-bottom: 5px;
 }
 .thinking-body {
-	white-space: pre-wrap;
+	font-size: 12px;
 }
 .msg.thinking-only {
 	justify-self: stretch;
-	max-width: 100%;
-	padding: 6px 9px;
-	background: transparent;
+	padding: 7px 10px;
 	border: 1px dashed var(--line);
+	border-radius: 10px;
+	background: var(--panel);
 	font-size: 12px;
 }
 .msg.thinking-only details {
@@ -515,78 +555,211 @@ button:disabled {
 .msg.thinking-only .role {
 	margin-bottom: 2px;
 }
+.msg.tool {
+	justify-self: stretch;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 2px 4px;
+	color: var(--muted);
+	font-size: 12px;
+	line-height: 1.4;
+}
+.tool-status {
+	width: 14px;
+	color: var(--accent);
+	font-weight: 700;
+	text-align: center;
+}
+.msg.tool.tool-error .tool-status {
+	color: var(--danger);
+}
+.tool-main {
+	display: grid;
+	gap: 1px;
+	min-width: 0;
+	flex: 1;
+}
+.tool-name {
+	color: var(--text);
+	font-weight: 600;
+}
+.tool-detail {
+	overflow: hidden;
+	color: var(--muted);
+	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	font-size: 10.5px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.tool-duration {
+	margin-left: 4px;
+	color: var(--muted);
+	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	font-size: 10.5px;
+}
 .tool-group {
 	justify-self: stretch;
 	max-width: 100%;
-	padding: 6px 9px;
-	border: 1px dashed var(--line);
-	border-radius: var(--radius);
+	padding: 7px 10px;
+	border: 1px solid var(--line);
+	border-radius: 10px;
+	background: var(--panel);
 	color: var(--muted);
 	font-size: 12px;
 }
-.tool-group > summary {
-	cursor: pointer;
+.tool-group-title {
+	margin-bottom: 3px;
+	color: var(--muted);
+	font-size: 10.5px;
+	font-weight: 600;
 }
-.tool-group .msg {
-	max-width: 100%;
-	margin-top: 6px;
-	padding: 4px 0;
-	border: 0;
-	background: transparent;
+.tool-group .msg.tool {
+	padding: 5px 0;
+}
+.tool-group .msg.tool + .msg.tool {
+	border-top: 1px dashed var(--line);
 }
 .msg a {
 	color: var(--accent);
 	text-decoration: underline;
+	text-underline-offset: 2px;
 }
-.md-h {
-	margin-top: 4px;
+.md-body {
+	min-width: 0;
+}
+.md-body > :first-child {
+	margin-top: 0;
+}
+.md-body > :last-child {
+	margin-bottom: 0;
+}
+.md-body p {
+	margin: 0 0 12px;
+	line-height: 1.68;
+	white-space: pre-wrap;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+	margin: 16px 0 7px;
 	font-weight: 700;
+	line-height: 1.35;
 }
-.md-li {
-	margin-left: 2px;
+.md-body h1 {
+	font-size: 1.3em;
 }
-.md-quote {
-	border-left: 2px solid var(--line);
-	padding-left: 8px;
+.md-body h2 {
+	font-size: 1.18em;
+}
+.md-body h3 {
+	font-size: 1.08em;
+}
+.md-body h4 {
+	font-size: 1em;
+}
+.md-body ul,
+.md-body ol {
+	margin: 4px 0 12px;
+	padding-left: 1.35em;
+}
+.md-body li {
+	margin: 3px 0;
+	padding-left: 2px;
+}
+.md-body blockquote {
+	margin: 8px 0;
+	padding: 6px 10px;
+	border-left: 3px solid var(--accent);
+	border-radius: 0 6px 6px 0;
+	background: var(--bubble);
 	color: var(--muted);
 }
+.md-body hr {
+	margin: 14px 0;
+	border: 0;
+	border-top: 1px solid var(--line);
+}
+.md-body code {
+	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	font-size: 0.9em;
+}
+.md-body :not(pre) > code {
+	padding: 0.12em 0.35em;
+	border-radius: 4px;
+	background: var(--bubble);
+}
 .md-table-wrap {
+	margin: 10px 0;
+	border: 1px solid var(--line);
+	border-radius: 10px;
 	overflow-x: auto;
-	margin: 6px 0;
 	white-space: normal;
 }
 .md-table {
+	width: 100%;
 	border-collapse: collapse;
-	font-size: 12px;
+	font-size: 12.5px;
 }
 .md-table th,
 .md-table td {
-	border: 1px solid var(--line);
-	padding: 4px 6px;
+	padding: 6px 8px;
+	border-bottom: 1px solid var(--line);
 	text-align: left;
 	vertical-align: top;
 }
 .md-table th {
 	background: var(--bg);
 	font-weight: 600;
+	white-space: nowrap;
+}
+.md-table tr:last-child td {
+	border-bottom: 0;
 }
 .msg img {
 	max-width: 100%;
+	margin-top: 8px;
 	border-radius: 8px;
-	margin-top: 6px;
 }
-.msg pre {
-	margin: 6px 0 0;
-	padding: 8px;
-	background: var(--bg);
+.code-block {
+	margin: 10px 0;
 	border: 1px solid var(--line);
-	border-radius: 8px;
-	overflow-x: auto;
-	font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-	white-space: pre;
+	border-radius: 10px;
+	background: var(--bg);
+	overflow: hidden;
 }
-.msg code {
-	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+.code-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 5px 10px;
+	border-bottom: 1px solid var(--line);
+	background: var(--panel);
+	color: var(--muted);
+	font-size: 11px;
+}
+.code-copy {
+	padding: 2px 0;
+	border: 0;
+	background: transparent;
+	color: var(--muted);
+	font: inherit;
+	cursor: pointer;
+}
+.code-copy:active {
+	color: var(--accent);
+}
+.code-block pre {
+	margin: 0;
+	padding: 10px 12px;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	overflow-x: auto;
+	font: 12.5px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	white-space: pre;
 }
 .load-older {
 	justify-self: center;
