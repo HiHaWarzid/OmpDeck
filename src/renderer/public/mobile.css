@@ -46,10 +46,16 @@ body.sheet-open {
 	overflow: hidden;
 }
 #app {
-	height: 100dvh;
-	display: grid;
-	grid-template-rows: auto minmax(0, 1fr) auto;
+	height: var(--app-height, 100dvh);
+	display: flex;
+	flex-direction: column;
 	padding-top: env(safe-area-inset-top);
+}
+#topbar,
+#connection,
+#tabs,
+#composer {
+	flex: none;
 }
 #topbar {
 	display: flex;
@@ -66,6 +72,15 @@ body.sheet-open {
 	display: grid;
 	gap: 1px;
 }
+#connection {
+	padding: 8px 12px;
+	font-size: 12px;
+	text-align: center;
+	color: var(--danger);
+	background: color-mix(in srgb, var(--danger) 10%, var(--panel));
+	border-bottom: 1px solid var(--line);
+	cursor: pointer;
+}
 .heading strong {
 	font-size: 16px;
 	white-space: nowrap;
@@ -80,8 +95,8 @@ body.sheet-open {
 	text-overflow: ellipsis;
 }
 .icon {
-	width: 36px;
-	height: 36px;
+	width: 44px;
+	height: 44px;
 	flex: none;
 	display: grid;
 	place-items: center;
@@ -109,6 +124,8 @@ body.sheet-open {
 	height: 20px;
 }
 main {
+	flex: 1;
+	min-height: 0;
 	overflow-y: auto;
 	-webkit-overflow-scrolling: touch;
 	padding: 12px;
@@ -142,6 +159,7 @@ main {
 .search input {
 	flex: 1;
 	min-width: 0;
+	font-size: 16px;
 	border: 0;
 	outline: none;
 	background: transparent;
@@ -161,6 +179,9 @@ main {
 }
 .chip {
 	flex: none;
+	display: inline-flex;
+	align-items: center;
+	min-height: 40px;
 	border: 1px solid var(--line);
 	background: var(--panel);
 	color: var(--text);
@@ -185,6 +206,7 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 10px;
+	min-height: 56px;
 	padding: 12px;
 	border-bottom: 1px solid var(--line);
 	cursor: pointer;
@@ -334,7 +356,8 @@ main {
 #input {
 	flex: 1;
 	min-width: 0;
-	min-height: 40px;
+	min-height: 44px;
+	font-size: 16px;
 	max-height: 132px;
 	resize: none;
 	border: 1px solid var(--line);
@@ -342,7 +365,8 @@ main {
 	background: var(--bg);
 	color: var(--text);
 	padding: 9px 11px;
-	font: inherit;
+	font-family: inherit;
+	font-size: 16px;
 	outline: none;
 }
 #input:focus {
@@ -351,7 +375,7 @@ main {
 button.primary,
 button.danger {
 	flex: none;
-	min-height: 40px;
+	min-height: 44px;
 	padding: 0 14px;
 	border-radius: 12px;
 	border: 1px solid transparent;
@@ -389,7 +413,7 @@ button:disabled {
 .chat-tools::-webkit-scrollbar {
 	display: none;
 }
-.tool {
+.chat-tools .tool {
 	flex: none;
 	display: flex;
 	align-items: center;
@@ -399,12 +423,12 @@ button:disabled {
 	color: var(--muted);
 	border-radius: 999px;
 	padding: 0 9px;
-	height: 26px;
+	height: 36px;
 	line-height: 1;
 	font-size: 11px;
 	cursor: pointer;
 }
-.tool b {
+.chat-tools .tool b {
 	max-width: 150px;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -599,6 +623,7 @@ button:disabled {
 }
 .token-form input,
 .settings-pad input {
+	font-size: 16px;
 	border: 1px solid var(--line);
 	border-radius: 10px;
 	background: var(--bg);
@@ -712,5 +737,97 @@ button:disabled {
 	to {
 		transform: none;
 		opacity: 1;
+	}
+}
+
+/* 手机端触控与可达性：焦点环、骨架屏、新消息提示、展开按钮。 */
+:where(button, a, input, textarea, summary):focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+.skeleton-search,
+.skeleton-chip,
+.skeleton-row {
+	pointer-events: none;
+}
+.skeleton-search {
+	height: 44px;
+	border-radius: 10px;
+	background: var(--panel);
+	border: 1px solid var(--line);
+}
+.skeleton-chip {
+	width: 72px;
+	height: 40px;
+	border-radius: 999px;
+	background: var(--bubble);
+}
+.skeleton-row {
+	display: grid;
+	gap: 8px;
+	padding: 14px 12px;
+	min-height: 56px;
+}
+.skeleton-line {
+	display: block;
+	height: 12px;
+	border-radius: 6px;
+	background: linear-gradient(90deg, var(--bubble), var(--line), var(--bubble));
+	background-size: 200% 100%;
+	animation: skeleton-wave 1.2s linear infinite;
+}
+.skeleton-line.short {
+	width: 56%;
+	height: 10px;
+}
+@keyframes skeleton-wave {
+	to {
+		background-position: -200% 0;
+	}
+}
+.new-messages {
+	position: sticky;
+	bottom: 8px;
+	justify-self: center;
+	z-index: 3;
+	border: 1px solid var(--accent);
+	background: var(--panel);
+	color: var(--accent);
+	border-radius: 999px;
+	min-height: 36px;
+	padding: 0 14px;
+	font-size: 12px;
+	font-weight: 700;
+	cursor: pointer;
+	box-shadow: var(--shadow);
+}
+.msg .expand {
+	display: block;
+	margin-top: 6px;
+	border: 0;
+	background: transparent;
+	color: var(--accent);
+	padding: 4px 0;
+	font-size: 12px;
+	font-weight: 600;
+	cursor: pointer;
+	text-align: left;
+}
+.sheet-row,
+.chip,
+.tab,
+.tool,
+.load-older,
+.new-messages {
+	touch-action: manipulation;
+}
+@media (prefers-reduced-motion: reduce) {
+	.spinner,
+	.skeleton-line,
+	.sheet-panel {
+		animation: none;
+	}
+	* {
+		scroll-behavior: auto !important;
 	}
 }

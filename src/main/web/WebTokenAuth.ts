@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { isIPv4 } from "node:net";
 import type { AppSettings } from "../../shared/types";
 
 /**
@@ -131,5 +132,7 @@ export function verifyWebToken(
 export function isLoopbackAddress(address: string | undefined): boolean {
 	const raw = address?.trim().toLowerCase() ?? "";
 	const value = raw.startsWith("::ffff:") ? raw.slice("::ffff:".length) : raw;
-	return value === "::1" || value === "localhost" || value.startsWith("127.");
+	// Host 头也会走这里，必须确认是真正的 IPv4 字面量；仅 startsWith("127.")
+	// 会把 127.0.0.1.attacker.tld 误判成回环，绕过令牌。
+	return value === "::1" || value === "localhost" || (isIPv4(value) && value.startsWith("127."));
 }

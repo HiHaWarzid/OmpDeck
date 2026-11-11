@@ -70,7 +70,7 @@
 | **Session Management** | Create sessions, browse inline project history, restore historical sessions, rename, copy, export HTML, delete history, and close agents from the sidebar or context menus. |
 | **Session Import** | Import local Codex and Claude sessions from the project context menu, then browse or restore them as OmpDeck history sessions. |
 | **Git Integration** | Real-time branch display with local + remote branch selector, branch count badge, switching support, and branch creation. |
-| **Phone / LAN Web Control** | Enable the web service in Settings to browse and reopen session history, create sessions, keep chatting, and answer approvals from a phone browser. Loopback-only by default; LAN access requires explicit opt-in and a token, with QR pairing and PWA support. |
+| **Phone / LAN Web Control** | Enable the web service in Settings to browse and reopen session history, create sessions, and keep chatting from a phone browser. Loopback-only by default; LAN access requires explicit opt-in and a token, with QR pairing and PWA support. |
 | **Remote Access (Tailscale)** | Enable it in Settings to publish the loopback web service to your tailnet through Tailscale Serve. Phones can reach it over HTTPS from anywhere without exposing a public port; the OmpDeck token is still required. |
 | **Session Activity View** | Thinking notes, tool calls, and answer updates are grouped into a compact flow with expandable/copyable details and clear status or exit-code labels. |
 | **Built-in Browser Preview** | Right-drawer browser with tabs, URL bar, fullscreen mode, and PC/mobile/tablet viewport presets for checking web pages alongside the conversation. |
@@ -187,7 +187,7 @@ npm run dev
 1. On the desktop app, open **Settings → Web Service** and enable it.
 2. Put the phone and computer on the same network; only for LAN access, switch the listen address from the default `127.0.0.1` to `0.0.0.0`.
 3. Scan the QR code in Settings, or open the copied token URL on the phone.
-4. From the phone you can browse/reopen session history, create sessions, keep chatting, stop an agent, and answer approvals.
+4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop an agent; project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
 
 ### Remote / Off-network Access
 

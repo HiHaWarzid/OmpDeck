@@ -1,16 +1,17 @@
 # Mobile Control
 
-OmpDeck can be controlled from a phone browser: browse session history, reopen historical sessions, create new sessions, and keep chatting. It reuses the desktop renderer and the built-in web service — no app install and no third-party relay required.
+OmpDeck can be controlled from a phone browser: browse session history, reopen historical sessions, create new sessions, and keep chatting. The phone uses a dedicated lightweight page instead of loading the 4 MB desktop renderer bundle; it reuses the built-in web service and the same pi sessions — no app install and no third-party relay required.
 
 ## What You Can Do
 
 - Browse sessions per project and reopen historical sessions.
 - Create sessions, send prompts, and stop a running agent.
 - Switch models and thinking levels.
-- Answer agent confirmation/selection requests and project trust prompts.
 - Load earlier messages on demand in long conversations.
 
-Mobile control focuses on chat and session control. Desktop-only surfaces — terminal, file tree/editor, Git panel, settings/Skills/Extensions, session import/export/rename/delete, and project management — still belong on the desktop app.
+Agent confirmation/selection requests still belong on the desktop. If a project has not been trusted yet, creating or resuming a session from the phone shows a trust prompt where you can trust for this run, always trust, or deny.
+
+Mobile control focuses on chat and session control; the lightweight page is currently Chinese-only. Desktop-only surfaces — terminal, file tree/editor, Git panel, settings/Skills/Extensions, session import/export/rename/delete, and project management — still belong on the desktop app.
 
 ## Enable It
 
@@ -59,7 +60,7 @@ In a secure context (HTTPS or `localhost`), OmpDeck can be added to the phone ho
 - **iOS Safari**: Share → Add to Home Screen.
 - **Android Chrome**: Menu → Install app / Add to Home screen.
 
-The service worker precaches the app shell, uses network-first for navigation and cache-first for hashed assets; `/api/` session data is never cached. Plain LAN HTTP usually does not qualify for PWA installation — that is a browser rule, not an app setting.
+The service worker precaches the app shell, uses network-first for navigation and cache-first for hashed assets; `/api/` session data is never cached. Message polling requests only the latest window plus collapsed previews, and expands full content by message id on demand; the refresh rate increases automatically while an agent is running. Plain LAN HTTP usually does not qualify for PWA installation — that is a browser rule, not an app setting.
 
 ## Troubleshooting
 

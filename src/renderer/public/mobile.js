@@ -1,7 +1,12 @@
 /* OmpDeck 手机端：轻量页面，不加载桌面 renderer 的 4MB bundle。
  * 只依赖 /api/state?light=1、/api/projects/:id/sessions、
- * /api/agents/:id/messages?tail=N 和 /api/agents/:id/history-page 这些已有接口。 */
+ * /api/agents/:id/messages?tail=N、/api/agents/:id/history-page 和
+ * /api/agents/:id/messages/:messageId（展开折叠内容）这些已有接口。 */
 (() => {
+	const stateApi = globalThis.OmpMobileState;
+	const TAIL_LIMIT = 40;
+	const HOME_CACHE_KEY = "omp-mobile-home-cache-v1";
+	const PROJECTS_CACHE_KEY = "omp-mobile-projects-cache-v1";
 	const $ = (id) => document.getElementById(id);
 	const view = $("view");
 	const composer = $("composer");
@@ -18,15 +23,18 @@
 	const sheetBody = $("sheet-body");
 
 	const params = new URLSearchParams(location.search);
-	let token = params.get("token") || localStorage.getItem("omp-mobile-token") || "";
-	if (params.get("token")) {
-		localStorage.setItem("omp-mobile-token", params.get("token"));
+	const urlToken = params.get("token") || "";
+	if (urlToken) {
 		params.delete("token");
 		const query = params.toString();
 		history.replaceState(null, "", location.pathname + (query ? `?${query}` : ""));
 	}
+	// URL 里的令牌先当临时令牌，只有请求成功才落盘；否则一个过期/错误的扫码链接
+	// 会覆盖 localStorage 里原本有效的令牌，把已连接设备踢下线。
+	let token = urlToken || localStorage.getItem("omp-mobile-token") || "";
+	let pendingUrlToken = urlToken;
 
-	let appState = { projects: [], agents: [] };
+	let appState = { projects: readProjectsCache(), agents: [] };
 	let projectId = localStorage.getItem("omp-mobile-project") || "";
 	let sessions = [];
 	let activeAgentId = null;
@@ -35,6 +43,9 @@
 	let olderMessages = [];
 	let nextCursor = null;
 	let pollTimer = null;
+	let pollInFlight = false;
+	let refreshQueued = false;
+	let epoch = 0;
 	let supportsTail = null;
 	let sending = false;
 	let lastStatus = "";
@@ -42,6 +53,13 @@
 	let currentTab = "home";
 	let currentRuntime = {};
 	let searchQuery = "";
+	let lastMessageId = "";
+	let messageVersion = "";
+	let connectionState = "";
+	let newMessageCount = 0;
+	let pendingResumeAgentId = null;
+	let creating = false;
+	let homeCache = readHomeCache();
 
 	function escapeHtml(value) {
 		return String(value ?? "").replace(/[&<>"']/g, (char) => {
@@ -60,6 +78,66 @@
 		});
 	}
 
+	function readHomeCache() {
+		try {
+			const parsed = JSON.parse(localStorage.getItem(HOME_CACHE_KEY) || "{}");
+			return parsed && typeof parsed === "object" ? parsed : {};
+		} catch {
+			return {};
+		}
+	}
+
+	function readProjectsCache() {
+		try {
+			const parsed = JSON.parse(localStorage.getItem(PROJECTS_CACHE_KEY) || "[]");
+			return Array.isArray(parsed) ? parsed : [];
+		} catch {
+			return [];
+		}
+	}
+
+	function writeProjectsCache(projects) {
+		try {
+			localStorage.setItem(PROJECTS_CACHE_KEY, JSON.stringify((projects || []).slice(0, 100)));
+		} catch {
+			// 隐私模式下 localStorage 不可用时，项目列表只保留在内存里。
+		}
+	}
+
+	function writeHomeCache() {
+		try {
+			const entries = Object.entries(homeCache)
+				.sort((left, right) => (right[1]?.at || 0) - (left[1]?.at || 0))
+				.slice(0, 8);
+			localStorage.setItem(HOME_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+		} catch {
+			// localStorage 满或隐私模式不可用时，首页仍可在内存里使用。
+		}
+	}
+
+	function cacheSessions(id, list) {
+		if (!id) return;
+		homeCache[id] = {
+			at: Date.now(),
+			sessions: (list || []).slice(0, 100),
+		};
+		writeHomeCache();
+	}
+
+	function cachedSessions(id) {
+		return Array.isArray(homeCache[id]?.sessions) ? homeCache[id].sessions : [];
+	}
+
+	function renderSkeleton() {
+		view.setAttribute("aria-busy", "true");
+		view.innerHTML = `
+			<div class="search skeleton-search"></div>
+			<div class="section-title">项目</div>
+			<div class="chips">${Array.from({ length: 3 }, () => '<span class="chip skeleton-chip"></span>').join("")}</div>
+			<div class="section-title">历史会话</div>
+			<div class="card">${Array.from({ length: 5 }, () => '<div class="row skeleton-row"><span class="skeleton-line"></span><span class="skeleton-line short"></span></div>').join("")}</div>`;
+	}
+
 	function toast(message) {
 		toastEl.textContent = message;
 		toastEl.hidden = false;
@@ -70,29 +148,72 @@
 	}
 
 	async function api(path, options = {}) {
-		const headers = { accept: "application/json", ...(options.headers || {}) };
+		const { timeout: timeoutMs = 10000, ...fetchOptions } = options;
+		const headers = { accept: "application/json", ...(fetchOptions.headers || {}) };
 		if (token) headers["x-omp-token"] = token;
-		if (options.body) headers["content-type"] = "application/json";
-		const response = await fetch(path, { ...options, headers });
-		const text = await response.text();
-		let data = null;
+		if (fetchOptions.body) headers["content-type"] = "application/json";
+		const controller = new AbortController();
+		// 0 表示不设客户端超时：prompt 的 RPC 可能跑满主进程的 rpcTimeout，
+		// 固定 10s 中断会让已受理的消息被当成失败并触发重发。
+		const timeout =
+			timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
 		try {
-			data = text ? JSON.parse(text) : null;
-		} catch {
-			data = null;
-		}
-		if (!response.ok) {
-			const error = new Error(data?.error || data?.message || `HTTP ${response.status}`);
-			error.status = response.status;
+			const response = await fetch(path, {
+				...fetchOptions,
+				headers,
+				signal: controller.signal,
+			});
+			const text = await response.text();
+			let data = null;
+			try {
+				data = text ? JSON.parse(text) : null;
+			} catch {
+				data = null;
+			}
+			if (!response.ok) {
+				// 扫码链接里的临时令牌失效时，优先回退到本机已保存的令牌；
+				// 401 只代表服务端拒绝，未产生副作用，重试是安全的。
+				if (response.status === 401 && pendingUrlToken && token === pendingUrlToken) {
+					const stored = localStorage.getItem("omp-mobile-token") || "";
+					if (stored && stored !== token) {
+						token = stored;
+						pendingUrlToken = "";
+						return api(path, options);
+					}
+				}
+				const error = new Error(data?.error || data?.message || `HTTP ${response.status}`);
+				error.status = response.status;
+				throw error;
+			}
+			if (pendingUrlToken && token === pendingUrlToken) {
+				localStorage.setItem("omp-mobile-token", token);
+				pendingUrlToken = "";
+			}
+			return data;
+		} catch (error) {
+			if (error?.name === "AbortError") {
+				const timeoutError = new Error("请求超时");
+				timeoutError.code = "timeout";
+				throw timeoutError;
+			}
+			// fetch 在断网/服务未启动时只抛 TypeError("Failed to fetch")，换成可读提示。
+			if (error instanceof TypeError) {
+				const networkError = new Error("网络连接失败");
+				networkError.code = "network";
+				throw networkError;
+			}
 			throw error;
+		} finally {
+			clearTimeout(timeout);
 		}
-		return data;
 	}
 
 	function handleError(error) {
 		if (error?.status === 401) {
 			token = "";
+			pendingUrlToken = "";
 			localStorage.removeItem("omp-mobile-token");
+			if (activeAgentId) pendingResumeAgentId = activeAgentId;
 			renderTokenPrompt();
 			toast("访问令牌无效或已过期");
 			return;
@@ -116,8 +237,30 @@
 		updateTabs();
 	}
 
+	function setConnection(state) {
+		if (connectionState === state) return;
+		connectionState = state;
+		const banner = $("connection");
+		if (!banner) return;
+		if (state === "online") {
+			banner.hidden = true;
+			return;
+		}
+		banner.hidden = false;
+		banner.textContent =
+			state === "offline" ? "连接中断，点此重试" : "连接中…";
+	}
+
+	function resetChatEpoch() {
+		epoch += 1;
+		pollInFlight = false;
+		refreshQueued = false;
+		newMessageCount = 0;
+	}
+
 	function renderTokenPrompt() {
 		stopPolling();
+		resetChatEpoch();
 		currentTab = "home";
 		activeAgentId = null;
 		activeAgent = null;
@@ -185,6 +328,7 @@
 			projects: Array.isArray(state?.projects) ? state.projects : [],
 			agents: Array.isArray(state?.agents) ? state.agents : [],
 		};
+		writeProjectsCache(appState.projects);
 		if (!projectId || !appState.projects.some((project) => project.id === projectId)) {
 			projectId = appState.projects[0]?.id || "";
 		}
@@ -196,9 +340,20 @@
 			sessions = [];
 			return;
 		}
-		const data = await api(`/api/projects/${encodeURIComponent(projectId)}/sessions`);
-		sessions = Array.isArray(data?.sessions) ? data.sessions.slice() : [];
-		sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+		const requestedProject = projectId;
+		try {
+			const data = await api(`/api/projects/${encodeURIComponent(requestedProject)}/sessions`);
+			if (requestedProject !== projectId) return;
+			sessions = Array.isArray(data?.sessions) ? data.sessions.slice() : [];
+			sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+			cacheSessions(requestedProject, sessions);
+		} catch (error) {
+			// 网络失败时回退到上次缓存，首页不至于变成空白；错误仍交给调用方提示。
+			if (requestedProject === projectId && sessions.length === 0) {
+				sessions = cachedSessions(requestedProject);
+			}
+			throw error;
+		}
 	}
 
 	function sessionTitle(session) {
@@ -219,6 +374,7 @@
 
 	function renderHome() {
 		stopPolling();
+		resetChatEpoch();
 		currentTab = "home";
 		activeAgentId = null;
 		activeAgent = null;
@@ -281,13 +437,16 @@
 
 		view.querySelectorAll("[data-project]").forEach((button) => {
 			button.addEventListener("click", async () => {
-				projectId = button.dataset.project;
+				const nextProject = button.dataset.project;
+				if (!nextProject || nextProject === projectId) return;
+				projectId = nextProject;
 				searchQuery = "";
 				localStorage.setItem("omp-mobile-project", projectId);
+				sessions = cachedSessions(projectId);
 				renderHome();
 				try {
 					await loadSessions();
-					renderHome();
+					if (projectId === nextProject && currentTab === "home") renderHome();
 				} catch (error) {
 					handleError(error);
 				}
@@ -305,22 +464,80 @@
 			filterHomeRows();
 		});
 		filterHomeRows();
+		view.setAttribute("aria-busy", "false");
 	}
 
-	async function openSession(filePath) {
-		const session = sessions.find((item) => item.filePath === filePath);
-		if (!session) return;
-		const existing = appState.agents.find(
-			(agent) => agent.projectId === projectId && agent.sessionPath === filePath && agent.status !== "closed",
+	let trustWatchTimer = null;
+	let trustSheetOpen = false;
+
+	function stopTrustWatch() {
+		clearInterval(trustWatchTimer);
+		trustWatchTimer = null;
+	}
+
+	function showTrustSheet(request) {
+		trustSheetOpen = true;
+		openSheet(
+			"项目信任确认",
+			`<div class="empty">是否信任项目「${escapeHtml(request.projectName || request.cwd)}」？<br />信任后 Agent 才能在该目录运行。</div>
+			<button class="sheet-row" type="button" data-trust-choice="trust-session">
+				<div class="grow"><span class="name">本次运行信任</span><span class="meta">仅当前 Agent 会话有效</span></div>
+			</button>
+			<button class="sheet-row" type="button" data-trust-choice="trust-remember">
+				<div class="grow"><span class="name">始终信任</span><span class="meta">写入项目 trust 配置</span></div>
+			</button>
+			<button class="sheet-row" type="button" data-trust-choice="deny">
+				<div class="grow"><span class="name">拒绝</span><span class="meta">本次新建/恢复会话将失败</span></div>
+			</button>`,
 		);
-		if (existing) {
-			await openAgent(existing.id);
-			return;
-		}
+		sheetBody.querySelectorAll("[data-trust-choice]").forEach((button) => {
+			button.addEventListener("click", async () => {
+				button.disabled = true;
+				try {
+					await api(`/api/trust/${encodeURIComponent(request.requestId)}`, {
+						method: "POST",
+						body: JSON.stringify({ choice: button.dataset.trustChoice }),
+					});
+					trustSheetOpen = false;
+					closeSheet();
+				} catch (error) {
+					button.disabled = false;
+					handleError(error);
+				}
+			});
+		});
+	}
+
+	/**
+	 * 新建/恢复会话可能等待桌面信任确认（主进程最多等 60s）。手机端没有 IPC
+	 * 事件，只能在等待期间轮询 light state，拿到 pending 请求后主动弹层。
+	 */
+	function watchTrustDuringCreate() {
+		stopTrustWatch();
+		trustWatchTimer = setInterval(async () => {
+			try {
+				const data = await api("/api/state?light=1");
+				const request = Array.isArray(data?.trustRequests) ? data.trustRequests[0] : null;
+				if (!request) return;
+				stopTrustWatch();
+				showTrustSheet(request);
+			} catch {
+				// 等待期间的轮询失败不打断创建请求本身。
+			}
+		}, 1500);
+	}
+
+	async function createAgentAndOpen(body) {
+		if (!projectId || creating) return;
+		creating = true;
+		newSessionButton.disabled = true;
+		watchTrustDuringCreate();
 		try {
+			// 主进程可能等待项目信任确认（最长 60s），10s 默认超时会误报失败。
 			const data = await api("/api/agents", {
 				method: "POST",
-				body: JSON.stringify({ projectId, sessionPath: filePath, title: sessionTitle(session) }),
+				timeout: 120000,
+				body: JSON.stringify({ projectId, ...body }),
 			});
 			if (data?.agent?.id) {
 				appState.agents.push(data.agent);
@@ -328,7 +545,29 @@
 			}
 		} catch (error) {
 			handleError(error);
+		} finally {
+			stopTrustWatch();
+			if (trustSheetOpen) {
+				trustSheetOpen = false;
+				closeSheet();
+			}
+			creating = false;
+			newSessionButton.disabled = false;
 		}
+	}
+
+	async function openSession(filePath) {
+		const session = sessions.find((item) => item.filePath === filePath);
+		if (!session || creating) return;
+		const existing = appState.agents.find(
+			(agent) => agent.projectId === projectId && agent.sessionPath === filePath && agent.status !== "closed",
+		);
+		if (existing) {
+			// 已打开的 agent 标题可能是自动生成的；历史会话列表里的名字更准确。
+			await openAgent(existing.id, { title: sessionTitle(session) });
+			return;
+		}
+		await createAgentAndOpen({ sessionPath: filePath, title: sessionTitle(session) });
 	}
 
 	async function newSession() {
@@ -336,56 +575,78 @@
 			toast("没有可用项目");
 			return;
 		}
-		try {
-			const data = await api("/api/agents", {
-				method: "POST",
-				body: JSON.stringify({ projectId, title: "手机会话" }),
-			});
-			if (data?.agent?.id) {
-				appState.agents.push(data.agent);
-				await openAgent(data.agent.id);
-			}
-		} catch (error) {
-			handleError(error);
-		}
+		await createAgentAndOpen({ title: "手机会话" });
 	}
 
 	function agentFromState(id) {
 		return appState.agents.find((agent) => agent.id === id) || null;
 	}
 
-	async function openAgent(id) {
+	/** 异步响应落地前统一检查 epoch + agent，避免切会话后旧请求覆盖新界面。 */
+	function isCurrentRequest(requestEpoch, requestAgentId) {
+		return stateApi.shouldAcceptResponse({
+			requestEpoch,
+			currentEpoch: epoch,
+			requestAgentId,
+			currentAgentId: activeAgentId,
+		});
+	}
+
+	async function openAgent(id, options = {}) {
 		stopPolling();
+		resetChatEpoch();
+		const requestEpoch = epoch;
 		currentTab = "chat";
 		activeAgentId = id;
 		activeAgent = agentFromState(id);
+		if (activeAgent && options.title) activeAgent.title = options.title;
 		olderMessages = [];
 		nextCursor = null;
 		lastStatus = "";
 		chatMessages = [];
 		currentRuntime = {};
+		lastMessageId = "";
+		messageVersion = "";
 		setHeader(activeAgent?.title || "会话", statusLabel(activeAgent), { back: true, composer: true });
+		setConnection("connecting");
 		view.innerHTML = `
 			<div class="chat-tools">
 				<button class="tool" id="model-btn" type="button">模型 <b id="model-name">…</b></button>
 				<button class="tool" id="thinking-btn" type="button">思考 <b id="thinking-level">…</b></button>
 			</div>
-			<div id="messages"></div>
+			<div id="messages" aria-live="polite" aria-busy="true"></div>
+			<button class="new-messages" id="new-messages" type="button" hidden></button>
 			<button class="load-older" id="load-older" type="button" hidden>加载更早消息</button>`;
 		$("model-btn").addEventListener("click", () => void openModelSheet());
 		$("thinking-btn").addEventListener("click", () => void openThinkingSheet());
 		$("load-older").addEventListener("click", loadOlder);
-		await refreshChat({ initial: true });
-		pollTimer = setInterval(() => {
-			if (!document.hidden) void refreshChat();
-		}, 3000);
+		$("new-messages").addEventListener("click", () => {
+			view.scrollTop = view.scrollHeight;
+			newMessageCount = 0;
+			updateNewMessagesButton();
+		});
+		$("messages").addEventListener("click", (event) => {
+			const button = event.target.closest("[data-expand]");
+			if (button) void expandMessage(button.dataset.expand);
+		});
+		restoreDraft();
+		await refreshChat({ initial: true, epoch: requestEpoch });
 	}
 
 	function stopPolling() {
 		if (pollTimer) {
-			clearInterval(pollTimer);
+			clearTimeout(pollTimer);
 			pollTimer = null;
 		}
+	}
+
+	function schedulePoll(delay) {
+		stopPolling();
+		if (delay === null || delay === undefined || !activeAgentId || currentTab !== "chat") return;
+		pollTimer = setTimeout(() => {
+			pollTimer = null;
+			if (!document.hidden && activeAgentId) void refreshChat();
+		}, delay);
 	}
 
 	async function refreshChat(options = {}) {
@@ -393,36 +654,71 @@
 		// 旧版主进程没有 tail 参数时，新会话（还没有 session 文件）只能全量拉消息；
 		// 不要每 3s 拉一次，等用户手动刷新或主进程更新后再轮询。
 		if (supportsTail === false && !activeAgent?.sessionPath && !options.initial) return;
+		if (pollInFlight) {
+			refreshQueued = true;
+			return;
+		}
+		pollInFlight = true;
+		const requestEpoch = options.epoch ?? epoch;
+		const requestAgentId = activeAgentId;
+		let running = false;
+		const previousHeight = view.scrollHeight;
+		const previousTop = view.scrollTop;
+		const nearBottom = stateApi.isNearBottom({
+			scrollHeight: previousHeight,
+			scrollTop: previousTop,
+			clientHeight: view.clientHeight,
+		});
 		try {
-			const runtimePromise = api(`/api/agents/${encodeURIComponent(activeAgentId)}/runtime`).catch(
+			const runtimePromise = api(`/api/agents/${encodeURIComponent(requestAgentId)}/runtime`).catch(
 				() => null,
 			);
 			const messagesPromise = (async () => {
 				// 旧版主进程没有 tail 参数；历史会话退回 history-page，避免每 3s 拉整段消息。
 				if (supportsTail === false && activeAgent?.sessionPath) {
 					const page = await api(
-						`/api/agents/${encodeURIComponent(activeAgentId)}/history-page?limit=40`,
+						`/api/agents/${encodeURIComponent(requestAgentId)}/history-page?limit=40&compact=1`,
 					);
-					nextCursor = page?.nextCursor || null;
-					return { messages: Array.isArray(page?.messages) ? page.messages : [] };
+					return { messages: Array.isArray(page?.messages) ? page.messages : [], legacy: true };
 				}
-				const data = await api(`/api/agents/${encodeURIComponent(activeAgentId)}/messages?tail=40`);
+				const length = Math.max(1, stateApi.tailLength(chatMessages));
+				const afterId = options.initial ? "" : lastMessageId;
+				const query = new URLSearchParams({
+					tail: String(TAIL_LIMIT),
+					length: String(Math.min(200, length)),
+					compact: "1",
+				});
+				if (afterId) query.set("afterId", afterId);
+				if (messageVersion) query.set("version", messageVersion);
+				const data = await api(
+					`/api/agents/${encodeURIComponent(requestAgentId)}/messages?${query.toString()}`,
+				);
 				supportsTail = Boolean(data && Object.prototype.hasOwnProperty.call(data, "tail"));
 				return data;
 			})();
 			const [messagesData, runtimeData] = await Promise.all([messagesPromise, runtimePromise]);
+			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
+				return;
+			}
 			const list = Array.isArray(messagesData?.messages) ? messagesData.messages : [];
-			chatMessages = list.slice(-40);
+			const reset = Boolean(messagesData?.reset) || Boolean(messagesData?.legacy);
+			const limit = Number(messagesData?.tail) || TAIL_LIMIT;
+			const newCount = reset ? 0 : stateApi.countNewMessages(chatMessages, list);
+			chatMessages = stateApi.appendTail(chatMessages, list, { reset, limit });
+			chatMessages = stateApi.removeAcknowledgedOptimistic(chatMessages, list);
+			lastMessageId = stateApi.lastRealMessageId(chatMessages) || lastMessageId;
+			messageVersion = messagesData?.version || messageVersion;
 			const runtime = runtimeData?.state || {};
 			currentRuntime = runtime;
-			const running = Boolean(runtime.isStreaming) || runtime.status === "running";
-			const status = running ? "running" : activeAgent?.status || (runtime.status ?? "idle");
+			running = Boolean(runtime.isStreaming) || runtime.status === "running";
+			const status = running ? "running" : runtime.status || activeAgent?.status || "idle";
 			if (activeAgent) activeAgent.status = status;
 			const model = runtime.modelName || runtime.modelId || "";
 			const subtitle = [statusLabel({ status }), model].filter(Boolean).join(" · ");
 			if (subtitle !== lastStatus) {
 				lastStatus = subtitle;
-				$("subtitle").textContent = subtitle;
+				const subtitleEl = $("subtitle");
+				if (subtitleEl) subtitleEl.textContent = subtitle;
 			}
 			const modelName = $("model-name");
 			if (modelName) modelName.textContent = model || "默认";
@@ -431,18 +727,45 @@
 			stopButton.hidden = !running;
 			sendButton.disabled = sending;
 			if (options.initial) {
-				await loadLatestHistoryCursor();
+				await loadLatestHistoryCursor(requestEpoch, requestAgentId);
 			}
-			renderMessages({ scroll: options.initial || isNearBottom() });
+			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
+				return;
+			}
+			setConnection("online");
+			renderMessages({
+				mode: options.initial ? "initial" : options.keepBottom ? "preserve" : "auto",
+				previousHeight,
+				previousTop,
+				nearBottom,
+				newCount,
+			});
 		} catch (error) {
-			if (error?.status === 401) handleError(error);
-			else if (options.initial) toast(error?.message || "加载消息失败");
+			if (error?.status === 401) {
+				handleError(error);
+			} else {
+				setConnection("offline");
+				if (options.initial) toast(error?.message || "加载消息失败");
+			}
+		} finally {
+			pollInFlight = false;
+			if (refreshQueued) {
+				refreshQueued = false;
+				schedulePoll(0);
+			} else {
+				schedulePoll(stateApi.pollDelay({ running, hidden: document.hidden }));
+			}
 		}
 	}
 
-	async function loadLatestHistoryCursor() {
+	async function loadLatestHistoryCursor(requestEpoch, requestAgentId) {
 		try {
-			const page = await api(`/api/agents/${encodeURIComponent(activeAgentId)}/history-page?limit=40`);
+			const page = await api(
+				`/api/agents/${encodeURIComponent(requestAgentId)}/history-page?limit=40&compact=1`,
+			);
+			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
+				return;
+			}
 			if (Array.isArray(page?.messages) && page.messages.length > 0) {
 				olderMessages = page.messages;
 				nextCursor = page.nextCursor || null;
@@ -454,34 +777,41 @@
 
 	async function loadOlder() {
 		if (!activeAgentId) return;
+		const requestEpoch = epoch;
+		const requestAgentId = activeAgentId;
+		const previousHeight = view.scrollHeight;
+		const previousTop = view.scrollTop;
 		try {
 			let page;
 			if (nextCursor) {
 				page = await api(
-					`/api/agents/${encodeURIComponent(activeAgentId)}/history-page?before=${encodeURIComponent(nextCursor)}&limit=40`,
+					`/api/agents/${encodeURIComponent(requestAgentId)}/history-page?before=${encodeURIComponent(nextCursor)}&limit=40&compact=1`,
 				);
 			} else {
-				page = await api(`/api/agents/${encodeURIComponent(activeAgentId)}/history-page?limit=40`);
+				page = await api(
+					`/api/agents/${encodeURIComponent(requestAgentId)}/history-page?limit=40&compact=1`,
+				);
+			}
+			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
+				return;
 			}
 			const list = Array.isArray(page?.messages) ? page.messages : [];
-			const known = new Set(olderMessages.map((message) => message.id));
-			olderMessages = [...list.filter((message) => !known.has(message.id)), ...olderMessages];
+			olderMessages = stateApi.mergeOlder(olderMessages, list);
 			nextCursor = page?.nextCursor || null;
-			renderMessages({ scroll: false, keepBottom: true });
+			renderMessages({
+				mode: "preserve",
+				previousHeight,
+				previousTop,
+				nearBottom: false,
+				newCount: 0,
+			});
 		} catch (error) {
 			handleError(error);
 		}
 	}
 
-	function isNearBottom() {
-		return view.scrollHeight - view.scrollTop - view.clientHeight < 80;
-	}
-
 	function mergedMessages() {
-		const byId = new Map();
-		for (const message of olderMessages) byId.set(message.id, message);
-		for (const message of chatMessages) byId.set(message.id, message);
-		return Array.from(byId.values());
+		return stateApi.mergeMessageLists(olderMessages, chatMessages);
 	}
 
 	function renderInline(text) {
@@ -630,54 +960,186 @@
 		const { body, thinking } = splitThinking(message.text, message.thinking);
 		const thinkingOnly = !body && !!thinking;
 		const thinkingBlock = thinking
-			? `<details><summary>思考过程</summary><div class="thinking-body">${renderText(thinking)}</div></details>`
+			? `<details data-detail="thinking"><summary>思考过程</summary><div class="thinking-body">${renderText(thinking)}</div></details>`
 			: "";
 		const text = role === "tool" ? toolLabel(body) : body;
-		return { role, label, images, body, thinking, thinkingOnly, text, thinkingBlock };
+		const meta = message.meta || {};
+		const textRemaining = Number.isFinite(Number(meta.fullLength))
+			? Number(meta.fullLength) - String(body || "").length
+			: 0;
+		const thinkingRemaining = Number.isFinite(Number(meta.fullThinkingLength))
+			? Number(meta.fullThinkingLength) - String(thinking || "").length
+			: 0;
+		const expand = meta.hasMore || meta.thinkingHasMore
+			? {
+					label:
+						meta.hasMore && meta.thinkingHasMore
+							? "展开全文"
+							: meta.hasMore
+								? "展开工具输出"
+								: "展开思考",
+					remaining: Math.max(0, textRemaining, thinkingRemaining),
+				}
+			: null;
+		return {
+			id: message.id,
+			role,
+			label,
+			images,
+			body,
+			thinking,
+			thinkingOnly,
+			text,
+			thinkingBlock,
+			expand,
+		};
 	}
 
 	function renderMessage(item) {
-		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}"><span class="role">${escapeHtml(item.label)}</span>${renderText(item.text)}${item.thinkingBlock}${item.images}</div>`;
+		const expand = item.expand
+			? `<button class="expand" type="button" data-expand="${escapeHtml(item.id)}">${escapeHtml(item.expand.label)}${item.expand.remaining ? ` · 还有 ${item.expand.remaining} 字` : ""}</button>`
+			: "";
+		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}" data-mid="${escapeHtml(item.id)}"><span class="role">${escapeHtml(item.label)}</span>${renderText(item.text)}${expand}${item.thinkingBlock}${item.images}</div>`;
+	}
+
+	function buildRenderItems() {
+		// 只保留有正文的助手消息；连续工具调用折叠成过程，避免手机端时间线被
+		// 大量英文思考和工具行淹没。纯思考消息仍保留，交给 details 折叠。
+		const messages = mergedMessages()
+			.map(messageView)
+			.filter((item) => !(item.role === "assistant" && !item.body && !item.images && !item.thinking));
+		const items = [];
+		for (let index = 0; index < messages.length; index += 1) {
+			const item = messages[index];
+			if (item.role === "tool") {
+				const group = [item];
+				while (index + 1 < messages.length && messages[index + 1].role === "tool") {
+					index += 1;
+					group.push(messages[index]);
+				}
+				if (group.length > 1) {
+					items.push({
+						key: `group:${group[0].id}`,
+						html: `<details class="tool-group" data-detail="group"><summary>工具 · ${group.length} 次</summary>${group
+							.map(renderMessage)
+							.join("")}</details>`,
+					});
+				} else {
+					items.push({ key: item.id, html: renderMessage(item) });
+				}
+				continue;
+			}
+			items.push({ key: item.id, html: renderMessage(item) });
+		}
+		return items;
+	}
+
+	function createMessageNode(item) {
+		const template = document.createElement("template");
+		template.innerHTML = item.html.trim();
+		const node = template.content.firstElementChild;
+		if (!node) return null;
+		node.dataset.key = item.key;
+		node.__html = item.html;
+		return node;
+	}
+
+	function openDetailKeys(container) {
+		const keys = new Set();
+		container.querySelectorAll("details[open]").forEach((details) => {
+			const owner = details.closest("[data-mid]")?.dataset.mid || "";
+			const siblings = Array.from(details.parentElement?.querySelectorAll("details") || []);
+			keys.add(`${owner}:${siblings.indexOf(details)}`);
+		});
+		return keys;
+	}
+
+	function restoreOpenDetails(container, keys) {
+		if (!keys.size) return;
+		container.querySelectorAll("details").forEach((details) => {
+			const owner = details.closest("[data-mid]")?.dataset.mid || "";
+			const siblings = Array.from(details.parentElement?.querySelectorAll("details") || []);
+			if (keys.has(`${owner}:${siblings.indexOf(details)}`)) details.open = true;
+		});
+	}
+
+	function updateNewMessagesButton() {
+		const button = $("new-messages");
+		if (!button) return;
+		button.hidden = newMessageCount <= 0;
+		button.textContent = newMessageCount > 0 ? `${newMessageCount} 条新消息` : "";
 	}
 
 	function renderMessages(options = {}) {
 		const container = $("messages");
 		if (!container) return;
-		// 只保留有正文的助手消息；纯思考消息和连续工具调用折叠成过程，
-		// 避免手机端时间线被大量英文思考和工具行淹没。
-		const items = mergedMessages()
-			.map(messageView)
-			.filter((item) => !(item.role === "assistant" && !item.body && !item.images));
+		const items = buildRenderItems();
 		const loadOlderButton = $("load-older");
 		if (loadOlderButton) loadOlderButton.hidden = !nextCursor;
-		const previousHeight = view.scrollHeight;
-		const html = [];
-		for (let index = 0; index < items.length; index += 1) {
-			const item = items[index];
-			if (item.role === "tool") {
-				const group = [item];
-				while (index + 1 < items.length && items[index + 1].role === "tool") {
-					index += 1;
-					group.push(items[index]);
-				}
-				if (group.length > 1) {
-					html.push(
-						`<details class="tool-group"><summary>工具 · ${group.length} 次</summary>${group
-							.map(renderMessage)
-							.join("")}</details>`,
-					);
-				} else {
-					html.push(renderMessage(item));
-				}
-				continue;
+		const previousHeight = Number(options.previousHeight) || view.scrollHeight;
+		const previousTop = Number(options.previousTop) || view.scrollTop;
+		const openKeys = openDetailKeys(container);
+		const existing = Array.from(container.children);
+		const canPatch =
+			options.mode !== "initial" &&
+			existing.length > 0 &&
+			existing.length <= items.length &&
+			existing.every((node, index) => node.dataset.key === items[index].key);
+		if (canPatch) {
+			for (let index = existing.length; index < items.length; index += 1) {
+				const node = createMessageNode(items[index]);
+				if (node) container.append(node);
 			}
-			html.push(renderMessage(item));
+			for (let index = 0; index < existing.length; index += 1) {
+				if (existing[index].__html === items[index].html) continue;
+				const node = createMessageNode(items[index]);
+				if (node) existing[index].replaceWith(node);
+			}
+		} else {
+			const nodes = items.map(createMessageNode).filter(Boolean);
+			container.replaceChildren(...nodes);
 		}
-		container.innerHTML = html.join("");
-		if (options.keepBottom) {
-			view.scrollTop += view.scrollHeight - previousHeight;
-		} else if (options.scroll) {
-			view.scrollTop = view.scrollHeight;
+		restoreOpenDetails(container, openKeys);
+		container.setAttribute("aria-busy", "false");
+		const plan = stateApi.scrollPlan({
+			mode: options.mode || "auto",
+			nearBottom: options.nearBottom,
+			previousHeight,
+			previousTop,
+			scrollHeight: view.scrollHeight,
+			newCount: options.newCount,
+		});
+		view.scrollTop = plan.scrollTop;
+		if (options.mode === "initial" || options.nearBottom) {
+			newMessageCount = 0;
+		} else if (plan.showNewMessages) {
+			newMessageCount += Number(options.newCount) || 0;
+		}
+		updateNewMessagesButton();
+	}
+
+	async function expandMessage(messageId) {
+		if (!activeAgentId || !messageId) return;
+		const requestAgentId = activeAgentId;
+		const requestEpoch = epoch;
+		try {
+			const data = await api(
+				`/api/agents/${encodeURIComponent(requestAgentId)}/messages/${encodeURIComponent(messageId)}`,
+			);
+			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
+				return;
+			}
+			const full = data?.message;
+			if (!full) return;
+			for (const list of [chatMessages, olderMessages]) {
+				const index = list.findIndex((message) => message.id === messageId);
+				if (index !== -1) list[index] = full;
+			}
+			const previousHeight = view.scrollHeight;
+			const previousTop = view.scrollTop;
+			renderMessages({ mode: "preserve", previousHeight, previousTop });
+		} catch (error) {
+			handleError(error);
 		}
 	}
 
@@ -783,25 +1245,82 @@
 		});
 	}
 
+	function draftKey(id) {
+		return `omp-mobile-draft:${id}`;
+	}
+
+	function saveDraft() {
+		if (!activeAgentId) return;
+		try {
+			if (input.value) localStorage.setItem(draftKey(activeAgentId), input.value);
+			else localStorage.removeItem(draftKey(activeAgentId));
+		} catch {
+			// 隐私模式下 localStorage 可能抛错，草稿只是增强能力。
+		}
+	}
+
+	function restoreDraft() {
+		if (!activeAgentId) return;
+		try {
+			input.value = localStorage.getItem(draftKey(activeAgentId)) || "";
+		} catch {
+			input.value = "";
+		}
+		input.style.height = "auto";
+		input.style.height = `${Math.min(132, input.scrollHeight)}px`;
+	}
+
+	function removeOptimistic(id) {
+		chatMessages = chatMessages.filter((message) => message.id !== id);
+	}
+
 	async function sendPrompt() {
 		const text = input.value.trim();
 		if (!text || !activeAgentId || sending) return;
+		const agentId = activeAgentId;
+		const requestEpoch = epoch;
+		const optimisticId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		const optimistic = {
+			id: optimisticId,
+			agentId,
+			role: "user",
+			text,
+			timestamp: Date.now(),
+			optimistic: true,
+		};
 		sending = true;
 		sendButton.disabled = true;
+		const previousHeight = view.scrollHeight;
+		const previousTop = view.scrollTop;
+		chatMessages = stateApi.appendTail(chatMessages, [optimistic], { limit: TAIL_LIMIT });
+		input.value = "";
+		input.style.height = "auto";
+		saveDraft();
+		renderMessages({ mode: "auto", nearBottom: true, previousHeight, previousTop, newCount: 0 });
 		try {
-			const data = await api(`/api/agents/${encodeURIComponent(activeAgentId)}/prompt`, {
+			const data = await api(`/api/agents/${encodeURIComponent(agentId)}/prompt`, {
 				method: "POST",
+				// prompt RPC 可能跑满主进程 rpcTimeout；客户端超时中断无法证明服务端未受理。
+				timeout: 0,
 				body: JSON.stringify({ message: text }),
 			});
 			const result = data?.result;
 			if (!result?.accepted) {
+				removeOptimistic(optimisticId);
+				if (!input.value) input.value = text;
+				saveDraft();
+				renderMessages({ mode: "preserve", previousHeight, previousTop });
 				toast(result?.error || "发送失败");
-			} else {
-				input.value = "";
-				input.style.height = "auto";
+				return;
+			}
+			if (isCurrentRequest(requestEpoch, agentId)) {
 				await refreshChat({ initial: true });
 			}
 		} catch (error) {
+			removeOptimistic(optimisticId);
+			if (!input.value) input.value = text;
+			saveDraft();
+			renderMessages({ mode: "preserve", previousHeight, previousTop });
 			handleError(error);
 		} finally {
 			sending = false;
@@ -820,10 +1339,17 @@
 	}
 
 	async function showHome() {
+		// 先切回首页状态，避免返回后仍在跑的轮询把旧会话消息写进新页面。
+		stopPolling();
+		resetChatEpoch();
+		activeAgentId = null;
+		activeAgent = null;
+		setConnection("connecting");
 		try {
 			await refreshState();
 			await loadSessions();
 			renderHome();
+			setConnection("online");
 		} catch (error) {
 			if (error?.status === 401) {
 				handleError(error);
@@ -831,20 +1357,25 @@
 			}
 			if (!appState.projects.length) {
 				renderFatal(error);
+				setConnection("offline");
 				return;
 			}
 			renderHome();
+			setConnection("offline");
 			toast(error?.message || "刷新失败");
 		}
 	}
 
 	function renderSettings() {
 		stopPolling();
+		resetChatEpoch();
 		currentTab = "settings";
 		activeAgentId = null;
 		activeAgent = null;
 		setHeader("设置", "连接与令牌", { tabs: true });
-		const desktopHref = `?desktop=1${token ? `&token=${encodeURIComponent(token)}` : ""}`;
+		// 桌面版从同源 localStorage 读取令牌，不把令牌再拼进 URL，避免历史记录/分享泄露。
+		if (token) localStorage.setItem("ompdeck.web.token", token);
+		const desktopHref = "?desktop=1";
 		view.innerHTML = `
 			<div class="section-title">连接</div>
 			<div class="card">
@@ -901,17 +1432,38 @@
 
 	async function boot() {
 		setHeader("OmpDeck", "连接中…", { tabs: false });
-		view.innerHTML = '<div class="loading"><span class="spinner"></span>正在连接…</div>';
+		setConnection("connecting");
+		const cached = projectId ? cachedSessions(projectId) : [];
+		if (cached.length) {
+			sessions = cached;
+			renderHome();
+		} else {
+			renderSkeleton();
+		}
 		try {
 			await refreshState();
 			await loadSessions();
 			renderHome();
+			setConnection("online");
+			const pending = pendingResumeAgentId;
+			pendingResumeAgentId = null;
+			if (pending && appState.agents.some((agent) => agent.id === pending)) {
+				await openAgent(pending);
+			}
 		} catch (error) {
 			if (error?.status === 401) {
 				handleError(error);
 				return;
 			}
+			// 有缓存/已知项目时先展示离线首页，别让断网直接吞掉可读的历史会话。
+			if (sessions.length > 0 || appState.projects.length > 0) {
+				renderHome();
+				setConnection("offline");
+				toast(error?.message || "刷新失败");
+				return;
+			}
 			renderFatal(error);
+			setConnection("offline");
 		}
 	}
 
@@ -955,6 +1507,7 @@
 	input.addEventListener("input", () => {
 		input.style.height = "auto";
 		input.style.height = `${Math.min(132, input.scrollHeight)}px`;
+		saveDraft();
 	});
 	input.addEventListener("keydown", (event) => {
 		if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -972,9 +1525,33 @@
 	document.addEventListener("keydown", (event) => {
 		if (event.key === "Escape" && !sheetEl.hidden) closeSheet();
 	});
-	document.addEventListener("visibilitychange", () => {
-		if (!document.hidden && activeAgentId) void refreshChat();
+	$("connection").addEventListener("click", () => {
+		if (activeAgentId) {
+			void refreshChat({ initial: true });
+		} else {
+			void showHome();
+		}
 	});
+	document.addEventListener("visibilitychange", () => {
+		if (document.hidden) {
+			stopPolling();
+			return;
+		}
+		if (activeAgentId) void refreshChat();
+	});
+
+	function syncViewportHeight() {
+		const height = window.visualViewport?.height || window.innerHeight;
+		document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+	}
+	window.visualViewport?.addEventListener("resize", syncViewportHeight);
+	window.visualViewport?.addEventListener("scroll", syncViewportHeight);
+	syncViewportHeight();
+
+	// 手机端装到主屏后离线也能打开外壳；API 请求永不缓存，恢复网络即可继续。
+	if ("serviceWorker" in navigator) {
+		void navigator.serviceWorker.register("./sw.js").catch(() => undefined);
+	}
 
 	void boot();
 })();

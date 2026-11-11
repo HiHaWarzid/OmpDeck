@@ -408,7 +408,9 @@ export class AgentManager {
 		const runtime = this.requireRuntime(agentId);
 		const sessionPath = runtime.tab.sessionPath;
 		if (!sessionPath) return { messages: [], nextCursor: null, hasMore: false };
-		const messages = await this.readSessionDisplayMessages(sessionPath);
+		// 必须带 agentId 生成历史消息 id：实时 transcript 也用同一个 agentId 前缀，
+		// 手机端才能把 history-page 与 messages 窗口按 id 去重、按 id 拉完整详情。
+		const messages = await this.readSessionDisplayMessages(sessionPath, agentId);
 		const pageSize = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 40));
 		const end = before === undefined || before === "" ? messages.length : Number(before);
 		if (!Number.isInteger(end) || end < 0 || end > messages.length) {

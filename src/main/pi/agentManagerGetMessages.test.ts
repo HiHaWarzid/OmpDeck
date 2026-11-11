@@ -117,3 +117,27 @@ test("单条即超预算时至少保留最后一条，基线不会为空", () =>
 
 	assert.deepEqual(manager.getMessages("a1").map((m) => m.id), ["m2"]);
 });
+
+test("getHistoryPage 使用 agentId 生成历史消息 id，能与实时 transcript 去重", async () => {
+	const manager = makeManager([]);
+	const sessionJsonl = (manager as unknown as {
+		sessionJsonl: { readDisplayMessages: (...args: unknown[]) => Promise<ChatMessage[]> };
+	}).sessionJsonl;
+	vi.spyOn(sessionJsonl, "readDisplayMessages").mockImplementation(async (_path, agentId) => [
+		{
+			id: `${String(agentId)}-history-0`,
+			agentId: String(agentId),
+			role: "user",
+			text: "hello",
+			timestamp: 1,
+		},
+	]);
+	const agents = (manager as unknown as { agents: Map<string, TestRuntime> }).agents;
+	agents.set("a1", {
+		tab: { id: "a1", sessionPath: "C:/session.jsonl" } as AgentTab,
+		transcript: { messages: [] },
+	});
+
+	const page = await manager.getHistoryPage("a1");
+	assert.equal(page.messages[0]?.id, "a1-history-0");
+});

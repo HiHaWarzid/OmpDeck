@@ -4,6 +4,7 @@ import { gunzipSync } from "node:zlib";
 import { describe, expect, test } from "vitest";
 import type { AgentRuntimeState, AgentTab, CreateAgentInput, SendPromptResult } from "../../shared/types";
 import { WebServiceManager } from "./WebServiceManager";
+import { isLoopbackAddress } from "./WebTokenAuth";
 
 // 用真实局域网地址访问 0.0.0.0 监听：socket.remoteAddress 不是回环，
 // 才能覆盖「手机必须带令牌」的主路径；CI 无网卡时跳过。
@@ -258,7 +259,7 @@ describe.skipIf(!lan)("web service token gate", () => {
 			});
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as Record<string, unknown>;
-			expect(Object.keys(body).sort()).toEqual(["agents", "projects"]);
+			expect(Object.keys(body).sort()).toEqual(["agents", "projects", "trustRequests"]);
 		} finally {
 			await manager.stop();
 		}
@@ -392,5 +393,17 @@ describe.skipIf(!lan)("web service token gate", () => {
 		} finally {
 			await manager.stop();
 		}
+	});
+});
+
+describe("回环 Host 判定", () => {
+	test("只接受真正的 127.0.0.0/8 字面量，不接受前缀伪装域名", () => {
+		expect(isLoopbackAddress("127.0.0.1")).toBe(true);
+		expect(isLoopbackAddress("127.12.34.56")).toBe(true);
+		expect(isLoopbackAddress("::1")).toBe(true);
+		expect(isLoopbackAddress("::ffff:127.0.0.1")).toBe(true);
+		expect(isLoopbackAddress("localhost")).toBe(true);
+		expect(isLoopbackAddress("127.0.0.1.attacker.tld")).toBe(false);
+		expect(isLoopbackAddress("127.evil.example")).toBe(false);
 	});
 });

@@ -48,6 +48,10 @@ function hasForwardedHeaders(request: IncomingMessage): boolean {
 	);
 }
 
+/** compact 轮询只回传折叠内容预览；完整内容走单条消息详情端点。 */
+const COMPACT_TOOL_TEXT_LIMIT = 1024;
+const COMPACT_THINKING_LIMIT = 800;
+
 type WebServiceSettings = Pick<
 	AppSettings,
 	| "webServiceEnabled"
@@ -343,17 +347,16 @@ export class WebServiceManager {
 					this.sendJson(request, response, {
 						projects: this.deps.listProjects(),
 						agents: this.deps.listAgents(),
+						// 手机端在等待新建会话时轮询这里，才能弹出项目信任确认；
+						// 信任请求本身只有 requestId/cwd/projectName，不含会话内容。
+						trustRequests: this.deps.listTrustRequests(),
 					});
 					return;
 				}
 				// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
 				// 的双重序列化（web UI 每 600ms 轮询，命中缓存时零 stringify 开销）
 				const payload = this.getStatePayload();
-				response.writeHead(200, {
-					...this.baseHeaders(),
-					"content-type": "application/json; charset=utf-8",
-				});
-				response.end(payload);
+				this.sendJsonText(request, response, payload);
 				return;
 			}
 			const sessionsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions$/);
@@ -389,11 +392,88 @@ export class WebServiceManager {
 				const tailParam = url.searchParams.get("tail");
 				const tail = tailParam === null ? null : Math.min(200, Math.max(1, Number(tailParam) || 40));
 				const window = tail === null ? messages : messages.slice(-tail);
-				this.sendJson(request, response, {
-					messages: window,
+				// 手机要看到 thinking 流式增长，但 messageStreamVersion 只看正文；
+				// 追加末条 thinking 长度，避免“正文没变就不刷新”卡住思考块。
+				const version = `${messageStreamVersion(messages)}:${messages[messages.length - 1]?.thinking?.length ?? 0}`;
+				const compact = url.searchParams.get("compact") === "1";
+				const afterId = url.searchParams.get("afterId") || null;
+				const clientVersion = url.searchParams.get("version");
+				const lengthParam = url.searchParams.get("length");
+				const length = lengthParam === null ? null : Number(lengthParam);
+				const payload = (list: ChatMessage[]) =>
+					compact ? list.map((message) => this.compactMessage(message)) : list;
+				const base = {
 					total: messages.length,
 					...(tail === null ? {} : { tail }),
+					version,
+				};
+				const sendWindow = (reset: boolean) => {
+					this.sendJson(request, response, {
+						...base,
+						messages: payload(window),
+						reset,
+						unchanged: false,
+					});
+				};
+
+				if (!afterId) {
+					sendWindow(false);
+					return;
+				}
+
+				// length 是客户端当前 tail 窗口的条数。服务端窗口长度变化说明客户端
+				// 的基线已经不可靠（例如新会话只有几条消息），必须整窗重置；只有
+				// 长度一致时才按 afterId 做尾部增量。
+				if (length !== null && Number.isFinite(length) && length !== window.length) {
+					sendWindow(true);
+					return;
+				}
+
+				const afterIndex = messages.findIndex((message) => message.id === afterId);
+				if (afterIndex === -1) {
+					sendWindow(true);
+					return;
+				}
+
+				if (afterIndex === messages.length - 1) {
+					// 最后一条 id 相同：客户端带 version 时用它判断内容是否真的变化
+					// （流式正文/thinking 会就地增长），只回传最后一条替换即可；
+					// 未带 version 的旧客户端保持“不传消息体”的兼容行为。
+					if (clientVersion === null || clientVersion === version) {
+						this.sendJson(request, response, {
+							...base,
+							reset: false,
+							unchanged: true,
+						});
+						return;
+					}
+					this.sendJson(request, response, {
+						...base,
+						messages: payload([messages[afterIndex]]),
+						reset: false,
+						unchanged: false,
+					});
+					return;
+				}
+
+				this.sendJson(request, response, {
+					...base,
+					messages: payload(messages.slice(afterIndex)),
+					reset: false,
+					unchanged: false,
 				});
+				return;
+			}
+			const messageDetailMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages\/([^/]+)$/);
+			if (messageDetailMatch && request.method === "GET") {
+				const agentId = decodeURIComponent(messageDetailMatch[1]);
+				const messageId = decodeURIComponent(messageDetailMatch[2]);
+				const message = this.deps.getMessages(agentId).find((item) => item.id === messageId);
+				if (!message) {
+					this.sendError(response, 404, "消息不存在", "message_not_found");
+					return;
+				}
+				this.sendJson(request, response, { message });
 				return;
 			}
 			const historyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/history-page$/);
@@ -404,7 +484,15 @@ export class WebServiceManager {
 					url.searchParams.get("before") ?? undefined,
 					Number.isFinite(limit) ? limit : 40,
 				);
-				this.sendJson(request, response, page);
+				// 手机翻页同样只取折叠预览；展开时再按消息 id 拉完整内容。
+				const compact = url.searchParams.get("compact") === "1";
+				this.sendJson(
+					request,
+					response,
+					compact
+						? { ...page, messages: page.messages.map((message) => this.compactMessage(message)) }
+						: page,
+				);
 				return;
 			}
 			const uiResponseMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/ui-response$/);
@@ -650,6 +738,34 @@ export class WebServiceManager {
 		if (bucket.count > MUTATION_RATE_LIMIT_PER_MINUTE) {
 			throw new HttpError(429, "请求过于频繁，请稍后再试", "rate_limited");
 		}
+	}
+
+	/**
+	 * compact 轮询只裁剪折叠内容：tool 输出和 thinking 通常最长，但展开后仍需
+	 * 完整文本，所以这里只改返回副本，不触碰 AgentManager 的原消息对象。
+	 * meta 上的 hasMore/thinkingHasMore 由手机端用来显示“展开完整内容”。
+	 */
+	private compactMessage(message: ChatMessage): ChatMessage {
+		let next = message;
+		if (message.role === "tool" && message.text.length > COMPACT_TOOL_TEXT_LIMIT) {
+			next = {
+				...next,
+				text: message.text.slice(0, COMPACT_TOOL_TEXT_LIMIT),
+				meta: { ...(next.meta ?? {}), hasMore: true, fullLength: message.text.length },
+			};
+		}
+		if (typeof message.thinking === "string" && message.thinking.length > COMPACT_THINKING_LIMIT) {
+			next = {
+				...next,
+				thinking: message.thinking.slice(0, COMPACT_THINKING_LIMIT),
+				meta: {
+					...(next.meta ?? {}),
+					thinkingHasMore: true,
+					fullThinkingLength: message.thinking.length,
+				},
+			};
+		}
+		return next;
 	}
 
 	/**
@@ -907,7 +1023,12 @@ export class WebServiceManager {
 		// 手机默认进轻量页面：桌面 bundle 首屏 4MB，经 Tailscale DERP 基本不可用。
 		// 需要桌面版时显式访问 /index.html 或加 ?desktop=1。
 		const mobilePage = join(this.rendererRoot, "mobile.html");
-		const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(request.headers["user-agent"] ?? "");
+		// iPadOS 13+ 的 Safari UA 伪装成 Macintosh，靠 sec-ch-ua-mobile 或 ?mobile=1
+		// 才能进手机页；桌面端仍可用 ?desktop=1 强制回桌面版。
+		const isMobile =
+			/Android|iPhone|iPad|iPod|Mobile/i.test(request.headers["user-agent"] ?? "") ||
+			request.headers["sec-ch-ua-mobile"] === "?1" ||
+			request.url?.includes("mobile=1") === true;
 		const wantsDesktop = request.url?.includes("desktop=1") ?? false;
 		if (requestedPath === "/" && isMobile && !wantsDesktop && existsSync(mobilePage)) {
 			await this.sendFile(mobilePage, response);
@@ -991,7 +1112,14 @@ export class WebServiceManager {
 	}
 
 	private sendJson(request: IncomingMessage, response: ServerResponse, body: unknown) {
-		const payload = JSON.stringify(body);
+		this.sendJsonText(request, response, JSON.stringify(body));
+	}
+
+	/**
+	 * 已序列化的 JSON 也走同一压缩路径：/api/state 命中缓存时直接复用字符串，
+	 * 不能为了 gzip 再 JSON.parse + stringify 一遍。
+	 */
+	private sendJsonText(request: IncomingMessage, response: ServerResponse, payload: string) {
 		// 手机通过 Tailscale DERP 访问时带宽只有几百 KB/s；大会话状态 JSON 压缩后
 		// 通常只剩 10%，这是远程可用性的关键路径。
 		if (payload.length > 1024 && /\bgzip\b/.test(request.headers["accept-encoding"] ?? "")) {
