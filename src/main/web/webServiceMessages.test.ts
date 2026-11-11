@@ -47,6 +47,10 @@ const deps: WebDeps = {
 	sendUiResponse: async () => {},
 	respondTrustRequest: async () => {},
 	getHistoryPage: async () => ({ messages: [], nextCursor: null, hasMore: false }),
+	readMessageFullText: async (_agentId, messageId, entryId) => {
+		if (messageId !== "m2") throw new Error("unavailable");
+		return { text: `full:${entryId ?? ""}` };
+	},
 	listTrustRequests: () => [],
 	persistWebToken: async () => {},
 	runtimeState: stubRuntimeState,
@@ -215,6 +219,15 @@ describe("手机端消息增量契约", () => {
 	test("不存在的消息详情返回 404", async () => {
 		const { response } = await getJson("/api/agents/agent-1/messages/missing");
 		expect(response.status).toBe(404);
+	});
+
+	test("工具全文按 entryId 读取，找不到时返回 404", async () => {
+		const full = await getJson("/api/agents/agent-1/messages/m2/full-text?entryId=entry-2");
+		expect(full.response.status).toBe(200);
+		expect(full.data).toEqual({ text: "full:entry-2" });
+
+		const missing = await getJson("/api/agents/agent-1/messages/m9/full-text");
+		expect(missing.response.status).toBe(404);
 	});
 
 	test("大响应带 gzip 编码", async () => {

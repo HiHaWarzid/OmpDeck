@@ -1280,6 +1280,8 @@ app.whenReady().then(async () => {
 			agentManager.respondTrustRequest(requestId, choice);
 		},
 		getHistoryPage: (agentId, before, limit) => agentManager.getHistoryPage(agentId, before, limit),
+		readMessageFullText: (agentId, messageId, entryId) =>
+			agentManager.readMessageFullText(agentId, messageId, entryId),
 		listTrustRequests: () => agentManager.listPendingTrustRequests(),
 		persistWebToken: async (patch) => {
 			await settingsStore.update(patch);

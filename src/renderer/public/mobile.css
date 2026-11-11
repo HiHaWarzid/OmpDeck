@@ -33,6 +33,10 @@
 [hidden] {
 	display: none !important;
 }
+button,
+a {
+	-webkit-tap-highlight-color: transparent;
+}
 html,
 body {
 	margin: 0;
@@ -206,12 +210,17 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 10px;
+	width: 100%;
 	min-height: 56px;
 	padding: 12px;
+	border: 0;
 	border-bottom: 1px solid var(--line);
+	background: transparent;
 	cursor: pointer;
 	text-decoration: none;
 	color: inherit;
+	font: inherit;
+	text-align: left;
 }
 .row:last-child {
 	border-bottom: 0;
@@ -273,6 +282,9 @@ main {
 	text-align: center;
 	color: var(--muted);
 	font-size: 13px;
+}
+.card.empty > button.primary {
+	margin-top: 12px;
 }
 .home-note {
 	text-align: center;
@@ -560,12 +572,23 @@ button:disabled {
 	display: flex;
 	align-items: center;
 	gap: 8px;
+	width: 100%;
 	padding: 2px 4px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
 	color: var(--muted);
+	font-family: inherit;
 	font-size: 12px;
 	line-height: 1.4;
+	text-align: left;
+	cursor: pointer;
+}
+.msg.tool:active {
+	background: var(--bubble);
 }
 .tool-status {
+	flex: none;
 	width: 14px;
 	color: var(--accent);
 	font-weight: 700;
@@ -593,6 +616,7 @@ button:disabled {
 	white-space: nowrap;
 }
 .tool-duration {
+	flex: none;
 	margin-left: 4px;
 	color: var(--muted);
 	font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
@@ -609,10 +633,23 @@ button:disabled {
 	font-size: 12px;
 }
 .tool-group-title {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
 	margin-bottom: 3px;
 	color: var(--muted);
 	font-size: 10.5px;
 	font-weight: 600;
+}
+.tool-group-state {
+	color: var(--muted);
+	font-weight: 500;
+}
+.tool-group-state.running {
+	color: var(--accent);
+}
+.tool-group-state.error {
+	color: var(--danger);
 }
 .tool-group .msg.tool {
 	padding: 5px 0;
@@ -796,13 +833,13 @@ button:disabled {
 }
 .token-form input,
 .settings-pad input {
+	font-family: inherit;
 	font-size: 16px;
 	border: 1px solid var(--line);
 	border-radius: 10px;
 	background: var(--bg);
 	color: var(--text);
 	padding: 10px;
-	font: inherit;
 	outline: none;
 }
 .token-form input:focus,
@@ -810,6 +847,7 @@ button:disabled {
 	border-color: var(--accent);
 }
 .chev {
+	flex: none;
 	color: var(--muted);
 	font-size: 20px;
 	line-height: 1;
@@ -901,6 +939,47 @@ button:disabled {
 .sheet-row .check {
 	color: var(--accent);
 	font-weight: 700;
+}
+.tool-sheet {
+	padding-bottom: 10px;
+}
+.tool-section {
+	padding: 10px 16px 0;
+}
+.tool-section-title {
+	margin-bottom: 5px;
+	color: var(--muted);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+.tool-output {
+	max-height: 46vh;
+	margin: 0;
+	padding: 10px;
+	overflow: auto;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--bg);
+	color: var(--text);
+	font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	word-break: break-word;
+}
+.sheet-action {
+	display: block;
+	width: calc(100% - 32px);
+	min-height: 40px;
+	margin: 12px 16px 0;
+	border: 1px solid var(--accent);
+	border-radius: 10px;
+	background: transparent;
+	color: var(--accent);
+	font: inherit;
+	font-weight: 600;
+	cursor: pointer;
 }
 @keyframes sheet-up {
 	from {

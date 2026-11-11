@@ -7,10 +7,12 @@ type Message = {
 	text?: string;
 	timestamp?: number;
 	optimistic?: boolean;
+	meta?: { toolName?: string; result?: string };
 };
 
 type MobileState = {
 	mergeMessageLists: (...lists: Message[][]) => Message[];
+	mergeTimeline: (older: Message[], chat: Message[]) => Message[];
 	appendTail: (current: Message[], incoming: Message[], options?: { reset?: boolean; limit?: number }) => Message[];
 	mergeOlder: (older: Message[], incoming: Message[]) => Message[];
 	countNewMessages: (current: Message[], incoming: Message[]) => number;
@@ -65,6 +67,40 @@ describe("mobile-state 消息合并", () => {
 				(item) => item.id,
 			),
 		).toEqual(["a", "b", "c"]);
+	});
+
+	test("历史页与实时 tail 重叠时按内容去掉历史副本", () => {
+		const older = [
+			message("h1", { role: "user", text: "a" }),
+			message("h2", { role: "assistant", text: "b" }),
+			message("h3", { role: "tool", text: "c", meta: { toolName: "bash", result: "ok" } }),
+		];
+		const live = [
+			message("l2", { role: "assistant", text: "b" }),
+			message("l3", { role: "tool", text: "c", meta: { toolName: "bash", result: "ok" } }),
+			message("l4", { role: "assistant", text: "d" }),
+		];
+		expect(state.mergeTimeline(older, live).map((item) => item.id)).toEqual([
+			"h1",
+			"l2",
+			"l3",
+			"l4",
+		]);
+	});
+
+	test("历史页与实时 tail 无重叠时保留全部消息", () => {
+		const older = [message("h1", { text: "a" })];
+		const live = [message("l1", { text: "b" })];
+		expect(state.mergeTimeline(older, live).map((item) => item.id)).toEqual(["h1", "l1"]);
+	});
+
+	test("内容重复时按出现次数去重，不吞掉历史里多出的同文消息", () => {
+		const older = [
+			message("h1", { role: "user", text: "继续" }),
+			message("h2", { role: "user", text: "继续" }),
+		];
+		const live = [message("l1", { role: "user", text: "继续" })];
+		expect(state.mergeTimeline(older, live).map((item) => item.id)).toEqual(["h2", "l1"]);
 	});
 
 	test("只统计客户端尚未见过的消息", () => {

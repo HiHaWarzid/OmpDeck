@@ -36,6 +36,41 @@
 		return mergeMessageLists(incoming, older);
 	}
 
+	/**
+	 * 历史页消息 id 由 entryId 生成，实时 transcript 用运行态 id，两者内容相同但 id 不同。
+	 * 历史文件与运行态对 thinking/重试消息的收录顺序并不完全一致，不能按前后缀对齐；
+	 * 这里按内容签名做多重集匹配：live 中每出现一次，就抵掉 history 中同一条，保留未匹配的
+	 * 更早历史消息，避免打开正在运行的会话时同一轮对话显示两遍。
+	 */
+	function timelineSignature(message) {
+		const meta = message && message.meta ? message.meta : {};
+		// 只取前缀，容忍流式结束时历史文件与运行态正文的尾差；tool 结果带上名称与结果前缀。
+		return [
+			message?.role || "",
+			String(message?.text || "").slice(0, 200),
+			meta.toolName || "",
+			typeof meta.result === "string" ? meta.result.slice(0, 200) : "",
+		].join("\u0000");
+	}
+
+	function mergeTimeline(older, chat) {
+		const history = Array.isArray(older) ? older : [];
+		const live = Array.isArray(chat) ? chat : [];
+		const liveCounts = new Map();
+		for (const message of live) {
+			const key = timelineSignature(message);
+			liveCounts.set(key, (liveCounts.get(key) || 0) + 1);
+		}
+		const unmatchedHistory = [];
+		for (const message of history) {
+			const key = timelineSignature(message);
+			const count = liveCounts.get(key) || 0;
+			if (count > 0) liveCounts.set(key, count - 1);
+			else unmatchedHistory.push(message);
+		}
+		return mergeMessageLists(unmatchedHistory, live);
+	}
+
 	function countNewMessages(current, incoming) {
 		const known = new Set((current || []).map((message) => message.id));
 		return (incoming || []).filter((message) => message && !known.has(message.id)).length;
@@ -118,6 +153,7 @@
 
 	return {
 		mergeMessageLists,
+		mergeTimeline,
 		appendTail,
 		mergeOlder,
 		countNewMessages,

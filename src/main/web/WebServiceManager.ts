@@ -99,6 +99,15 @@ type WebServiceDependencies = {
 	respondTrustRequest: PiDesktopApi["agents"]["respondTrustRequest"];
 	/** 历史分页（与桌面 IPC 同一实现）。 */
 	getHistoryPage: (agentId: string, before?: string, limit?: number) => Promise<AgentHistoryPage>;
+	/**
+	 * 工具输出超过截断阈值时按需读取全文（与桌面「查看完整输出」同一实现）。
+	 * 老版本主进程没有这个能力时路由返回 404，手机端保留截断结果。
+	 */
+	readMessageFullText?: (
+		agentId: string,
+		messageId: string,
+		entryId?: string,
+	) => Promise<{ text: string }>;
 	/** 手机端轮询待确认的项目信任请求。 */
 	listTrustRequests: () => Array<{ requestId: string; cwd: string; projectName: string; createdAt: number }>;
 	/** 首次启动自动生成的令牌需要落盘，否则每次重启都会让已扫码设备掉线。 */
@@ -462,6 +471,29 @@ export class WebServiceManager {
 					reset: false,
 					unchanged: false,
 				});
+				return;
+			}
+			const fullTextMatch = url.pathname.match(
+				/^\/api\/agents\/([^/]+)\/messages\/([^/]+)\/full-text$/,
+			);
+			if (fullTextMatch && request.method === "GET") {
+				const agentId = decodeURIComponent(fullTextMatch[1]);
+				const messageId = decodeURIComponent(fullTextMatch[2]);
+				if (!this.deps.readMessageFullText) {
+					this.sendError(response, 404, "完整输出不可用", "message_full_text_unavailable");
+					return;
+				}
+				try {
+					const result = await this.deps.readMessageFullText(
+						agentId,
+						messageId,
+						url.searchParams.get("entryId") ?? undefined,
+					);
+					this.sendJson(request, response, result);
+				} catch {
+					// 全文缓存被 LRU 淘汰或历史 entry 找不到时，不要回退成截断文本冒充全文。
+					this.sendError(response, 404, "完整输出不可用", "message_full_text_unavailable");
+				}
 				return;
 			}
 			const messageDetailMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages\/([^/]+)$/);

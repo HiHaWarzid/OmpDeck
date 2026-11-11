@@ -7,6 +7,7 @@ OmpDeck can be controlled from a phone browser: browse session history, reopen h
 - Browse sessions per project and reopen historical sessions.
 - Create sessions, send prompts, and stop a running agent.
 - Switch models and thinking levels.
+- Tool calls are grouped by turn; tap one for full arguments and results.
 - Load earlier messages on demand in long conversations.
 
 Agent confirmation/selection requests still belong on the desktop. If a project has not been trusted yet, creating or resuming a session from the phone shows a trust prompt where you can trust for this run, always trust, or deny.
