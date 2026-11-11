@@ -80,6 +80,7 @@
 	let sending = false;
 	let imageBusy = false;
 	let agentRunning = false;
+	let composerStateKey = "";
 	let pendingImages = [];
 	let lastStatus = "";
 	let toastTimer = null;
@@ -93,6 +94,7 @@
 	let pendingResumeAgentId = null;
 	let creating = false;
 	let homeCache = readHomeCache();
+	let homeSearchKeys = new Map();
 
 	function escapeHtml(value) {
 		return String(value ?? "").replace(/[&<>"']/g, (char) => {
@@ -113,6 +115,11 @@
 
 	function updateComposerState() {
 		const disabled = sending || imageBusy;
+		// 轮询每 500ms 调一次；状态没变时避免重复写 disabled/textContent/aria，
+		// 这些写入会触发样式与可访问性树更新。
+		const key = `${sending ? 1 : 0}:${imageBusy ? 1 : 0}:${agentRunning ? 1 : 0}`;
+		if (key === composerStateKey) return;
+		composerStateKey = key;
 		sendButton.disabled = disabled;
 		attachButton.disabled = disabled;
 		sendMoreButton.hidden = !agentRunning || disabled;
@@ -544,7 +551,9 @@
 		}
 		const requestedProject = projectId;
 		try {
-			const data = await api(`/api/projects/${encodeURIComponent(requestedProject)}/sessions`);
+			const data = await api(
+				`/api/projects/${encodeURIComponent(requestedProject)}/sessions?topLevel=1`,
+			);
 			if (requestedProject !== projectId) return;
 			sessions = Array.isArray(data?.sessions) ? data.sessions.filter(isTopLevelSession) : [];
 			sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
@@ -558,6 +567,29 @@
 		}
 	}
 
+	// state 和 sessions 互不依赖：首页刷新时先并行发出，再按项目是否变化决定是否
+	// 复用结果。loadSessions 内部已有 requestedProject 守卫，旧项目的响应会被丢弃。
+	function beginSessionsLoad() {
+		if (!projectId) return null;
+		const requestedProject = projectId;
+		return {
+			projectId: requestedProject,
+			promise: loadSessions().then(
+				() => null,
+				(error) => error,
+			),
+		};
+	}
+
+	async function finishSessionsLoad(pending) {
+		if (!pending || pending.projectId !== projectId) {
+			await loadSessions();
+			return;
+		}
+		const error = await pending.promise;
+		if (error) throw error;
+	}
+
 	function sessionTitle(session) {
 		return session.name || session.preview?.split("\n")[0] || "未命名会话";
 	}
@@ -567,7 +599,7 @@
 		const rows = view.querySelectorAll("[data-session]");
 		let visible = 0;
 		rows.forEach((row) => {
-			const hit = !query || (row.dataset.search || "").includes(query);
+			const hit = !query || (homeSearchKeys.get(row.dataset.session) || "").includes(query);
 			row.hidden = !hit;
 			if (hit) visible += 1;
 		});
@@ -611,12 +643,15 @@
 				</button>`,
 			)
 			.join("");
+		homeSearchKeys = new Map();
 		const sessionRows = historySessions
 			.map((session) => {
 				const title = sessionTitle(session);
-				const searchKey = `${title} ${session.preview || ""}`.toLowerCase();
+				// 搜索键只留在内存里，不再写进每个 row 的 data-search 属性；
+				// 146 条会话的 preview 会重复占用一大块 DOM 属性内存。
+				homeSearchKeys.set(session.filePath, `${title} ${session.preview || ""}`.toLowerCase());
 				return `
-				<button class="row" type="button" data-session="${escapeHtml(session.filePath)}" data-search="${escapeHtml(searchKey)}">
+				<button class="row" type="button" data-session="${escapeHtml(session.filePath)}">
 					<span class="grow">
 						<span class="name">${escapeHtml(title)}</span>
 						<span class="preview">${escapeHtml(session.preview || "")}</span>
@@ -924,6 +959,11 @@
 		const requestId = ++pollRequestId;
 		const requestEpoch = options.epoch ?? epoch;
 		const requestAgentId = activeAgentId;
+		// 首屏只等 messages/runtime；history-page 在历史会话上可能读文件，放并行后
+		// 首屏先渲染，游标返回再显示“加载更早”，不再多等一个 RTT。
+		const historyPromise = options.initial
+			? fetchLatestHistoryCursor(requestEpoch, requestAgentId)
+			: null;
 		let running = false;
 		const previousHeight = view.scrollHeight;
 		const previousTop = view.scrollTop;
@@ -993,20 +1033,44 @@
 			stopButton.hidden = !running;
 			agentRunning = running;
 			updateComposerState();
-			if (options.initial) {
-				await loadLatestHistoryCursor(requestEpoch, requestAgentId);
-			}
 			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
 				return;
 			}
 			setConnection("online");
-			renderMessages({
-				mode: options.initial ? "initial" : options.keepBottom ? "preserve" : "auto",
-				previousHeight,
-				previousTop,
-				nearBottom,
-				newCount,
-			});
+			// 长工具执行期间服务端会返回 unchanged/空 messages；此时时间线没有任何
+			// 变化，重建 items、查询 details 和写滚动位置都是白工。初始渲染和
+			// reset（窗口/会话重建）仍必须走一次完整渲染。
+			if (options.initial || reset || list.length > 0) {
+				renderMessages({
+					mode: options.initial ? "initial" : options.keepBottom ? "preserve" : "auto",
+					previousHeight,
+					previousTop,
+					nearBottom,
+					newCount,
+				});
+			}
+			if (historyPromise) {
+				void historyPromise.then((page) => {
+					if (!page || !isCurrentRequest(requestEpoch, requestAgentId)) return;
+					// history-page 可能比 messages 晚返回。若它带回更早的历史，必须补一次
+					// preserve 渲染，否则首屏只显示运行态消息，历史要等下一轮轮询才出现。
+					// 空页不覆盖已加载的 olderMessages（手动刷新时不能把翻过的历史清空）。
+					const nextOlder =
+						Array.isArray(page.messages) && page.messages.length > 0
+							? page.messages
+							: olderMessages;
+					const changed = nextOlder !== olderMessages;
+					olderMessages = nextOlder;
+					nextCursor = page.nextCursor || null;
+					const loadOlderButton = $("load-older");
+					if (loadOlderButton) loadOlderButton.hidden = !nextCursor;
+					if (changed) {
+						const previousHeight = view.scrollHeight;
+						const previousTop = view.scrollTop;
+						renderMessages({ mode: "preserve", previousHeight, previousTop });
+					}
+				});
+			}
 		} catch (error) {
 			if (error?.status === 401) {
 				handleError(error);
@@ -1030,20 +1094,18 @@
 		}
 	}
 
-	async function loadLatestHistoryCursor(requestEpoch, requestAgentId) {
+	async function fetchLatestHistoryCursor(requestEpoch, requestAgentId) {
 		try {
 			const page = await api(
 				`/api/agents/${encodeURIComponent(requestAgentId)}/history-page?limit=40&compact=1`,
 			);
 			if (!isCurrentRequest(requestEpoch, requestAgentId)) {
-				return;
+				return null;
 			}
-			if (Array.isArray(page?.messages) && page.messages.length > 0) {
-				olderMessages = page.messages;
-				nextCursor = page.nextCursor || null;
-			}
+			return page || null;
 		} catch {
 			// 新会话还没有 session 文件时 history-page 会返回空；消息接口仍可用。
+			return null;
 		}
 	}
 
@@ -1368,14 +1430,28 @@
 		return parts.length ? `<div class="msg-meta">${parts.join("")}</div>` : "";
 	}
 
+	// 轮询会反复拿到同一批消息对象（appendTail 对未变化的消息保留原引用）。
+	// Markdown/思考块解析是手机端最贵的纯计算，按对象缓存 view 与最终 HTML，
+	// 让未变化的消息在每轮轮询里只做一次 Map 查找。
+	const messageViewCache = new WeakMap();
+	const messageHtmlCache = new WeakMap();
+
 	function messageView(message) {
+		const cached = messageViewCache.get(message);
+		if (cached !== undefined) return cached;
+		const built = buildMessageView(message);
+		messageViewCache.set(message, built);
+		return built;
+	}
+
+	function buildMessageView(message) {
 		const role = message.role || "assistant";
 		const label = role === "system" ? "系统" : role === "error" ? "错误" : "助手";
 		const images = Array.isArray(message.images)
 			? message.images
 					.map(
 						(image) =>
-							`<img src="data:${escapeHtml(image.mimeType)};base64,${escapeHtml(image.data)}" alt="" />`,
+							`<img src="data:${escapeHtml(image.mimeType)};base64,${escapeHtml(image.data)}" alt="" loading="lazy" decoding="async" />`,
 					)
 					.join("")
 			: "";
@@ -1441,6 +1517,14 @@
 	}
 
 	function renderMessage(item) {
+		const cached = messageHtmlCache.get(item);
+		if (cached !== undefined) return cached;
+		const html = buildMessageHtml(item);
+		messageHtmlCache.set(item, html);
+		return html;
+	}
+
+	function buildMessageHtml(item) {
 		const expand = item.expand
 			? `<button class="expand" type="button" data-expand="${escapeHtml(item.id)}">${escapeHtml(item.expand.label)}${item.expand.remaining ? ` · 还有 ${item.expand.remaining} 字` : ""}</button>`
 			: "";
@@ -1518,22 +1602,33 @@
 		return node?.dataset.mid || node?.dataset.key || "";
 	}
 
+	/**
+	 * 记录/恢复展开的 details。旧实现每个 details 都 querySelectorAll 一次兄弟节点，
+	 * 工具组多时会退化成平方级查询；这里一次遍历并按父节点计数，保持原有
+	 * “owner:父节点内序号”键不变。
+	 */
+	function detailIndex(details, seen) {
+		const parent = details.parentElement;
+		const index = seen.get(parent) || 0;
+		seen.set(parent, index + 1);
+		return `${detailOwner(details)}:${index}`;
+	}
+
 	function openDetailKeys(container) {
 		const keys = new Set();
-		container.querySelectorAll("details[open]").forEach((details) => {
-			const owner = detailOwner(details);
-			const siblings = Array.from(details.parentElement?.querySelectorAll("details") || []);
-			keys.add(`${owner}:${siblings.indexOf(details)}`);
+		const seen = new Map();
+		container.querySelectorAll("details").forEach((details) => {
+			const key = detailIndex(details, seen);
+			if (details.open) keys.add(key);
 		});
 		return keys;
 	}
 
 	function restoreOpenDetails(container, keys) {
 		if (!keys.size) return;
+		const seen = new Map();
 		container.querySelectorAll("details").forEach((details) => {
-			const owner = detailOwner(details);
-			const siblings = Array.from(details.parentElement?.querySelectorAll("details") || []);
-			if (keys.has(`${owner}:${siblings.indexOf(details)}`)) details.open = true;
+			if (keys.has(detailIndex(details, seen))) details.open = true;
 		});
 	}
 
@@ -2046,10 +2141,11 @@
 		if (!sessions.length && projectId) sessions = cachedSessions(projectId);
 		if (sessions.length || appState.projects.length) renderHome();
 		else renderSkeleton();
+		const pendingSessions = beginSessionsLoad();
 		try {
 			await refreshState();
 			if (!isCurrentHome()) return;
-			await loadSessions();
+			await finishSessionsLoad(pendingSessions);
 			if (!isCurrentHome()) return;
 			renderHome();
 			setConnection("online");
@@ -2129,8 +2225,9 @@
 		});
 		$("refresh-all").addEventListener("click", async () => {
 			try {
+				const pendingSessions = beginSessionsLoad();
 				await refreshState();
-				await loadSessions();
+				await finishSessionsLoad(pendingSessions);
 				toast("已刷新");
 				renderSettings();
 			} catch (error) {
@@ -2155,13 +2252,14 @@
 		} else {
 			renderSkeleton();
 		}
+		const pendingSessions = beginSessionsLoad();
 		try {
 			await refreshState();
 			if (!isCurrentHome()) {
 				pendingResumeAgentId = null;
 				return;
 			}
-			await loadSessions();
+			await finishSessionsLoad(pendingSessions);
 			if (!isCurrentHome()) {
 				pendingResumeAgentId = null;
 				return;
@@ -2208,8 +2306,9 @@
 		}
 		if (currentTab === "settings") {
 			try {
+				const pendingSessions = beginSessionsLoad();
 				await refreshState();
-				await loadSessions();
+				await finishSessionsLoad(pendingSessions);
 				toast("已刷新");
 				renderSettings();
 			} catch (error) {
@@ -2324,18 +2423,41 @@
 		{ passive: true },
 	);
 
+	let lastViewportHeight = 0;
+	let viewportSyncFrame = 0;
 	function syncViewportHeight() {
-		const height = window.visualViewport?.height || window.innerHeight;
-		document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+		const height = Math.round(window.visualViewport?.height || window.innerHeight);
+		if (height === lastViewportHeight) return;
+		lastViewportHeight = height;
+		document.documentElement.style.setProperty("--app-height", `${height}px`);
 	}
-	window.visualViewport?.addEventListener("resize", syncViewportHeight);
-	window.visualViewport?.addEventListener("scroll", syncViewportHeight);
+	function scheduleViewportSync() {
+		// 键盘弹出/地址栏收缩时 visualViewport scroll 会高频触发；合并到一帧，
+		// 避免每次事件都改 CSS 变量触发整页样式重算。
+		if (viewportSyncFrame) return;
+		viewportSyncFrame = requestAnimationFrame(() => {
+			viewportSyncFrame = 0;
+			syncViewportHeight();
+		});
+	}
+	window.visualViewport?.addEventListener("resize", scheduleViewportSync);
+	window.visualViewport?.addEventListener("scroll", scheduleViewportSync);
 	syncViewportHeight();
 
 	// 手机端装到主屏后离线也能打开外壳；API 请求永不缓存，恢复网络即可继续。
-	if ("serviceWorker" in navigator) {
-		void navigator.serviceWorker.register("./sw.js").catch(() => undefined);
+	// 放到首屏请求完成后的空闲期注册：SW 安装会再拉一遍外壳资源，弱网下与
+	// state/sessions 抢带宽会直接拖慢首屏。
+	let serviceWorkerRegistered = false;
+	function registerServiceWorker() {
+		if (serviceWorkerRegistered || !("serviceWorker" in navigator)) return;
+		serviceWorkerRegistered = true;
+		const start = () => void navigator.serviceWorker.register("./sw.js").catch(() => undefined);
+		if (typeof requestIdleCallback === "function") {
+			requestIdleCallback(start, { timeout: 2000 });
+		} else {
+			setTimeout(start, 0);
+		}
 	}
 
-	void boot();
+	void boot().finally(registerServiceWorker);
 })();

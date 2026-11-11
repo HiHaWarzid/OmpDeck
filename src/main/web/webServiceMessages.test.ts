@@ -7,6 +7,7 @@ import type {
 	ChatMessage,
 	SendPromptInput,
 	SendPromptResult,
+	SessionSummary,
 } from "../../shared/types";
 import { WebServiceManager } from "./WebServiceManager";
 
@@ -130,6 +131,37 @@ describe("手机端消息增量契约", () => {
 		expect(data.projects).toBeTruthy();
 		expect(data.agents).toBeTruthy();
 		expect(data).not.toHaveProperty("messagesByAgent");
+	});
+
+	test("sessions 接口可按 topLevel 过滤子会话", async () => {
+		const original = deps.listSessions;
+		const top = {
+			filePath: "C:/sessions/top.jsonl",
+			preview: "顶层会话",
+			updatedAt: 1,
+			messageCount: 1,
+		} as SessionSummary;
+		const child = {
+			...top,
+			filePath: "C:/sessions/child.jsonl",
+			parentSessionPath: top.filePath,
+		} as SessionSummary;
+		const codexChild = {
+			...top,
+			filePath: "C:/sessions/codex-child.jsonl",
+			codexParentThreadId: "thread-1",
+			codexThreadSource: "subagent",
+		} as SessionSummary;
+		deps.listSessions = async () => [top, child, codexChild];
+		try {
+			const all = await getJson("/api/projects/project-1/sessions");
+			expect(all.data.sessions).toHaveLength(3);
+
+			const filtered = await getJson("/api/projects/project-1/sessions?topLevel=1");
+			expect(filtered.data.sessions).toEqual([top]);
+		} finally {
+			deps.listSessions = original;
+		}
 	});
 
 	test("tail 限制窗口条数并返回内容版本", async () => {

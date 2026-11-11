@@ -132,6 +132,11 @@ type _WebAgentDepsDriftGuard = {
 } extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
+/** 与手机端 isTopLevelSession 保持同一规则：扩展 worker/reviewer 会话不占首页。 */
+function isTopLevelSessionSummary(session: SessionSummary): boolean {
+	return !session.parentSessionPath && !session.codexParentThreadId && session.codexThreadSource !== "subagent";
+}
+
 /**
  * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 600ms
  * fetch 轮询走 keep-alive，只要浏览器 tab 开着、或正好有请求在途，server.close()
@@ -373,7 +378,12 @@ export class WebServiceManager {
 				const projectId = decodeURIComponent(sessionsMatch[1]);
 				this.assertProjectExists(projectId);
 				const sessions = await this.deps.listSessions(projectId);
-				this.sendJson(request, response, { sessions });
+				// 手机首页只展示顶层会话；子会话占列表的 60%+，在服务端剔除可显著减少
+				// 弱网传输和手机端解析/渲染成本。桌面端不传该参数，保留完整嵌套数据。
+				const onlyTopLevel = url.searchParams.get("topLevel") === "1";
+				this.sendJson(request, response, {
+					sessions: onlyTopLevel ? sessions.filter(isTopLevelSessionSummary) : sessions,
+				});
 				return;
 			}
 			if (url.pathname === "/api/agents" && request.method === "POST") {
@@ -1063,7 +1073,7 @@ export class WebServiceManager {
 			request.url?.includes("mobile=1") === true;
 		const wantsDesktop = request.url?.includes("desktop=1") ?? false;
 		if (requestedPath === "/" && isMobile && !wantsDesktop && existsSync(mobilePage)) {
-			await this.sendFile(mobilePage, response);
+			await this.sendFile(mobilePage, response, request);
 			return;
 		}
 		const relativePath = requestedPath === "/" || !extname(requestedPath)
@@ -1074,15 +1084,15 @@ export class WebServiceManager {
 		// relative() 比 startsWith 前缀判断可靠：避免 renderer-evil/ 被误判在 renderer/ 内。
 		if (fromRoot.startsWith("..") || isAbsolute(fromRoot) || !existsSync(filePath)) {
 			if (relativePath !== "index.html" && existsSync(join(this.rendererRoot, "index.html"))) {
-				return this.sendFile(join(this.rendererRoot, "index.html"), response);
+				return this.sendFile(join(this.rendererRoot, "index.html"), response, request);
 			}
 			this.sendHtml(response, this.renderPage());
 			return;
 		}
-		await this.sendFile(filePath, response);
+		await this.sendFile(filePath, response, request);
 	}
 
-	private async sendFile(filePath: string, response: ServerResponse) {
+	private async sendFile(filePath: string, response: ServerResponse, request: IncomingMessage) {
 		const body = await readFile(filePath);
 		// 只有 Vite 产出的 /assets/ 带内容哈希，可以长缓存；public 下的
 		// mobile.* / boot-diagnostics.js 等文件名固定，必须每次回源。
@@ -1091,12 +1101,28 @@ export class WebServiceManager {
 			filePath.endsWith("sw.js") ||
 			filePath.endsWith(".webmanifest") ||
 			!filePath.includes(`${sep}assets${sep}`);
-		response.writeHead(200, {
+		const headers: Record<string, string | number> = {
 			...this.baseHeaders(),
 			"content-type": this.contentType(filePath),
 			"cache-control": noStore ? "no-store" : "public, max-age=31536000, immutable",
-		});
-		response.end(body);
+		};
+		// 手机端外壳（mobile.js/css/html）未压缩合计约 100KB，Tailscale 弱网下
+		// 传输时间远超解析时间。只压文本且限制体积，避免桌面 4MB bundle 每请求
+		// 都花 CPU 做同步 gzip。
+		const acceptEncoding = request.headers["accept-encoding"];
+		const compressible =
+			body.length <= 512 * 1024 &&
+			/\.(?:html|js|css|json|svg|webmanifest)$/i.test(filePath) &&
+			typeof acceptEncoding === "string" &&
+			/\bgzip\b/.test(acceptEncoding);
+		const payload = compressible ? gzipSync(body) : body;
+		if (compressible) {
+			headers["content-encoding"] = "gzip";
+			headers.vary = "accept-encoding";
+		}
+		headers["content-length"] = payload.length;
+		response.writeHead(200, headers);
+		response.end(payload);
 	}
 
 	private sendHtml(response: ServerResponse, html: string) {
