@@ -1550,12 +1550,27 @@
 		const items = buildRenderItems();
 		const loadOlderButton = $("load-older");
 		if (loadOlderButton) loadOlderButton.hidden = !nextCursor;
-		const previousHeight = Number.isFinite(Number(options.previousHeight))
-			? Number(options.previousHeight)
-			: view.scrollHeight;
-		const previousTop = Number.isFinite(Number(options.previousTop))
-			? Number(options.previousTop)
-			: view.scrollTop;
+		// 轮询请求可能在用户滑动期间才返回。若沿用请求发起时的 scrollTop，
+		// 渲染完会把用户刚滑到的位置硬拉回去；这里在真正改 DOM 前重新取实时位置。
+		const liveHeight = view.scrollHeight;
+		const liveTop = view.scrollTop;
+		const liveNearBottom = stateApi.isNearBottom({
+			scrollHeight: liveHeight,
+			scrollTop: liveTop,
+			clientHeight: view.clientHeight,
+		});
+		const preserveMode = options.mode === "preserve";
+		const requestedTop = Number(options.previousTop);
+		const requestedHeight = Number(options.previousHeight);
+		// preserve 用于“在顶部插入更早消息/展开详情”，必须加上高度差；
+		// 但如果用户已经在请求期间滚走，就改用当前视口，避免再次拉回。
+		const keepRequestedAnchor =
+			preserveMode &&
+			Number.isFinite(requestedTop) &&
+			Number.isFinite(requestedHeight) &&
+			Math.abs(liveTop - requestedTop) <= 2;
+		const previousHeight = keepRequestedAnchor ? requestedHeight : liveHeight;
+		const previousTop = keepRequestedAnchor ? requestedTop : liveTop;
 		const openKeys = openDetailKeys(container);
 		const existing = Array.from(container.children);
 		const canPatch =
@@ -1579,16 +1594,22 @@
 		}
 		restoreOpenDetails(container, openKeys);
 		container.setAttribute("aria-busy", "false");
+		const mode = options.mode || "auto";
 		const plan = stateApi.scrollPlan({
-			mode: options.mode || "auto",
-			nearBottom: options.nearBottom,
+			mode,
+			// 轮询传入的 nearBottom 是请求发起时的快照；用户可能已经滑走，
+			// 因此 auto 模式用渲染时的实时位置重新判断是否贴底。
+			nearBottom: mode === "auto" ? liveNearBottom : options.nearBottom,
 			previousHeight,
 			previousTop,
 			scrollHeight: view.scrollHeight,
 			newCount: options.newCount,
 		});
-		view.scrollTop = plan.scrollTop;
-		if (options.mode === "initial" || options.nearBottom) {
+		// 值没变时不要写 scrollTop：移动端在惯性滑动中重复赋值会打断滚动。
+		if (Math.abs(view.scrollTop - plan.scrollTop) > 1) {
+			view.scrollTop = plan.scrollTop;
+		}
+		if (mode === "initial" || (mode === "auto" && liveNearBottom)) {
 			newMessageCount = 0;
 		} else if (plan.showNewMessages) {
 			newMessageCount += Number(options.newCount) || 0;

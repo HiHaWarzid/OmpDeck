@@ -5,7 +5,7 @@
  * - 带 ?v= 版本号的静态资源缓存优先，升级时由版本号换键，首次联网后离线可用；
  * - /api/ 与带 ?token= 的请求永不写入 Cache Storage。
  */
-const CACHE_NAME = "ompdeck-shell-v23";
+const CACHE_NAME = "ompdeck-shell-v24";
 const SHELL_ASSETS = [
 	"./",
 	"./index.html",
