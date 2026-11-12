@@ -22,7 +22,11 @@ describe("session workspace core", () => {
     const entry = snapshot.entries.get(sessionA)!;
     expect(entry.kind).toBe("tab");
     // 快照只带结构；切片状态一律经 getSlice 读取
-    expect(store.getSlice(sessionA, "composer")).toEqual({ mode: "normal", busyDraft: false });
+    expect(store.getSlice(sessionA, "composer")).toEqual({
+      mode: "normal",
+      busyDraft: false,
+      compacting: false,
+    });
   });
 
   it("rejoining the same key is a no-op that never resets state", () => {
@@ -42,9 +46,9 @@ describe("session workspace core", () => {
     store.dispatchTo(sessionA, composerActions.setBusyDraft(true));
 
     const b = store.getSlice(sessionB, "composer");
-    expect(b).toEqual({ mode: "normal", busyDraft: false });
+    expect(b).toEqual({ mode: "normal", busyDraft: false, compacting: false });
     const a = store.getSlice(sessionA, "composer");
-    expect(a).toEqual({ mode: "plan", busyDraft: true });
+    expect(a).toEqual({ mode: "plan", busyDraft: true, compacting: false });
   });
 
   it("leave removes the entry; rejoin reseeds fresh state", () => {

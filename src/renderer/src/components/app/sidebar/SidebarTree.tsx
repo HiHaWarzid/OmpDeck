@@ -155,7 +155,8 @@ export interface SidebarTreeProps {
 	setAgentMenu: Dispatch<SetStateAction<SidebarAgentMenu | null>>;
 	setSessionFilterOpen: Dispatch<SetStateAction<SidebarSessionFilterAnchor | null>>;
 	setWorktreeCreateDialog: Dispatch<SetStateAction<{ projectId: string } | null>>;
-	setVisibleProjectChildCountByProject: Dispatch<SetStateAction<Record<string, number>>>;
+	/** 「显示更多」：按固定页大小追加该项目可见子项数（分页状态由 useProjectTree 持有）。 */
+	showMoreProjectChildren: (projectId: string) => void;
 	setCollapsedWorktrees: Dispatch<SetStateAction<Set<string>>>;
 	setExpandedWorktreeSessions: Dispatch<SetStateAction<Set<string>>>;
 	setActiveProjectId: Dispatch<SetStateAction<string | undefined>>;
@@ -233,7 +234,7 @@ function SidebarTreeView({
 	setAgentMenu,
 	setSessionFilterOpen,
 	setWorktreeCreateDialog,
-	setVisibleProjectChildCountByProject,
+	showMoreProjectChildren,
 	setCollapsedWorktrees,
 	setExpandedWorktreeSessions,
 	setActiveProjectId,
@@ -841,14 +842,7 @@ function SidebarTreeView({
 							{!isCollapsed && projectDisplay.hiddenChildCount > 0 && (
 								<button
 									className="session-more-row"
-									onClick={() => {
-										setVisibleProjectChildCountByProject((current) => ({
-											...current,
-											[project.id]:
-												(current[project.id] ?? SIDEBAR_PROJECT_CHILD_PAGE_SIZE) +
-												SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
-										}));
-									}}
+									onClick={() => showMoreProjectChildren(project.id)}
 								>
 									<span className="agent-more-branch" />
 									<span>

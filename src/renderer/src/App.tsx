@@ -9,7 +9,6 @@ import {
   useCallback,
   useTransition,
   useDeferredValue,
-  useSyncExternalStore,
   type PointerEvent,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -116,9 +115,19 @@ import { withTimeout } from "./utils/withTimeout";
 import {
   buildQueueRows,
   type QueuePanelRow,
-  type UncertainPrompt,
 } from "./utils/queueChips";
 import { usePersistedState } from "./hooks/usePersistedState";
+import { usePiEnvironment } from "./hooks/usePiEnvironment";
+import { useStableHandlers } from "./hooks/useStableHandlers";
+import { useUpdateCenter } from "./hooks/useUpdateCenter";
+import {
+  DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY,
+  dismissWidgetKeys,
+  isWidgetDismissed,
+  normalizeDismissedWidgets,
+  restoreWidgetKey,
+  type DismissedWidgetRecord,
+} from "./utils/extensionWidgetDismissals";
 import {
   TERMINAL_HEIGHT_STORAGE_KEY,
   TERMINAL_HEIGHT_MIN,
@@ -129,6 +138,7 @@ import {
 } from "./terminalDockState";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
+import { useProjectTree } from "./hooks/useProjectTree";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
 import { useSessionImport } from "./hooks/useSessionImport";
 import { reconcileAgentState, sameAgentTabList } from "./utils/agentStateReconciliation";
@@ -139,6 +149,8 @@ import { dispatchToAgent } from "./workspace/dispatch";
 import { createTranscriptRuntime, reconcileTranscriptEntries, type TranscriptRuntime } from "./workspace/transcriptRuntime";
 import { composerActions } from "./workspace/slices/composerSlice";
 import { extensionWidgetActions } from "./workspace/slices/extensionWidgetsSlice";
+import { queueActions } from "./workspace/slices/queueSlice";
+import { uiRequestActions } from "./workspace/slices/uiRequestSlice";
 import { rpcLogActions } from "./workspace/slices/rpcLogSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
@@ -185,7 +197,6 @@ import { SidebarTree } from "./components/app/sidebar/SidebarTree";
 import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
 import {
   buildSidebarProjectDisplay,
-  SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
 import {
@@ -239,7 +250,6 @@ import type {
   AppUpdateDownloadProgress,
   AppUpdateInfo,
   AvailableModel,
-  PiCliUpdateResult,
   ExternalEditor,
   ChatMessage,
   FileTreeNode,
@@ -250,15 +260,10 @@ import type {
   WorktreeEntry,
   ImageContent,
   PiCommand,
-  PiInstallStatus,
-  PiInstallExecResult,
-  NpmAvailabilityResult,
-  PiUpdateCheckResult,
   Project,
   SessionSummary,
   ComposerAgentMode,
   AgentTodoPhase,
-  AgentUiRequest,
   CrashedRun,
   RestoredQueuedMessage,
   ThinkingUpdate,
@@ -348,93 +353,6 @@ function isAbsoluteFilePath(path: string) {
   return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/");
 }
 
-/** 侧栏展开项目 id（含 chat）；localStorage 作首屏缓存，settings.json 作跨进程可靠落盘 */
-const SIDEBAR_EXPANDED_PROJECTS_KEY = "pid:sidebar-expanded-projects";
-/** 旧版「折叠集合」key，仅用于一次性迁移 */
-const SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY = "pid:sidebar-collapsed-projects";
-/** 与主进程 ProjectStore 内置 chat id 保持一致 */
-const BUILTIN_CHAT_PROJECT_ID = "builtin-chat";
-/** 侧栏子会话展开状态持久化键（含孙级递归树） */
-const SUBAGENT_GROUPS_STORAGE_KEY = "pid:sidebar-expanded-subagent-groups";
-
-function parseProjectIdArray(raw: string | null): string[] | null {
-	if (raw === null) return null;
-	try {
-		const parsed = JSON.parse(raw);
-		if (!Array.isArray(parsed)) return null;
-		return parsed.filter((id): id is string => typeof id === "string");
-	} catch {
-		return null;
-	}
-}
-
-/**
- * 读取侧栏展开项目 id。
- * 优先新 key；若仅有旧折叠 key 则返回 null，等拿到项目列表后再反演迁移。
- */
-function loadExpandedSidebarProjectsFromLocal(): string[] | null {
-	const expanded = parseProjectIdArray(
-		localStorage.getItem(SIDEBAR_EXPANDED_PROJECTS_KEY),
-	);
-	if (expanded) return expanded;
-	// 旧 key 存在但还不能反演（缺项目全集）→ 交给后续迁移
-	if (localStorage.getItem(SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY) !== null) {
-		return null;
-	}
-	return null;
-}
-
-function saveExpandedSidebarProjectsToLocal(ids: Set<string>) {
-	try {
-		localStorage.setItem(
-			SIDEBAR_EXPANDED_PROJECTS_KEY,
-			JSON.stringify([...ids]),
-		);
-		// 迁移完成后清掉旧 key，避免两套数据源互相打架
-		localStorage.removeItem(SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY);
-	} catch {
-		// localStorage 不可用时静默忽略；settings.json 仍会落盘
-	}
-}
-
-/** 默认只展开内置 chat，与「启动不全量扫会话」策略一致 */
-function defaultExpandedSidebarProjects(): Set<string> {
-	return new Set([BUILTIN_CHAT_PROJECT_ID]);
-}
-
-/** 从 localStorage 恢复会话来源过滤配置 */
-function loadSessionSourceFilter(): Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null> {
-	try {
-		const raw = localStorage.getItem("pideck-session-source-filter");
-		if (!raw) return {};
-		const parsed = JSON.parse(raw);
-		const result: Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null> = {};
-		for (const [key, val] of Object.entries(parsed)) {
-			if (val === null) {
-				result[key] = null;
-			} else if (Array.isArray(val)) {
-				result[key] = new Set(val);
-			}
-		}
-		return result;
-	} catch {
-		return {};
-	}
-}
-
-/** 将会话来源过滤持久化到 localStorage */
-function saveSessionSourceFilter(filter: Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null>) {
-	try {
-		const obj: Record<string, string[] | null> = {};
-		for (const [key, val] of Object.entries(filter)) {
-			obj[key] = val === null ? null : [...val];
-		}
-		localStorage.setItem("pideck-session-source-filter", JSON.stringify(obj));
-	} catch {
-		// 静默失败
-	}
-}
-
 function resolveFileLinkPath(path: string, basePath?: string) {
   if (!path || isAbsoluteFilePath(path) || !basePath) return path;
   // 浏览器端不引入 Node path;按项目根路径分隔符拼接,满足点击 AI 输出的项目相对路径。
@@ -442,40 +360,8 @@ function resolveFileLinkPath(path: string, basePath?: string) {
   return `${basePath.replace(/[\\/]+$/, "")}${separator}${path.replace(/^[\\/]+/, "")}`;
 }
 
-const DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY =
-  "pid:extension-widget-dismissed-by-session";
-
-function loadDismissedExtensionWidgets(): Record<string, string[]> {
-  try {
-    const parsed = JSON.parse(
-      localStorage.getItem(DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY) ?? "{}",
-    );
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const result: Record<string, string[]> = {};
-    for (const [sessionKey, widgetKeys] of Object.entries(parsed)) {
-      if (Array.isArray(widgetKeys)) {
-        result[sessionKey] = widgetKeys.filter(
-          (widgetKey): widgetKey is string => typeof widgetKey === "string",
-        );
-      }
-    }
-    return result;
-  } catch {
-    return {};
-  }
-}
-
-function saveDismissedExtensionWidgets(value: Record<string, string[]>) {
-  try {
-    localStorage.setItem(
-      DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY,
-      JSON.stringify(value),
-    );
-  } catch {
-    // localStorage 可能因隐私模式/配额失败；关闭状态丢失不应影响主流程。
-  }
-}
-
+// widget 关闭态的校验/去重/恢复规则收敛在 utils/extensionWidgetDismissals，
+// 落盘交给 usePersistedState（键与旧实现一致，无数据迁移）。
 function getAgentSessionStorageKey(agent?: AgentTab, fallbackAgentId?: string) {
   return agent?.sessionPath ?? fallbackAgentId ?? "";
 }
@@ -528,35 +414,16 @@ export function App() {
   // 立刻打开会话，那时闭包里的 projects state 还是空数组，按 state 查项目会直接返回。
   const projectsRef = useRef<Project[]>([]);
   projectsRef.current = projects;
-  // 项目的 git worktree 列表：{ parentId -> WorktreeEntry[] }
-  const [worktreesByProject, setWorktreesByProject] = useState<
-    Record<string, WorktreeEntry[]>
-  >({});
-  // 统一分支信息 store（按 projectId）：合并原 gitInfo（当前项目全量）与
-  // branchByProject（各项目 current）两个平行切片；composer 分支展示、worktree
-  // 分支 chip 统一读取，GitPanel 面板分支由面板自持（initialBranchInfo 种子）。
-  const [branchInfoByProject, setBranchInfoByProject] = useState<
-    Record<string, GitBranchInfo>
-  >({});
-  const [draggingProjectId, setDraggingProjectId] = useState<string>();
-  const [dragOverProjectId, setDragOverProjectId] = useState<string>();
   /** 侧栏 π logo 重播令牌：agent 启动（含历史会话）/关闭时递增，驱动 BrandLockup 动画 */
   const [brandLogoReplayToken, setBrandLogoReplayToken] = useState(0);
   const [activeProjectId, setActiveProjectId] = useState<string>();
   const activeProjectIdRef = useRef<string | undefined>(activeProjectId);
   activeProjectIdRef.current = activeProjectId;
-  // visibleProjectChildCountByProject 需在 useAgentSessions 之前声明：
-  // hook 的 onSessionsByProjectChanged 回调通过它更新侧栏可见子项数。
-  const [visibleProjectChildCountByProject, setVisibleProjectChildCountByProject] =
-    useState<Record<string, number>>({});
-  // 项目会话列表变更后更新侧栏可见子项数：hook 只管数据获取，UI 分页由此回调驱动。
+  // 项目会话列表变更后要更新侧栏可见子项数（表状态由 useProjectTree 持有，而树 hook 又依赖
+  // useAgentSessions 的 sessionsByProject）——用 ref 打破这个顺序依赖。
+  const noteProjectSessionsChangedRef = useRef<(projectId: string) => void>(() => {});
   const handleSessionsByProjectChanged = useCallback(
-    (projectId: string) => {
-      setVisibleProjectChildCountByProject((current) => ({
-        ...current,
-        [projectId]: current[projectId] ?? SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
-      }));
-    },
+    (projectId: string) => noteProjectSessionsChangedRef.current(projectId),
     [],
   );
   // Agent/会话状态集中管理：状态、refs、计算值从 useAgentSessions 获取，
@@ -578,6 +445,54 @@ export function App() {
     activeProjectId,
     onSessionsByProjectChanged: handleSessionsByProjectChanged,
   });
+  // 侧栏项目树（展开集合/worktree/折叠/来源过滤/拖拽/确认弹框）统一由 useProjectTree 持有，
+  // 持久化与迁移规则收在模块内，App 只做组合与渲染。
+  const tree = useProjectTree({
+    api,
+    projects,
+    sessionsByProject,
+    refreshProjectSessions,
+    setProjects,
+    activeProjectId,
+    onExpandedPersisted: (ids) =>
+      setSettings((current) => ({ ...current, sidebarExpandedProjectIds: ids })),
+  });
+  noteProjectSessionsChangedRef.current = tree.noteProjectSessionsChanged;
+  const {
+    expandedSidebarProjects,
+    setProjectSidebarExpanded,
+    applyExpandedFromSettings,
+    getExpandedProjectIds,
+    worktreesByProject,
+    branchInfoByProject,
+    setBranchInfo,
+    refreshBranchInfo,
+    resetBranchInfo,
+    refreshWorktrees,
+    collapsedWorktrees,
+    setCollapsedWorktrees,
+    expandedWorktreeSessions,
+    setExpandedWorktreeSessions,
+    removingWorktreePaths,
+    setRemovingWorktreePaths,
+    draggingProjectId,
+    setDraggingProjectId,
+    dragOverProjectId,
+    setDragOverProjectId,
+    visibleProjectChildCountByProject,
+    showMoreProjectChildren,
+    forgetProject,
+    sessionSourceFilter,
+    setSessionSourceFilter,
+    expandedSubagentGroups,
+    toggleSubagentGroup,
+    sidebarDeleteConfirm,
+    setSidebarDeleteConfirm,
+    worktreeCreateDialog,
+    setWorktreeCreateDialog,
+    worktreeCreating,
+    setWorktreeCreating,
+  } = tree;
   // Agent 生命周期 per-agent 状态：prompt/images/dock/drawer/promptHistory，
   // 以及 agent 替换时的原子迁移方法。queuedPrompts 已删除——待投递队列
   // 以 omp get_state.queuedMessages 为唯一事实来源。
@@ -593,10 +508,8 @@ export function App() {
   // 条目成员关系 = 存活 agent tab（agents ∪ pendingAgents），键 = agentId。
   // store.subscribe 只报结构变化（焦点/成员），因此根组件不会被 20Hz 流式切片唤醒；
   // busyDraft / composer 模式经按 (key, slice) 订阅读取，thinking 由消息列表自己订阅。
-  const workspaceSnapshot = useSyncExternalStore(
-    sessionWorkspaceStore.subscribe,
-    sessionWorkspaceStore.getSnapshot,
-  );
+  // 根组件不订阅 store 结构快照：成员关系变化由 useWorkspaceSlice/子组件各自处理，
+  // 这里此前读取 workspaceSnapshot 却从未使用，导致 join/leave 唤醒整棵 9k 行根树。
   const activeWorkspaceComposer = useWorkspaceSlice(activeAgentId, "composer");
   const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
   const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
@@ -643,15 +556,6 @@ export function App() {
       void api.settings.get().then(setSettings).catch(() => undefined);
     }
   }, [activeAgentId]);
-  // 侧栏展开集合：有 id = 展开。localStorage 首屏缓存 + settings.json 可靠落盘（dev 强杀也不丢）。
-  const [expandedSidebarProjects, setExpandedSidebarProjects] = useState<Set<string>>(
-    () => {
-      const cached = loadExpandedSidebarProjectsFromLocal();
-      return cached ? new Set(cached) : defaultExpandedSidebarProjects();
-    },
-  );
-  const expandedSidebarProjectsRef = useRef(expandedSidebarProjects);
-  expandedSidebarProjectsRef.current = expandedSidebarProjects;
   // 冷扫描先返回部分摘要，完整扫描结束后主进程推送 sessions:changed。
   // 用 ref 取最新 refresh 函数，避免事件监听随每次渲染重绑定。
   const refreshProjectSessionsRef = useRef(refreshProjectSessions);
@@ -672,7 +576,7 @@ export function App() {
       // 已经加载过列表的项目（侧栏/活动项目）都要补一次完整快照；
       // 只认 expanded 会漏掉当前活动但尚未展开的项目。
       const projectIds = new Set(Object.keys(sessionsByProjectRef.current));
-      for (const projectId of expandedSidebarProjectsRef.current) projectIds.add(projectId);
+      for (const projectId of getExpandedProjectIds()) projectIds.add(projectId);
       const active = activeProjectIdRef.current;
       if (active) projectIds.add(active);
       for (const projectId of projectIds) {
@@ -681,8 +585,6 @@ export function App() {
       }
     });
   }, []);
-  /** 已从 settings.json 合并过展开状态，避免被后续 settings 刷新覆盖用户刚点的展开 */
-  const expandedSidebarFromSettingsRef = useRef(false);
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [commands, setCommands] = useState<PiCommand[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
@@ -770,7 +672,8 @@ export function App() {
   }, [editorsOpen]);
 
   /** 活跃的 Extension UI 请求 map（requestId → UiRequest），用于实时显示 ask_question 卡片 */
-  const [activeUiRequest, setActiveUiRequest] = useState<Record<string, AgentUiRequest> | null>(null);
+  // 待答 UI 请求属于条目状态：键 = 条目键，agent 关闭即回收（原根级 record 不裁剪）。
+  const activeUiRequests = useWorkspaceSlice(activeAgentId, "uiRequest")?.requests;
   /** Extension widget 容器折叠状态（全局持久化，不按 agentId 隔离，重启后恢复） */
   const [widgetsCollapsed, setWidgetsCollapsed] = useState(() => {
     try {
@@ -783,40 +686,26 @@ export function App() {
     }
   });
   /** 用户手动关闭的 extension widget（widgetKey）；按稳定 sessionPath 隔离，避免切换 agent 串状态。 */
-  const [agentDismissedWidgets, setAgentDismissedWidgets] = useState<
-    Record<string, string[]>
-  >(() => loadDismissedExtensionWidgets());
+  const [agentDismissedWidgets, setAgentDismissedWidgets] = usePersistedState<
+    DismissedWidgetRecord
+  >(DISMISSED_EXTENSION_WIDGETS_STORAGE_KEY, {}, { parse: normalizeDismissedWidgets });
   /** 侧栏选中态：当前活跃 Agent 对应的 session 路径（activeAgent 在后面定义，这里用函数式） */
   const displayedSidebarSessionPath = activeAgentId
     ? [...agents, ...pendingAgents].find((agent) => agent.id === activeAgentId)?.sessionPath
     : undefined;
-  /** Goal 状态 */
-  const [goalText, setGoalText] = useState<string>("");
-  const goalTextRef = useRef("");
-  const [goalStatus, setGoalStatus] = useState<"none" | "active" | "paused" | "complete">("none");
-  const goalStatusRef = useRef<"none" | "active" | "paused" | "complete">("none");
-  const [goalStartedAt, setGoalStartedAt] = useState(0);
-  const goalStartedAtRef = useRef(0);
-  const [goalCompletedAt, setGoalCompletedAt] = useState(0);
-  const goalIterationRef = useRef(0);
-  /** 标记是否已经在等待自动续接,防止多个异步续接冲突 */
-  const goalContinuationPendingRef = useRef(false);
-  /** 记录上次续接前已看到的 agent 响应,用于识别运行状态抖动造成的无进展空转。 */
-  const goalLastResponseSignatureRef = useRef("");
-  /** 最大自动续接次数,达到后暂停而不是伪装完成,避免目标未完成时进入死循环。 */
-  const GOAL_MAX_CONTINUATIONS = 5;
+  // Goal 自动续接状态已全部移除：没有任何 setGoal* 调用方，留着只会让
+  // 每个渲染周期多分配 9 个 useState/useRef 槽位，并暗示不存在的功能。
   /** 上一次 isAgentBusy 状态,用于检测 busy→idle 转换 */
   const prevIsAgentBusyRef = useRef(false);
   /**
    * 待发送轨道 = omp 服务端队列（runtimeState.queuedMessages）+ 本地未知投递提示。
    * omp 队列经 runtime 切片订阅唤醒，服务端增删/提升后自动重渲染。
    */
-  const [uncertainPrompts, setUncertainPrompts] = useState<
-    Record<string, UncertainPrompt[]>
-  >({});
+  // 未知投递提示属于条目状态：键 = 条目键，agent 关闭即回收（原根级 record 不裁剪）。
+  const activeUncertainPrompts = useWorkspaceSlice(activeAgentId, "queue")?.uncertain;
   const activeQueueRows: QueuePanelRow[] = buildQueueRows(
     agentRuntimeState?.queuedMessages,
-    activeAgentId ? uncertainPrompts[activeAgentId] : undefined,
+    activeUncertainPrompts,
   );
 
   const [sessionRefPickerOpen, setSessionRefPickerOpen] = useState(false);
@@ -886,11 +775,6 @@ export function App() {
     projectId: string;
     session: SessionSummary;
   } | null>(null);
-  /** 侧边栏删除确认：父会话包含子会话时弹窗提醒 */
-  const [sidebarDeleteConfirm, setSidebarDeleteConfirm] = useState<{
-    session: SessionSummary;
-    childCount: number;
-  } | null>(null);
   const [agentRenameValue, setAgentRenameValue] = useState("");
   const [agentRenaming, setAgentRenaming] = useState(false);
   const [projectMenu, setProjectMenu] = useState<{
@@ -900,61 +784,6 @@ export function App() {
   } | null>(null);
   /** 会话管理弹框 */
   const [sessionManagerProject, setSessionManagerProject] = useState<Project | null>(null);
-  /** Worktree 创建弹窗 */
-  const [worktreeCreateDialog, setWorktreeCreateDialog] = useState<{
-    projectId: string;
-  } | null>(null);
-  /** worktree 创建进行中，用于禁用弹框按钮并显示"创建中" */
-  const [worktreeCreating, setWorktreeCreating] = useState(false);
-  /** 展开会话的 worktree 路径集合：默认子工作区只展示 3 条会话，展开后显示全部 */
-  const [expandedWorktreeSessions, setExpandedWorktreeSessions] = useState<
-    Set<string>
-  >(() => new Set());
-  /**
-   * 折叠的工作区 key 集合（main:${projectId} / wt:${path}）。
-   * 默认展开；再次点击当前工作区时切换折叠，切换到其他工作区时自动展开目标。
-   */
-  const [collapsedWorktrees, setCollapsedWorktrees] = useState<Set<string>>(
-    () => new Set(),
-  );
-  /** 正在被删除的 worktree 路径集合：触发淡出动画期间保留 DOM，动画结束后才移除。 */
-  const [removingWorktreePaths, setRemovingWorktreePaths] = useState<
-    Set<string>
-  >(() => new Set());
-  /** 历史会话来源过滤（按项目）：undefined=显示全部，Record 含项目ID对应 Set */
-  const [sessionSourceFilter, setSessionSourceFilter] = useState<
-  	Record<string, Set<"pi" | "codex" | "claude" | "opencode"> | null>
-  >(() => loadSessionSourceFilter());
-  /** 侧栏子会话展开状态（统一管理 Codex 子代理和 pi 子会话），localStorage 持久化 */
-  const [expandedSubagentGroups, setExpandedSubagentGroups] =
-    useState<Set<string>>(() => {
-      try {
-        const raw = localStorage.getItem(SUBAGENT_GROUPS_STORAGE_KEY);
-        if (!raw) return new Set<string>();
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed)
-          ? new Set(parsed.filter((key): key is string => typeof key === "string"))
-          : new Set<string>();
-      } catch {
-        // localStorage 不可用/损坏时退化为全部收起
-        return new Set<string>();
-      }
-    });
-  /** 切换子会话组展开状态并持久化（父行/孙级 toggle 共用） */
-  const toggleSubagentGroup = (key: string) => {
-    setExpandedSubagentGroups((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      try {
-        localStorage.setItem(SUBAGENT_GROUPS_STORAGE_KEY, JSON.stringify([...next]));
-      } catch {
-        // 配额/隐私模式失败时静默忽略，展开状态仅本次会话有效
-      }
-      return next;
-    });
-  };
-
   /** 来源过滤弹窗（关联项目ID和位置） */
   const [sessionFilterOpen, setSessionFilterOpen] = useState<{
   	x: number;
@@ -1283,7 +1112,7 @@ export function App() {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [historyNavigating, setHistoryNavigating] = useState(false);
   const [savedPrompt, setSavedPrompt] = useState("");
-  const [compacting, setCompacting] = useState(false);
+  // compact 在途标志按条目存放（composer 切片），不再是根级 boolean。
   const [drawer, setDrawer] = useState<DrawerPanel | null>(null);
 
   useEffect(() => {
@@ -1383,20 +1212,8 @@ export function App() {
   const [afkOpen, setAfkOpen] = useState(false);
   // 从 AFK 中心「去配置」跳转：SettingsModal 挂载时定位到 afk tab，关闭后复位
   const [settingsInitialTab, setSettingsInitialTab] = useState<"afk" | null>(null);
-  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
-  const [updateError, setUpdateError] = useState<string | null>(null);
-  const [updateChecking, setUpdateChecking] = useState(false);
-  const [updateDownloading, setUpdateDownloading] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState<AppUpdateDownloadProgress | null>(null);
-  const [downloadedUpdatePath, setDownloadedUpdatePath] = useState<string | null>(null);
-  const [upToDateVersion, setUpToDateVersion] = useState<string | null>(null);
-  const [piUpdating, setPiUpdating] = useState(false);
-  const [piUpdateChecking, setPiUpdateChecking] = useState(false);
-  const [piUpdateCheck, setPiUpdateCheck] = useState<PiUpdateCheckResult | null>(null);
-  const [piUpdateResult, setPiUpdateResult] = useState<PiCliUpdateResult | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
   const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(false);
-  const [_debugOpen, _setDebugOpen] = useState(false);
 
   const [settings, setSettings] = useState<AppSettings>({
     useNativeTitleBar: true,
@@ -1475,7 +1292,6 @@ export function App() {
   const [piProxyNoticeTone, setPiProxyNoticeTone] = useState<
     "info" | "success" | "error"
   >("info");
-  const [piStatus, setPiStatus] = useState<PiInstallStatus | null>(null);
   const [piProxyChecking, setPiProxyChecking] = useState(false);
   const [webServiceChanging, setWebServiceChanging] = useState(false);
   const [appInfo, setAppInfo] = useState<AppInfo>({
@@ -1484,46 +1300,35 @@ export function App() {
     platform: "win32",
     homeDir: "",
   });
-  const [piChecking, setPiChecking] = useState(false);
+  // pi 环境（检测/安装/自定义路径/npm）状态机，见 hooks/usePiEnvironment.ts。
+  const piEnv = usePiEnvironment({
+    api,
+    showToast,
+    onSettingsSaved: setSettings,
+    // 设置页内联检测失败时关掉设置、让环境弹框露出来（原有体验）。
+    onInlineCheckFailed: () => setSettingsOpen(false),
+  });
+  // 应用更新 + pi CLI 更新：状态/动作/自动检查都在 useUpdateCenter（可注入依赖、可单测）。
+  // showToast / piEnv.checkInline 在此处只是闭包引用，不读首帧旧值。
+  const updates = useUpdateCenter({
+    api,
+    showToast,
+    disableUpdateCheck: settings.disableUpdateCheck,
+    releasesUrl: appInfo.releasesUrl,
+    onPiUpdated: piEnv.checkInline,
+  });
+  const { app: appUpdate, pi: piUpdate } = updates;
+  const {
+    checkAppUpdate,
+    downloadAppUpdate,
+    installDownloadedAppUpdate,
+    checkPiCliUpdateOnStartup,
+    checkPiCliUpdate,
+    updatePiCli,
+  } = updates;
   const [systemLanguage, setSystemLanguage] = useState<string | null>(null);
   const resolvedLocale = resolveLocale(settings.language, systemLanguage ?? undefined);
   setI18nLocale(resolvedLocale);
-  // 手动输入 pi 路径相关状态
-  const [customPiPath, setCustomPiPath] = useState("");
-  const [customPathValidating, setCustomPathValidating] = useState(false);
-  const [customPathResult, setCustomPathResult] =
-    useState<PiInstallStatus | null>(null);
-  /** 用户是否手动编辑/清除过自定义路径；置位后检测结果不再自动填充输入框 */
-  const customPathTouchedRef = useRef(false);
-  // 检测到 omp 且用户未编辑、无已保存路径时，把检测路径作为输入框初始值；
-  // 否则 placeholder 里显示的检测路径容易让人误以为已填内容（校验/清除按钮却因空值禁用）。
-  useEffect(() => {
-    if (
-      !customPathTouchedRef.current &&
-      !customPiPath &&
-      piStatus?.installed &&
-      piStatus.command
-    ) {
-      setCustomPiPath(piStatus.command);
-    }
-  }, [piStatus, customPiPath]);
-  /** npm 可用性检测 */
-  const [npmAvailable, setNpmAvailable] = useState<boolean | null>(null);
-  const [npmVersion, setNpmVersion] = useState<string | undefined>(undefined);
-  const [npmChecking, setNpmChecking] = useState(false);
-  /** 安装命令文本（可编辑） */
-  const [installCommand, setInstallCommand] = useState(
-    "npm install -g @earendil-works/pi-coding-agent",
-  );
-  /** 是否使用国内镜像源 */
-  const [installUseMirror, setInstallUseMirror] = useState(false);
-  /** 是否正在执行安装 */
-  const [installExecuting, setInstallExecuting] = useState(false);
-  /** 安装执行结果 */
-  const [installResult, setInstallResult] = useState<PiInstallExecResult | null>(null);
-  /** 安装是否已成功完成 */
-  const [installCompleted, setInstallCompleted] = useState(false);
-  const [environmentDialog, setEnvironmentDialog] = useState(false);
   const DEFAULT_LIST_WIDTH = 221;
   const LIST_WIDTH_STORAGE_KEY = "pid:list-width";
   const DRAWER_WIDTH_STORAGE_KEY = "pid:drawer-width";
@@ -1952,14 +1757,14 @@ export function App() {
   // 等待用户回答的对话框发送到桌面端，包含 requestId、title、options 等完整信息。
   // batch_ask：扩展把整份问卷塞进一次 input envelope，桌面端用 Tab UI 一次答完。
   const activeUiAsk = useMemo(() => {
-    if (!activeUiRequest) return undefined;
-    return Object.values(activeUiRequest).find(
+    if (!activeUiRequests) return undefined;
+    // 切片已按条目隔离，这里只需排除 completed 与非交互方法。
+    return activeUiRequests.find(
       (req) =>
         !req.completed &&
-        req.agentId === activeAgentId &&
         ["select", "confirm", "input", "editor", "batch_ask", "ask"].includes(req.method),
     );
-  }, [activeUiRequest, activeAgentId]);
+  }, [activeUiRequests]);
   // dialog 显示条件：仅当有活跃的交互式 UI 请求时
   const showAskDialog = activeUiAsk !== undefined;
   // 用 body class 控制内联 ask 卡片的显示
@@ -2353,23 +2158,11 @@ export function App() {
       .catch(() => undefined);
     void api.settings.get().then((next) => {
       setSettings(next);
-      setCustomPiPath(next.customPiPath ?? "");
       // 已有已保存路径时不自动填充；为空时允许检测结果填充输入框初始值
-      customPathTouchedRef.current = Boolean(next.customPiPath);
+      piEnv.adoptSavedPath(next.customPiPath ?? "");
       // settings.json 为展开状态的权威来源（dev 强杀后 localStorage 可能丢写入）
-      if (
-        !expandedSidebarFromSettingsRef.current &&
-        Array.isArray(next.sidebarExpandedProjectIds)
-      ) {
-        expandedSidebarFromSettingsRef.current = true;
-        const fromSettings = new Set(
-          next.sidebarExpandedProjectIds.filter(
-            (id): id is string => typeof id === "string",
-          ),
-        );
-        expandedSidebarProjectsRef.current = fromSettings;
-        setExpandedSidebarProjects(fromSettings);
-        saveExpandedSidebarProjectsToLocal(fromSettings);
+      if (Array.isArray(next.sidebarExpandedProjectIds)) {
+        applyExpandedFromSettings(next.sidebarExpandedProjectIds);
       }
       if (!Object.values(next.externalEditors).some((editor) => editor.command)) {
         void api.editors
@@ -2383,7 +2176,7 @@ export function App() {
       }
       if (!next.piEnvironmentChecked) {
         // 首次检测延后一帧启动,先让主界面完成绘制,避免 packaged app 打开时出现几秒白屏。
-        window.setTimeout(() => void checkPiInstall("startup"), 300);
+        window.setTimeout(() => void piEnv.check("startup"), 300);
       }
       if (!next.disableUpdateCheck) {
         window.setTimeout(() => void checkPiCliUpdateOnStartup(), 1200);
@@ -2437,16 +2230,7 @@ export function App() {
       setSettings(next);
       showToast(t("settings.restartNotice"));
     });
-    const offUpdateProgress = api.app.onUpdateProgress((progress) => {
-      setUpdateProgress(progress);
-      if (progress.state === "completed") {
-        setUpdateDownloading(false);
-        setDownloadedUpdatePath(progress.filePath ?? null);
-      } else if (progress.state === "failed") {
-        setUpdateDownloading(false);
-        setUpdateError(progress.error ?? t("update.downloadFailed"));
-      }
-    });
+    const offUpdateProgress = api.app.onUpdateProgress(updates.ingestAppUpdateProgress);
     // 直接在原始 runtimeState 事件上识别 tool true→false，避免 React 把很快的
     // tool_start/tool_end 批量成一次 render 后漏掉 steer 的投递窗口。
     const offOpenInBrowser = api.app.onOpenInBrowser?.((url: string) => {
@@ -2535,14 +2319,7 @@ export function App() {
             dismissedTargetAgent,
             request.agentId,
           );
-          setAgentDismissedWidgets((prev) => {
-            const current = prev[widgetSessionKey];
-            if (!current?.includes(widgetKey)) return prev;
-            return {
-              ...prev,
-              [widgetSessionKey]: current.filter((k) => k !== widgetKey),
-            };
-          });
+          setAgentDismissedWidgets((prev) => restoreWidgetKey(prev, widgetSessionKey, widgetKey));
         }
         return;
       }
@@ -2574,14 +2351,11 @@ export function App() {
         );
       }
 
-      setActiveUiRequest((current) => {
+      {
         // completed 事件：只删对应 requestId；其它 pending 请求保留。
         if (request.completed) {
-          if (!current?.[request.requestId]) return current;
-          const next = { ...current };
-          delete next[request.requestId];
-          if (Object.keys(next).length === 0) return null;
-          return next;
+          dispatchToAgent(request.agentId, uiRequestActions.remove(request.requestId));
+          return;
         }
 
         /*
@@ -2601,13 +2375,13 @@ export function App() {
               api.agents.sendUiResponse(targetAgentId, request.requestId, { value });
             });
           }
-          // 不把这个 input 请求放进 activeUiRequest，用户侧保持「一次提交」
-          return current;
+          // 不把这个 input 请求放进 store，用户侧保持「一次提交」
+          return;
         }
 
         // 新增或更新 UI 请求
-        return { ...(current ?? {}), [request.requestId]: request };
-      });
+        dispatchToAgent(request.agentId, uiRequestActions.upsert(request));
+      }
     });
     // 监听项目信任确认请求：主进程在启动 pi 前对含 .pi 资源的项目发起，弹窗等待用户决策
     const offTrustRequest = api.agents.onTrustRequest((request) => {
@@ -2727,118 +2501,16 @@ export function App() {
     return off;
   }, []);
 
-  /**
-   * 更新侧栏展开集合并双写持久化：
-   * 1) localStorage：同步，首屏可读
-   * 2) settings.json：主进程 writeFile，dev 强杀/重启也不丢
-   */
-  const commitExpandedSidebarProjects = useCallback((next: Set<string>) => {
-    // 标记已有权威写入，防止启动时迟到的 settings.get 用旧值覆盖用户刚点的展开
-    expandedSidebarFromSettingsRef.current = true;
-    expandedSidebarProjectsRef.current = next;
-    setExpandedSidebarProjects(next);
-    saveExpandedSidebarProjectsToLocal(next);
-    void api.settings
-      .update({ sidebarExpandedProjectIds: [...next] })
-      .then((saved) => {
-        // 只合并本字段，避免覆盖用户在设置页刚改的其它项的本地缓存
-        setSettings((current) => ({
-          ...current,
-          sidebarExpandedProjectIds: saved.sidebarExpandedProjectIds,
-        }));
-      })
-      .catch(() => undefined);
-  }, []);
-
-  /** 展开/折叠某个项目；forceExpand=true 时只展开不切换 */
-  const setProjectSidebarExpanded = useCallback(
-    (projectId: string, forceExpand?: boolean) => {
-      const prev = expandedSidebarProjectsRef.current;
-      const next = new Set(prev);
-      const shouldExpand = forceExpand ?? !next.has(projectId);
-      if (shouldExpand) next.add(projectId);
-      else next.delete(projectId);
-      const unchanged =
-        next.size === prev.size && [...next].every((id) => prev.has(id));
-      if (unchanged) return next;
-      commitExpandedSidebarProjects(next);
-      return next;
-    },
-    [commitExpandedSidebarProjects],
-  );
-
   useEffect(() => {
     const projectIds = new Set(projects.map((project) => project.id));
-    // 三个按项目键的裁剪统一走 pruneRecordKeys：无键被删时返回原引用，
+    // 按项目键的裁剪统一走 pruneRecordKeys：无键被删时返回原引用，
     // 项目列表刷新（内容未变）时不会以新对象触发整树重渲染。
     setSessionsByProject((current) => pruneRecordKeys(current, projectIds));
-    setVisibleProjectChildCountByProject((current) =>
-      pruneRecordKeys(current, projectIds),
-    );
     setSessionLoadingByProject((current) =>
       pruneRecordKeys(current, projectIds),
     );
-
-    if (projects.length === 0) return;
-
-    // 旧版 collapsed key → expanded 迁移（仅一次）
-    const legacyCollapsed = parseProjectIdArray(
-      localStorage.getItem(SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY),
-    );
-    const hasExpandedCache =
-      localStorage.getItem(SIDEBAR_EXPANDED_PROJECTS_KEY) !== null;
-    if (legacyCollapsed && !hasExpandedCache && !expandedSidebarFromSettingsRef.current) {
-      const migrated = new Set(
-        projects
-          .map((project) => project.id)
-          .filter((id) => !legacyCollapsed.includes(id)),
-      );
-      // 至少保留 chat，避免迁移后侧栏全空
-      if (projectIds.has(BUILTIN_CHAT_PROJECT_ID)) {
-        migrated.add(BUILTIN_CHAT_PROJECT_ID);
-      }
-      commitExpandedSidebarProjects(migrated);
-    } else {
-      // 修剪已删除项目 id，不自动展开新建项目，也不把用户主动折叠的 chat 加回来
-      const prev = expandedSidebarProjectsRef.current;
-      const pruned = new Set([...prev].filter((id) => projectIds.has(id)));
-      if (pruned.size !== prev.size || [...pruned].some((id) => !prev.has(id))) {
-        expandedSidebarProjectsRef.current = pruned;
-        setExpandedSidebarProjects(pruned);
-        saveExpandedSidebarProjectsToLocal(pruned);
-      }
-    }
-
-    // 按展开状态恢复会话列表
-    const expanded = expandedSidebarProjectsRef.current;
-    for (const project of projects) {
-      if (!expanded.has(project.id)) continue;
-      if (project.id in sessionsByProject) continue;
-      void refreshProjectSessions(project.id).catch(() => undefined);
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectIdsKey, commitExpandedSidebarProjects]);
-
-  // 展开集合变化时，为新展开且无缓存的项目补加载会话
-  useEffect(() => {
-    for (const project of projects) {
-      if (!expandedSidebarProjects.has(project.id)) continue;
-      if (project.id in sessionsByProject) continue;
-      void refreshProjectSessions(project.id).catch(() => undefined);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expandedSidebarProjects]);
-
-  useEffect(() => {
-    // 当禁用版本检测时，不启动定时和启动后的自动检测
-    if (settings.disableUpdateCheck) return;
-    const timer = window.setInterval(
-      () => void checkAppUpdate("auto"),
-      1000 * 60 * 60 * 6,
-    );
-    window.setTimeout(() => void checkAppUpdate("auto"), 5000);
-    return () => window.clearInterval(timer);
-  }, [settings.disableUpdateCheck]);
+  }, [projectIdsKey]);
 
   useEffect(() => {
     if (activeAgentId && !isPendingAgentId(activeAgentId))
@@ -3085,15 +2757,6 @@ export function App() {
     setSelectedSuggestionIndex(0);
   }, [suggestionItems.length]);
 
-  // 持久化会话来源过滤配置
-  useEffect(() => {
-    try {
-      saveSessionSourceFilter(sessionSourceFilter);
-    } catch (error) {
-      // 静默失败
-    }
-  }, [sessionSourceFilter]);
-
   // 追踪 agent 会话开始/结束时间,计算会话时长
   // 点击外部区域自动关闭会话组合下拉
   useEffect(() => {
@@ -3134,7 +2797,7 @@ export function App() {
     if (!activeProjectId) {
       setFiles([]);
       setSessions([]);
-      setBranchInfoByProject({});
+      resetBranchInfo();
       return;
     }
 
@@ -3171,313 +2834,12 @@ export function App() {
       .list(activeProjectId)
       .then(setFiles)
       .catch((error) => captureDebugLog(String(error)));
-    void api.git
-      .branches(activeProjectId)
-      .then((info) => {
-        setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: info }));
-      })
-      .catch(() =>
-        setBranchInfoByProject((prev) => ({
-          ...prev,
-          [activeProjectId]: { current: null, branches: [] },
-        })),
-      );
+    void refreshBranchInfo(activeProjectId);
   }, [activeProjectId, displayAgents.length]);
-
-  useEffect(() => {
-    if (!activeProjectId) return;
-    let stopped = false;
-    let timer: number | undefined;
-    const refreshGitInfo = async () => {
-      try {
-        const next = await api.git.branches(activeProjectId);
-        if (stopped) return;
-        // 分支可能在外部终端/IDE 中切换,轮询只在状态真的变化时更新,避免不必要重渲染。
-        setBranchInfoByProject((current) => {
-          const prev = current[activeProjectId] ?? { current: null, branches: [] };
-          return prev.current === next.current &&
-            prev.branches.join("\n") === next.branches.join("\n")
-            ? current
-            : { ...current, [activeProjectId]: next };
-        });
-      } catch {
-        if (!stopped) {
-          setBranchInfoByProject((current) => ({
-            ...current,
-            [activeProjectId]: { current: null, branches: [] },
-          }));
-        }
-      }
-    };
-    // 窗口可见时轮询分支信息；最小化/隐藏时停止 IPC 调用，避免无意义的 git 进程开销。
-    // 分支切换是低频操作，10s 间隔足够及时反映外部变更（原 4s 过于激进）。
-    const start = () => {
-      if (timer) return;
-      void refreshGitInfo();
-      timer = window.setInterval(refreshGitInfo, 10_000);
-    };
-    const stop = () => {
-      if (timer) {
-        window.clearInterval(timer);
-        timer = undefined;
-      }
-    };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
-    };
-    start();
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      stopped = true;
-      stop();
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [activeProjectId]);
-
-  async function checkPiInstall(source: "startup" | "manual" = "manual") {
-    setSettingsOpen(false);
-    setPiChecking(true);
-    setEnvironmentDialog(true);
-    try {
-      const next = await api.pi.check();
-      setPiStatus(next);
-      if (next.installed && source === "startup") {
-        // 首次启动检测通过后落盘,后续启动不再阻塞/打扰;用户仍可在设置里手动重新检测。
-        const saved = await api.settings.update({ piEnvironmentChecked: true });
-        setSettings(saved);
-        window.setTimeout(() => setEnvironmentDialog(false), 3000);
-      }
-      if (next.installed && source === "manual")
-        window.setTimeout(() => setEnvironmentDialog(false), 3000);
-    } finally {
-      setPiChecking(false);
-    }
-  }
-
-  async function checkPiInstallInline() {
-    setPiChecking(true);
-    setCustomPathResult(null);
-    try {
-      const next = await api.pi.check();
-      setPiStatus(next);
-      if (next.installed) {
-        const saved = await api.settings.update({ piEnvironmentChecked: true });
-        setSettings(saved);
-        showToast(
-          t("app.piCheckPassed", {
-            value: next.command ?? next.version ?? "omp",
-          }),
-        );
-      } else {
-        /* 检测失败时弹出环境检测弹框，方便用户查看安装指引 */
-        setSettingsOpen(false);
-        setEnvironmentDialog(true);
-        setPiStatus(next);
-      }
-    } finally {
-      setPiChecking(false);
-    }
-  }
-
-  /**
-   * 校验用户手动输入的 pi 路径。
-   * 主进程执行 command --version 验证后,通过则自动保存到 settings.customPiPath,
-   * 之后新建/重启 agent 时 PiProcess 会优先使用自定义路径。
-   */
-  async function validateCustomPiPath(
-    options: { closeDialogOnSuccess?: boolean } = {},
-  ) {
-    const path = customPiPath.trim();
-    if (!path) return;
-    setCustomPathValidating(true);
-    setCustomPathResult(null);
-    try {
-      const result = await api.pi.checkCustom(path);
-      setCustomPathResult(result);
-      if (result.installed) {
-        // 主进程会保存 PiLocator 归一化后的路径;这里重新读取,确保 UI 展示的是实际使用路径。
-        const updated = await api.settings.get();
-        setSettings(updated);
-        setCustomPiPath(updated.customPiPath ?? result.command ?? path);
-        setPiStatus(result);
-        showToast(
-          t("app.piPathSaved", {
-            path: result.command ?? updated.customPiPath ?? path,
-          }),
-        );
-        if (options.closeDialogOnSuccess) {
-          // 启动检测弹窗场景下保持原有成功后自动关闭体验;设置页内校验不关闭设置窗口。
-          window.setTimeout(() => setEnvironmentDialog(false), 3000);
-        }
-      } else {
-        showToast(
-          t("app.piPathValidateFailed", {
-            error: result.error ?? t("environment.unableToRun"),
-          }),
-        );
-      }
-    } finally {
-      setCustomPathValidating(false);
-    }
-  }
-
-  async function clearCustomPiPath() {
-    // 用户明确清除：标记为已触碰，避免后续检测结果自动回填
-    customPathTouchedRef.current = true;
-    const updated = await api.settings.update({ customPiPath: "" });
-    setSettings(updated);
-    setCustomPiPath("");
-    setCustomPathResult(null);
-    showToast(t("app.piPathCleared"));
-    const status = await api.pi.check();
-    setPiStatus(status);
-  }
-
-  /**
-   * 检查 npm 是否可用。
-   * 通过主进程执行 npm --version 检测系统中是否安装了 npm。
-   */
-  async function checkNpm() {
-    setNpmChecking(true);
-    try {
-      const result = await api.pi.checkNpm();
-      setNpmAvailable(result.available);
-      setNpmVersion(result.version);
-    } finally {
-      setNpmChecking(false);
-    }
-  }
-
-  /**
-   * 执行安装命令的 handler。
-   * 调用主进程执行命令，根据退出码判断成功/失败。
-   */
-  async function execInstallCommand() {
-    const cmd = installCommand.trim();
-    if (!cmd) return;
-    setInstallExecuting(true);
-    setInstallResult(null);
-    setInstallCompleted(false);
-    try {
-      const result = await api.pi.execInstall(cmd);
-      setInstallResult(result);
-      // 退出码 0 表示成功（npm install 成功时 exitCode 为 0）
-      if (result.success && result.exitCode === 0) {
-        setInstallCompleted(true);
-      }
-    } finally {
-      setInstallExecuting(false);
-    }
-  }
 
   /** 统一通知：使用 sonner toast 展示非模态消息 */
   function showToast(message: string, duration = 3500) {
     showNotice(message, duration);
-  }
-
-  async function downloadAppUpdate() {
-    const asset = updateInfo?.recommendedAsset;
-    if (!asset) {
-      await api.app.openExternal(updateInfo?.releaseUrl ?? appInfo.releasesUrl);
-      return;
-    }
-    setUpdateDownloading(true);
-    setDownloadedUpdatePath(null);
-    setUpdateProgress({
-      assetName: asset.name,
-      receivedBytes: 0,
-      totalBytes: asset.size,
-      percent: 0,
-      state: "downloading",
-    });
-    try {
-      const result = await api.app.downloadUpdate(asset);
-      setDownloadedUpdatePath(result.filePath);
-      showToast(t("update.downloadCompleted"));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setUpdateError(message);
-      showToast(t("update.downloadFailed"));
-    } finally {
-      setUpdateDownloading(false);
-    }
-  }
-
-  async function installDownloadedAppUpdate() {
-    if (!downloadedUpdatePath) return;
-    await api.app.installUpdate(downloadedUpdatePath);
-  }
-
-  async function checkPiCliUpdateOnStartup() {
-    if (settings.disableUpdateCheck) return;
-    try {
-      const result = await api.pi.checkUpdate();
-      setPiUpdateCheck(result);
-      if (result.hasUpdate) {
-        // 启动后后台提醒即可，不阻塞主界面；低版本 pi 可能缺少新版协议/工具能力。
-        const message = t("settings.piUpdateStartupNotice");
-        showToast(message, 6500);
-      }
-    } catch {
-      // 后台检查失败不打扰用户；设置页仍可手动检查并看到详细错误。
-    }
-  }
-
-  async function checkPiCliUpdate() {
-    if (settings.disableUpdateCheck) return;
-    setPiUpdateChecking(true);
-    try {
-      const result = await api.pi.checkUpdate();
-      setPiUpdateCheck(result);
-      showToast(result.error ? t("settings.piUpdateFailed", { error: result.error }) : result.hasUpdate ? t("settings.piUpdateAvailable") : t("settings.piUpdateChecked"));
-    } finally {
-      setPiUpdateChecking(false);
-    }
-  }
-
-  async function updatePiCli() {
-    setPiUpdating(true);
-    setPiUpdateResult(null);
-    try {
-      const result = await api.pi.update();
-      setPiUpdateResult(result);
-      await checkPiInstallInline();
-      setPiUpdateCheck(await api.pi.checkUpdate());
-      showToast(result.updated ? t("settings.piUpdateDone") : t("settings.piUpdateChecked"));
-    } catch (error) {
-      showToast(t("settings.piUpdateFailed", { error: error instanceof Error ? error.message : String(error) }));
-    } finally {
-      setPiUpdating(false);
-    }
-  }
-
-
-  async function checkAppUpdate(source: "auto" | "manual" = "manual") {
-    if (updateChecking) return;
-    if (source === "auto" && settings.disableUpdateCheck) return;
-    setUpdateChecking(true);
-    try {
-      const next = await api.app.checkUpdate();
-      if (next.hasUpdate) {
-        setUpdateInfo(next);
-      } else if (source === "manual") {
-        // 手动检查且无更新时,显示模态框提示
-        setUpToDateVersion(next.currentVersion);
-        showToast(
-          t("app.latestVersionNotice", { version: next.currentVersion }),
-        );
-      }
-    } catch (error) {
-      if (source === "manual") {
-        const message = error instanceof Error ? error.message : String(error);
-        showToast(t("app.updateFailedNotice", { error: message }));
-        setUpdateError(message);
-        showToast(t("app.updateFailed"));
-      }
-    } finally {
-      setUpdateChecking(false);
-    }
   }
 
   async function refreshProjects(): Promise<Project[]> {
@@ -3492,22 +2854,6 @@ export function App() {
       }
     }
     return next;
-  }
-
-  async function refreshWorktrees(projectId: string) {
-    try {
-      const [entries, branchInfo] = await Promise.all([
-        api.git.worktreeList(projectId),
-        api.git.branches(projectId).catch(() => ({ current: null, branches: [] })),
-      ]);
-      setWorktreesByProject((prev) => ({ ...prev, [projectId]: entries }));
-      setBranchInfoByProject((prev) => ({ ...prev, [projectId]: branchInfo }));
-      // 刷新项目列表（可能已有新注册的 worktree 子项目）
-      const next = await api.projects.list();
-      setProjects(next);
-    } catch {
-      setWorktreesByProject((prev) => ({ ...prev, [projectId]: [] }));
-    }
   }
 
   /** 刷新项目侧栏数据：根项目会话 + worktree 列表 + worktree 子项目会话。 */
@@ -3609,24 +2955,8 @@ export function App() {
 
   // 传给 memo 化子树的回调必须引用恒定：AssistantText/TurnRow/MessageListContent/ToolCard 的
   // memo 比较器按仓库约定不比较回调（回调行为与单条消息无关），所以只要引用变了，整窗消息
-  // 与工具卡片就会跟着 App 一起重渲染。上面这些 handler 是函数声明（每次渲染重建，且闭包
-  // 依赖 activeAgent/flatFiles/modifiedFiles 等），这里用 latest-ref 适配器把引用固定下来：
-  // 调用始终走最新实现（不会读到陈旧闭包），引用恒定则子树 memo 真正生效。
-  const latestHandlersRef = useRef({ openFilePath, diffFilePath, viewFilePath });
-  latestHandlersRef.current = { openFilePath, diffFilePath, viewFilePath };
-  const stableOpenFilePath = useCallback(
-    (path: string) => latestHandlersRef.current.openFilePath(path),
-    [],
-  );
-  const stableDiffFilePath = useCallback(
-    (path: string, originalContent?: string, content?: string) =>
-      latestHandlersRef.current.diffFilePath(path, originalContent, content),
-    [],
-  );
-  const stableViewFilePath = useCallback(
-    (path: string) => latestHandlersRef.current.viewFilePath(path),
-    [],
-  );
+  // 与工具卡片就会跟着 App 一起重渲染。useStableHandlers 固定引用、调用走最新实现。
+  const stableFileHandlers = useStableHandlers({ openFilePath, diffFilePath, viewFilePath });
 
   async function openWorkspaceFileDiff(group: GitResourceGroupType, path: string) {
     if (!activeProjectId) return;
@@ -4038,11 +3368,7 @@ export function App() {
       delete updated[removedProjectId];
       return updated;
     });
-    setVisibleProjectChildCountByProject((current) => {
-      const updated = { ...current };
-      delete updated[removedProjectId];
-      return updated;
-    });
+    forgetProject(removedProjectId);
     if (activeProjectId === removedProjectId) {
       setActiveProjectId(next[0]?.id);
       setActiveAgentId(undefined);
@@ -4535,9 +3861,9 @@ export function App() {
 
   async function compactAgent(compactPrompt?: string, agentId = activeAgentId) {
     if (!agentId || isPendingAgentId(agentId)) return;
-    // 按 agent 维度锁 compacting：避免全局 boolean 在切换会话时错绑状态，
+    // 按条目锁 compacting（composer 切片）：切换会话不会把忙碌态错绑到另一个 tab，
     // 也保证 /compact 与底栏按钮走同一条路径、同一套 busy/toast 语义。
-    setCompacting(true);
+    dispatchToAgent(agentId, composerActions.setCompacting(true));
     try {
       const state = await api.agents.compact(agentId, compactPrompt);
       applyAgentRuntimeState(agentId, state);
@@ -4558,7 +3884,7 @@ export function App() {
               : t("app.compactFailed");
       showToast(friendly, 6500);
     } finally {
-      setCompacting(false);
+      dispatchToAgent(agentId, composerActions.setCompacting(false));
     }
   }
 
@@ -4639,26 +3965,18 @@ export function App() {
   }
 
   function addUncertainPrompt(agentId: string, text: string, error?: string) {
-    const entry: UncertainPrompt = {
-      id: crypto.randomUUID(),
-      text,
-      error: error ?? t("app.queuedUnknown"),
-    };
-    setUncertainPrompts((current) => ({
-      ...current,
-      [agentId]: [...(current[agentId] ?? []), entry],
-    }));
+    dispatchToAgent(
+      agentId,
+      queueActions.append({
+        id: crypto.randomUUID(),
+        text,
+        error: error ?? t("app.queuedUnknown"),
+      }),
+    );
   }
 
   function dismissUncertainPrompt(agentId: string, promptId: string) {
-    setUncertainPrompts((current) => {
-      const next = (current[agentId] ?? []).filter((item) => item.id !== promptId);
-      if (next.length === 0) {
-        const { [agentId]: _removed, ...rest } = current;
-        return rest;
-      }
-      return { ...current, [agentId]: next };
-    });
+    dispatchToAgent(agentId, queueActions.dismiss(promptId));
   }
 
   /**
@@ -4925,7 +4243,8 @@ export function App() {
 
   const agentStarting = isAgentStarting(activeAgent);
   const composerDisabled = !activeAgent || agentStarting;
-  // isCompacting / 本地 compacting 也算 busy：压缩期间禁止再发消息，并显示停止区语义。
+  // isCompacting / 本条目 compact 在途也算 busy：压缩期间禁止再发消息，并显示停止区语义。
+  const compacting = activeWorkspaceComposer?.compacting ?? false;
   const isAgentBusy = Boolean(
     activeAgent &&
     (agentBusy(activeAgent, activeRuntimeState) ||
@@ -5874,7 +5193,7 @@ export function App() {
       }
       // WSL/Windows pi 源切换：重新检测 pi 环境、刷新项目和会话列表
       if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
-        void api.pi.check().then((next) => setPiStatus(next)).catch(() => undefined);
+        void piEnv.refreshStatus();
         void api.agents.list().then(setAgents).catch(() => undefined);
         void api.projects.list().then(setProjects).catch(() => undefined);
         if (activeProjectId) {
@@ -5933,7 +5252,7 @@ export function App() {
     setSwitchingBranch(branch);
     try {
       const next = await api.git.checkout(activeProjectId, branch);
-      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: next }));
+      setBranchInfo(activeProjectId, next);
       return next;
     } catch (error) {
       showToast(
@@ -5942,10 +5261,7 @@ export function App() {
         }),
       );
       // 失败后主动刷新一次,覆盖 git 拒绝切换或外部同时切换导致的 UI 状态偏差。
-      const refreshed = await api.git
-        .branches(activeProjectId)
-        .catch(() => ({ current: null, branches: [] }));
-      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: refreshed }));
+      const refreshed = await refreshBranchInfo(activeProjectId);
       return refreshed;
     } finally {
       setSwitchingBranch(null);
@@ -5957,7 +5273,7 @@ export function App() {
     setSwitchingBranch(branchName);
     try {
       const next = await api.git.createBranch(activeProjectId, branchName);
-      setBranchInfoByProject((prev) => ({ ...prev, [activeProjectId]: next }));
+      setBranchInfo(activeProjectId, next);
       showToast(t("app.branchCreated", { branch: branchName }), 2500);
       return next;
     } catch (error) {
@@ -5972,38 +5288,14 @@ export function App() {
     }
   }
 
-  // 传给 memo 化 GitPanel 的回调同样必须引用恒定（理由见 latestHandlersRef 注释）：
+  // 传给 memo 化 GitPanel 的回调同样必须引用恒定（理由见 stableFileHandlers）：
   // 面板内是数千行资源列表，回调引用一变整块列表就会重渲染。
-  const latestGitHandlersRef = useRef({
+  const stableGitHandlers = useStableHandlers({
     openCommitFileDiff,
     openWorkspaceFileDiff,
     switchBranch,
     createBranch,
   });
-  latestGitHandlersRef.current = {
-    openCommitFileDiff,
-    openWorkspaceFileDiff,
-    switchBranch,
-    createBranch,
-  };
-  const stableOpenCommitFileDiff = useCallback(
-    (commit: CommitEntry, file: GitChangedFile) =>
-      latestGitHandlersRef.current.openCommitFileDiff(commit, file),
-    [],
-  );
-  const stableOpenWorkspaceFileDiff = useCallback(
-    (group: GitResourceGroupType, path: string) =>
-      latestGitHandlersRef.current.openWorkspaceFileDiff(group, path),
-    [],
-  );
-  const stableSwitchBranch = useCallback(
-    (branch: string) => latestGitHandlersRef.current.switchBranch(branch),
-    [],
-  );
-  const stableCreateBranch = useCallback(
-    (branchName: string) => latestGitHandlersRef.current.createBranch(branchName),
-    [],
-  );
 
   /** 创建新的 git worktree 工作区 */
   async function createWorktree(projectId: string, branchName: string) {
@@ -6323,10 +5615,9 @@ export function App() {
     setDrawerCollapsed(false);
   };
 
-  // SidebarTree 是 memo 边界，但这些处理函数每次 App 渲染都会重新声明；
-  // 直接把函数传进去会让浅比较恒失败，流式/输入等无关更新都会重算整棵侧栏。
-  // 通过 ref 转发到最新实现，保持传入引用的恒定（与 GitPanel 的 stable* 同策略）。
-  const latestSidebarHandlersRef = useRef({
+  // SidebarTree 是 memo 边界：侧栏处理函数每帧重建会让浅比较恒失败，
+  // 流式/输入等无关更新都会重算整棵侧栏。useStableHandlers 一行固定全部引用。
+  const stableSidebarHandlers = useStableHandlers({
     addProject,
     toggleListCollapsed,
     setProjectSidebarExpanded,
@@ -6345,78 +5636,6 @@ export function App() {
     adjustMenuPos,
     openHomepageInBrowser: handleOpenHomepageInBrowser,
   });
-  latestSidebarHandlersRef.current = {
-    addProject,
-    toggleListCollapsed,
-    setProjectSidebarExpanded,
-    handleProjectDragStart,
-    handleProjectDragOver,
-    handleProjectDragLeave,
-    handleProjectDrop,
-    finishProjectDrag,
-    refreshProjectSessions,
-    ensureAgentMessagesLoaded,
-    openSidebarSession,
-    createAgent,
-    showToast,
-    requestRemoveWorktree,
-    toggleSubagentGroup,
-    adjustMenuPos,
-    openHomepageInBrowser: handleOpenHomepageInBrowser,
-  };
-  const stableSidebarHandlers = useMemo(
-    () => ({
-      addProject: () => latestSidebarHandlersRef.current.addProject(),
-      toggleListCollapsed: () => latestSidebarHandlersRef.current.toggleListCollapsed(),
-      setProjectSidebarExpanded: (projectId: string, forceExpand?: boolean) =>
-        latestSidebarHandlersRef.current.setProjectSidebarExpanded(projectId, forceExpand),
-      handleProjectDragStart: (
-        event: React.DragEvent<HTMLButtonElement>,
-        projectId: string,
-      ) => latestSidebarHandlersRef.current.handleProjectDragStart(event, projectId),
-      handleProjectDragOver: (
-        event: React.DragEvent<HTMLButtonElement>,
-        projectId: string,
-      ) => latestSidebarHandlersRef.current.handleProjectDragOver(event, projectId),
-      handleProjectDragLeave: (projectId: string) =>
-        latestSidebarHandlersRef.current.handleProjectDragLeave(projectId),
-      handleProjectDrop: (
-        event: React.DragEvent<HTMLButtonElement>,
-        targetProjectId: string,
-      ) => latestSidebarHandlersRef.current.handleProjectDrop(event, targetProjectId),
-      finishProjectDrag: () => latestSidebarHandlersRef.current.finishProjectDrag(),
-      refreshProjectSessions: (projectId: string, silent?: boolean) =>
-        latestSidebarHandlersRef.current.refreshProjectSessions(projectId, silent),
-      ensureAgentMessagesLoaded: (agentId: string) =>
-        latestSidebarHandlersRef.current.ensureAgentMessagesLoaded(agentId),
-      openSidebarSession: (projectId: string, session: SessionSummary) =>
-        latestSidebarHandlersRef.current.openSidebarSession(projectId, session),
-      createAgent: (
-        projectId?: string,
-        sessionPath?: string,
-        title?: string,
-        noSession?: boolean,
-      ) => latestSidebarHandlersRef.current.createAgent(projectId, sessionPath, title, noSession),
-      showToast: (message: string, duration?: number) =>
-        latestSidebarHandlersRef.current.showToast(message, duration),
-      requestRemoveWorktree: (
-        parentProjectId: string,
-        worktreePath: string,
-        childProject: Project | undefined,
-      ) =>
-        latestSidebarHandlersRef.current.requestRemoveWorktree(
-          parentProjectId,
-          worktreePath,
-          childProject,
-        ),
-      toggleSubagentGroup: (key: string) =>
-        latestSidebarHandlersRef.current.toggleSubagentGroup(key),
-      adjustMenuPos: (x: number, y: number, width?: number, height?: number) =>
-        latestSidebarHandlersRef.current.adjustMenuPos(x, y, width, height),
-      openHomepageInBrowser: () => latestSidebarHandlersRef.current.openHomepageInBrowser(),
-    }),
-    [],
-  );
 
   return (
     <div
@@ -6551,7 +5770,7 @@ export function App() {
         setAgentMenu={setAgentMenu}
         setSessionFilterOpen={setSessionFilterOpen}
         setWorktreeCreateDialog={setWorktreeCreateDialog}
-        setVisibleProjectChildCountByProject={setVisibleProjectChildCountByProject}
+        showMoreProjectChildren={showMoreProjectChildren}
         setCollapsedWorktrees={setCollapsedWorktrees}
         setExpandedWorktreeSessions={setExpandedWorktreeSessions}
         setActiveProjectId={setActiveProjectId}
@@ -6771,8 +5990,8 @@ export function App() {
             void createAgent();
           }}
           onPreviewImage={setPreviewImage}
-          onOpenFile={stableOpenFilePath}
-          onDiffFile={stableDiffFilePath}
+          onOpenFile={stableFileHandlers.openFilePath}
+          onDiffFile={stableFileHandlers.diffFilePath}
           onEditMessage={editMessage}
           onDeleteMessage={deleteMessage}
           onForkMessage={forkFromUserMessage}
@@ -6811,7 +6030,7 @@ export function App() {
             const entries = Object.entries(activeExtensionWidgets);
             const widgetSessionKey = getAgentSessionStorageKey(activeAgent, activeAgentId);
             const isDismissed = (key: string) =>
-              Boolean(widgetSessionKey && agentDismissedWidgets[widgetSessionKey]?.includes(key));
+              isWidgetDismissed(agentDismissedWidgets, widgetSessionKey, key);
             const visibleEntries = entries.filter(([key]) => !isDismissed(key));
             if (widgetsCollapsed || visibleEntries.length === 0) return null;
 
@@ -6840,22 +6059,7 @@ export function App() {
             ].filter((s): s is { key: string; label: string; lines: string[] } => Boolean(s));
 
             const dismissKeys = (keys: string[]) => {
-              if (!widgetSessionKey || keys.length === 0) return;
-              setAgentDismissedWidgets((prev) => {
-                const current = prev[widgetSessionKey] ?? [];
-                const merged = [...current];
-                let changed = false;
-                for (const key of keys) {
-                  if (!merged.includes(key)) {
-                    merged.push(key);
-                    changed = true;
-                  }
-                }
-                if (!changed) return prev;
-                const next = { ...prev, [widgetSessionKey]: merged };
-                saveDismissedExtensionWidgets(next);
-                return next;
-              });
+              setAgentDismissedWidgets((prev) => dismissWidgetKeys(prev, widgetSessionKey, keys));
             };
 
             return (
@@ -7084,24 +6288,12 @@ export function App() {
               onCancel={() => {
                 if (!activeUiAsk.requestId || !activeAgentId) return;
                 showToast(t("ask.cancelBatchHint"));
-                setActiveUiRequest((current) => {
-                  if (!current) return null;
-                  const next = { ...current };
-                  delete next[activeUiAsk.requestId];
-                  if (Object.keys(next).length === 0) return null;
-                  return next;
-                });
+                dispatchToAgent(activeAgentId, uiRequestActions.remove(activeUiAsk.requestId));
                 api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
               }}
               onSubmit={(answers) => {
                 if (!activeUiAsk.requestId || !activeAgentId) return;
-                setActiveUiRequest((current) => {
-                  if (!current) return null;
-                  const next = { ...current };
-                  delete next[activeUiAsk.requestId];
-                  if (Object.keys(next).length === 0) return null;
-                  return next;
-                });
+                dispatchToAgent(activeAgentId, uiRequestActions.remove(activeUiAsk.requestId));
                 api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { answers });
               }}
             />
@@ -7116,25 +6308,13 @@ export function App() {
                 if (activeUiAsk.requestId && activeAgentId) {
                   // 与单问一致：关闭问卷时给明确 toast，避免静默取消。
                   showToast(t("ask.cancelBatchHint"));
-                  setActiveUiRequest((current) => {
-                    if (!current) return null;
-                    const next = { ...current };
-                    delete next[activeUiAsk.requestId];
-                    if (Object.keys(next).length === 0) return null;
-                    return next;
-                  });
+                  dispatchToAgent(activeAgentId, uiRequestActions.remove(activeUiAsk.requestId));
                   api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
                 }
               }}
               onSubmit={(answersJson: string) => {
                 if (activeUiAsk.requestId && activeAgentId) {
-                  setActiveUiRequest((current) => {
-                    if (!current) return null;
-                    const next = { ...current };
-                    delete next[activeUiAsk.requestId];
-                    if (Object.keys(next).length === 0) return null;
-                    return next;
-                  });
+                  dispatchToAgent(activeAgentId, uiRequestActions.remove(activeUiAsk.requestId));
                   api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value: answersJson });
                 }
               }}
@@ -7182,13 +6362,7 @@ export function App() {
 
             const dismissAsk = () => {
               if (!activeUiAsk.requestId || !activeAgentId) return;
-              setActiveUiRequest((current) => {
-                if (!current) return null;
-                const next = { ...current };
-                delete next[activeUiAsk.requestId];
-                if (Object.keys(next).length === 0) return null;
-                return next;
-              });
+              dispatchToAgent(activeAgentId, uiRequestActions.remove(activeUiAsk.requestId));
             };
             const respondValue = (value: string) => {
               if (!activeUiAsk.requestId || !activeAgentId) return;
@@ -7797,7 +6971,7 @@ export function App() {
         </footer>
         )}
 
-        {!isLanWeb && !settingsOpen && !configOpen && !environmentDialog && terminalDockVisible && (
+        {!isLanWeb && !settingsOpen && !configOpen && !piEnv.dialogOpen && terminalDockVisible && (
           <Suspense
             fallback={
               // 首次打开终端时 xterm chunk 从磁盘加载（本地瞬时）；用同尺寸占位
@@ -7979,11 +7153,11 @@ export function App() {
                           projectId={activeProjectId}
                           projectRoot={activeProject?.path}
                           git={api.git}
-                          onOpenCommitFileDiff={stableOpenCommitFileDiff}
-                          onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
+                          onOpenCommitFileDiff={stableGitHandlers.openCommitFileDiff}
+                          onOpenWorkspaceFileDiff={stableGitHandlers.openWorkspaceFileDiff}
                           initialBranchInfo={activeGitInfo}
-                          onSwitchBranch={stableSwitchBranch}
-                          onCreateBranch={stableCreateBranch}
+                          onSwitchBranch={stableGitHandlers.switchBranch}
+                          onCreateBranch={stableGitHandlers.createBranch}
                         />
                       </Suspense>
                     </div>
@@ -8066,8 +7240,8 @@ export function App() {
                           const p = projects.find((p) => p.id === activeProjectId);
                           if (p) void api.files.open(p.path);
                         }}
-                        onViewFile={stableViewFilePath}
-                        onOpenFile={stableOpenFilePath}
+                        onViewFile={stableFileHandlers.viewFilePath}
+                        onOpenFile={stableFileHandlers.openFilePath}
                         onDropFiles={(targetDir, fileList) => {
                           const paths: string[] = [];
                           for (let i = 0; i < fileList.length; i++) {
@@ -8683,83 +7857,37 @@ export function App() {
           />
         </Suspense>
       )}
-      {environmentDialog && (
+      {piEnv.dialogOpen && (
         <Suspense fallback={null}>
         <EnvironmentDialog
-          status={piStatus}
-          checking={piChecking}
-          onClose={() => {
-            setEnvironmentDialog(false);
-            setCustomPathResult(null);
-            // 关闭时重置安装状态
-            setInstallResult(null);
-            setInstallCompleted(false);
-            setNpmAvailable(null);
-          }}
-          onRecheck={() => {
-            setCustomPathResult(null);
-            setNpmAvailable(null);
-            setNpmVersion(undefined);
-            setInstallResult(null);
-            setInstallCompleted(false);
-            setInstallUseMirror(false);
-            checkPiInstall("manual");
-          }}
+          status={piEnv.status}
+          checking={piEnv.checking}
+          onClose={piEnv.closeDialog}
+          onRecheck={() => void piEnv.recheck()}
           onOpenInstallDocs={() =>
             api.app.openExternal(
               "https://pi.dev/docs/latest/quickstart#install",
             )
           }
-          customPath={customPiPath}
-          customPathValidating={customPathValidating}
-          customPathResult={customPathResult}
-          onCustomPathChange={(path) => {
-            customPathTouchedRef.current = true;
-            setCustomPiPath(path);
-            setCustomPathResult(null);
-          }}
+          customPath={piEnv.customPath}
+          customPathValidating={piEnv.customPathValidating}
+          customPathResult={piEnv.customPathResult}
+          onCustomPathChange={piEnv.setCustomPath}
           onValidateCustomPath={() =>
-            validateCustomPiPath({ closeDialogOnSuccess: true })
+            void piEnv.validateCustomPath({ closeDialogOnSuccess: true })
           }
-          npmAvailable={npmAvailable}
-          npmVersion={npmVersion}
-          npmChecking={npmChecking}
-          installCommand={installCommand}
-          installUseMirror={installUseMirror}
-          installExecuting={installExecuting}
-          installResult={installResult}
-          installCompleted={installCompleted}
-          onCheckNpm={checkNpm}
-          onInstallCommandChange={(cmd) => {
-            setInstallCommand(cmd);
-            setInstallResult(null);
-            setInstallCompleted(false);
-          }}
-          onToggleInstallMirror={() => {
-            setInstallUseMirror((prev) => {
-              // 切换镜像，同时更新命令文本
-              if (prev) {
-                // 移除镜像
-                setInstallCommand((cmd) =>
-                  cmd.replace(
-                    /\s+--registry=https:\/\/registry\.npmmirror\.com/g,
-                    "",
-                  ),
-                );
-              } else {
-                // 添加镜像
-                setInstallCommand((cmd) =>
-                  cmd.includes("--registry=")
-                    ? cmd
-                    : cmd + " --registry=https://registry.npmmirror.com",
-                );
-              }
-              return !prev;
-            });
-            setInstallResult(null);
-            setInstallCompleted(false);
-          }}
-          onExecInstall={execInstallCommand}
+          npmAvailable={piEnv.npmAvailable}
+          npmVersion={piEnv.npmVersion}
+          npmChecking={piEnv.npmChecking}
+          installCommand={piEnv.installCommand}
+          installUseMirror={piEnv.installUseMirror}
+          installExecuting={piEnv.installExecuting}
+          installResult={piEnv.installResult}
+          installCompleted={piEnv.installCompleted}
+          onCheckNpm={() => void piEnv.checkNpm()}
+          onInstallCommandChange={piEnv.setInstallCommand}
+          onToggleInstallMirror={piEnv.toggleInstallMirror}
+          onExecInstall={() => void piEnv.execInstallCommand()}
           onRestartApp={() => api.app.restart()}
           onClearCheckFlag={async () => {
             await api.settings.update({ piEnvironmentChecked: false });
@@ -8837,29 +7965,25 @@ export function App() {
         <SettingsModal
           settings={settings}
           initialTab={settingsInitialTab ?? undefined}
-          piStatus={piStatus}
-          piChecking={piChecking}
+          piStatus={piEnv.status}
+          piChecking={piEnv.checking}
           piProxyChecking={piProxyChecking}
           piProxyNotice={piProxyNotice}
           piProxyNoticeTone={piProxyNoticeTone}
           webServiceChanging={webServiceChanging}
           appInfo={appInfo}
-          customPiPath={customPiPath}
-          customPathValidating={customPathValidating}
-          customPathResult={customPathResult}
-          updateChecking={updateChecking}
-          piUpdating={piUpdating}
-          piUpdateChecking={piUpdateChecking}
-          piUpdateCheck={piUpdateCheck}
-          piUpdateResult={piUpdateResult}
-          onCustomPathChange={(path) => {
-            customPathTouchedRef.current = true;
-            setCustomPiPath(path);
-            setCustomPathResult(null);
-          }}
-          onValidateCustomPath={() => validateCustomPiPath()}
-          onClearCustomPath={clearCustomPiPath}
-          onCheckPi={checkPiInstallInline}
+          customPiPath={piEnv.customPath}
+          customPathValidating={piEnv.customPathValidating}
+          customPathResult={piEnv.customPathResult}
+          updateChecking={appUpdate.checking}
+          piUpdating={piUpdate.updating}
+          piUpdateChecking={piUpdate.checking}
+          piUpdateCheck={piUpdate.lastCheck}
+          piUpdateResult={piUpdate.lastResult}
+          onCustomPathChange={piEnv.setCustomPath}
+          onValidateCustomPath={() => void piEnv.validateCustomPath()}
+          onClearCustomPath={() => void piEnv.clearCustomPath()}
+          onCheckPi={() => void piEnv.checkInline()}
           onTestPiProxy={() => testPiProxy()}
           onCheckUpdate={() => checkAppUpdate("manual")}
           onCheckPiUpdate={checkPiCliUpdate}
@@ -8899,40 +8023,44 @@ export function App() {
           />
         </Suspense>
       )}
-      {updateInfo && (
+      {appUpdate.info && (
         <UpdateModal
-          info={updateInfo}
-          checking={updateChecking}
-          downloading={updateDownloading}
-          progress={updateProgress}
-          downloadedPath={downloadedUpdatePath}
-          onClose={() => setUpdateInfo(null)}
-          onOpenRelease={() => api.app.openExternal(updateInfo.releaseUrl)}
+          info={appUpdate.info}
+          checking={appUpdate.checking}
+          downloading={appUpdate.downloading}
+          progress={appUpdate.progress}
+          downloadedPath={appUpdate.downloadedPath}
+          onClose={updates.dismissAppUpdateInfo}
+          onOpenRelease={() =>
+            void api.app.openExternal(appUpdate.info?.releaseUrl ?? appInfo.releasesUrl)
+          }
           onDownload={() => void downloadAppUpdate()}
           onInstall={() => void installDownloadedAppUpdate()}
           onBrowserDownload={() =>
-            api.app.openExternal(
-              updateInfo.recommendedAsset?.url ?? updateInfo.releaseUrl,
+            void api.app.openExternal(
+              appUpdate.info?.recommendedAsset?.url ??
+                appUpdate.info?.releaseUrl ??
+                appInfo.releasesUrl,
             )
           }
         />
       )}
-      {updateError && (
+      {appUpdate.error && (
         <Suspense fallback={null}>
         <UpdateErrorModalLazy
-          message={updateError}
+          message={appUpdate.error}
           releasesUrl={appInfo.releasesUrl}
-          onClose={() => setUpdateError(null)}
+          onClose={updates.dismissAppUpdateError}
           onOpenRelease={() => api.app.openExternal(appInfo.releasesUrl, true)}
         />
       </Suspense>
       )}
-      {upToDateVersion && (
+      {appUpdate.upToDateVersion && (
         <Suspense fallback={null}>
         <UpToDateModalLazy
-          version={upToDateVersion}
+          version={appUpdate.upToDateVersion}
           releasesUrl={appInfo.releasesUrl}
-          onClose={() => setUpToDateVersion(null)}
+          onClose={updates.dismissUpToDate}
           onOpenRelease={() => api.app.openExternal(appInfo.releasesUrl, true)}
         />
       </Suspense>

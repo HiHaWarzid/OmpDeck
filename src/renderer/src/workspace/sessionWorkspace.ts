@@ -3,11 +3,13 @@ import {
 	extensionWidgetsSlice,
 	type ExtensionWidgetState,
 } from "./slices/extensionWidgetsSlice";
+import { queueSlice, type QueueState } from "./slices/queueSlice";
 import { rpcLogSlice, type RpcLogState } from "./slices/rpcLogSlice";
 import { runtimeSlice, type RuntimeState } from "./slices/runtimeSlice";
 import { subagentsSlice, type SubagentsState } from "./slices/subagentsSlice";
 import { thinkingSlice, type ThinkingState } from "./slices/thinkingSlice";
 import { transcriptSlice, type TranscriptState } from "./slices/transcriptSlice";
+import { uiRequestSlice, type UiRequestState } from "./slices/uiRequestSlice";
 
 /**
  * 会话工作区（SessionWorkspace）——渲染层深模块核心（切片 0，纯逻辑，零 React）。
@@ -85,6 +87,8 @@ export const workspaceSlices = {
   runtime: runtimeSlice,
   subagents: subagentsSlice,
   extensionWidgets: extensionWidgetsSlice,
+  queue: queueSlice,
+  uiRequest: uiRequestSlice,
 } as const;
 
 type Slices = typeof workspaceSlices;
@@ -101,6 +105,8 @@ export type SliceStateMap = {
   runtime: RuntimeState;
   subagents: SubagentsState;
   extensionWidgets: ExtensionWidgetState;
+  queue: QueueState;
+  uiRequest: UiRequestState;
 };
 
 /** 切片名（manifest 的键集合）：订阅与读取都按它定位。 */
@@ -203,6 +209,8 @@ function seedEntryData(kind: EntryKind): EntryData {
     runtime: runtimeSlice.seed(kind),
     subagents: subagentsSlice.seed(kind),
     extensionWidgets: extensionWidgetsSlice.seed(kind),
+    queue: queueSlice.seed(kind),
+    uiRequest: uiRequestSlice.seed(kind),
   } as EntryData;
 }
 

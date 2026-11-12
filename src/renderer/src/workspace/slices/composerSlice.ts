@@ -16,11 +16,19 @@ export interface ComposerState {
   mode: ComposerAgentMode;
   /** 用户在该条目忙碌期间是否已开始撰写（驱动分段发送控件显隐）。 */
   busyDraft: boolean;
+  /**
+   * 该条目正在执行上下文压缩（/compact 请求在途）。
+   * 与 runtime 快照的 isCompacting 互补：后者要等压缩结果回来才更新，
+   * 这段在途窗口也需要锁住发送区，且必须按条目锁——原实现是根级 boolean，
+   * 压缩 A 时切到 B 会把 B 也显示成忙碌。
+   */
+  compacting: boolean;
 }
 
 export type ComposerAction =
   | { type: "composer/setMode"; mode: ComposerAgentMode }
-  | { type: "composer/setBusyDraft"; busyDraft: boolean };
+  | { type: "composer/setBusyDraft"; busyDraft: boolean }
+  | { type: "composer/setCompacting"; compacting: boolean };
 
 export const composerActions = {
   setMode: (mode: ComposerAgentMode): ComposerAction => ({
@@ -31,6 +39,10 @@ export const composerActions = {
     type: "composer/setBusyDraft",
     busyDraft,
   }),
+  setCompacting: (compacting: boolean): ComposerAction => ({
+    type: "composer/setCompacting",
+    compacting,
+  }),
 };
 
 export const composerSlice = {
@@ -38,7 +50,7 @@ export const composerSlice = {
 
   seed(_kind: EntryKind): ComposerState {
     // 默认 normal；历史会话恢复时由上层按需 setMode（plan 模式不落盘）
-    return { mode: "normal", busyDraft: false };
+    return { mode: "normal", busyDraft: false, compacting: false };
   },
 
   reduce(state: ComposerState, action: WorkspaceAction): ComposerState {
@@ -53,6 +65,13 @@ export const composerSlice = {
           { type: "composer/setBusyDraft" }
         >;
         return state.busyDraft === busyDraft ? state : { ...state, busyDraft };
+      }
+      case "composer/setCompacting": {
+        const { compacting } = action as Extract<
+          ComposerAction,
+          { type: "composer/setCompacting" }
+        >;
+        return state.compacting === compacting ? state : { ...state, compacting };
       }
       default:
         return state; // 非本切片动作：原引用，引用相等即"无变更"

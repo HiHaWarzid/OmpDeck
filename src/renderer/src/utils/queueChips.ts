@@ -18,7 +18,7 @@ export type QueuePanelRow =
  */
 export function buildQueueRows(
 	queued: AgentQueuedMessages | undefined,
-	uncertain?: UncertainPrompt[],
+	uncertain?: readonly UncertainPrompt[],
 ): QueuePanelRow[] {
 	const rows: QueuePanelRow[] = [];
 	const pushQueue = (
