@@ -31,6 +31,7 @@ import { showNotice } from "../../../utils/notice";
 import { writeClipboard } from "../../../utils/clipboard";
 import type { ChatMessage, ImageContent, TodoItem } from "../../../../../shared/types";
 import { extractTodoItems, isTodoWriteToolName } from "../../../../../shared/todo";
+import { toolArgSummary } from "../../../../../shared/sessionDisplayContract";
 import { formatDuration, stripAnsi } from "../format";
 import type { DiffFileHandler } from "../types";
 
@@ -58,46 +59,12 @@ function toolIcon(toolName: string): ReactNode {
 	return <Wrench size={15} />;
 }
 /** 从工具消息 meta 中提取副标题（文件路径或命令），让 trigger 行能体现工具作用对象。
- *  pi 的工具参数可能是对象，也可能已被主进程截断/序列化为 JSON 字符串；两种格式都要兼容，否则 bash 命令摘要会丢失。 */
+ *  参数键优先级由 shared/sessionDisplayContract 统一定义，手机端拿到的是
+ *  服务端用同一函数算好的 meta.summary，避免两端对同一工具显示不同对象。 */
 function getToolSubtitle(message: ChatMessage): string {
-	const meta = message.meta;
-	if (!meta) return "";
-	// 优先从 args 取参数（pi 工具事件的标准结构）
-	const args = parseToolArgs(meta.args);
-	if (args) {
-		for (const key of [
-			// 文件操作类
-			"filePath", "file_path", "path", "file",
-			// bash/shell 命令
-			"command",
-			// 搜索/查询类（grep、web_search 等）
-			"pattern", "query", "queries",
-			// 网络获取类（fetch_content 等）
-			"url", "urls",
-			// 待办事项类（todo 等）
-			"action", "text",
-		]) {
-			const v = args[key];
-			if (typeof v === "string" && v) return v;
-			// queries 和 urls 是数组，取第一条
-			if (Array.isArray(v) && v.length > 0 && typeof v[0] === "string") return v[0];
-		}
-	}
-	// 兼容历史平铺写法
-	const path = meta.path;
-	if (typeof path === "string" && path) return path;
-	const command = meta.command;
-	if (typeof command === "string" && command) return command;
-	const file = meta.file;
-	if (typeof file === "string" && file) return file;
-	// 兜底：取 args 中第一个非空字符串值
-	if (args && typeof args === "object") {
-		for (const val of Object.values(args as Record<string, unknown>)) {
-			if (typeof val === "string" && val) return val;
-		}
-	}
-	return "";
+	return toolArgSummary(message.meta?.args, message.meta) ?? "";
 }
+
 function getToolArgFilePath(args: Record<string, unknown> | undefined): string | undefined {
 	return getToolFilePath(args);
 }

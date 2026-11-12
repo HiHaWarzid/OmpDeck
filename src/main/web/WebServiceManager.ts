@@ -21,6 +21,10 @@ import type {
 import type { PiDesktopApi } from "../../shared/api";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import {
+	compactChatMessage,
+	isTopLevelSessionSummary,
+} from "../../shared/sessionDisplayContract";
+import {
 	ensureWebTokenState,
 	extractRequestToken,
 	webTokenPatch,
@@ -49,9 +53,7 @@ function hasForwardedHeaders(request: IncomingMessage): boolean {
 	);
 }
 
-/** compact 轮询只回传折叠内容预览；完整内容走单条消息详情端点。 */
-const COMPACT_TOOL_TEXT_LIMIT = 1024;
-const COMPACT_THINKING_LIMIT = 800;
+/** 展示推导（顶层过滤、compact 截断、工具摘要）统一在 shared SessionDisplayContract，见该模块注释。 */
 
 type WebServiceSettings = Pick<
 	AppSettings,
@@ -153,10 +155,7 @@ type _WebAgentDepsDriftGuard = {
 } extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
-/** 与手机端 isTopLevelSession 保持同一规则：扩展 worker/reviewer 会话不占首页。 */
-function isTopLevelSessionSummary(session: SessionSummary): boolean {
-	return !session.parentSessionPath && !session.codexParentThreadId && session.codexThreadSource !== "subagent";
-}
+/** 顶层会话规则已收口到 shared/sessionDisplayContract（服务端与手机首页同一实现）。 */
 
 /**
  * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 1000ms
@@ -451,7 +450,7 @@ export class WebServiceManager {
 				const lengthParam = url.searchParams.get("length");
 				const length = lengthParam === null ? null : Number(lengthParam);
 				const payload = (list: ChatMessage[]) =>
-					compact ? list.map((message) => this.compactMessage(message)) : list;
+					compact ? list.map((message) => compactChatMessage(message)) : list;
 				const base = {
 					total: messages.length,
 					...(tail === null ? {} : { tail }),
@@ -563,7 +562,7 @@ export class WebServiceManager {
 					request,
 					response,
 					compact
-						? { ...page, messages: page.messages.map((message) => this.compactMessage(message)) }
+						? { ...page, messages: page.messages.map((message) => compactChatMessage(message)) }
 						: page,
 				);
 				return;
@@ -936,34 +935,6 @@ export class WebServiceManager {
 		if (bucket.count > MUTATION_RATE_LIMIT_PER_MINUTE) {
 			throw new HttpError(429, "请求过于频繁，请稍后再试", "rate_limited");
 		}
-	}
-
-	/**
-	 * compact 轮询只裁剪折叠内容：tool 输出和 thinking 通常最长，但展开后仍需
-	 * 完整文本，所以这里只改返回副本，不触碰 AgentManager 的原消息对象。
-	 * meta 上的 hasMore/thinkingHasMore 由手机端用来显示“展开完整内容”。
-	 */
-	private compactMessage(message: ChatMessage): ChatMessage {
-		let next = message;
-		if (message.role === "tool" && message.text.length > COMPACT_TOOL_TEXT_LIMIT) {
-			next = {
-				...next,
-				text: message.text.slice(0, COMPACT_TOOL_TEXT_LIMIT),
-				meta: { ...(next.meta ?? {}), hasMore: true, fullLength: message.text.length },
-			};
-		}
-		if (typeof message.thinking === "string" && message.thinking.length > COMPACT_THINKING_LIMIT) {
-			next = {
-				...next,
-				thinking: message.thinking.slice(0, COMPACT_THINKING_LIMIT),
-				meta: {
-					...(next.meta ?? {}),
-					thinkingHasMore: true,
-					fullThinkingLength: message.thinking.length,
-				},
-			};
-		}
-		return next;
 	}
 
 	/**

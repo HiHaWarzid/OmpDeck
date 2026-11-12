@@ -22,14 +22,21 @@ const agent: AgentTab = {
 } as AgentTab;
 
 const messages: ChatMessage[] = [
-	{ id: "m1", agentId: agent.id, role: "user", text: "hello", timestamp: 1 },
+	{
+		id: "m1",
+		agentId: agent.id,
+		role: "user",
+		text: "hello",
+		timestamp: 1,
+		meta: { streamingBehavior: "followUp" },
+	},
 	{
 		id: "m2",
 		agentId: agent.id,
 		role: "tool",
 		text: "x".repeat(2048),
 		timestamp: 2,
-		meta: { toolName: "bash" },
+		meta: { toolName: "bash", args: { command: "npm test" } },
 	},
 	{
 		id: "m3",
@@ -264,6 +271,9 @@ describe("手机端消息增量契约", () => {
 		expect(tool.meta).toMatchObject({ hasMore: true, fullLength: 2048 });
 		expect(assistant.thinking).toHaveLength(800);
 		expect(assistant.meta).toMatchObject({ thinkingHasMore: true, fullThinkingLength: 2048 });
+		// 手机端不复制展示规则：摘要与投递语义由服务端按共享契约预先写好。
+		expect(tool.meta?.summary).toBe("npm test");
+		expect(list.find((message) => message.id === "m1")?.meta?.delivery).toBe("follow-up");
 
 		const detail = await getJson("/api/agents/agent-1/messages/m2");
 		expect(detail.data.message).toMatchObject({ id: "m2", text: messages[1].text });

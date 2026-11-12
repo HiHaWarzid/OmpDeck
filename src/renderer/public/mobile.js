@@ -302,33 +302,22 @@
 		}
 	}
 
-	// 子会话是扩展产生的内部 worker/reviewer，桌面端挂在父会话下；手机首页不做嵌套，
-	// 直接隐藏，避免历史列表被大量 "Complete assignment..." 内部会话淹没。
-	// Codex 导入的 subagent 没有 parentSessionPath，但会带 codexParentThreadId/threadSource。
-	function isTopLevelSession(session) {
-		return (
-			Boolean(session) &&
-			!session.parentSessionPath &&
-			!session.codexParentThreadId &&
-			session.codexThreadSource !== "subagent"
-		);
-	}
-
+	// 子会话过滤由服务端 ?topLevel=1 用 shared/sessionDisplayContract 统一完成；
+	// 手机端只缓存服务端返回的列表，不再复制一份规则（旧本地缓存可能含子会话，
+	// 下次写入即被服务端结果覆盖）。
 	function cacheSessions(id, list) {
 		if (!id) return;
 		homeCache[id] = {
 			at: Date.now(),
 			// 不再截断到 100 条：手机端分页只控制 DOM 渲染数量，数据层要保留完整列表，
 			// 否则滑到底部也无法加载第 101 条之后的历史会话。
-			sessions: (list || []).filter(isTopLevelSession),
+			sessions: Array.isArray(list) ? list : [],
 		};
 		writeHomeCache();
 	}
 
 	function cachedSessions(id) {
-		return Array.isArray(homeCache[id]?.sessions)
-			? homeCache[id].sessions.filter(isTopLevelSession)
-			: [];
+		return Array.isArray(homeCache[id]?.sessions) ? homeCache[id].sessions : [];
 	}
 
 	function renderSkeleton() {
@@ -614,7 +603,7 @@
 				`/api/projects/${encodeURIComponent(requestedProject)}/sessions?topLevel=1`,
 			);
 			if (requestedProject !== projectId) return;
-			sessions = Array.isArray(data?.sessions) ? data.sessions.filter(isTopLevelSession) : [];
+			sessions = Array.isArray(data?.sessions) ? data.sessions : [];
 			sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 			cacheSessions(requestedProject, sessions);
 		} catch (error) {
@@ -1479,36 +1468,11 @@
 		return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 	}
 
-	/** 工具消息只带工具名；从 meta.args/detailText 里提取一行可读参数，
-	 *  让手机端能直接看到执行了什么命令、读了哪个文件，而不是只有“命令”。 */
+	/** 工具卡片副标题：服务端 compact 时已用 shared/sessionDisplayContract 算好
+	 *  meta.summary（参数键优先级唯一实现）；这里只保留 detailText / result 兜底，
+	 *  避免手机端再维护一份参数键表。 */
 	function toolSummary(meta) {
-		let args = meta.args;
-		if (typeof args === "string") {
-			try {
-				args = JSON.parse(args);
-			} catch {
-				args = null;
-			}
-		}
-		if (args && typeof args === "object") {
-			for (const key of [
-				"command",
-				"cmd",
-				"path",
-				"file_path",
-				"filePath",
-				"pattern",
-				"query",
-				"url",
-				"description",
-				"title",
-				"question",
-				"prompt",
-			]) {
-				const value = args[key];
-				if (typeof value === "string" && value.trim()) return shortText(value);
-			}
-		}
+		if (typeof meta.summary === "string" && meta.summary) return meta.summary;
 		const detailLine = String(meta.detailText || "")
 			.split("\n")
 			.map((line) => line.trim())
@@ -1567,10 +1531,12 @@
 		const toolStatus =
 			meta.status === "running" || toolMatch?.[1] === "▶" ? "▶" : toolError ? "✗" : "✓";
 		const duration = durationText(meta.durationMs);
+		// 语义值（follow-up / steer）由服务端按共享契约写入 meta.delivery；
+		// 手机端只做中文文案，不再解析 streamingBehavior 原始值。
 		const delivery =
-			meta.streamingBehavior === "followUp"
+			meta.delivery === "follow-up"
 				? "排队到下一轮"
-				: meta.streamingBehavior === "steer"
+				: meta.delivery === "steer"
 					? "已加入当前回合"
 					: "";
 		const toolDetail = role === "tool" ? toolSummary(meta) : "";

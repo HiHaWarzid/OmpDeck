@@ -35,6 +35,7 @@ import { t } from "../../../i18n";
 import { showNotice } from "../../../utils/notice";
 import { writeClipboard } from "../../../utils/clipboard";
 import type { ChatMessage, ImageContent } from "../../../../../shared/types";
+import { deliveryKind } from "../../../../../shared/sessionDisplayContract";
 import { parseRichInputChips, unwrapFileChipPath } from "../RichInput";
 import { formatDuration, formatTime, stripAnsi, stripMarkdown, stripThinkingTags } from "../format";
 import { AssistantText } from "./AssistantText";
@@ -703,15 +704,13 @@ export const UserBubble = memo(function UserBubble(props: {
 		const extracted = extractSkillBlocks(stripAnsi(props.message.text));
 		return { skills: extracted.skills, cleanText: extracted.text };
 	}, [props.message.text]);
-	// 投递策略标签：steer(下次调用前插入) / followUp(停止后排队)
-	const deliveryBehavior = message.meta?.streamingBehavior as
-		| "steer"
-		| "followUp"
-		| undefined;
+	// 投递策略标签：steer(下次调用前插入) / followUp(停止后排队)。
+	// 语义值由 shared/sessionDisplayContract 解析；这里只负责本地化文案。
+	const delivery = deliveryKind(message.meta?.streamingBehavior);
 	const deliveryLabel =
-		deliveryBehavior === "steer"
+		delivery === "steer"
 			? t("app.messageDeliverySteer")
-			: deliveryBehavior === "followUp"
+			: delivery === "follow-up"
 				? t("app.messageDeliveryFollowUp")
 				: null;
 	// chip 节点同样是"文本 → 元素树"的解析产物，随上面的 cleanText 一起缓存，
@@ -789,10 +788,10 @@ export const UserBubble = memo(function UserBubble(props: {
 				{deliveryLabel && (
 					<span
 						className={`user-turn-delivery${
-							deliveryBehavior === "followUp" ? " follow-up" : " steer"
+							delivery === "follow-up" ? " follow-up" : " steer"
 						}`}
 						title={
-							deliveryBehavior === "followUp"
+							delivery === "follow-up"
 								? t("app.messageDeliveryFollowUpTitle")
 								: t("app.messageDeliverySteerTitle")
 						}

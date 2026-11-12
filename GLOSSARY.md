@@ -172,3 +172,8 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 - `main/sessions/sessionTranscript.ts`：**会话语义唯一实现**。`selectActiveBranch` 沿 parentId 回溯活动分支并应用压缩窗口（`firstKeptEntryId`），`messageLines` 是「可渲染消息条目（id + message + 偏移）」的唯一谓词，`asMessageEntry` 负责单条收窄。
 
 规则：任何新的会话读取（扫描摘要、查看器时间线、尾部最近消息、历史分页、prompt history、缓存命中率）都必须消费这两层的结果，不得再对 `raw.split("\n")` 手写 `JSON.parse` 循环或自行实现分支回溯。
+
+### SessionDisplayContract（会话展示契约）
+主进程、桌面渲染层、手机端共用的**展示推导唯一实现**（`src/shared/sessionDisplayContract.ts`）：顶层会话扁平过滤（`isTopLevelSessionSummary`）、工具参数摘要键优先级（`toolArgSummary` / `toolSummaryFromMeta`）、compact 截断标记（`compactChatMessage` 的 `hasMore/fullLength`、`thinkingHasMore/fullThinkingLength`）、投递语义（`deliveryKind` → `follow-up` / `steer`）。
+
+规则：手机端是 classic script，不 import 该模块；它消费服务端 compact 时**附加的派生字段** `meta.summary` 与 `meta.delivery`。因此任何新的展示规则要么进本模块并由服务端序列化，要么留在单一客户端，不允许两端各写一份。桌面侧栏的树形投影（含 orphan 恢复）语义不同，不属于本契约，仍由 `agentListDisplay.getSessionTreeProjection` 实现。
