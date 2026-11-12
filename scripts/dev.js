@@ -6,7 +6,6 @@
  */
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { ensureDevElectronExecutable } = require("./devElectronIdentity");
 
 const ELECTRON_VITE_BIN = path.join(__dirname, "..", "node_modules", "electron-vite", "bin", "electron-vite.js");
 const STALE_ELECTRON_VITE_ENV_KEYS = [
@@ -97,10 +96,10 @@ function runDev() {
 		}
 	}
 	const env = createDevEnvironment();
-	// electron-vite 读取 ELECTRON_EXEC_PATH；createDevEnvironment 会清掉从外部继承的
-	// 旧值，这里再注入本次生成的品牌化开发 exe。
-	const devExecutable = ensureDevElectronExecutable();
-	if (devExecutable) env.ELECTRON_EXEC_PATH = devExecutable;
+	// 开发态不再注入 ELECTRON_EXEC_PATH 指向品牌化副本（node_modules/electron/dist/OmpDeck.exe）：
+	// Electron 43 会按可执行文件名判断是否进入默认 app 模式，重命名后的 electron.exe 副本
+	// 会静默退出（不加载入口、不写日志、退出码 0）。打包态仍由 electron-builder 产出的
+	// 品牌化 exe 承担通知/任务栏身份；开发态使用 electron.exe，保证 npm run dev 可启动。
 	const child = spawn(invocation.command, invocation.args, {
 		stdio: "inherit",
 		env,
