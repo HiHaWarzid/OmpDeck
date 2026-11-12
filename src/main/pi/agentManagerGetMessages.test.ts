@@ -139,6 +139,6 @@ test("getHistoryPage 使用 agentId 生成历史消息 id，能与实时 transcr
 		transcript: { messages: [] },
 	});
 
-	const page = await manager.getHistoryPage("a1");
+	const page = await manager.history.webPage("a1");
 	assert.equal(page.messages[0]?.id, "a1-history-0");
 });

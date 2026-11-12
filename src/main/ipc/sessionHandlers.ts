@@ -117,7 +117,7 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 				if (entryId !== undefined && (typeof entryId !== "string" || !entryId.trim())) {
 					throw new Error("Invalid entryId");
 				}
-				return agentManager.readMessageFullText(agentId, messageId, entryId as string | undefined);
+				return agentManager.history.fullText(agentId, messageId, entryId as string | undefined);
 			},
 			readArchivedMessages: async (_event, agentId, compactionId) => {
 				// 入参校验在边界（渲染层数据不可信）

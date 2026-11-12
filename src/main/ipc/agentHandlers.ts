@@ -73,7 +73,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				) {
 					throw new Error("getHistoryPage: beforeOffset must be a non-negative finite number");
 				}
-				return agentManager.readHistoryPage(agentId, beforeOffset);
+				return agentManager.history.page(agentId, beforeOffset);
 			},
 			create: async (_event, input: CreateAgentInput) => {
 				void appLogger.info("agent", "Agent create IPC received", {
@@ -115,7 +115,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			},
 			historyPage: async (_event, input: WebAgentHistoryPageInput) => {
 				if (!input?.agentId) throw new Error("agentId 不能为空");
-				return agentManager.getHistoryPage(input.agentId, input.before, input.limit);
+				return agentManager.history.webPage(input.agentId, input.before, input.limit);
 			},
 			rename: async (_event, agentId: string, name: string) => {
 				const result = await agentManager.rename(agentId, name);

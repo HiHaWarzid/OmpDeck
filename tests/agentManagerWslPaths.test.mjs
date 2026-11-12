@@ -191,6 +191,8 @@ function loadAgentManager() {
 	// 运行控制模块（模型/思考档/服务档/自动压缩/todo）；同样只值导入共享类型，
 	// 无 src 内运行时依赖，注入后 AgentManager 才能解析 `./agentControl`。
 	registry["./agentControl"] = loadModule("src/main/pi/agentControl.ts", "agentControl.ts");
+	// 历史读取模块（翻页/全文）；依赖 agentTranscript 与 messageTimeline，两者已在上方注入。
+	registry["./agentHistory"] = loadModule("src/main/pi/agentHistory.ts", "agentHistory.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {

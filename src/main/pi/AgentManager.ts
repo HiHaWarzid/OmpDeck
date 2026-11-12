@@ -7,7 +7,6 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type {
 	AbortAndRestoreQueueResult,
-	WebAgentHistoryPage,
 	AgentQueuedMessages,
 	AgentRuntimeState,
 	AgentStatus,
@@ -40,6 +39,7 @@ import {
 	type DeferredFollowUp,
 } from "./followUpQueue";
 import { AgentControl, normalizeTodoPhases } from "./agentControl";
+import { AgentHistory, HISTORY_PAGE_TURNS } from "./agentHistory";
 import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
@@ -133,7 +133,6 @@ import {
 	clearThinkingBuffer,
 	createTranscriptState,
 	endThinking,
-	fullTextOf,
 	markAllMessagesDirty,
 	markDirtyFrom,
 	markMessageDirty,
@@ -264,11 +263,8 @@ export class AgentManager {
 	 * 文件直接读取仅解析近尾部少量消息，避免大会话加载导致的界面冻结。
 	 */
 	private static readonly MAX_AUTO_HISTORY_LOAD_BYTES = 5 * 1024 * 1024;
-	/**
-	 * 大会话直接从文件尾部读取时，最多保留的最近消息轮次（每条 user 消息算一轮）。
-	 * 原值 8 对于一些需要回看较多历史的长会话偏少，提高至 30 轮。
-	 */
-	private static readonly MAX_HISTORY_LOAD_TURNS = 30;
+	// 文件尾部读取与向前翻页共用 30 轮窗口：常量在 agentHistory.HISTORY_PAGE_TURNS。
+
 	/**
 	 * statusChanged 语义事件的去重基准：记录每个 agent 上次已向语义订阅者发表的 status。
 	 * emitStateNow 是 50ms 聚合快照，若每次都全量发 statusChanged，会把「无变化」也当成
@@ -340,6 +336,8 @@ export class AgentManager {
 	 * IPC handler 与本类都不再各自拼「取运行时 → 发请求 → 读状态」。
 	 */
 	readonly control: AgentControl;
+	/** 会话历史读取模块：向前翻页（字节/下标两套游标）与按需取全文。 */
+	readonly history: AgentHistory;
 
 	constructor(
 		private readonly getProject: (id: string) => Project | undefined,
@@ -380,6 +378,13 @@ export class AgentManager {
 			createArchiveWorker,
 			getBlobsDir: () => this.blobsDir(),
 			logger: this.appLogger,
+		});
+		// history 依赖 sessionJsonl 的实例，必须在赋值之后再装配；把它挪到前面会让
+		// host.jsonl 永久停在 undefined（TS 只在严格初始化下才报）。
+		this.history = new AgentHistory({
+			runtime: (agentId) => this.requireRuntime(agentId),
+			jsonl: this.sessionJsonl,
+			log: this.appLogger,
 		});
 	}
 
@@ -498,63 +503,6 @@ export class AgentManager {
 	}
 
 	/**
-	 * 向前读取一页更早的会话历史，供活动会话突破 30 轮尾窗限制。
-	 * 只读会话文件并按 cursor 反向翻页；消息带 `meta.historyPage`，渲染层据此
-	 * 把这些只读旧页与可编辑的尾窗消息区分开（编辑/删除仍按 entryId 定位）。
-	 */
-	async readHistoryPage(
-		agentId: string,
-		beforeOffset?: number,
-	): Promise<{ messages: ChatMessage[]; cursor: number; hasMore: boolean }> {
-		const runtime = this.requireRuntime(agentId);
-		const sessionPath = runtime.tab.sessionPath;
-		if (!sessionPath) return { messages: [], cursor: 0, hasMore: false };
-		let cursor = typeof beforeOffset === "number" && Number.isFinite(beforeOffset)
-			? Math.max(0, Math.trunc(beforeOffset))
-			: undefined;
-		// 首次加载没有 cursor：优先用文件基线自己记录的窗口起点（精确到字节），
-		// 否则以当前时间线最旧一条消息的 entryId 作为上界。两条路都只返回基线之前
-		// 的内容，否则会先返回一页与基线重叠的最近 30 轮，用户点一次却看不到新消息。
-		if (cursor === undefined) {
-			if (typeof runtime.historyCursor === "number" && runtime.historyCursor >= 0) {
-				cursor = runtime.historyCursor;
-			} else {
-				const oldestEntryId = runtime.transcript.messages
-					.map((message) => message.meta?.entryId)
-					.find((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
-				if (oldestEntryId) {
-					const offset = await this.sessionJsonl.findEntryOffset(sessionPath, oldestEntryId);
-					if (offset === undefined) {
-						return { messages: [], cursor: 0, hasMore: false };
-					}
-					cursor = offset;
-				}
-			}
-		}
-		const page = await this.sessionJsonl.readOlderMessages(
-			sessionPath,
-			cursor,
-			AgentManager.MAX_HISTORY_LOAD_TURNS,
-		);
-		if (page.messages.length === 0) {
-			return { messages: [], cursor: page.cursor, hasMore: page.hasMore };
-		}
-		const messages = convertAgentMessages(agentId, page.messages, page.entryIds, false);
-		for (const message of messages) {
-			message.meta = { ...message.meta, historyPage: true };
-		}
-		void this.appLogger?.info("agent", "Older history page loaded", {
-			agentId,
-			sessionPath,
-			beforeOffset: cursor,
-			cursor: page.cursor,
-			hasMore: page.hasMore,
-			messages: messages.length,
-		});
-		return { messages, cursor: page.cursor, hasMore: page.hasMore };
-	}
-
-	/**
 	 * 不启动 pi 进程，直接从 JSONL 构造与运行态相同的时间线数据。
 	 * 转换规则（活动分支回溯 + 压缩归档参与）在 SessionJsonl.readDisplayMessages；
 	 * 本方法只负责把协议路径交给 sessionJsonl 的宿主路径解析。
@@ -565,31 +513,6 @@ export class AgentManager {
 		sessionContent?: string,
 	): Promise<ChatMessage[]> {
 		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, sessionContent);
-	}
-
-	/**
-	 * 历史会话分页：以「从旧到新的数组下标」为游标，每次返回 before 之前的 limit 条。
-	 * 手机端打开大会话时先拿最新一页，再按 nextCursor 向更早翻；游标不暴露文件路径。
-	 * 当前实现每次整读会话文件（与桌面端大会话兜底同一读取管线），页大小上限 100。
-	 */
-	async getHistoryPage(agentId: string, before?: string, limit = 40): Promise<WebAgentHistoryPage> {
-		const runtime = this.requireRuntime(agentId);
-		const sessionPath = runtime.tab.sessionPath;
-		if (!sessionPath) return { messages: [], nextCursor: null, hasMore: false };
-		// 必须带 agentId 生成历史消息 id：实时 transcript 也用同一个 agentId 前缀，
-		// 手机端才能把 history-page 与 messages 窗口按 id 去重、按 id 拉完整详情。
-		const messages = await this.readSessionDisplayMessages(sessionPath, agentId);
-		const pageSize = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 40));
-		const end = before === undefined || before === "" ? messages.length : Number(before);
-		if (!Number.isInteger(end) || end < 0 || end > messages.length) {
-			throw new Error("历史分页游标无效");
-		}
-		const start = Math.max(0, end - pageSize);
-		return {
-			messages: messages.slice(start, end),
-			nextCursor: start > 0 ? String(start) : null,
-			hasMore: start > 0,
-		};
 	}
 
 	recordHostExchange(agentId: string, userText: string, assistantText: string) {
@@ -634,7 +557,7 @@ export class AgentManager {
 		const messagesPromise = earlyMessagesPromise ?? (oversizedSession
 			? this.sessionJsonl.readRecentMessages(
 				runtime.tab.sessionPath as string,
-				AgentManager.MAX_HISTORY_LOAD_TURNS,
+				HISTORY_PAGE_TURNS,
 			).catch(() => runtime.slot.process.client.request({ type: "get_messages" }))
 			: runtime.slot.process.client.request({
 				type: "get_messages",
@@ -713,7 +636,7 @@ export class AgentManager {
 				if (existsSync(sessionHostPath) && statSync(sessionHostPath).size > 0) {
 					const fileFallback = await this.sessionJsonl.readRecentMessages(
 						runtime.tab.sessionPath,
-						AgentManager.MAX_HISTORY_LOAD_TURNS,
+						HISTORY_PAGE_TURNS,
 					).catch(() => undefined);
 					const fallbackData = fileFallback?.data as HistoryResponseData | undefined;
 					const fallbackMessages = fallbackData?.messages ?? [];
@@ -1232,7 +1155,7 @@ export class AgentManager {
 					true,
 					this.sessionJsonl.readRecentMessages(
 						input.sessionPath,
-						AgentManager.MAX_HISTORY_LOAD_TURNS,
+						HISTORY_PAGE_TURNS,
 					),
 					{ preserveMessagesAfter },
 				)
@@ -3225,27 +3148,6 @@ export class AgentManager {
 			messageId,
 			elapsedMs: Date.now() - startTime,
 		});
-	}
-
-	/**
-	 * 按需读取消息完整文本（工具结果截断后的「查看完整输出」）。
-	 * 优先本 agent 的运行时全文缓存（仅截断下发时才写入），
-	 * 回退按 entryId 在会话文件里定位读取；找不到或读取失败抛错，由 IPC 层转结构化错误。
-	 */
-	async readMessageFullText(
-		agentId: string,
-		messageId: string,
-		entryId?: string,
-	): Promise<{ text: string }> {
-		const runtime = this.agents.get(agentId);
-		const cached = runtime ? fullTextOf(runtime.transcript, messageId) : undefined;
-		if (cached !== undefined) return { text: cached };
-		const sessionPath = runtime?.tab.sessionPath;
-		if (sessionPath && entryId) {
-			const text = await this.sessionJsonl.readEntryTextById(sessionPath, entryId);
-			if (text !== null) return { text };
-		}
-		throw new Error("Message full text unavailable");
 	}
 
 	/**
