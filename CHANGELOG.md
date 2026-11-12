@@ -27,6 +27,14 @@ All notable changes to PiDeck are documented here.
 - **Auto compaction & service tiers** — The model picker footer can toggle the
   session's auto-compaction and Fast/Slow service tiers; unsupported tiers report
   the model limitation instead of failing silently.
+- **Phone / LAN web control** — Browse projects and sessions, reopen historical sessions, create sessions, keep chatting, stop the current turn (aborts generation without closing the session), switch models/thinking levels, and confirm project trust from a phone browser. Agent UI confirmation/selection prompts still require the desktop.
+- **QR pairing and token management** — The settings page shows a tokenized URL and QR code, with copy, show/hide, token rotation, and 1-day / 7-day / 30-day / never-expires lifetimes.
+- **Mobile layout and PWA** — Narrow-screen sidebar becomes a drawer, the detail drawer overlays the chat, and the composer respects safe areas. Add to home screen is supported; the service worker caches static assets only and stays network-first.
+- **Mobile message rendering** — Assistant replies render Markdown headings, lists, tables, quotes, and code blocks (with one-tap copy). Tool calls are grouped by turn with the command/path, status, and duration; tap one to see full arguments and results. Thinking blocks show a first-line preview, and long histories load earlier messages on demand.
+- **Large-session mobile polling** — Poll only the latest message window and collapsed previews, fetch full content by message id on expand, apply version-based incremental updates, and poll faster while an agent runs so streaming text and thinking appear without waiting for the next message.
+- **Mobile image attachments and send semantics** — Attach up to four photos, auto-resize/compress them to JPEG before upload, preview/remove before sending, and send image-only messages. While the agent is running, choose whether a message steers the current turn or queues for the next turn; the delivery state is shown on the message.
+- **Mobile loading performance** — Home fetches state and sessions in parallel, the server filters subagent sessions out of the mobile session list (about 70% smaller payload), mobile shell assets are gzip-compressed, the history cursor no longer blocks first paint, and service-worker installation is deferred until the first screen is idle. The home history list renders 40 sessions per page and appends the next batch near the bottom; requests longer than 150ms show a top progress bar. Unchanged polls now skip timeline rebuilds, message Markdown/thinking HTML is cached per message, tool-detail open state is restored in one pass, and composer/viewport DOM writes are coalesced.
+- **One-switch phone remote access** — The main Settings tab has a single phone remote access switch. Turning it on automatically starts the loopback web service and publishes it to your tailnet over HTTPS with Tailscale Serve, with status, QR pairing, copy, and retry. OmpDeck only removes the Serve handler pointing at its own local port.
 
 ### ✨ Improvements
 
@@ -40,6 +48,13 @@ All notable changes to PiDeck are documented here.
 - **Config export/import no longer carries credentials** — Exports contain no
   `apiKey`; imports keep the target machine's existing keys and only take an
   explicitly non-empty key from the package.
+
+### 🔒 Security
+
+- **Loopback-only by default** — `webServiceHost` now defaults to `127.0.0.1` instead of `0.0.0.0`; LAN access requires an explicit opt-in in Settings.
+- **Token required for non-loopback requests** — Phones, other devices, and tunnel hostnames must send `Authorization: Bearer`, `X-Omp-Token`, or `?token=` on API calls; only loopback addresses or the explicitly configured host are exempt, so arbitrary IP-literal Hosts and local reverse proxies that rewrite Host cannot bypass auth via DNS rebinding. Requests carrying proxy forwarding headers (Tailscale Serve, Cloudflare Tunnel, `Forwarded`, `X-Real-IP`, etc.) are never treated as loopback, even when the proxy connects back from `127.0.0.1`.
+- **Write-request hardening** — Origin/Host matching, rejection of non-JSON Content-Type, per-IP write rate limiting (120 requests/minute), and a 2 MB request-body cap.
+- Plain LAN HTTP is unencrypted. Use an HTTPS entry point such as Tailscale Serve or Cloudflare Tunnel for remote access, and never expose the service port directly to the public internet.
 
 ### 🐛 Bug Fixes
 

@@ -7,6 +7,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type {
 	AbortAndRestoreQueueResult,
+	WebAgentHistoryPage,
 	AgentManagerEvent,
 	AgentManagerEventListener,
 	AgentQueuedMessages,
@@ -293,7 +294,10 @@ export class AgentManager {
 	 */
 	private readonly lastEmittedTabStatus = new Map<string, AgentStatus>();
 	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
-	private readonly pendingTrustRequests = new Map<string, { resolve: (choice: ProjectTrustChoice) => void }>();
+	private readonly pendingTrustRequests = new Map<
+		string,
+		{ resolve: (choice: ProjectTrustChoice) => void; cwd: string; projectName: string; createdAt: number }
+	>();
 	/**
 	 * emitRuntimeState 并发合并：工具密集循环（tool_start/end 交替）每个边沿都会
 	 * 触发一次 get_state + get_session_stats RPC 与文件尾部读取；同一时刻只允许
@@ -559,6 +563,31 @@ export class AgentManager {
 		sessionContent?: string,
 	): Promise<ChatMessage[]> {
 		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, sessionContent);
+	}
+
+	/**
+	 * 历史会话分页：以「从旧到新的数组下标」为游标，每次返回 before 之前的 limit 条。
+	 * 手机端打开大会话时先拿最新一页，再按 nextCursor 向更早翻；游标不暴露文件路径。
+	 * 当前实现每次整读会话文件（与桌面端大会话兜底同一读取管线），页大小上限 100。
+	 */
+	async getHistoryPage(agentId: string, before?: string, limit = 40): Promise<WebAgentHistoryPage> {
+		const runtime = this.requireRuntime(agentId);
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) return { messages: [], nextCursor: null, hasMore: false };
+		// 必须带 agentId 生成历史消息 id：实时 transcript 也用同一个 agentId 前缀，
+		// 手机端才能把 history-page 与 messages 窗口按 id 去重、按 id 拉完整详情。
+		const messages = await this.readSessionDisplayMessages(sessionPath, agentId);
+		const pageSize = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 40));
+		const end = before === undefined || before === "" ? messages.length : Number(before);
+		if (!Number.isInteger(end) || end < 0 || end > messages.length) {
+			throw new Error("历史分页游标无效");
+		}
+		const start = Math.max(0, end - pageSize);
+		return {
+			messages: messages.slice(start, end),
+			nextCursor: start > 0 ? String(start) : null,
+			hasMore: start > 0,
+		};
 	}
 
 	recordHostExchange(agentId: string, userText: string, assistantText: string) {
@@ -5257,6 +5286,9 @@ export class AgentManager {
 					clearTimeout(timer);
 					resolve(choice);
 				},
+				cwd,
+				projectName,
+				createdAt: Date.now(),
 			});
 			win.webContents.send(ipcChannels.agentsTrustRequest, { requestId, cwd, projectName });
 		});
@@ -5269,6 +5301,16 @@ export class AgentManager {
 			this.pendingTrustRequests.delete(requestId);
 			pending.resolve(choice);
 		}
+	}
+
+	/** 手机端状态轮询用：列出仍在等待确认的项目信任请求（不含 resolve 函数）。 */
+	listPendingTrustRequests(): Array<{ requestId: string; cwd: string; projectName: string; createdAt: number }> {
+		return [...this.pendingTrustRequests].map(([requestId, pending]) => ({
+			requestId,
+			cwd: pending.cwd,
+			projectName: pending.projectName,
+			createdAt: pending.createdAt,
+		}));
 	}
 
 	private handleAssistantMessageEvent(runtime: AgentRuntime, event: Record<string, any>) {

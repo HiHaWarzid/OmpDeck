@@ -130,12 +130,37 @@ ReactDOM.createRoot(rootElement).render(
  * 最小展示时长 MIN_BOOT_MS：防止"加载页秒没"——React 挂载极快时读条几乎不可见，
  * 给读条留出存在感；若真实启动本来就慢（已超过该时长），则立即淡出不额外拖慢。
  *
- * 计时起点：窗口首次可见（visibilitychange → visible），而非脚本执行时刻。
- * 主进程用 ready-to-show 门控显示窗口，hidden 启动（如 dev 重启回退构建产物）时
- * 脚本可能在窗口显示前几百 ms 就执行完，从脚本起算会把加载页压缩到一闪而过。
+ * 计时起点：脚本执行时刻。主进程用 ready-to-show 门控显示窗口，hidden 启动
+ * （如 dev 重启回退构建产物）时脚本可能在窗口显示前几百 ms 就执行完，从脚本
+ * 起算会把加载页压缩到一闪而过；因此保留最小展示时长，但不再等待窗口可见。
+ *
+ * 注意：部分手机浏览器/WebView 会永久报告 document.visibilityState === "hidden"，
+ * 或对后台页面不触发 requestAnimationFrame。旧逻辑在这种情况下会一直等
+ * visibilitychange，导致 React 已挂载、启动遮罩却永久盖在上面。这里改为
+ * 正常 rAF 淡出 + 固定定时器兜底，任何环境下都不会无限停留。
  */
 const MIN_BOOT_MS = 850;
 const bootMountedAt = performance.now();
+const bootOverlay = document.getElementById("boot-overlay");
+let bootOverlayFading = false;
+let bootOverlayRemoved = false;
+
+const removeBootOverlay = () => {
+  if (bootOverlayRemoved || !bootOverlay) return;
+  bootOverlayRemoved = true;
+  bootOverlay.remove();
+};
+
+const fadeOutBootOverlay = () => {
+  if (bootOverlayFading || bootOverlayRemoved || !bootOverlay) return;
+  bootOverlayFading = true;
+  bootOverlay.classList.add("fade-out");
+
+  // 过渡结束后从 DOM 移除覆盖层，释放层级上下文
+  bootOverlay.addEventListener("transitionend", removeBootOverlay, { once: true });
+  // 兜底：某些环境下 transitionend 可能不触发
+  window.setTimeout(removeBootOverlay, 700);
+};
 
 requestAnimationFrame(() => {
   // 启动基线：模块开始执行到 React 首帧 commit 完成。
@@ -145,41 +170,14 @@ requestAnimationFrame(() => {
     mountedMs: Math.round(performance.now()),
     bootOverlayMs: Math.round(bootMountedAt),
   });
-
-  const overlay = document.getElementById("boot-overlay");
-  if (!overlay) return;
-
-  let removed = false;
-  const removeOverlay = () => {
-    if (removed) return;
-    removed = true;
-    overlay.remove();
-  };
-  const startFadeOut = () => {
-    overlay.classList.add("fade-out");
-
-    // 过渡结束后从 DOM 移除覆盖层，释放层级上下文
-    overlay.addEventListener("transitionend", removeOverlay, { once: true });
-    // 兜底：某些环境下 transitionend 可能不触发
-    window.setTimeout(removeOverlay, 700);
-  };
   // 已展示时长不足最小展示时长时，推迟到满足后再淡出。
-  const scheduleFadeOut = (from: number) => {
-    const remaining = Math.max(0, MIN_BOOT_MS - (performance.now() - from));
-    window.setTimeout(startFadeOut, remaining);
-  };
-
-  if (document.visibilityState === "hidden") {
-    // 窗口尚未显示：从首次可见那一刻起算最小展示时长。
-    document.addEventListener(
-      "visibilitychange",
-      () => {
-        if (document.visibilityState !== "visible") return;
-        scheduleFadeOut(performance.now());
-      },
-      { once: true },
-    );
-  } else {
-    scheduleFadeOut(bootMountedAt);
-  }
+  const remaining = Math.max(0, MIN_BOOT_MS - (performance.now() - bootMountedAt));
+  window.setTimeout(fadeOutBootOverlay, remaining);
 });
+
+// rAF 在隐藏页面、部分 WebView 中可能被节流甚至永不触发；固定兜底保证
+// 应用已经挂载时不会一直被启动画面遮挡。React 尚未挂载时保留启动页，
+// 让 boot-diagnostics.js 的超时提示继续可见。
+window.setTimeout(() => {
+  if (document.getElementById("root")?.childElementCount) fadeOutBootOverlay();
+}, 3000);

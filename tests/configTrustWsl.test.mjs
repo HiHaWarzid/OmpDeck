@@ -91,9 +91,15 @@ function loadConfigManager() {
 		if (id === "../utils/fsRetry") return fsRetry;
 		return undefined;
 	}, { fsPromises: fsPromisesFake });
+	const ompConfigFile = loadTranspiledModule("src/main/config/OmpConfigFile.ts", (id) => {
+		if (id === "../storage/JsonFileStore") return jsonFileStore;
+		return undefined;
+	}, { fsPromises: fsPromisesFake });
+	const ompConfigSettings = loadTranspiledModule("src/shared/ompConfigSettings.ts");
 	const rolesStore = loadTranspiledModule("src/main/config/OmpRolesStore.ts", (id) => {
 		if (id === "../../shared/types/ompRoles") return sharedRoles;
 		if (id === "../storage/JsonFileStore") return jsonFileStore;
+		if (id === "./OmpConfigFile") return ompConfigFile;
 		return undefined;
 	}, { fsPromises: fsPromisesFake });
 	const trustStore = loadTranspiledModule("src/main/config/TrustStore.ts", (id) => {
@@ -114,6 +120,8 @@ function loadConfigManager() {
 		require: (id) => {
 			if (id === "./baseUrlPath") return loadBaseUrlPath();
 			if (id === "./OmpRolesStore") return rolesStore;
+			if (id === "./OmpConfigFile") return ompConfigFile;
+			if (id === "../../shared/ompConfigSettings") return ompConfigSettings;
 			if (id === "./TrustStore") return trustStore;
 			if (id === "./providerProbe") return probe;
 			// ConfigManager 自身也直接构造 JsonFileStore（provider 模型缓存等），

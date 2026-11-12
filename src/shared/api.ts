@@ -10,6 +10,8 @@
  */
 import type {
 	AbortAndRestoreQueueResult,
+	WebAgentHistoryPage,
+	WebAgentHistoryPageInput,
 	AgentMessagesDelta,
 	AgentRuntimeState,
 	AgentSubagent,
@@ -107,6 +109,8 @@ import type {
 	TerminalExitEvent,
 	TerminalTab,
 	ThinkingUpdate,
+	WebServiceStatus,
+	RemoteAccessStatus,
 	WorktreeEntry,
 	YaoPromptDetailResult,
 	YaoPromptListResult,
@@ -520,6 +524,8 @@ export interface AgentsApi {
 	/** 向前读取一页更早的会话历史（大会话 30 轮尾窗之外）。 */
 	getHistoryPage: (agentId: string, beforeOffset?: number) => Promise<AgentHistoryPage>;
 	create: (input: CreateAgentInput) => Promise<AgentTab>;
+	/** 历史会话分页读取：大会话打开后按页向更早翻，避免一次把整份 JSONL 推到手机。 */
+	historyPage: (input: WebAgentHistoryPageInput) => Promise<WebAgentHistoryPage>;
 	rename: (agentId: string, name: string) => Promise<AgentTab>;
 	stop: (agentId: string) => Promise<void>;
 	prompt: (input: SendPromptInput) => Promise<SendPromptResult>;
@@ -628,6 +634,22 @@ export interface AgentsApi {
 	onTrustRequest: (callback: (request: { requestId: string; cwd: string; projectName: string }) => void) => () => void;
 	/** 回传用户对项目信任确认弹窗的选择（trust-remember/trust-session/deny） */
 	respondTrustRequest: (requestId: string, choice: "trust-remember" | "trust-session" | "deny") => Promise<void>;
+}
+
+export interface WebApi {
+	/** 当前 Web 服务监听状态与访问令牌（设置页展示二维码/复制地址用） */
+	status: () => Promise<WebServiceStatus>;
+	/** 立即轮换访问令牌；已连接的手机需要重新扫码 */
+	rotateToken: () => Promise<WebServiceStatus>;
+}
+
+export interface RemoteAccessApi {
+	/** 当前 Tailscale Serve 远程访问状态（设置页展示/排障用） */
+	status: () => Promise<RemoteAccessStatus>;
+	/** 按当前设置启动或重新配置远程访问；失败时抛出带分类的错误 */
+	start: () => Promise<RemoteAccessStatus>;
+	/** 停止远程访问并移除 OmpDeck 自己的 Serve 处理器 */
+	stop: () => Promise<RemoteAccessStatus>;
 }
 
 export interface PetApi {
@@ -764,6 +786,8 @@ export interface PiDesktopApi {
 	settings: SettingsApi;
 	config: ConfigApi;
 	agents: AgentsApi;
+	web: WebApi;
+	remoteAccess: RemoteAccessApi;
 	pet: PetApi;
 	terminal: TerminalApi;
 	feishu: FeishuApi;

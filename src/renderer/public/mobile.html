@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+		<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)" />
+		<meta name="theme-color" content="#111418" media="(prefers-color-scheme: dark)" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<title>OmpDeck Mobile</title>
+		<link rel="manifest" href="./manifest.webmanifest" />
+		<link rel="apple-touch-icon" href="./icon-192.png" />
+		<link rel="stylesheet" href="./mobile.css?v=19" />
+	</head>
+	<body>
+		<div id="app">
+			<header id="topbar">
+				<button id="back" class="icon" type="button" aria-label="返回" hidden>
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6" /></svg>
+				</button>
+				<div class="heading">
+					<strong id="title">OmpDeck</strong>
+					<span id="subtitle"></span>
+				</div>
+				<button id="refresh" class="icon" type="button" aria-label="刷新">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 10-2.3 6.7M20 5v6h-6" /></svg>
+				</button>
+			</header>
+			<div id="loading-bar" role="progressbar" aria-label="加载中" hidden></div>
+			<div id="connection" role="status" hidden></div>
+			<main id="view"></main>
+			<nav id="tabs" aria-label="主导航">
+				<button class="tab" data-tab="home" type="button">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5M5 9.5V21h14V9.5" /></svg>
+					<span>会话</span>
+				</button>
+				<button class="tab new" id="new-session" type="button" aria-label="新建会话">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+				</button>
+				<button class="tab" data-tab="settings" type="button">
+					<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></svg>
+					<span>设置</span>
+				</button>
+			</nav>
+			<footer id="composer" hidden>
+				<div id="attachments" class="attachments" hidden></div>
+				<div class="composer-main">
+					<button id="attach" class="icon attach" type="button" aria-label="添加图片">
+						<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.05l-8.49 8.49a6 6 0 01-8.49-8.49l8.49-8.49a4 4 0 015.66 5.66l-8.49 8.49a2 2 0 01-2.83-2.83l7.78-7.78" /></svg>
+					</button>
+					<input id="image-input" type="file" accept="image/*" multiple hidden />
+					<textarea id="input" rows="1" placeholder="输入消息…"></textarea>
+					<div class="send-stack">
+						<button id="send" class="primary" type="button">发送</button>
+						<button id="send-more" class="send-more" type="button" aria-label="选择发送方式" aria-haspopup="menu" aria-expanded="false" hidden>
+							<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" /></svg>
+						</button>
+						<div id="send-menu" class="send-menu" role="menu" hidden>
+							<button type="button" role="menuitem" data-send-behavior="steer">
+								<strong>加入当前回合</strong>
+								<span>当前工具结束后立即注入</span>
+							</button>
+							<button type="button" role="menuitem" data-send-behavior="followUp">
+								<strong>排队到下一轮</strong>
+								<span>当前回合结束后再发送</span>
+							</button>
+						</div>
+					</div>
+					<button id="stop" class="danger" type="button" hidden>停止</button>
+				</div>
+			</footer>
+			<div id="toast" role="status" hidden></div>
+			<div id="sheet" hidden>
+				<div class="sheet-backdrop" data-close></div>
+				<div class="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+					<div class="sheet-head">
+						<strong id="sheet-title"></strong>
+						<button id="sheet-close" class="icon" type="button" aria-label="关闭">
+							<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+						</button>
+					</div>
+					<div id="sheet-body" class="sheet-body"></div>
+				</div>
+			</div>
+		</div>
+		<script src="./mobile-state.js?v=14"></script>
+		<script src="./mobile.js?v=37"></script>
+	</body>
+</html>

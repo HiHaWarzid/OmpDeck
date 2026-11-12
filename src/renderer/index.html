@@ -2,7 +2,16 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#111315" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="OmpDeck" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icon-512.png" />
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' file: data: blob: https://cloudcache.tencent-cloud.com https://skillhub-1388575217.cos.accelerate.myqcloud.com; font-src 'self' data:; connect-src 'self' ws: http://127.0.0.1:* http://localhost:* https://api.skillhub.cn"
@@ -110,6 +119,35 @@
         }
       }
 
+      .boot-retry {
+        margin-top: 4px;
+        padding: 8px 18px;
+        border: 1px solid rgba(15, 23, 42, 0.18);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.7);
+        color: #202124;
+        font: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      .boot-retry:hover {
+        background: #fff;
+      }
+      .boot-retry:focus-visible {
+        outline: 2px solid #22c55e;
+        outline-offset: 2px;
+      }
+      @media (prefers-color-scheme: dark) {
+        .boot-retry {
+          border-color: rgba(255, 255, 255, 0.2);
+          background: rgba(255, 255, 255, 0.08);
+          color: #eceff3;
+        }
+        .boot-retry:hover {
+          background: rgba(255, 255, 255, 0.14);
+        }
+      }
+
       @media (prefers-color-scheme: dark) {
         html, body {
           background: #111315;
@@ -179,6 +217,13 @@
         <div class="boot-progress-bar"></div>
       </div>
     </div>
+    <noscript>
+      <div style="position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;background:#eef0f3;color:#202124;font:16px/1.6 Georgia,serif;padding:24px;text-align:center">
+        OmpDeck 需要启用 JavaScript 才能启动。
+      </div>
+    </noscript>
+    <!-- 启动诊断必须先于主模块执行，弱网/脚本失败时才能给出提示。 -->
+    <script src="./boot-diagnostics.js"></script>
     <!-- React 挂载 -->
     <script type="module" src="/src/main.tsx"></script>
   </body>

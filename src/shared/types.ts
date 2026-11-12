@@ -24,3 +24,4 @@ export * from "./types/afk";
 export * from "./types/agentEvents";
 export * from "./types/ompRoles";
 export * from "./types/config";
+export * from "./types/web";

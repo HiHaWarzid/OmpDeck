@@ -14,7 +14,8 @@ import type { ChatMessage } from "./types";
  * 与主进程消息推送的 messageDirtyFrom/replaceFrom（下标级变更追踪，增量传输）互补：
  * 那边是「从哪条下标开始变」，这边是「整条流的内容签名」，用于缓存失效判断。
  *
- * 返回值仅供同进程内比较（缓存键/指纹），不落盘、不上网，不承诺跨版本稳定。
+ * 返回值是不透明版本串：仅供相等比较（缓存键/指纹），手机端增量接口会把它
+ * 当作 opaque token 回传；不得落盘、解析或跨版本依赖其格式。
  */
 export function messageStreamVersion(messages: readonly ChatMessage[]): string {
 	const last = messages[messages.length - 1];

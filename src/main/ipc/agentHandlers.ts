@@ -9,7 +9,7 @@
 import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { AgentTodoPhase, AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentTodoPhase, AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult, WebAgentHistoryPageInput } from "../../shared/types";
 import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
@@ -31,7 +31,7 @@ interface AgentHandlerDeps {
 
 type AgentHandlerMaps = {
 	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>,
-		| "list" | "getMessages" | "getHistoryPage" | "create" | "rename" | "stop" | "prompt" | "abort"
+		| "list" | "getMessages" | "getHistoryPage" | "create" | "historyPage" | "rename" | "stop" | "prompt" | "abort"
 		| "abortAndRestoreQueue" | "removeQueuedMessage" | "promoteQueuedMessage"
 		| "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
@@ -112,6 +112,10 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 					});
 					throw error;
 				}
+			},
+			historyPage: async (_event, input: WebAgentHistoryPageInput) => {
+				if (!input?.agentId) throw new Error("agentId 不能为空");
+				return agentManager.getHistoryPage(input.agentId, input.before, input.limit);
 			},
 			rename: async (_event, agentId: string, name: string) => {
 				const result = await agentManager.rename(agentId, name);

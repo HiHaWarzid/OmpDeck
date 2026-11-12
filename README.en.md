@@ -72,7 +72,8 @@
 | **Session Management** | Create sessions, browse inline project history, restore historical sessions, rename, copy, export HTML, delete history, and close agents from the sidebar or context menus. |
 | **Session Import** | Import local Codex and Claude sessions from the project context menu, then browse or restore them as OmpDeck history sessions. |
 | **Git Integration** | Real-time branch display with local + remote branch selector, branch count badge, switching support, and branch creation. |
-| **LAN Web Service** | Start a local web service from Settings so devices on the same network can open OmpDeck through the host IP and port. |
+| **Phone / LAN Web Control** | Enable the web service in Settings to browse and reopen session history, create sessions, and keep chatting from a phone browser. Loopback-only by default; LAN access requires explicit opt-in and a token, with QR pairing and PWA support. |
+| **Remote Access (Tailscale)** | Enable it in Settings to publish the loopback web service to your tailnet through Tailscale Serve. Phones can reach it over HTTPS from anywhere without exposing a public port; the OmpDeck token is still required. |
 | **Session Activity View** | Thinking notes, tool calls, and answer updates are grouped into a compact flow with expandable/copyable details and clear status or exit-code labels. |
 | **Built-in Browser Preview** | Right-drawer browser with tabs, URL bar, fullscreen mode, and PC/mobile/tablet viewport presets for checking web pages alongside the conversation. |
 | **Session File Summary** | Completed agent runs show a compact list of modified file names and changed line counts; more than three files can be expanded. |
@@ -183,6 +184,25 @@ npm run dev
 
 ---
 
+## Mobile Control
+
+1. On the desktop app, open **Settings → Web Service** and enable it.
+2. Put the phone and computer on the same network; only for LAN access, switch the listen address from the default `127.0.0.1` to `0.0.0.0`.
+3. Scan the QR code in Settings, or open the copied token URL on the phone.
+4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop the current turn (aborts generation without closing the session); the composer accepts photos (auto-compressed), and while an agent is running you can choose **steer into current turn** or **queue for next turn**. Project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
+
+### Remote / Off-network Access
+
+1. Install and sign in to Tailscale on both the computer and the phone (same tailnet).
+2. Open **Settings → General → Phone Remote Access (Tailscale)** on the desktop and turn on the switch. OmpDeck turns on the web service and configures `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>` against the local loopback port.
+3. The first use requires enabling **HTTPS certificates / Serve** in the Tailscale admin console; the settings page reports a retryable error until then.
+4. Once configured, the settings page shows `https://<machine>.<tailnet>.ts.net:8443` and a QR code; scan it on the phone.
+5. When you disable remote access or quit, OmpDeck removes only the Serve rule pointing at its own local port; other Serve rules are left alone.
+
+Security boundary: loopback-only by default; non-loopback requests require the access token, and reverse-proxy/tunneled requests are never exempt even when they originate from loopback. Plain LAN HTTP is unencrypted, so use an HTTPS entry point such as Tailscale Serve or Cloudflare Tunnel for remote access and never expose the port directly to the public internet. Tokens last 30 days by default and can be rotated or re-scoped in Settings. See the [mobile control guide](docs-site/en/guide/mobile-control.md).
+
+---
+
 ## Development
 
 | Command | Description |
@@ -257,7 +277,7 @@ Join the OmpDeck QQ group for discussion and feedback:
 
 ## Security
 
-This app starts local `pi` processes and exposes limited file operations through Electron IPC. Only run from trusted source code. The app sends an anonymous, low-frequency `app_heartbeat` by default to understand version distribution, platform compatibility, and active installations; it can be disabled in Settings. It does not collect project paths, code, message content, session content, or file names, and it does not upload files. The third-party analytics service receives request metadata. pi agent process proxy and desktop model fetch/test proxy can be configured separately; external links opened in the system browser still follow the browser/system network settings.
+This app starts local `pi` processes and exposes limited file operations through Electron IPC. Only run from trusted source code. The web service listens on loopback by default; after switching to LAN, every non-loopback API request must carry the access token, plain LAN HTTP is unencrypted, and remote access should go through an HTTPS entry point such as Tailscale Serve or Cloudflare Tunnel. The app sends an anonymous, low-frequency `app_heartbeat` by default to understand version distribution, platform compatibility, and active installations; it can be disabled in Settings. It does not collect project paths, code, message content, session content, or file names, and it does not upload files. The third-party analytics service receives request metadata. pi agent process proxy and desktop model fetch/test proxy can be configured separately; external links opened in the system browser still follow the browser/system network settings.
 
 ## License
 

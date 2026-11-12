@@ -231,6 +231,8 @@ import { ExtensionManager } from "./extensions/ExtensionManager";
 import { restoreAllParkedExtensions } from "./pi/piExtensionFilter";
 import { ProjectResourceManager } from "./projects/ProjectResourceManager";
 import { WebServiceManager } from "./web/WebServiceManager";
+import { RemoteAccessManager } from "./remote/RemoteAccessManager";
+import { createCommandRunner } from "./utils/CommandRunner";
 import { preparePreloadPath } from "./preloadPath";
 import { AppLogger } from "./logging/AppLogger";
 import { registerLogHandlers } from "./ipc/logHandlers";
@@ -349,6 +351,7 @@ let skillManager: SkillManager;
 let extensionManager: ExtensionManager;
 let projectResourceManager: ProjectResourceManager;
 let webServiceManager: WebServiceManager;
+let remoteAccessManager: RemoteAccessManager;
 let terminalManager: TerminalSessionManager;
 let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
@@ -587,6 +590,9 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 		// 正常退出必须先落盘「干净退出」标记：漏了这一步，下次启动会把上次的会话当成崩溃恢复。
 		// 同步写在这里是必要的——before-quit 之后进程随时可能被系统收走。
 		openSessionSnapshot?.markCleanExit();
+		// 先撤掉 Tailscale Serve，再停 Web 服务，避免短暂留下指向死端口的入口。
+		// 退出路径不 await：off 命令由独立进程完成，新实例启动时会重新配置。
+		void remoteAccessManager?.dispose();
 		void webServiceManager?.stop();
 		// 关闭会话目录 watcher，避免进程退出前仍持有目录句柄。
 		void sessionScanner?.close();
@@ -1199,6 +1205,7 @@ function registerIpc() {
 			restartApp,
 			getPetSystem: () => petSystem,
 			getWebServiceManager: () => webServiceManager,
+			getRemoteAccessManager: () => remoteAccessManager,
 			getAfkOrchestrator: () => afkOrchestrator,
 			// 崩溃恢复快照在渲染层挂载后一次性取走（主进程内只剩这一个消费者）
 			takeCrashedSessions: () => openSessionSnapshot?.takeCrashedRun() ?? null,
@@ -1357,6 +1364,20 @@ app.whenReady().then(async () => {
 		createAgent: (input) => agentManager.create(input),
 		sendPrompt: (input) => agentManager.sendPrompt(input),
 		stopAgent: (agentId) => agentManager.stop(agentId),
+		abortAgent: async (agentId) => agentManager.abort(agentId),
+		sendUiResponse: async (agentId, requestId, response) => {
+			agentManager.sendUIResponse(agentId, requestId, response);
+		},
+		respondTrustRequest: async (requestId, choice) => {
+			agentManager.respondTrustRequest(requestId, choice);
+		},
+		getHistoryPage: (agentId, before, limit) => agentManager.getHistoryPage(agentId, before, limit),
+		readMessageFullText: (agentId, messageId, entryId) =>
+			agentManager.readMessageFullText(agentId, messageId, entryId),
+		listTrustRequests: () => agentManager.listPendingTrustRequests(),
+		persistWebToken: async (patch) => {
+			await settingsStore.update(patch);
+		},
 		runtimeState: (agentId) => agentManager.getRuntimeState(agentId),
 		cycleModel: (agentId) => agentManager.cycleModel(agentId),
 		availableModels: (agentId) => agentManager.getAvailableModels(agentId),
@@ -1374,6 +1395,13 @@ app.whenReady().then(async () => {
 			agentManager.removeQueuedMessage(agentId, message, queue),
 		promoteQueuedMessage: (agentId, message) =>
 			agentManager.promoteQueuedMessage(agentId, message),
+	});
+	// 远程访问只配置 Tailscale Serve，转发目标始终是回环 Web 服务。
+	remoteAccessManager = new RemoteAccessManager({
+		runCommand: createCommandRunner().runCommand,
+		getWebPort: () => webServiceManager.getStatus(false).port,
+		isWebRunning: () => webServiceManager.isRunning(),
+		logger: appLogger,
 	});
 	// AFK 编排器：消费 AgentManager 语义事件（settled/statusChanged error）驱动
 	// ticket→worktree→agent→PR 链路；启动自动恢复在 runPostWindowStartupTasks。
@@ -1504,10 +1532,23 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	}
 
 
-	void webServiceManager.applySettings(settingsStore.get()).catch((error) => {
-		console.error("Failed to start web service:", error);
-		void settingsStore.update({ webServiceEnabled: false });
-	});
+	void (async () => {
+		const settings = settingsStore.get();
+		try {
+			await webServiceManager.applySettings(settings);
+		} catch (error) {
+			console.error("Failed to start web service:", error);
+			void settingsStore.update({ webServiceEnabled: false, remoteAccessEnabled: false });
+			return;
+		}
+		try {
+			await remoteAccessManager.applySettings(settingsStore.get());
+		} catch (error) {
+			// 远程访问启动失败不应影响桌面端；关闭开关，设置页会显示具体原因。
+			console.error("Failed to start remote access:", error);
+			void settingsStore.update({ remoteAccessEnabled: false });
+		}
+	})();
 
 	// 自动连接：如果已有 Bot 配置，自动启动飞书连接
 	autoConnectFeishu();

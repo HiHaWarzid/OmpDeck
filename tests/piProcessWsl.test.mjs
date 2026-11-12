@@ -37,6 +37,9 @@ function loadPiProcess(spawnCalls) {
 	const paths = loadWslPaths();
 	class FakeRpcClient extends EventEmitter {
 		close() {}
+		request() {
+			return Promise.resolve({});
+		}
 	}
 	class FakePiLocator {}
 	const sandbox = {

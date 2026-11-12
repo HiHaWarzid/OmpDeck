@@ -77,10 +77,26 @@ export type AppSettings = {
 	telemetryEnabled: boolean;
 	/** 是否开启局域网 Web 服务 */
 	webServiceEnabled: boolean;
-	/** Web 服务监听地址，默认 0.0.0.0 允许局域网访问 */
+	/** Web 服务监听地址，默认 127.0.0.1 仅本机可访问；局域网访问需显式改为 0.0.0.0 */
 	webServiceHost: string;
 	/** Web 服务监听端口 */
 	webServicePort: number;
+	/**
+	 * 是否通过 Tailscale Serve 暴露远程访问。启用后主进程把 Serve 的 HTTPS
+	 * 端口转发到回环 Web 服务；不是第二个 Web 服务。
+	 */
+	remoteAccessEnabled?: boolean;
+	/**
+	 * Web 服务访问令牌。非回环地址请求必须携带，避免同一局域网内任意设备
+	 * 直接操作 Agent。缺失时由主进程在启动/首次启用时生成并持久化。
+	 */
+	webServiceToken?: string;
+	/** 令牌生成时间（毫秒时间戳），用于展示与过期计算 */
+	webServiceTokenGeneratedAt?: number;
+	/** 令牌过期时间（毫秒时间戳）；null 表示永不过期 */
+	webServiceTokenExpiresAt?: number | null;
+	/** 令牌有效期（天）；0 表示永不过期 */
+	webServiceTokenTtlDays?: number;
 	/** 本地生成的匿名安装标识，不包含账号、路径或机器名 */
 	telemetryInstallId?: string;
 	/** 最近一次发送 app_heartbeat 的本地日期，格式 YYYY-MM-DD */

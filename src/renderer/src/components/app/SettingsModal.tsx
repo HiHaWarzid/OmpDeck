@@ -10,15 +10,20 @@ import {
 	Minus,
 	Plus,
 	Eye,
+	EyeOff,
 	Bot,
+	Copy,
+	RefreshCw,
+	QrCode,
 } from "lucide-react";
+import QRCode from "qrcode";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import { ModelRolesTab } from "./ModelRolesTab";
-import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest } from "../../../shared/types";
+import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest, RemoteAccessStatus, WebServiceStatus } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
 const ZOOM_FACTOR_MIN = 0.8;
@@ -159,7 +164,7 @@ type SettingsModalProps = {
 	onClearCheckFlag?: () => void;
 	onOpenWebService: (port: string) => void;
 	onClose: () => void;
-	onChange: (patch: Partial<AppSettings>) => void;
+	onChange: (patch: Partial<AppSettings>) => Promise<boolean>;
 };
 
 /**
@@ -250,10 +255,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 	// ── 全局设置草稿：进入弹框时快照 props.settings，所有修改在 draft 上操作，保存时统一提交 ──
 	const [draftSettings, setDraftSettings] = useState<AppSettings>(() => ({ ...props.settings }));
 	const [dirtyFields, setDirtyFields] = useState<Set<string>>(new Set());
+	const [saving, setSaving] = useState(false);
+	/** 同步 ref 防止保存请求在 React 重渲染前被连点触发两次。 */
+	const savingRef = useRef(false);
 	/** 打开弹框时的原始设置快照，用于取消时回退 */
 	const baseSnapshotRef = useRef<AppSettings>({ ...props.settings });
-	/** 标记是否为首次挂载（跳过外部 props.settings 同步） */
-	const initialMountRef = useRef(true);
 
 	/** 更新草稿并标记对应字段为已修改。调用方传入的 patch 中的每个 key 都会追加到 dirtyFields。 */
 	const updateDraft = (patch: Partial<AppSettings>) => {
@@ -272,17 +278,35 @@ function SettingsModalContent(props: SettingsModalProps) {
 		return dirtyFields.has(field);
 	};
 
-	/** 保存全部已修改的字段：计算差异后一次性提交 */
-	const saveAll = () => {
-		if (dirtyFields.size === 0) return;
+	/**
+	 * 保存全部已修改的字段：计算差异后一次性提交。
+	 * 只有主进程确认落盘成功才更新快照/清除 dirty；失败时保留草稿和 dirty，
+	 * 否则用户会看到「已保存」而实际设置已回滚。保存期间的新编辑按字段保留。
+	 */
+	const saveAll = async (): Promise<boolean> => {
+		if (dirtyFields.size === 0) return true;
+		if (savingRef.current) return false;
+		savingRef.current = true;
+		setSaving(true);
+		const savedKeys = new Set(dirtyFields);
 		const patch: Partial<AppSettings> = {};
-		for (const key of dirtyFields) {
+		for (const key of savedKeys) {
 			(patch as Record<string, unknown>)[key] = (draftSettings as Record<string, unknown>)[key];
 		}
-		props.onChange(patch);
-		// 更新快照基准为当前草稿值，并清除修改标记
-		baseSnapshotRef.current = { ...baseSnapshotRef.current, ...patch };
-		setDirtyFields(new Set());
+		try {
+			const ok = await props.onChange(patch);
+			if (!ok) return false;
+			baseSnapshotRef.current = { ...baseSnapshotRef.current, ...patch };
+			setDirtyFields((prev) => {
+				const next = new Set(prev);
+				for (const key of savedKeys) next.delete(key);
+				return next;
+			});
+			return true;
+		} finally {
+			savingRef.current = false;
+			setSaving(false);
+		}
 	};
 
 	/** 取消全部修改：将草稿回退到初始快照，丢弃所有未保存变更 */
@@ -309,11 +333,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 		}
 	};
 
-	/** 关闭确认弹框时选择保存并关闭 */
-	const handleSaveAndClose = () => {
-		saveAll();
+	/** 关闭确认弹框时选择保存并关闭；保存失败则留在弹框里让用户修正。 */
+	const handleSaveAndClose = async () => {
+		const ok = await saveAll();
 		setCloseConfirmOpen(false);
-		props.onClose();
+		if (ok) props.onClose();
 	};
 
 	/** 关闭确认弹框时选择放弃更改 */
@@ -330,6 +354,163 @@ function SettingsModalContent(props: SettingsModalProps) {
 			draftSettings.inputFontSize !== null,
 	);
 	const [webPortDraft, setWebPortDraft] = useState(String(draftSettings.webServicePort));
+	const [webStatus, setWebStatus] = useState<WebServiceStatus | null>(null);
+	const [webQr, setWebQr] = useState("");
+	const [webTokenVisible, setWebTokenVisible] = useState(false);
+	const [webTokenBusy, setWebTokenBusy] = useState(false);
+	const [remoteStatus, setRemoteStatus] = useState<RemoteAccessStatus | null>(null);
+	const [remoteQr, setRemoteQr] = useState("");
+	const [remoteBusy, setRemoteBusy] = useState(false);
+	const [remoteActionError, setRemoteActionError] = useState("");
+
+	const refreshWebStatus = async () => {
+		try {
+			setWebStatus(await window.piDesktop.web.status());
+		} catch {
+			setWebStatus(null);
+		}
+	};
+
+	const refreshRemoteStatus = async () => {
+		try {
+			setRemoteStatus(await window.piDesktop.remoteAccess.status());
+		} catch {
+			setRemoteStatus(null);
+		}
+	};
+
+	useEffect(() => {
+		if (!props.settings.webServiceEnabled) {
+			setWebStatus(null);
+			return;
+		}
+		void refreshWebStatus();
+		// 端口草稿每次输入不请求；但保存后的 host/port/开关变化必须重新拉取，
+		// 否则二维码和访问地址会停留在保存前的监听信息。
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [
+		props.settings.webServiceEnabled,
+		props.settings.webServiceHost,
+		props.settings.webServicePort,
+	]);
+
+	useEffect(() => {
+		const token = webStatus?.token;
+		if (!token || !webStatus.url) {
+			setWebQr("");
+			return;
+		}
+		const url = `${webStatus.url}/?token=${encodeURIComponent(token)}`;
+		void QRCode.toDataURL(url, { margin: 1, width: 220 })
+			.then(setWebQr)
+			.catch(() => setWebQr(""));
+	}, [webStatus]);
+
+	useEffect(() => {
+		void refreshRemoteStatus();
+		// 保存后的开关/端口变化要重新拉取状态；关闭态也会返回 installed 信息。
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [props.settings.remoteAccessEnabled, props.settings.webServiceEnabled, props.settings.webServicePort]);
+
+	useEffect(() => {
+		const token = webStatus?.token;
+		if (!token || !remoteStatus?.url) {
+			setRemoteQr("");
+			return;
+		}
+		const url = `${remoteStatus.url}/?token=${encodeURIComponent(token)}`;
+		void QRCode.toDataURL(url, { margin: 1, width: 220 })
+			.then(setRemoteQr)
+			.catch(() => setRemoteQr(""));
+	}, [remoteStatus, webStatus?.token]);
+
+	const rotateWebToken = async () => {
+		setWebTokenBusy(true);
+		try {
+			setWebStatus(await window.piDesktop.web.rotateToken());
+		} catch {
+			// 失败保留旧状态；设置页会显示错误日志入口
+		} finally {
+			setWebTokenBusy(false);
+		}
+	};
+
+	const copyWebUrl = async () => {
+		const token = webStatus?.token;
+		if (!token || !webStatus.url) return;
+		await navigator.clipboard.writeText(`${webStatus.url}/?token=${encodeURIComponent(token)}`);
+	};
+
+	const copyRemoteUrl = async () => {
+		const token = webStatus?.token;
+		if (!token || !remoteStatus?.url) return;
+		await navigator.clipboard.writeText(`${remoteStatus.url}/?token=${encodeURIComponent(token)}`);
+	};
+
+	const retryRemoteAccess = async () => {
+		setRemoteBusy(true);
+		setRemoteActionError("");
+		try {
+			// 只走一次 settings.update：主进程会同时确保 Web 服务和 Serve 启动。
+			// 先单独调用 remoteAccess.start() 再 update 会重复执行同一套启动/持久化。
+			await props.onChange({ remoteAccessEnabled: true });
+			await Promise.all([refreshWebStatus(), refreshRemoteStatus()]);
+		} catch (error) {
+			setRemoteActionError(error instanceof Error ? error.message : String(error));
+			await refreshRemoteStatus();
+		} finally {
+			setRemoteBusy(false);
+		}
+	};
+
+	/**
+	 * 手机远程访问总开关：一次 settings.update 同时启动回环 Web 服务和 Tailscale Serve。
+	 * 主进程已保证 remoteAccessEnabled=true 会自动启用 Web 服务，失败时回滚开关；
+	 * 这里不再走设置草稿，避免用户还要额外点“保存”。
+	 */
+	const applyPhoneAccess = async (enabled: boolean) => {
+		setRemoteBusy(true);
+		setRemoteActionError("");
+		try {
+			await props.onChange(
+				enabled
+					? { webServiceEnabled: true, remoteAccessEnabled: true }
+					: { remoteAccessEnabled: false },
+			);
+			await Promise.all([refreshWebStatus(), refreshRemoteStatus()]);
+			// 立即生效的开关不经过 dirtyFields；无论成功失败，都以主进程实际落盘值为准。
+			// 失败路径尤其重要：Serve 启动失败时主进程只回滚 remoteAccessEnabled，
+			// webServiceEnabled 可能已经开启，草稿不能继续显示“Web 服务已关闭”。
+			const persisted = await window.piDesktop.settings.get().catch(() => props.settings);
+			const nextDraft: Partial<AppSettings> = {
+				webServiceEnabled: persisted.webServiceEnabled,
+				remoteAccessEnabled: persisted.remoteAccessEnabled,
+			};
+			setDraftSettings((prev) => ({ ...prev, ...nextDraft }));
+			baseSnapshotRef.current = { ...baseSnapshotRef.current, ...nextDraft };
+			setDirtyFields((prev) => {
+				const next = new Set(prev);
+				next.delete("webServiceEnabled");
+				next.delete("remoteAccessEnabled");
+				return next;
+			});
+		} finally {
+			setRemoteBusy(false);
+		}
+	};
+
+	const remoteErrorCode = remoteStatus?.errorCode ?? null;
+	const remoteErrorText = remoteErrorCode
+		? t(`settings.remoteAccessError.${remoteErrorCode}`)
+		: remoteActionError || remoteStatus?.error || "";
+	const remoteStateText =
+		remoteStatus?.state === "running"
+			? t("settings.remoteAccessRunning")
+			: remoteStatus?.state === "starting"
+				? t("settings.remoteAccessStarting")
+				: remoteStatus?.state === "error"
+					? t("settings.remoteAccessError")
+					: t("settings.remoteAccessStopped");
 	const piPath = props.settings.customPiPath || props.piStatus?.command || "";
 	const changeZoomFactor = (delta: number) => {
 		const next = Math.min(
@@ -541,6 +722,21 @@ function SettingsModalContent(props: SettingsModalProps) {
 	const hasDirtyChanges = dirtyFields.size > 0;
 	// 代理 tab 仍展示未保存提示；实际保存/取消统一走全局草稿，避免旧 proxyDirty 局部状态残留。
 	const proxyDirty = PROXY_FIELDS.some((field) => dirtyFields.has(field));
+	const isWebRuntime = document.documentElement.dataset.runtime === "web";
+	// 回环地址的二维码手机扫了也连不上，应改为提示用户切换监听地址。
+	const webUrlIsLoopback = (() => {
+		try {
+			const hostname = new URL(webStatus?.url ?? "").hostname;
+			return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+		} catch {
+			return false;
+		}
+	})();
+	// 手机远程访问会沿用 Web 服务监听地址。老用户可能保留 0.0.0.0，
+	// 一键开启时必须在常用设置里提示这是未加密的局域网 HTTP。
+	const remoteUsesLanHttp = !["127.0.0.1", "localhost", "::1", "[::1]"].includes(
+		draftSettings.webServiceHost,
+	);
 
 	return (
 		<div className="modal-backdrop" onClick={handleClose}>
@@ -554,7 +750,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 						{/* 全局保存/取消按钮：仅在存在未保存变更时显示，样式与配置弹框的导入/导出按钮一致 */}
 						{hasDirtyChanges && (
 							<>
-								<button className="config-btn primary" onClick={saveAll}>
+								<button
+									className="config-btn primary"
+									disabled={saving}
+									onClick={() => void saveAll()}
+								>
 									{t("common.save")}
 								</button>
 								<button className="config-btn" onClick={cancelAll}>
@@ -592,6 +792,92 @@ function SettingsModalContent(props: SettingsModalProps) {
 						{/* ── 常用设置 tab ── */}
 						{activeTab === "common" && (
 							<>
+								{!isWebRuntime && (
+									<SettingsSection
+										title={t("settings.remoteAccess")}
+										description={t("settings.remoteAccessDesc")}
+									>
+										<SettingSwitch
+											title={t("settings.remoteAccessEnable")}
+											description={
+												remoteBusy
+													? t("settings.remoteAccessStarting")
+													: props.settings.remoteAccessEnabled
+														? t("settings.remoteAccessOnDesc")
+														: t("settings.remoteAccessOffDesc")
+											}
+											checked={props.settings.remoteAccessEnabled === true}
+											disabled={props.webServiceChanging || remoteBusy}
+											onChange={(checked) => void applyPhoneAccess(checked)}
+										/>
+										<div className="web-endpoint-panel">
+											<div className="web-endpoint-summary">
+												<span className={remoteStatus?.state === "running" ? "online" : ""} />
+												<div>
+													<strong>
+														{remoteStatus?.url || t("settings.remoteAccessNotRunning")}
+													</strong>
+													<small>{remoteStateText}</small>
+												</div>
+												<div className="web-endpoint-actions">
+													{remoteStatus?.url && (
+														<IconButton
+															label={t("settings.remoteAccessCopy")}
+															onClick={() => void copyRemoteUrl()}
+														>
+															<Copy size={15} />
+														</IconButton>
+													)}
+													{remoteStatus?.state !== "running" && props.settings.remoteAccessEnabled && (
+														<Button
+															buttonSize="sm"
+															disabled={remoteBusy}
+															onClick={() => void retryRemoteAccess()}
+														>
+															{remoteBusy
+																? t("settings.remoteAccessStarting")
+																: t("settings.remoteAccessRetry")}
+														</Button>
+													)}
+												</div>
+											</div>
+											{remoteErrorText && (
+												<small className="web-token-warning">{remoteErrorText}</small>
+											)}
+											{remoteStatus?.state === "running" && !webStatus?.token && (
+												<small className="web-token-warning">
+													{t("settings.remoteAccessTokenMissing")}
+												</small>
+											)}
+											{remoteQr && webStatus?.token && (
+												<div className="web-token-qr">
+													<img
+														src={remoteQr}
+														alt={t("settings.remoteAccessQrAlt")}
+														width={180}
+														height={180}
+													/>
+													<div>
+														<strong>{t("settings.remoteAccessScan")}</strong>
+														<small>
+															{remoteStatus?.url} · {t("settings.remoteAccessScanHint")}
+														</small>
+													</div>
+												</div>
+											)}
+											{remoteUsesLanHttp &&
+												(props.settings.remoteAccessEnabled ||
+													draftSettings.webServiceEnabled) && (
+													<small className="web-token-warning">
+														{t("settings.webTokenHttpWarning")}
+													</small>
+												)}
+											<small className="web-token-warning">
+												{t("settings.remoteAccessSecurity")}
+											</small>
+										</div>
+									</SettingsSection>
+								)}
 								<SettingsSection title={t("settings.interface")}>
 									<div className="setting-field">
 										<span>
@@ -1417,10 +1703,26 @@ function SettingsModalContent(props: SettingsModalProps) {
 										checked={draftSettings.webServiceEnabled}
 										disabled={props.webServiceChanging}
 										onChange={(checked) =>
-											updateDraft({ webServiceEnabled: checked })
+											updateDraft({
+												webServiceEnabled: checked,
+												// 与后端一致：关闭 Web 服务会级联关闭远程访问，
+												// 草稿也要同步，避免重新打开 Web 时远程开关“复活”。
+												...(checked ? {} : { remoteAccessEnabled: false }),
+											})
 										}
 									/>
 									<div className="web-endpoint-panel">
+										<SelectField
+											label={t("settings.webHost")}
+											value={draftSettings.webServiceHost}
+											disabled={props.webServiceChanging}
+											options={[
+												{ value: "127.0.0.1", label: t("settings.webHostLoopback") },
+												{ value: "0.0.0.0", label: t("settings.webHostLan") },
+											]}
+											onChange={(value) => updateDraft({ webServiceHost: value })}
+											description={t("settings.webHostDesc")}
+										/>
 										<div className="web-endpoint-grid">
 											<div className="web-endpoint-metric">
 												<span>{t("common.host")}</span>
@@ -1450,9 +1752,14 @@ function SettingsModalContent(props: SettingsModalProps) {
 											<span className={draftSettings.webServiceEnabled ? "online" : ""} />
 											<div>
 												<strong>
-													http://127.0.0.1:{webPortDraft || draftSettings.webServicePort}
+													{webStatus?.url ||
+														`http://127.0.0.1:${webPortDraft || draftSettings.webServicePort}`}
 												</strong>
-												<small>{t("settings.localWebHint")}</small>
+												<small>
+													{webStatus?.lanUrls && webStatus.lanUrls.length > 1
+														? webStatus.lanUrls.join(" · ")
+														: t("settings.localWebHint")}
+												</small>
 											</div>
 											<Button
 												buttonSize="sm"
@@ -1464,8 +1771,77 @@ function SettingsModalContent(props: SettingsModalProps) {
 												{t("common.open")}
 											</Button>
 										</div>
+										{draftSettings.webServiceEnabled && webStatus?.token && (
+											<div className="web-token-panel">
+												<div className="web-token-head">
+													<div>
+														<strong>{t("settings.webToken")}</strong>
+														<small>{t("settings.webTokenDesc")}</small>
+													</div>
+													<div className="web-token-actions">
+														<IconButton
+															label={webTokenVisible ? t("settings.webTokenHide") : t("settings.webTokenShow")}
+															onClick={() => setWebTokenVisible((value) => !value)}
+														>
+															{webTokenVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+														</IconButton>
+														<IconButton
+															label={t("settings.webTokenCopy")}
+															onClick={() => void copyWebUrl()}
+														>
+															<Copy size={15} />
+														</IconButton>
+														{!isWebRuntime && (
+															<IconButton
+																label={t("settings.webTokenRotate")}
+																disabled={webTokenBusy}
+																onClick={() => void rotateWebToken()}
+															>
+																<RefreshCw size={15} className={webTokenBusy ? "spin" : ""} />
+															</IconButton>
+														)}
+													</div>
+												</div>
+												<code className="web-token-value">
+													{webTokenVisible ? webStatus.token : "••••••••••••••••"}
+												</code>
+												{!isWebRuntime && (
+													<SelectField
+														label={t("settings.webTokenTtl")}
+														value={String(draftSettings.webServiceTokenTtlDays ?? 30)}
+														options={[
+															{ value: "1", label: t("settings.webTokenTtl1") },
+															{ value: "7", label: t("settings.webTokenTtl7") },
+															{ value: "30", label: t("settings.webTokenTtl30") },
+															{ value: "0", label: t("settings.webTokenTtlNever") },
+														]}
+														onChange={(value) =>
+															updateDraft({ webServiceTokenTtlDays: Number(value) })
+														}
+													/>
+												)}
+												{webQr && !webUrlIsLoopback && (
+													<div className="web-token-qr">
+														<img src={webQr} alt={t("settings.webTokenQrAlt")} width={180} height={180} />
+														<div>
+															<strong>{t("settings.webTokenScan")}</strong>
+															<small>
+																{webStatus.url} · {t("settings.webTokenScanHint")}
+															</small>
+														</div>
+													</div>
+												)}
+												{webUrlIsLoopback && (
+													<small className="web-token-warning">{t("settings.webTokenLoopbackWarning")}</small>
+												)}
+												{!webUrlIsLoopback && webStatus.url.startsWith("http://") && (
+													<small className="web-token-warning">{t("settings.webTokenHttpWarning")}</small>
+												)}
+											</div>
+										)}
 									</div>
 								</SettingsSection>
+
 								<SettingsSection title={t("settings.privacy")}>
 									<SettingSwitch
 										title={t("settings.telemetry")}
@@ -1717,7 +2093,11 @@ function SettingsModalContent(props: SettingsModalProps) {
 								<button className="config-btn danger" onClick={handleDiscardAndClose}>
 									{t("settings.discardChanges")}
 								</button>
-								<button className="config-btn primary" onClick={handleSaveAndClose}>
+								<button
+									className="config-btn primary"
+									disabled={saving}
+									onClick={() => void handleSaveAndClose()}
+								>
 									{t("settings.saveAndClose")}
 								</button>
 							</div>

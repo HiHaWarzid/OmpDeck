@@ -122,11 +122,14 @@ function loadAgentManager() {
 		if (id === "node:os") return { homedir: () => "C:\\Users\\tester" };
 		if (id === "../../shared/ipc") return { ipcChannels: {} };
 		if (id === "./PiProcess") return { PiProcess: class {} };
+		if (id === "./sessionBlobs")
+			return { isBlobImageRef: () => false, resolveBlobImagesInMessages: (messages) => messages };
 		if (id === "./bashResult") return { formatBashToolMessage: () => ({}) };
 		if (id === "./messageContent") return { extractMessageText: (value) => String(value ?? "") };
 		if (id === "./historyMessages") return { mergeHistoryWithPreservedMessages: (value) => value };
 		if (id === "./LatestByKeyEmitter") return { LatestByKeyEmitter };
 		if (id === "../../shared/toolRuntimeState") return { updateActiveToolCalls: () => new Map() };
+		if (id === "../notifications") return { showAppNotification: () => {} };
 		if (id === "../wsl/WslPaths") return wslPaths;
 		if (id === "../vision/VisionBridge") return loadModule("src/main/vision/VisionBridge.ts", "VisionBridge.ts");
 		return require(id);
@@ -148,6 +151,7 @@ function loadAgentManager() {
 
 	// 依赖顺序：todo（共享解析，无运行时依赖）<- sessionEntryIds <- messageTextUtils <- askQuestionCard <- messageTimeline <- sessionJsonl；streamGate 独立。
 	registry["../../shared/todo"] = loadModule("src/shared/todo.ts", "todo.ts");
+	registry["../../shared/piCommands"] = loadModule("src/shared/piCommands.ts", "piCommands.ts");
 	registry["./sessionEntryIds"] = loadModule("src/main/pi/sessionEntryIds.ts", "sessionEntryIds.ts");
 	registry["./messageTextUtils"] = loadModule("src/main/pi/messageTextUtils.ts", "messageTextUtils.ts");
 	registry["./askQuestionCard"] = loadModule("src/main/pi/askQuestionCard.ts", "askQuestionCard.ts");
@@ -163,6 +167,7 @@ function loadAgentManager() {
 	// sessionJsonl 的读取管线收敛到 ../sessions/sessionEntries（唯一实现：编码守卫/逐行解析/
 	// 指纹/预算，仅依赖 node:fs/promises）；测试文件自身的 require 会把它解析到 tests/ 而失败。
 	registry["../sessions/sessionEntries"] = loadModule("src/main/sessions/sessionEntries.ts", "sessionEntries.ts");
+	registry["./sessionArchives"] = loadModule("src/main/pi/sessionArchives.ts", "sessionArchives.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
 	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
 	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");

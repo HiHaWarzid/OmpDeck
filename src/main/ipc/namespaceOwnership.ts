@@ -45,6 +45,8 @@ export const NAMESPACE_OWNERS: Record<Namespace, readonly string[]> = {
 	yaoPrompts: ["storeHandlers"],
 	extensions: ["extensionHandlers"],
 	settings: ["appHandlers"],
+	web: ["appHandlers"],
+	remoteAccess: ["appHandlers"],
 	config: ["configHandlers"],
 	agents: ["agentHandlers"],
 	// PetSystem.handlerMaps（src/main/pet/index.ts），非独立 handler 模块文件。

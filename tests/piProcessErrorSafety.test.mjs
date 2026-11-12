@@ -38,6 +38,9 @@ function loadPiProcess(spawnImpl) {
 
 	class FakeRpcClient extends EventEmitter {
 		close() {}
+		request() {
+			return Promise.resolve({});
+		}
 	}
 	class FakePiLocator {}
 
