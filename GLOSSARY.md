@@ -148,3 +148,14 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 ### 节奏（cadence）
 合并语义（“同一 agent 的一次状态收敛”）留在领域内：消息/思考/状态 50ms、运行态 150ms 的 latest-wins 窗口不变，语义事件是合并后的结果，不是每个 RPC delta；适配器只做映射，不改节奏。
+
+---
+
+# 会话运行术语（主进程）
+
+> 与 AFK 无关的会话运行时概念；架构评审候选 B 拆出。
+
+## 术语
+
+### FollowUpQueue（排队账本）
+每个 agent 一份的 follow-up 排队账本（`main/pi/followUpQueue.ts`）。负责"omp 收下消息后到底什么时候才落用户气泡"的全部判断：**准入对账**（get_state 快照里还有它 → 压着；没有 → 已投递）、**离队结算**（queue_update 里剩余条数少于本地条数 → 已投递；FIFO，故从尾部保留）、**墓碑**（本进程撤回/中止恢复造成的离队不算投递，TTL 30s）、**中止恢复**（恢复名单内丢弃快照，名单外补气泡；`truncated` 全部丢弃）。只做判断，不落气泡——时间线副作用留在 `AgentManager.bubbleDeliveredFollowUps`，因此规则可脱离 RPC/窗口/时间线单测。

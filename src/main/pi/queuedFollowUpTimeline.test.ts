@@ -4,6 +4,7 @@ import { afterEach, beforeEach, test, vi } from "vitest";
 import type { AgentQueuedMessages, AgentStatus, AgentTab } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
 import { createNullAgentEventSink } from "./agentEventSink";
+import { FollowUpQueue } from "./followUpQueue";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, type AgentRunState } from "./agentRunState";
 import type { SettingsStore } from "../settings/SettingsStore";
@@ -48,15 +49,7 @@ type TestRuntime = {
 	modelRefreshing: boolean;
 	autoRestartAttempted: boolean;
 	appliedConfigEpoch: number;
-	deferredFollowUps?: Array<{
-		text: string;
-		queueText: string;
-		meta: Record<string, unknown>;
-		images?: Array<{ type: string; data: string; mimeType: string }>;
-	}>;
-	withdrawnFollowUps?: Map<string, number>;
-	lastQueuedSnapshot?: AgentQueuedMessages;
-	lastQueueUpdateAt?: number;
+	queue: FollowUpQueue;
 };
 
 function makeTab(id: string, status: AgentStatus): AgentTab {
@@ -115,7 +108,7 @@ function makeRuntime(tab: AgentTab, dataByCommand: StubData): TestRuntime {
 		modelRefreshing: false,
 		autoRestartAttempted: false,
 		appliedConfigEpoch: 0,
-		deferredFollowUps: [],
+		queue: new FollowUpQueue(),
 	};
 }
 
@@ -166,14 +159,14 @@ test("排队中的 follow-up 不落气泡，投递后才出现在时间线", asy
 
 	assert.deepEqual(result, { accepted: true });
 	assert.deepEqual(lines(runtime), [], "排队期间时间线不应出现用户气泡");
-	assert.equal(runtime.deferredFollowUps?.length, 1);
+	assert.equal(runtime.queue.pending.length, 1);
 
 	// omp 在本轮结束时把队列取出投递：queue_update 先于新一轮 agent_start 到达。
 	inner.handlePiEvent("a1", { type: "queue_update", steering: [], followUp: [] });
 
 	assert.deepEqual(lines(runtime), ["user:等这轮跑完再补"]);
 	assert.equal(runtime.transcript.messages[0]?.meta?.streamingBehavior, "followUp");
-	assert.equal(runtime.deferredFollowUps?.length, 0);
+	assert.equal(runtime.queue.pending.length, 0);
 });
 
 /** 本地 busy 快照过期时 omp 会立即开跑：那时队列里没有它，气泡必须马上补上。 */
@@ -192,7 +185,7 @@ test("队列里查不到时立即落气泡", async () => {
 	});
 
 	assert.deepEqual(lines(runtime), ["user:立即执行"]);
-	assert.equal(runtime.deferredFollowUps?.length, 0);
+	assert.equal(runtime.queue.pending.length, 0);
 });
 
 /** 撤回成功的消息不会再执行，队列清空事件不能把它补成一条幽灵气泡。 */
@@ -244,7 +237,7 @@ test("abortAndRestoreQueue 的队列清空事件不算投递", async () => {
 
 	assert.deepEqual(restored.followUp, [{ text: "停止前排队" }]);
 	assert.deepEqual(lines(runtime), [], "撤回的消息不应在时间线留下气泡");
-	assert.equal(runtime.deferredFollowUps?.length, 0);
+	assert.equal(runtime.queue.pending.length, 0);
 });
 
 /**
@@ -285,7 +278,7 @@ test("对账在途时撤回，不把撤回误判成投递", async () => {
 	await sending;
 
 	assert.deepEqual(lines(runtime), [], "撤回的消息不应在时间线留下气泡");
-	assert.equal(runtime.deferredFollowUps?.length, 0);
+	assert.equal(runtime.queue.pending.length, 0);
 });
 
 /**
@@ -314,7 +307,7 @@ test("同文案连发时按 FIFO 归属气泡内容", async () => {
 		images: [imageB],
 		streamingBehavior: "followUp",
 	});
-	assert.equal(runtime.deferredFollowUps?.length, 2);
+	assert.equal(runtime.queue.pending.length, 2);
 
 	// 第一条离队 = 先投递的那条（imageA）。
 	inner.handlePiEvent("a1", { type: "queue_update", steering: [], followUp: ["重试"] });
@@ -337,10 +330,10 @@ test("撤回 steering 不影响同文案的 follow-up 快照", async () => {
 	inner.agents.set("a1", runtime);
 
 	await manager.sendPrompt({ agentId: "a1", message: "继续", streamingBehavior: "followUp" });
-	assert.equal(runtime.deferredFollowUps?.length, 1);
+	assert.equal(runtime.queue.pending.length, 1);
 
 	await manager.removeQueuedMessage("a1", "继续", "steering");
-	assert.equal(runtime.deferredFollowUps?.length, 1, "steering 撤回不能动 follow-up 快照");
+	assert.equal(runtime.queue.pending.length, 1, "steering 撤回不能动 follow-up 快照");
 
 	inner.handlePiEvent("a1", { type: "queue_update", steering: [], followUp: [] });
 	assert.deepEqual(lines(runtime), ["user:继续"]);

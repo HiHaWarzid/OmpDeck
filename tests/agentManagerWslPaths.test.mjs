@@ -185,6 +185,9 @@ function loadAgentManager() {
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
 	// 跨 pi 版本的 RPC 命令名兼容层（新名优先 / 旧名兜底，仅类型导入无运行时依赖）。
 	registry["./piRpcCompat"] = loadModule("src/main/pi/piRpcCompat.ts", "piRpcCompat.ts");
+	// follow-up 队列账本（纯状态 + 判断，仅类型导入 shared）；测试文件自身的 require
+	// 同样解析不到 src 目录，必须显式注入。
+	registry["./followUpQueue"] = loadModule("src/main/pi/followUpQueue.ts", "followUpQueue.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {
