@@ -49,7 +49,10 @@ function makeSettingsStore() {
 }
 
 /** 只覆写 settings.update 需要的依赖；其余字段留空 stub。 */
-function register(webServiceManager: { applySettings: () => Promise<void>; isRunning: () => boolean }) {
+function register(
+	webServiceManager: { applySettings: () => Promise<void>; isRunning: () => boolean },
+	remoteAccessManager?: { applySettings: () => Promise<void> },
+) {
 	const settingsStore = makeSettingsStore();
 	const handlers = registerAppHandlers({
 		appLogger,
@@ -64,6 +67,7 @@ function register(webServiceManager: { applySettings: () => Promise<void>; isRun
 		restartApp: stubs,
 		getPetSystem: () => null,
 		getWebServiceManager: () => webServiceManager,
+		getRemoteAccessManager: () => remoteAccessManager ?? null,
 		openExternalUrl: stubs,
 		syncWslEnvironment: stubs,
 		applyNativeThemeSource: () => {},
@@ -119,4 +123,36 @@ test("同时改开关与端口且失败：两者都回滚", async () => {
 	expect(settingsStore.state.webServiceEnabled).toBe(true);
 	expect(settingsStore.state.webServiceHost).toBe("0.0.0.0");
 	expect(settingsStore.state.webServicePort).toBe(1234);
+});
+
+test("只开远程访问时自动启用 Web 服务，再配置 Serve", async () => {
+	const manager = { applySettings: async () => {}, isRunning: () => true };
+	const remote = { applySettings: async () => {} };
+	const { settingsStore, update } = register(manager, remote);
+	settingsStore.state.webServiceEnabled = false;
+
+	await update({} as never, { remoteAccessEnabled: true });
+
+	expect(settingsStore.state.webServiceEnabled).toBe(true);
+	expect(settingsStore.state.remoteAccessEnabled).toBe(true);
+});
+
+test("Serve 配置失败只回滚远程开关，保留已自动启用的 Web 服务", async () => {
+	const manager = { applySettings: async () => {}, isRunning: () => true };
+	const remote = {
+		applySettings: async () => {
+			throw new Error("tailscale serve failed");
+		},
+	};
+	const { settingsStore, update } = register(manager, remote);
+	settingsStore.state.webServiceEnabled = false;
+
+	await expect(update({} as never, { remoteAccessEnabled: true })).rejects.toThrow(
+		"tailscale serve failed",
+	);
+
+	// 一键开关失败后仍停在“Web 服务可用、远程未连接”的一致状态；
+	// SettingsModal 会重新读取持久化值，而不是把两个开关一起显示为关闭。
+	expect(settingsStore.state.webServiceEnabled).toBe(true);
+	expect(settingsStore.state.remoteAccessEnabled).toBe(false);
 });

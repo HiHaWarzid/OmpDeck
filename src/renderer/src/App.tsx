@@ -5886,7 +5886,7 @@ export function App() {
     }
   }
 
-  async function updateSettings(patch: Partial<AppSettings>) {
+  async function updateSettings(patch: Partial<AppSettings>): Promise<boolean> {
     const changesWebService =
       "webServiceEnabled" in patch ||
       "webServiceHost" in patch ||
@@ -5962,9 +5962,11 @@ export function App() {
         }
       }
       showToast(notice);
+      return true;
     } catch (error) {
       setSettings(await api.settings.get());
       showToast(error instanceof Error ? error.message : String(error));
+      return false;
     } finally {
       if (changesWebService) setWebServiceChanging(false);
     }

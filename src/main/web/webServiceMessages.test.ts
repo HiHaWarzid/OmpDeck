@@ -51,6 +51,7 @@ const deps: WebDeps = {
 	createAgent: async () => agent,
 	sendPrompt: async () => ({}) as unknown as SendPromptResult,
 	stopAgent: async () => {},
+	abortAgent: async () => {},
 	sendUiResponse: async () => {},
 	respondTrustRequest: async () => {},
 	getHistoryPage: async () => ({ messages: [], nextCursor: null, hasMore: false }),
@@ -126,6 +127,28 @@ afterAll(async () => {
 });
 
 describe("手机端消息增量契约", () => {
+	test("聊天页停止走 abort，只有显式关闭才走 stop", async () => {
+		const calls: string[] = [];
+		const originalAbort = deps.abortAgent;
+		const originalStop = deps.stopAgent;
+		deps.abortAgent = async (agentId) => {
+			calls.push(`abort:${agentId}`);
+		};
+		deps.stopAgent = async (agentId) => {
+			calls.push(`stop:${agentId}`);
+		};
+		try {
+			const abort = await fetch(`${baseUrl}/api/agents/agent-1/abort`, { method: "POST" });
+			expect(abort.status).toBe(200);
+			const stop = await fetch(`${baseUrl}/api/agents/agent-1/stop`, { method: "POST" });
+			expect(stop.status).toBe(200);
+			expect(calls).toEqual(["abort:agent-1", "stop:agent-1"]);
+		} finally {
+			deps.abortAgent = originalAbort;
+			deps.stopAgent = originalStop;
+		}
+	});
+
 	test("light 状态不携带 messagesByAgent", async () => {
 		const { data } = await getJson("/api/state?light=1");
 		expect(data.projects).toBeTruthy();

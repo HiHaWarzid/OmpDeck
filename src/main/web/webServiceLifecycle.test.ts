@@ -24,6 +24,7 @@ const deps: WebDeps = {
 	createAgent: async () => ({}) as unknown as AgentTab,
 	sendPrompt: async () => ({}) as unknown as SendPromptResult,
 	stopAgent: async () => {},
+	abortAgent: async () => {},
 	sendUiResponse: async () => {},
 	respondTrustRequest: async () => {},
 	getHistoryPage: async () => ({ messages: [], nextCursor: null, hasMore: false }),

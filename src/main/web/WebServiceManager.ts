@@ -86,13 +86,17 @@ type WebServiceDependencies = {
 	listSessions: (projectId: string) => Promise<SessionSummary[]>;
 	getMessages: (agentId: string) => ChatMessage[];
 	/**
-	 * 以下三个成员故意用 web 端点语义命名（create/sendPrompt/stopAgent），对应
-	 * agents 命名空间的 create/prompt/stop —— 名称映射是 web 面的刻意选择，签名
-	 * 仍以 agents 命名空间为准。
+	 * 以下成员故意用 web 端点语义命名（create/sendPrompt/stopAgent/abortAgent），
+	 * 对应 agents 命名空间的 create/prompt/stop/abort —— 名称映射是 web 面的刻意
+	 * 选择，签名仍以 agents 命名空间为准。
+	 *
+	 * stopAgent 会退役并结束 pi 进程（关闭会话），abortAgent 只中止当前回合。
+	 * 手机聊天页的「停止」必须走 abort，不能复用 stop，否则会话会被直接关闭。
 	 */
 	createAgent: (input: CreateAgentInput) => Promise<AgentTab>;
 	sendPrompt: (input: SendPromptInput) => Promise<SendPromptResult>;
 	stopAgent: (agentId: string) => Promise<void>;
+	abortAgent: (agentId: string) => Promise<void>;
 	/** 扩展 UI 响应：手机端回答 select/confirm/input/editor。 */
 	sendUiResponse: PiDesktopApi["agents"]["sendUiResponse"];
 	/** 项目信任确认：手机端回传 trust-remember/trust-session/deny。 */
@@ -587,6 +591,14 @@ export class WebServiceManager {
 				this.sendJson(request, response, { result });
 				return;
 			}
+			// abort 只停止当前回合，保留 pi 进程和会话；/stop 才会关闭会话。
+			// 手机聊天页的停止按钮走这里，不能复用 /stop。
+			const abortMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/abort$/);
+			if (abortMatch && request.method === "POST") {
+				await this.deps.abortAgent(decodeURIComponent(abortMatch[1]));
+				this.sendJson(request, response, { ok: true });
+				return;
+			}
 			const stopMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/stop$/);
 			if (stopMatch && request.method === "POST") {
 				await this.deps.stopAgent(decodeURIComponent(stopMatch[1]));
@@ -1040,11 +1052,14 @@ export class WebServiceManager {
 		});
 		el("stop").addEventListener("click", async () => {
 			if (!activeAgentId) return;
+			const agent = state.agents.find(item => item.id === activeAgentId);
+			const running = agent?.status === "running";
 			el("stop").disabled = true;
 			el("stop").textContent = "处理中";
 			try {
-				await api(\`/api/agents/\${encodeURIComponent(activeAgentId)}/stop\`, { method: "POST" });
-				activeAgentId = "";
+				// 运行中只中止当前回合；空闲时才关闭 Agent/会话。
+				await api(\`/api/agents/\${encodeURIComponent(activeAgentId)}/\${running ? "abort" : "stop"}\`, { method: "POST" });
+				if (!running) activeAgentId = "";
 				await refresh();
 			} finally {
 				el("stop").textContent = "关闭 Agent";

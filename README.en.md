@@ -187,12 +187,12 @@ npm run dev
 1. On the desktop app, open **Settings → Web Service** and enable it.
 2. Put the phone and computer on the same network; only for LAN access, switch the listen address from the default `127.0.0.1` to `0.0.0.0`.
 3. Scan the QR code in Settings, or open the copied token URL on the phone.
-4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop an agent; the composer accepts photos (auto-compressed), and while an agent is running you can choose **steer into current turn** or **queue for next turn**. Project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
+4. From the phone you can browse/reopen session history, create sessions, keep chatting, and stop the current turn (aborts generation without closing the session); the composer accepts photos (auto-compressed), and while an agent is running you can choose **steer into current turn** or **queue for next turn**. Project trust can be confirmed on the phone, while agent UI confirmations/choices still belong on the desktop.
 
 ### Remote / Off-network Access
 
 1. Install and sign in to Tailscale on both the computer and the phone (same tailnet).
-2. Open **Settings → Web Service → Remote Access (Tailscale)** on the desktop and enable it. OmpDeck turns on the web service and configures `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>` against the local loopback port.
+2. Open **Settings → General → Phone Remote Access (Tailscale)** on the desktop and turn on the switch. OmpDeck turns on the web service and configures `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>` against the local loopback port.
 3. The first use requires enabling **HTTPS certificates / Serve** in the Tailscale admin console; the settings page reports a retryable error until then.
 4. Once configured, the settings page shows `https://<machine>.<tailnet>.ts.net:8443` and a QR code; scan it on the phone.
 5. When you disable remote access or quit, OmpDeck removes only the Serve rule pointing at its own local port; other Serve rules are left alone.

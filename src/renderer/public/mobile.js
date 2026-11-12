@@ -5,6 +5,8 @@
 (() => {
 	const stateApi = globalThis.OmpMobileState;
 	const TAIL_LIMIT = 40;
+	// 首页历史会话先渲染一页，滑到底部再追加；避免一次把几百条 row 全部塞进 DOM。
+	const SESSION_PAGE_SIZE = 40;
 	const MAX_IMAGES = 4;
 	// 服务端请求体上限 2MB；base64 会膨胀约 33%，给文本和 JSON 留出余量。
 	const MAX_IMAGE_DATA_CHARS = 700_000;
@@ -28,6 +30,7 @@
 	const refreshButton = $("refresh");
 	const tabs = $("tabs");
 	const newSessionButton = $("new-session");
+	const loadingBar = $("loading-bar");
 	const toastEl = $("toast");
 	const sheetEl = $("sheet");
 	const sheetTitle = $("sheet-title");
@@ -66,6 +69,9 @@
 	let appState = { projects: readProjectsCache(), agents: [] };
 	let projectId = storageGet("omp-mobile-project");
 	let sessions = [];
+	let visibleSessionCount = SESSION_PAGE_SIZE;
+	let homeHistoryCount = 0;
+	let homeHistorySessions = [];
 	let activeAgentId = null;
 	let activeAgent = null;
 	let chatMessages = [];
@@ -84,6 +90,9 @@
 	let pendingImages = [];
 	let lastStatus = "";
 	let toastTimer = null;
+	let loadingRequests = 0;
+	let loadingBarTimer = null;
+	let lastViewKey = "";
 	let currentTab = "home";
 	let currentRuntime = {};
 	let searchQuery = "";
@@ -275,7 +284,18 @@
 		try {
 			const entries = Object.entries(homeCache)
 				.sort((left, right) => (right[1]?.at || 0) - (left[1]?.at || 0))
-				.slice(0, 8);
+				.slice(0, 8)
+				.map(([id, entry]) => [
+					id,
+					{
+						...entry,
+						// 内存里保留完整列表供分页；localStorage 只留首屏快照，
+						// 避免 8 个项目 × 几百条 preview 触发配额上限后整份缓存丢失。
+						sessions: Array.isArray(entry?.sessions)
+							? entry.sessions.slice(0, 100)
+							: entry?.sessions,
+					},
+				]);
 			localStorage.setItem(HOME_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
 		} catch {
 			// localStorage 满或隐私模式不可用时，首页仍可在内存里使用。
@@ -298,7 +318,9 @@
 		if (!id) return;
 		homeCache[id] = {
 			at: Date.now(),
-			sessions: (list || []).filter(isTopLevelSession).slice(0, 100),
+			// 不再截断到 100 条：手机端分页只控制 DOM 渲染数量，数据层要保留完整列表，
+			// 否则滑到底部也无法加载第 101 条之后的历史会话。
+			sessions: (list || []).filter(isTopLevelSession),
 		};
 		writeHomeCache();
 	}
@@ -328,6 +350,29 @@
 		}, 3200);
 	}
 
+	/**
+	 * 全局请求指示器：短请求不闪烁，超过 150ms 才显示顶部进度条。
+	 * 轮询也走 api()，但通常很快完成，不会每 3 秒闪一次。
+	 */
+	function beginLoading() {
+		loadingRequests += 1;
+		if (loadingRequests !== 1 || !loadingBar) return;
+		loadingBarTimer = setTimeout(() => {
+			loadingBarTimer = null;
+			if (loadingRequests > 0 && loadingBar) loadingBar.hidden = false;
+		}, 150);
+	}
+
+	function endLoading() {
+		loadingRequests = Math.max(0, loadingRequests - 1);
+		if (loadingRequests > 0) return;
+		if (loadingBarTimer) {
+			clearTimeout(loadingBarTimer);
+			loadingBarTimer = null;
+		}
+		if (loadingBar) loadingBar.hidden = true;
+	}
+
 	async function api(path, options = {}) {
 		const { timeout: timeoutMs = 10000, ...fetchOptions } = options;
 		const headers = { accept: "application/json", ...(fetchOptions.headers || {}) };
@@ -338,6 +383,7 @@
 		// 固定 10s 中断会让已受理的消息被当成失败并触发重发。
 		const timeout =
 			timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+		beginLoading();
 		try {
 			const response = await fetch(path, {
 				cache: "no-store",
@@ -387,6 +433,7 @@
 			throw error;
 		} finally {
 			clearTimeout(timeout);
+			endLoading();
 		}
 	}
 
@@ -432,6 +479,18 @@
 		banner.hidden = false;
 		banner.textContent =
 			state === "offline" ? "连接中断，点此重试" : "连接中…";
+	}
+
+	/** 只在真正的视图切换时播放一次进入动画；轮询重绘不会触发。 */
+	function animateView() {
+		const key = activeAgentId ? `agent:${activeAgentId}` : currentTab;
+		if (key === lastViewKey) return;
+		lastViewKey = key;
+		if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+		view.classList.remove("view-enter");
+		// 强制重排后再加 class，确保连续切换也能重新播放动画。
+		void view.offsetWidth;
+		view.classList.add("view-enter");
 	}
 
 	function resetChatEpoch() {
@@ -594,17 +653,59 @@
 		return session.name || session.preview?.split("\n")[0] || "未命名会话";
 	}
 
-	function filterHomeRows() {
+	function sessionRowHtml(session) {
+		const title = sessionTitle(session);
+		return `
+			<button class="row" type="button" data-session="${escapeHtml(session.filePath)}">
+				<span class="grow">
+					<span class="name">${escapeHtml(title)}</span>
+					<span class="preview">${escapeHtml(session.preview || "")}</span>
+					<span class="meta">${escapeHtml(timeText(session.updatedAt))} · ${Number(session.messageCount) || 0} 条${session.degraded ? " · 部分损坏" : ""}</span>
+				</span>
+				<span class="chev" aria-hidden="true">›</span>
+			</button>`;
+	}
+
+	/**
+	 * 历史列表只渲染当前页。搜索时从完整的内存索引里筛选，而不是依赖 DOM；
+	 * 这样既不会为几百条会话创建隐藏节点，也能搜索到尚未“加载更多”的会话。
+	 */
+	function renderSessionList() {
+		const card = $("sessions-card");
+		if (!card) return;
 		const query = searchQuery.trim().toLowerCase();
-		const rows = view.querySelectorAll("[data-session]");
-		let visible = 0;
-		rows.forEach((row) => {
-			const hit = !query || (homeSearchKeys.get(row.dataset.session) || "").includes(query);
-			row.hidden = !hit;
-			if (hit) visible += 1;
-		});
-		const empty = $("no-sessions");
-		if (empty) empty.hidden = visible > 0 || rows.length === 0;
+		const list = query
+			? homeHistorySessions.filter((session) =>
+					(homeSearchKeys.get(session.filePath) || "").includes(query),
+				)
+			: homeHistorySessions.slice(0, visibleSessionCount);
+		const rows = list.map(sessionRowHtml).join("");
+		const emptyText = query
+			? "没有匹配的会话"
+			: homeHistorySessions.length === 0
+				? appState.agents.some(
+						(agent) =>
+							agent.projectId === projectId &&
+							agent.status !== "closed" &&
+							Boolean(agent.sessionPath),
+					)
+					? "当前会话已在上方"
+					: "还没有历史会话"
+				: "";
+		const loadMore =
+			!query && visibleSessionCount < homeHistoryCount
+				? '<button class="load-more-sessions" id="load-more-sessions" type="button">加载更多会话</button>'
+				: "";
+		card.innerHTML = `${rows}${emptyText ? `<div class="empty">${emptyText}</div>` : ""}${loadMore}`;
+	}
+
+	// 首页滑到底部或点“加载更多”时追加下一批 row；只重建会话卡片，不重绘整页。
+	function revealMoreSessions() {
+		if (searchQuery.trim() || visibleSessionCount >= homeHistoryCount) return;
+		visibleSessionCount += SESSION_PAGE_SIZE;
+		const previousTop = view.scrollTop;
+		renderSessionList();
+		view.scrollTop = previousTop;
 	}
 
 	function renderHome() {
@@ -615,6 +716,7 @@
 		currentTab = "home";
 		activeAgentId = null;
 		activeAgent = null;
+		animateView();
 		setHeader(
 			"OmpDeck",
 			projectId ? `${projectName(projectId)} · ${sessions.length} 个会话` : "没有项目",
@@ -629,7 +731,8 @@
 		const agents = appState.agents.filter((agent) => agent.projectId === projectId && agent.status !== "closed");
 		// 已打开的会话已经在“正在使用”里，历史列表再出现一次会让手机首页重复。
 		const activeSessionPaths = new Set(agents.map((agent) => agent.sessionPath).filter(Boolean));
-		const historySessions = sessions.filter((session) => !activeSessionPaths.has(session.filePath));
+		homeHistorySessions = sessions.filter((session) => !activeSessionPaths.has(session.filePath));
+		homeHistoryCount = homeHistorySessions.length;
 		const agentRows = agents
 			.map(
 				(agent) => `
@@ -643,24 +746,14 @@
 				</button>`,
 			)
 			.join("");
+		// 搜索键只留在内存里；渲染时只插入当前页，避免几百条 row 同时进 DOM。
 		homeSearchKeys = new Map();
-		const sessionRows = historySessions
-			.map((session) => {
-				const title = sessionTitle(session);
-				// 搜索键只留在内存里，不再写进每个 row 的 data-search 属性；
-				// 146 条会话的 preview 会重复占用一大块 DOM 属性内存。
-				homeSearchKeys.set(session.filePath, `${title} ${session.preview || ""}`.toLowerCase());
-				return `
-				<button class="row" type="button" data-session="${escapeHtml(session.filePath)}">
-					<span class="grow">
-						<span class="name">${escapeHtml(title)}</span>
-						<span class="preview">${escapeHtml(session.preview || "")}</span>
-						<span class="meta">${escapeHtml(timeText(session.updatedAt))} · ${Number(session.messageCount) || 0} 条${session.degraded ? " · 部分损坏" : ""}</span>
-					</span>
-					<span class="chev" aria-hidden="true">›</span>
-				</button>`;
-			})
-			.join("");
+		for (const session of homeHistorySessions) {
+			homeSearchKeys.set(
+				session.filePath,
+				`${sessionTitle(session)} ${session.preview || ""}`.toLowerCase(),
+			);
+		}
 		view.innerHTML = `
 			<div class="search">
 				<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
@@ -674,10 +767,7 @@
 					: ""
 			}
 			<div class="section-title">历史会话</div>
-			<div class="card" id="sessions-card">
-				${sessionRows || `<div class="empty">${agents.some((agent) => agent.sessionPath) ? "当前会话已在上方" : "还没有历史会话"}</div>`}
-				<div class="empty" id="no-sessions" hidden>没有匹配的会话</div>
-			</div>
+			<div class="card" id="sessions-card"></div>
 			<div class="home-note">点会话继续，点底部 + 新建</div>`;
 		// 从会话/设置返回时保留聊天滚动位置会让首页停在中段，首页始终从顶部开始。
 		view.scrollTop = 0;
@@ -690,6 +780,7 @@
 				resetChatEpoch();
 				projectId = nextProject;
 				searchQuery = "";
+				visibleSessionCount = SESSION_PAGE_SIZE;
 				try {
 					localStorage.setItem("omp-mobile-project", projectId);
 				} catch {
@@ -708,15 +799,21 @@
 		view.querySelectorAll("[data-agent]").forEach((row) => {
 			row.addEventListener("click", () => openAgent(row.dataset.agent));
 		});
-		view.querySelectorAll("[data-session]").forEach((row) => {
-			row.addEventListener("click", () => openSession(row.dataset.session));
+		// 会话卡片会随分页/搜索重建，点击统一委托到卡片上，避免逐行绑定监听器。
+		$("sessions-card")?.addEventListener("click", (event) => {
+			if (event.target.closest("#load-more-sessions")) {
+				revealMoreSessions();
+				return;
+			}
+			const row = event.target.closest("[data-session]");
+			if (row) void openSession(row.dataset.session);
 		});
 		const search = $("session-search");
 		search?.addEventListener("input", () => {
 			searchQuery = search.value;
-			filterHomeRows();
+			renderSessionList();
 		});
-		filterHomeRows();
+		renderSessionList();
 		view.setAttribute("aria-busy", "false");
 	}
 
@@ -904,6 +1001,7 @@
 			<button class="load-older" id="load-older" type="button" hidden>加载更早消息</button>
 			<div id="messages" aria-live="polite" aria-busy="true"></div>
 			<button class="new-messages" id="new-messages" type="button" hidden></button>`;
+		animateView();
 		$("model-btn").addEventListener("click", () => void openModelSheet());
 		$("thinking-btn").addEventListener("click", () => void openThinkingSheet());
 		$("load-older").addEventListener("click", loadOlder);
@@ -2110,13 +2208,23 @@
 		if (!activeAgentId) return;
 		const agentId = activeAgentId;
 		const requestEpoch = epoch;
+		stopButton.disabled = true;
+		stopButton.textContent = "停止中…";
 		try {
-			await api(`/api/agents/${encodeURIComponent(agentId)}/stop`, { method: "POST" });
+			// 只中止当前回合；/stop 会关闭 pi 进程和会话，不能用于聊天页停止。
+			await api(`/api/agents/${encodeURIComponent(agentId)}/abort`, { method: "POST" });
 			if (isCurrentRequest(requestEpoch, agentId)) {
+				// 先本地收口停止按钮，避免 abort 已受理但下一次轮询还没回来时按钮仍可点。
+				agentRunning = false;
+				stopButton.hidden = true;
+				updateComposerState();
 				await refreshChat({ initial: true });
 			}
 		} catch (error) {
 			if (isCurrentRequest(requestEpoch, agentId)) handleError(error);
+		} finally {
+			stopButton.disabled = false;
+			stopButton.textContent = "停止";
 		}
 	}
 
@@ -2172,6 +2280,7 @@
 		currentTab = "settings";
 		activeAgentId = null;
 		activeAgent = null;
+		animateView();
 		setHeader("设置", "连接与令牌", { tabs: true });
 		// 桌面版从同源 localStorage 读取令牌，不把令牌再拼进 URL，避免历史记录/分享泄露。
 		if (token) storageSet("ompdeck.web.token", token);
@@ -2407,6 +2516,14 @@
 	view.addEventListener(
 		"scroll",
 		() => {
+			// 首页滑到接近底部时自动放出下一批历史会话；列表较长时不必反复点按钮。
+			if (
+				currentTab === "home" &&
+				!activeAgentId &&
+				view.scrollTop + view.clientHeight >= view.scrollHeight - 160
+			) {
+				revealMoreSessions();
+			}
 			// 用户自己滑到底部时，新消息提示不应继续挂着。
 			if (!newMessageCount) return;
 			if (

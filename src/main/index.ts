@@ -1273,6 +1273,7 @@ app.whenReady().then(async () => {
 		createAgent: (input) => agentManager.create(input),
 		sendPrompt: (input) => agentManager.sendPrompt(input),
 		stopAgent: (agentId) => agentManager.stop(agentId),
+		abortAgent: async (agentId) => agentManager.abort(agentId),
 		sendUiResponse: async (agentId, requestId, response) => {
 			agentManager.sendUIResponse(agentId, requestId, response);
 		},

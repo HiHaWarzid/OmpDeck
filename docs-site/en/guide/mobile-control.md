@@ -5,7 +5,7 @@ OmpDeck can be controlled from a phone browser: browse session history, reopen h
 ## What You Can Do
 
 - Browse sessions per project and reopen historical sessions.
-- Create sessions, send prompts, and stop a running agent.
+- Create sessions, send prompts, and stop the current turn (aborts generation without closing the session).
 - Attach up to four photos (auto-compressed); while the agent is running, choose **steer into current turn** or **queue for next turn**.
 - Switch models and thinking levels.
 - Tool calls are grouped by turn; tap one for full arguments and results.
@@ -32,7 +32,7 @@ After the first visit, the token is stored in that browser's local storage and t
 If you do not want to manage port forwarding, use the built-in Tailscale Serve integration:
 
 1. Install Tailscale on the computer and the phone, and sign both into the same tailnet.
-2. Open **Settings → Web Service → Remote Access (Tailscale)** on the desktop and enable it. OmpDeck turns on the web service and runs `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>`.
+2. Open **Settings → General → Phone Remote Access (Tailscale)** on the desktop and turn on the switch. OmpDeck turns on the web service and runs `tailscale serve --bg --yes --https=8443 http://127.0.0.1:<port>`.
 3. The first use requires enabling **HTTPS certificates / Serve** in the Tailscale admin console. The settings page reports a retryable error until it is enabled; activation usually takes a few seconds.
 4. Once the state becomes “connected”, the settings page shows `https://<machine>.<tailnet>.ts.net:8443` and a QR code; scan it on the phone.
 5. Disabling remote access or quitting OmpDeck removes only the Serve rule pointing at its own local port; other Serve rules are untouched.
