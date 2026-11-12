@@ -30,6 +30,7 @@ export type IpcOpKind = "invoke" | "subscribe" | "send" | "sendSync" | "local";
  */
 export type IpcPushSource =
 	| "agent-manager"
+	| "agent-event-bridge"
 	| "feishu-bridge"
 	| "feishu-handlers"
 	| "pet-index"
@@ -472,7 +473,7 @@ export const ipcTable = {
 		onSubagents: {
 			channel: "agents:subagents",
 			kind: "subscribe",
-			pushFrom: "agent-manager",
+			pushFrom: "agent-event-bridge",
 			pairKey: "agents:subagents",
 		},
 		/** 同一通道的 invoke 侧：渲染层重载/切 Agent 时拉取主进程 registry 快照。 */
@@ -502,25 +503,25 @@ export const ipcTable = {
 		setTodos: { channel: "agents:set-todos", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
 		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
-		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-manager" },
-		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager", web: true },
-		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
+		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-event-bridge" },
+		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-event-bridge", web: true },
+		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-event-bridge", pairKey: "agents:runtime-state" },
 		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe", pushFrom: "pet-index" },
-		onMessages: { channel: "agents:message", kind: "subscribe", pushFrom: "agent-manager", web: true },
-		onLog: { channel: "agents:log", kind: "subscribe", pushFrom: "agent-manager" },
+		onMessages: { channel: "agents:message", kind: "subscribe", pushFrom: "agent-event-bridge", web: true },
+		onLog: { channel: "agents:log", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 流式思考内容更新，agent 忙碌时实时推送当前思考文本 */
-		onThinking: { channel: "agents:thinking", kind: "subscribe", pushFrom: "agent-manager" },
+		onThinking: { channel: "agents:thinking", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 主进程 → 渲染进程的轻量 toast 通知（如 abort 已请求停止） */
-		onNotice: { channel: "agents:notice", kind: "subscribe", pushFrom: "agent-manager" },
-		/** RPC 日志，用于调试 */
+		onNotice: { channel: "agents:notice", kind: "subscribe", pushFrom: "agent-event-bridge" },
+		/** RPC 日志，用于调试（领域内唯一保留的窗口直发通道） */
 		onRpcLog: { channel: "agents:rpc-log", kind: "subscribe", pushFrom: "agent-manager" },
 		/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
-		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-manager" },
+		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 渲染进程 → 主进程，传递用户在 UI 请求中的响应（选中的选项、输入的文本等） */
 		sendUiResponse: { channel: "agents:ui-response", kind: "invoke" },
 		notifyAsk: { channel: "agents:notify-ask", kind: "invoke" },
 		/** 项目信任确认：主进程 → 渲染进程，启动 Agent 前请求用户对含 .pi 资源的项目做信任决策 */
-		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe", pushFrom: "agent-manager" },
+		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 项目信任确认：渲染进程 → 主进程，回传用户的信任选择（trust-remember/trust-session/deny） */
 		respondTrustRequest: { channel: "agents:trust-response", kind: "invoke" },
 	},

@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, test, vi } from "vitest";
 import type { AgentTab, AfkSettings, AfkState, AppSettings, CreateAgentInput, Project, SendPromptInput, SendPromptResult } from "../../shared/types";
-import type { AgentManagerEventListener } from "../../shared/types";
+import type { AgentEvent, AgentEventSink } from "../pi/agentEventSink";
 import { AfkOrchestrator, type AfkEffects, type AfkOrchestratorDeps } from "./AfkOrchestrator";
 import type { AfkTicket, TicketSource } from "./ticketSources";
 
@@ -52,7 +52,7 @@ let effects: FakeAfkEffects;
 // ── 依赖 fakes ──
 
 class FakeAgentManager {
-	readonly listeners: AgentManagerEventListener[] = [];
+	readonly listeners: Array<(event: AgentEvent) => void> = [];
 	readonly tabs = new Map<string, AgentTab>();
 	readonly prompts: SendPromptInput[] = [];
 	readonly stopped: string[] = [];
@@ -60,13 +60,16 @@ class FakeAgentManager {
 	rejectPromptError: string | null = null;
 	private counter = 0;
 
-	onAgentEvent(listener: AgentManagerEventListener): () => void {
-		this.listeners.push(listener);
-		return () => {
-			const index = this.listeners.indexOf(listener);
-			if (index >= 0) this.listeners.splice(index, 1);
-		};
-	}
+	/** 编排器只订阅语义事件；本 fake 不模拟 publish/snapshot。 */
+	readonly eventSink = {
+		onEvent: (listener: (event: AgentEvent) => void) => {
+			this.listeners.push(listener);
+			return () => {
+				const index = this.listeners.indexOf(listener);
+				if (index >= 0) this.listeners.splice(index, 1);
+			};
+		},
+	} as unknown as AgentEventSink;
 
 	list(): AgentTab[] {
 		return [...this.tabs.values()];
@@ -99,13 +102,13 @@ class FakeAgentManager {
 	}
 
 	emitSettled(agentId: string): void {
-		for (const listener of this.listeners) listener({ type: "settled", agentId });
+		for (const listener of this.listeners) listener({ kind: "settled", agentId });
 	}
 
 	emitError(agentId: string, lastError: string): void {
 		for (const listener of this.listeners) {
 			listener({
-				type: "statusChanged",
+				kind: "status-changed",
 				agentId,
 				status: "error",
 				tab: { id: agentId, projectId: "", cwd: "", title: "", status: "error", createdAt: 0, lastError },

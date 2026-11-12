@@ -143,11 +143,11 @@ export class AfkOrchestrator {
 		this.fx = resolveAfkEffects(deps.effects);
 
 		// 语义事件订阅（#2 杠杆点）：settled = agent 停止工作的权威完成信号；
-		// statusChanged === "error" = 失败信号。不轮询 addStateListener 快照。
-		this.agentManager.onAgentEvent((event) => {
-			if (event.type === "settled") {
+		// status-changed === "error" = 失败信号。不轮询 tabs 快照。
+		this.agentManager.eventSink.onEvent((event) => {
+			if (event.kind === "settled") {
 				void this.handleSettled(event.agentId);
-			} else if (event.type === "statusChanged") {
+			} else if (event.kind === "status-changed") {
 				this.handleStatusChanged(event);
 			}
 		});

@@ -30,6 +30,7 @@ import { ipcChannels, ipcTable, type IpcOpEntry, type IpcPushSource } from "./ip
 /** pushFrom 短名 → src/main 下模块文件（相对路径）。新增订阅通道时若推送源不在列，先扩展此映射。 */
 const PUSH_SOURCE_FILES: Readonly<Record<IpcPushSource, string>> = {
 	"agent-manager": "pi/AgentManager.ts",
+	"agent-event-bridge": "ipc/agentEventBridge.ts",
 	"feishu-bridge": "feishu/FeishuBridge.ts",
 	"feishu-handlers": "ipc/feishuHandlers.ts",
 	"pet-index": "pet/index.ts",

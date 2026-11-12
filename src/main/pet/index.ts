@@ -46,7 +46,7 @@ export class PetSystem {
 	async start() {
 		// 表驱动注册：通道名/协议取自通道表（pet.ready 为 send → ipcMain.on）
 		registerIpcHandlers(this.handlerMaps());
-		this.bridge.attach(this.deps.agentManager);
+		this.bridge.attach(this.deps.agentManager.eventSink);
 
 		const s = this.deps.settingsStore.get();
 		if (s.petEnabled) {

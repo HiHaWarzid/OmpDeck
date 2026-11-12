@@ -204,6 +204,13 @@ function createManager(AgentManager, configManager = {}) {
 		() => null,
 		{ get: () => ({}) },
 		configManager,
+		// 语义事件出口：本套件只断言会话文件读取，事件没有消费者。
+		{
+			publish() {},
+			onEvent: () => () => {},
+			snapshot: async () => ({ tabs: [], agents: {} }),
+			hasUiResponders: () => false,
+		},
 	);
 }
 

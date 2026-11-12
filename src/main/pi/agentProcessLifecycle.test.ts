@@ -4,6 +4,7 @@ import { test, vi } from "vitest";
 
 import type { AgentTab, ChatMessage, Project } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
+import { createNullAgentEventSink } from "./agentEventSink";
 import type { AgentProcessFactory, AgentProcessPort } from "./agentProcessSlot";
 import type { PiRpcClient } from "./PiRpcClient";
 import type { SettingsStore } from "../settings/SettingsStore";
@@ -115,8 +116,9 @@ function makeHarness(
 			trustStore: { decide: async () => undefined },
 			...extraDeps,
 		} as unknown as AgentConfigDeps,
-		undefined,
-		undefined,
+		createNullAgentEventSink(),
+		undefined, // rpcLogger
+		undefined, // appLogger
 		factory,
 	);
 	return {

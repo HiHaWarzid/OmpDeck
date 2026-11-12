@@ -1,6 +1,7 @@
 import type { BrowserWindow } from "electron";
 import type { AgentStatus, AgentTab, PetAggregateState, PetMode, PetNotification } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import type { AgentEventSink } from "../pi/agentEventSink";
 
 /**
  * PetStateBridge —— 多 Agent 状态聚合为一个宠物动画状态。
@@ -76,8 +77,11 @@ export class PetStateBridge {
 
 	get currentState(): PetAggregateState | null { return this.lastState; }
 
-	attach(agentManager: { addStateListener: (cb: (tabs: AgentTab[]) => void) => () => void }) {
-		this.unsubscribe = agentManager.addStateListener((tabs) => this.update(tabs));
+	attach(events: AgentEventSink) {
+		// 只关心聚合状态：消息/思考等高频事件不进入宠物窗路径。
+		this.unsubscribe = events.onEvent((event) => {
+			if (event.kind === "tabs-changed") this.update(event.tabs);
+		});
 	}
 
 	detach() {

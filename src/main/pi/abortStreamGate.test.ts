@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { AgentManager } from "./AgentManager";
+import { createAgentEventSink, type AgentEvent } from "./agentEventSink";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, type AgentRunState } from "./agentRunState";
 import type { AgentConfigDeps } from "./AgentManager";
@@ -32,6 +33,7 @@ type Harness = {
 	agents: Map<string, TestRuntime>;
 	handlePiEvent(agentId: string, event: unknown): void;
 	ipc: Array<{ channel: string; payload: unknown }>;
+	events: AgentEvent[];
 };
 
 type TestRuntime = {
@@ -60,15 +62,15 @@ type TestRuntime = {
 
 function makeHarness(): Harness {
 	const ipc: Array<{ channel: string; payload: unknown }> = [];
+	const events: AgentEvent[] = [];
+	const sink = createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) });
+	sink.onEvent((event) => events.push(event));
 	const manager = new AgentManager(
 		() => undefined,
-		() =>
-			({
-				isDestroyed: () => false,
-				webContents: { send: (channel: string, payload: unknown) => ipc.push({ channel, payload }) },
-			}) as unknown as Electron.BrowserWindow,
+		() => null,
 		{} as unknown as SettingsStore,
 		{} as unknown as AgentConfigDeps,
+		sink,
 	);
 	return {
 		manager,
@@ -76,6 +78,7 @@ function makeHarness(): Harness {
 		handlePiEvent: (agentId, event) =>
 			(manager as unknown as { handlePiEvent(id: string, e: unknown): void }).handlePiEvent(agentId, event),
 		ipc,
+		events,
 	};
 }
 
@@ -119,15 +122,15 @@ function textDeltaEvent(text: string) {
 
 describe("abort stream gate", () => {
 	it("abort seals the run and keeps the stop feedback out of the transcript", async () => {
-		const { manager, agents, ipc } = makeHarness();
+		const { manager, agents, events } = makeHarness();
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		agents.set("a1", runtime);
 
 		await manager.abort("a1");
 
-		// 停止反馈走 toast（notice 通道），不再往时间线塞系统卡片
+		// 停止反馈走 toast（notice 事件），不再往时间线塞系统卡片
 		expect(runtime.transcript.messages).toHaveLength(0);
-		expect(ipc.some((entry) => entry.channel.includes("notice"))).toBe(true);
+		expect(events.some((event) => event.kind === "notice")).toBe(true);
 		// 闸门封印 + 等待 abort settled
 		expect(runtime.run.streamGate.waitingForAbortSettled).toBe(true);
 		expect(runtime.tab.status).toBe("idle");

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, test, vi } from "vitest";
 
 import type { AgentQueuedMessages, AgentStatus, AgentTab } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
+import { createNullAgentEventSink } from "./agentEventSink";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
 import { createRunState, type AgentRunState } from "./agentRunState";
 import type { SettingsStore } from "../settings/SettingsStore";
@@ -124,6 +125,7 @@ function makeManager(): AgentManager {
 		() => null,
 		{ get: () => ({ rpcTimeout: 5_000 }) } as unknown as SettingsStore,
 		{} as unknown as AgentConfigDeps,
+		createNullAgentEventSink(),
 		undefined,
 		undefined,
 		undefined,

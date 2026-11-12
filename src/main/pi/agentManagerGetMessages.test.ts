@@ -3,6 +3,7 @@ import { test, vi } from "vitest";
 
 import type { AgentTab, ChatMessage } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
+import { createNullAgentEventSink } from "./agentEventSink";
 import { MAX_TRANSCRIPT_BYTES } from "./agentTranscript";
 import type { SettingsStore } from "../settings/SettingsStore";
 
@@ -29,7 +30,8 @@ function makeManager(warnings: string[]): AgentManager {
 			readOmpDefaultThinkingLevel: async () => undefined,
 			trustStore: { decide: async () => undefined },
 		} as unknown as AgentConfigDeps,
-		undefined,
+		createNullAgentEventSink(),
+		undefined, // rpcLogger：本测试只断言告警
 		{
 			warn: (_scope: string, message: string) => warnings.push(message),
 			info: () => {},

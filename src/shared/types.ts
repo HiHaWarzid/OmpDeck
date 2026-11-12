@@ -21,7 +21,6 @@ export * from "./types/git";
 export * from "./types/feishu";
 export * from "./types/app";
 export * from "./types/afk";
-export * from "./types/agentEvents";
 export * from "./types/ompRoles";
 export * from "./types/config";
 export * from "./types/web";

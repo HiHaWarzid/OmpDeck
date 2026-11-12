@@ -8,8 +8,6 @@ import { homedir } from "node:os";
 import type {
 	AbortAndRestoreQueueResult,
 	WebAgentHistoryPage,
-	AgentManagerEvent,
-	AgentManagerEventListener,
 	AgentQueuedMessages,
 	AgentRuntimeState,
 	AgentStatus,
@@ -39,6 +37,7 @@ import type {
 	ThinkingUpdate,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import type { AgentEvent, AgentEventSink, AgentSnapshot } from "./agentEventSink";
 import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
@@ -277,16 +276,6 @@ export class AgentManager {
 	 * 原值 8 对于一些需要回看较多历史的长会话偏少，提高至 30 轮。
 	 */
 	private static readonly MAX_HISTORY_LOAD_TURNS = 30;
-	/** 本地事件监听器（用于 FeishuBridge 等主进程内部订阅） */
-	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
-	/** 状态变更监听器（用于 PetStateBridge 等主进程内部模块订阅 AgentTab[] 聚合状态） */
-	private readonly stateListeners = new Set<(tabs: AgentTab[]) => void>();
-	/**
-	 * 语义事件监听器（AFK 编排器/后续 renderer 语义订阅用）。
-	 * 与 stateListeners 不同：这里订阅的是增量语义事件（消息追加/状态变更/运行态/已稳定），
-	 * 而非整表快照；回调在汇聚点同步执行，单个监听器抛异常不影响其它监听器。
-	 */
-	private readonly eventListeners = new Set<AgentManagerEventListener>();
 	/**
 	 * statusChanged 语义事件的去重基准：记录每个 agent 上次已向语义订阅者发表的 status。
 	 * emitStateNow 是 50ms 聚合快照，若每次都全量发 statusChanged，会把「无变化」也当成
@@ -358,6 +347,11 @@ export class AgentManager {
 		private readonly getWindow: () => BrowserWindow | null,
 		private readonly settingsStore: SettingsStore,
 		private readonly config: AgentConfigDeps,
+		/**
+		 * 语义事件出口（见 agentEventSink.ts）。领域只管 publish，
+		 * 通道名与窗口序列化全部在 Electron 适配器里，测试注入记录型 sink 即可观察。
+		 */
+		private readonly events: AgentEventSink,
 		private readonly rpcLogger?: RpcLogger,
 		private readonly appLogger?: AppLogger,
 		/**
@@ -1988,11 +1982,9 @@ export class AgentManager {
 					this.markMessagesDirty(runtime, idx);
 				}
 				// 让渲染层立刻收起内联问答条；不能等 pi 回 cancelled（abort 路径不一定回）。
-				this.emit(ipcChannels.agentsUiRequest, {
-					agentId,
-					requestId,
-					completed: true,
-					cancelled: true,
+				this.events.publish({
+					kind: "ui-request",
+					request: { agentId, requestId, completed: true, cancelled: true },
 				});
 			}
 			pending.clear();
@@ -2012,12 +2004,15 @@ export class AgentManager {
 		delete runtime.tab.lastError;
 		// 停止反馈改 toast，不再写入会话时间线：
 		// 1) 系统状态卡片太抢眼；2) 插在 assistant 中间会打断 agent-run 分组，放大“消息串台”体感。
-		this.emit(ipcChannels.agentsNotice, {
-			agentId,
-			message: "已请求停止当前响应",
-			i18nKey: "app.abortRequested",
-			kind: "info",
-			duration: 2500,
+		this.events.publish({
+			kind: "notice",
+			notice: {
+				agentId,
+				message: "已请求停止当前响应",
+				i18nKey: "app.abortRequested",
+				kind: "info",
+				durationMs: 2500,
+			},
 		});
 		this.emitState();
 		// 撤回队列的结果是 abort_and_restore_queue 的唯一数据来源，必须等响应；
@@ -2653,7 +2648,8 @@ export class AgentManager {
 
 	/** 子代理状态变化只走独立通道：progress 帧频率高，不能顺带触发 get_state RPC。 */
 	private emitSubagents(runtime: AgentRuntime) {
-		this.emit(ipcChannels.agentsSubagents, {
+		this.events.publish({
+			kind: "subagents-changed",
 			agentId: runtime.tab.id,
 			subagents: this.getSubagentSnapshot(runtime),
 		});
@@ -2791,7 +2787,8 @@ export class AgentManager {
 		runtime.toolStateSequence += 1;
 		// 工具边沿直接从原始 pi 事件发出，不等待 get_state/get_session_stats。
 		// 这样即使工具极快完成或完整状态请求乱序，renderer 仍能稳定看到 true → false。
-		this.emit(ipcChannels.agentsRuntimeState, {
+		this.events.publish({
+			kind: "runtime-changed",
 			agentId: runtime.tab.id,
 			state: {
 				isExecutingTool,
@@ -2843,10 +2840,9 @@ export class AgentManager {
 			state.isExecutingTool = !!runtime.toolExecuting;
 			state.executingToolName = runtime.toolExecuting ?? undefined;
 			state.toolStateSequence = runtime.toolStateSequence;
-			this.emit(ipcChannels.agentsRuntimeState, { agentId, state });
-			// 语义事件：完整运行态就绪后同步发给语义订阅者（与 IPC 推送同一份 state，
-			// 含调用完成时写入的 runtimeStateSeq/toolStateSequence 等真值字段）。
-			this.notifyEventListeners({ type: "runtimeStateChanged", agentId, state });
+			this.events.publish({ kind: "runtime-changed", agentId, state });
+			// 与 IPC 推送同一份 state（含调用完成时写入的 runtimeStateSeq/toolStateSequence
+			// 等真值字段）：消费者看到的是同一个快照，不做二次拼装。
 		} catch {
 			// 运行态刷新失败不影响主流程；下一次轮询或事件会继续同步。
 		} finally {
@@ -2926,14 +2922,17 @@ export class AgentManager {
 		const trimmed = providerId.trim();
 		if (!trimmed) throw new Error("providerId is required");
 		runtime.loginFlowProviderId = trimmed;
-		this.emit(ipcChannels.agentsUiRequest, {
-			agentId,
-			requestId: `login-${trimmed}`,
-			method: "login_flow",
-			title: "",
-			loginStatus: "started",
-			loginProviderId: trimmed,
-			loginFlow: true,
+		this.events.publish({
+			kind: "ui-request",
+			request: {
+				agentId,
+				requestId: `login-${trimmed}`,
+				method: "login_flow",
+				title: "",
+				loginStatus: "started",
+				loginProviderId: trimmed,
+				loginFlow: true,
+			},
 		});
 		try {
 			const response = await runtime.slot.process.client.request(
@@ -2948,27 +2947,33 @@ export class AgentManager {
 				typeof data?.providerId === "string" && data.providerId
 					? data.providerId
 					: trimmed;
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId: `login-${trimmed}`,
-				method: "login_flow",
-				title: "",
-				loginStatus: "succeeded",
-				loginProviderId: completedProvider,
-				loginFlow: true,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId: `login-${trimmed}`,
+					method: "login_flow",
+					title: "",
+					loginStatus: "succeeded",
+					loginProviderId: completedProvider,
+					loginFlow: true,
+				},
 			});
 			return { providerId: completedProvider };
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId: `login-${trimmed}`,
-				method: "login_flow",
-				title: "",
-				loginStatus: "failed",
-				loginProviderId: trimmed,
-				loginFlow: true,
-				error: message,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId: `login-${trimmed}`,
+					method: "login_flow",
+					title: "",
+					loginStatus: "failed",
+					loginProviderId: trimmed,
+					loginFlow: true,
+					error: message,
+				},
 			});
 			throw error;
 		} finally {
@@ -4098,32 +4103,44 @@ export class AgentManager {
 		return () => { this.localEventListeners.delete(listener); };
 	}
 
-	/** 注册状态变更监听器（供 PetStateBridge 等主进程内部模块使用）；每次 emitState 后同步回调最新 AgentTab[] */
-	addStateListener(listener: (tabs: AgentTab[]) => void): () => void {
-		this.stateListeners.add(listener);
-		return () => { this.stateListeners.delete(listener); };
+	/** 本地事件监听器（供 FeishuBridge 等主进程内部模块消费原始 pi 事件） */
+	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
+
+	/**
+	 * 对外语义出口。桌面适配器、AFK 编排器、宠物桥共用同一个 sink；
+	 * 谁订阅谁退订，`hasUiResponders()` 因此只对「能作答交互请求」的消费者为真。
+	 */
+	get eventSink(): AgentEventSink {
+		return this.events;
 	}
 
 	/**
-	 * 注册语义事件监听器（AFK 编排器/后续 renderer 语义订阅用）。
-	 * 提供的是增量语义事件而非整表快照；事件在汇聚点同步回调。
-	 * 返回的退订函数可安全重复调用。
+	 * 完整状态基线：新消费者（手机端连接、渲染层重载）先用它对齐，之后走增量事件。
+	 * 单个 agent 的 RPC 失败只跳过该项，不拖垮整次快照。
 	 */
-	onAgentEvent(listener: AgentManagerEventListener): () => void {
-		this.eventListeners.add(listener);
-		return () => { this.eventListeners.delete(listener); };
-	}
-
-	private notifyStateListeners(tabs: AgentTab[]) {
-		for (const listener of this.stateListeners) {
-			try { listener(tabs); } catch {}
+	async snapshot(): Promise<AgentSnapshot> {
+		const tabs = this.list();
+		const entries = await Promise.all(
+			tabs.map(async (tab) => {
+				const runtime = this.agents.get(tab.id);
+				if (!runtime) return null;
+				const state = await this.getRuntimeState(tab.id).catch(() => null);
+				if (!state) return null;
+				return [
+					tab.id,
+					{
+						runtime: state,
+						subagents: this.getSubagentSnapshot(runtime),
+						thinking: runtime.transcript.streamingThinking,
+					},
+				] as const;
+			}),
+		);
+		const agents: AgentSnapshot["agents"] = {};
+		for (const entry of entries) {
+			if (entry) agents[entry[0]] = entry[1];
 		}
-	}
-
-	private notifyEventListeners(event: AgentManagerEvent) {
-		for (const listener of this.eventListeners) {
-			try { listener(event); } catch {}
-		}
+		return { tabs, agents };
 	}
 
 	async stopAll(): Promise<void> {
@@ -4196,14 +4213,11 @@ export class AgentManager {
 		});
 		child.on("stderr", (text) => {
 			if (!owns()) return;
-			this.emit(ipcChannels.agentsLog, { agentId, text });
+			this.events.publish({ kind: "log", agentId, text });
 		});
 		child.on("protocol-error", (line) => {
 			if (!owns()) return;
-			this.emit(ipcChannels.agentsLog, {
-				agentId,
-				text: `Protocol error: ${line}`,
-			});
+			this.events.publish({ kind: "log", agentId, text: `Protocol error: ${line}` });
 			void this.appLogger?.error(
 				"agent",
 				`Protocol error: ${(line as string)?.slice(0, 200)}`,
@@ -4538,7 +4552,8 @@ export class AgentManager {
 		// 是斜线命令建议的唯一事实源。渲染层原先只在切换 Agent 时拉取一次，
 		// 运行中新增/移除的命令要等重启才可见。
 		if (typed.type === "available_commands_update") {
-			this.emit(ipcChannels.agentsCommandCatalog, {
+			this.events.publish({
+				kind: "command-catalog",
 				agentId,
 				commands: normalizePiCommands(typed.commands),
 			});
@@ -4571,12 +4586,15 @@ export class AgentManager {
 		// config.yml 的警告集合变化（设置页保存、/config 重载等）。
 		// omp 不在 get_state 里暴露警告文本，桌面端只提示用户去 /config 查看并刷新状态。
 		if (typed.type === "config_warnings_changed") {
-			this.emit(ipcChannels.agentsNotice, {
-				agentId,
-				message: "Config warnings changed",
-				i18nKey: "app.configWarningsChanged",
-				kind: "warning",
-				duration: 4500,
+			this.events.publish({
+				kind: "notice",
+				notice: {
+					agentId,
+					message: "Config warnings changed",
+					i18nKey: "app.configWarningsChanged",
+					kind: "warning",
+					durationMs: 4500,
+				},
 			});
 			void this.emitRuntimeState(agentId);
 			return;
@@ -5009,65 +5027,75 @@ export class AgentManager {
 				this.markMessagesDirty(runtime, idx);
 				this.scheduleMessageEmit(runtime, false);
 			}
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId: targetId,
-				completed: true,
-				cancelled: true,
+			this.events.publish({
+				kind: "ui-request",
+				request: { agentId, requestId: targetId, completed: true, cancelled: true },
 			});
 			return;
 		}
 		// pi RPC 协议将 setWidget / dialog 字段放在顶层，不嵌套 params
 		if (method === "notify") {
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method,
-				title: "",
-				message: String(typed.message ?? ""),
-				notifyType: typed.notifyType,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method,
+					title: "",
+					message: String(typed.message ?? ""),
+					notifyType: typed.notifyType,
+				},
 			});
 			return;
 		}
 
 		if (method === "set_editor_text") {
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method,
-				title: "",
-				text: String(typed.text ?? ""),
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method,
+					title: "",
+					text: String(typed.text ?? ""),
+				},
 			});
 			return;
 		}
 
 		if (method === "setWidget") {
 			// Plan Mode 等扩展会频繁刷新 widget；只走 IPC 状态，不落入会话消息，避免 JSONL 被进度噪声污染。
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method,
-				title: "",
-				widgetKey: String(typed.widgetKey ?? requestId),
-				widgetLines: Array.isArray(typed.widgetLines) ? typed.widgetLines : undefined,
-				widgetPlacement: typed.widgetPlacement,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method,
+					title: "",
+					widgetKey: String(typed.widgetKey ?? requestId),
+					widgetLines: Array.isArray(typed.widgetLines) ? typed.widgetLines : undefined,
+					widgetPlacement: typed.widgetPlacement,
+				},
 			});
 			return;
 		}
 
 		// omp 原生 OAuth：浏览器地址必须交给宿主打开；桌面端由登录浮层展示/打开。
 		if (method === "open_url") {
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method,
-				title: "",
-				url: typeof typed.url === "string" ? typed.url : undefined,
-				launchUrl: typeof typed.launchUrl === "string" ? typed.launchUrl : undefined,
-				instructions:
-					typeof typed.instructions === "string" ? typed.instructions : undefined,
-				loginFlow: runtime.loginFlowProviderId !== undefined,
-				loginProviderId: runtime.loginFlowProviderId,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method,
+					title: "",
+					url: typeof typed.url === "string" ? typed.url : undefined,
+					launchUrl: typeof typed.launchUrl === "string" ? typed.launchUrl : undefined,
+					instructions:
+						typeof typed.instructions === "string" ? typed.instructions : undefined,
+					loginFlow: runtime.loginFlowProviderId !== undefined,
+					loginProviderId: runtime.loginFlowProviderId,
+				},
 			});
 			return;
 		}
@@ -5091,13 +5119,16 @@ export class AgentManager {
 			runtime.pendingUIRequests.set(requestId, { method, title });
 			// 原生 ask 由渲染层的常驻内联问答条承载，不插入时间线 system 卡片，
 			// 避免与工具调用卡片重复展示同一个问题。
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method: "ask",
-				title,
-				askQuestions: questions,
-				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method: "ask",
+					title,
+					askQuestions: questions,
+					timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+				},
 			});
 			// 超时/abort 由 pi 主动发 method:"cancel" 关闭，桌面端不再自建超时，
 			// 避免两端计时竞争导致问答条提前消失。
@@ -5117,18 +5148,21 @@ export class AgentManager {
 		if (runtime.loginFlowProviderId) {
 			const loginTitle = String(typed.title ?? typed.question ?? "");
 			runtime.pendingUIRequests.set(requestId, { method, title: loginTitle });
-			this.emit(ipcChannels.agentsUiRequest, {
-				agentId,
-				requestId,
-				method,
-				title: loginTitle,
-				options: typed.options as string[] | undefined,
-				placeholder: typed.placeholder as string | undefined,
-				prefill: typed.prefill as string | undefined,
-				allowOther: typed.allowOther === true,
-				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
-				loginFlow: true,
-				loginProviderId: runtime.loginFlowProviderId,
+			this.events.publish({
+				kind: "ui-request",
+				request: {
+					agentId,
+					requestId,
+					method,
+					title: loginTitle,
+					options: typed.options as string[] | undefined,
+					placeholder: typed.placeholder as string | undefined,
+					prefill: typed.prefill as string | undefined,
+					allowOther: typed.allowOther === true,
+					timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+					loginFlow: true,
+					loginProviderId: runtime.loginFlowProviderId,
+				},
 			});
 			return;
 		}
@@ -5168,7 +5202,7 @@ export class AgentManager {
 		});
 
 		// 通知渲染进程显示交互卡片
-		this.emit(ipcChannels.agentsUiRequest, request);
+		this.events.publish({ kind: "ui-request", request });
 		this.scheduleUIRequestTimeout(agentId, requestId, typed.timeout);
 	}
 
@@ -5235,7 +5269,10 @@ export class AgentManager {
 		this.scheduleMessageEmit(runtime, false);
 
 		// 通知渲染进程 UI 请求已完成
-		this.emit(ipcChannels.agentsUiRequest, { agentId, requestId, completed: true, ...response });
+		this.events.publish({
+			kind: "ui-request",
+			request: { agentId, requestId, completed: true, ...response },
+		});
 	}
 
 	/**
@@ -5266,13 +5303,13 @@ export class AgentManager {
 	}
 
 	/**
-	 * 通过 IPC 请求渲染进程弹出项目信任确认窗，等待用户选择。
-	 * 无窗口可用（如 headless）或 60 秒未响应时默认拒绝（安全优先）。
+	 * 通过事件出口请求用户（桌面弹窗/后续手机端）弹出项目信任确认，等待用户选择。
+	 * 无消费者在线（headless、窗口已关闭）或 60 秒未响应时默认拒绝（安全优先）。
 	 */
 	private requestProjectTrust(cwd: string, projectName: string): Promise<ProjectTrustChoice> {
 		const requestId = randomUUID();
-		const win = this.getWindow();
-		if (!win || win.isDestroyed()) {
+		// 没有消费者就没有人能回答：直接拒绝，不把启动流程挂在 60 秒超时上。
+		if (!this.events.hasUiResponders()) {
 			return Promise.resolve<ProjectTrustChoice>("deny");
 		}
 		return new Promise<ProjectTrustChoice>((resolve) => {
@@ -5290,7 +5327,7 @@ export class AgentManager {
 				projectName,
 				createdAt: Date.now(),
 			});
-			win.webContents.send(ipcChannels.agentsTrustRequest, { requestId, cwd, projectName });
+			this.events.publish({ kind: "trust-request", requestId, cwd, projectName });
 		});
 	}
 
@@ -5443,9 +5480,6 @@ export class AgentManager {
 		});
 		if (role === "user" || role === "assistant") this.refreshAutoTitle(runtime);
 		this.scheduleMessageEmit(runtime, true);
-		// 语义事件：消息追加在统一写入点汇聚发出（而非散落在各调用处），
-		// 保证订阅者拿到的 message 与 runtime.transcript.messages 中实际落库的对象完全同构。
-		this.notifyEventListeners({ type: "messageAppended", agentId: runtime.tab.id, message });
 	}
 
 	private refreshAutoTitle(runtime: AgentRuntime) {
@@ -5566,7 +5600,10 @@ export class AgentManager {
 				this.scheduleMessageEmit(runtime, false);
 			}
 
-			this.emit(ipcChannels.agentsUiRequest, { agentId, requestId, completed: true, cancelled: true });
+			this.events.publish({
+				kind: "ui-request",
+				request: { agentId, requestId, completed: true, cancelled: true },
+			});
 		}, Math.floor(timeout));
 		timer.unref?.();
 	}
@@ -5632,7 +5669,7 @@ export class AgentManager {
 		this.emitThinking(agentId, "");
 		this.emitState();
 		void this.emitRuntimeState(agentId);
-		if (notifySettled) this.notifyEventListeners({ type: "settled", agentId });
+		if (notifySettled) this.events.publish({ kind: "settled", agentId });
 	}
 
 	/**
@@ -5986,7 +6023,8 @@ export class AgentManager {
 		// 全量基线（渲染层 slice(0,0) 合并即整体替换），其余情况为尾部增量。
 		const { replaceFrom, messages } = takeDirtySlice(runtime.transcript);
 		const t0 = perfStart("agents:message-flush");
-		this.emit(ipcChannels.agentsMessage, {
+		this.events.publish({
+			kind: "message-appended",
 			agentId: runtime.tab.id,
 			replaceFrom,
 			messages,
@@ -6015,8 +6053,7 @@ export class AgentManager {
 	}
 
 	private emitThinkingNow(agentId: string, thinking: string) {
-		const update: ThinkingUpdate = { agentId, thinking };
-		this.emit(ipcChannels.agentsThinking, update);
+		this.events.publish({ kind: "thinking-delta", agentId, thinking });
 	}
 
 	/**
@@ -6039,11 +6076,7 @@ export class AgentManager {
 
 	private emitStateNow() {
 		const tabs = this.list();
-		this.emit(ipcChannels.agentsState, tabs);
-		// 同步通知主进程内部状态订阅者（PetStateBridge），使宠物窗能拿到聚合状态。
-		// 设计文档原拟用 ipcMain.on("agents:state") 桥接是错的：webContents.send 是
-		// 主进程→渲染层单向通道，ipcMain 收不到主进程自己发出的消息，故改用本钩子。
-		this.notifyStateListeners(tabs);
+		this.events.publish({ kind: "tabs-changed", tabs });
 		// 语义事件：statusChanged 只在状态实际变化时发（diff 上次已发表值）。
 		// 不选 ~20 处 `tab.status =` 散点 hook：散点路径多（start/stop/exit/settle/restart
 		// 等）易遗漏，且同一状态连续赋值不应重复通知；50ms 聚合点做 diff 侵入最小且不遗漏。
@@ -6051,8 +6084,8 @@ export class AgentManager {
 			const previous = this.lastEmittedTabStatus.get(tab.id);
 			if (previous !== tab.status) {
 				this.lastEmittedTabStatus.set(tab.id, tab.status);
-				this.notifyEventListeners({
-					type: "statusChanged",
+				this.events.publish({
+					kind: "status-changed",
 					agentId: tab.id,
 					status: tab.status,
 					tab,
@@ -6061,6 +6094,13 @@ export class AgentManager {
 		}
 	}
 
+	/**
+	 * 唯一的窗口直发通道：RPC 控制台日志。
+	 *
+	 * 例外理由：日志是原始 RPC 帧的逐条镜像，语义事件化会为「调试用原始帧」
+	 * 造一个和 ui-request 一样宽的负载类型，收益为负。除此之外所有领域事件必须走
+	 * `this.events.publish`，不要在新增调用点复用本方法。
+	 */
 	private emit(channel: string, payload: unknown) {
 		const window = this.getWindow();
 		if (!window || window.isDestroyed()) return;

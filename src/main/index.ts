@@ -206,6 +206,8 @@ import type {
 import { ProjectStore } from "./projects/ProjectStore";
 import { FileSystemService } from "./fs/FileSystemService";
 import { AgentManager } from "./pi/AgentManager";
+import { createAgentEventSink } from "./pi/agentEventSink";
+import { createElectronAgentEventBridge, type ElectronAgentEventBridge } from "./ipc/agentEventBridge";
 import { PiLocator } from "./pi/PiLocator";
 import { PiProcess } from "./pi/PiProcess";
 import { QuickGenProcess } from "./pi/QuickGenProcess";
@@ -274,6 +276,8 @@ import { perfDump } from "./perf";
 import { startSoakRecorder } from "./perf/soak";
 
 let mainWindow: BrowserWindow | null = null;
+/** 语义事件 → 主窗通道的适配器（AgentManager 构造时创建，窗口创建后 attach）。 */
+let desktopAgentEvents: ElectronAgentEventBridge | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
 let isQuitting = false;
 // 主窗口主 frame 加载健康状态（自愈判断用，见 handleVersionFocusRequest）。
@@ -800,6 +804,9 @@ async function createWindow() {
 			webviewTag: true,
 		},
 	});
+	// 语义事件投递绑定到主窗：窗口重建时重新绑定，关闭时自动退订
+	// （sink.hasUiResponders() 因此代表"此刻真有人能作答信任确认"）。
+	desktopAgentEvents?.attach(mainWindow);
 	const createdWindow = mainWindow;
 	let hasShownMainWindow = false;
 	function showMainWindowOnce(source: string) {
@@ -1316,6 +1323,18 @@ app.whenReady().then(async () => {
 		appLogger,
 	});
 	projectResourceManager = new ProjectResourceManager((projectId) => projectStore.get(projectId));
+	// 语义事件出口：领域只 publish，桌面通道映射在 agentEventBridge；手机端与主进程内
+	// 消费者共用同一 sink。snapshot 是闭包，构造顺序上先有 sink 后有 manager 也没问题
+	// （构造期间无人调用 snapshot）。
+	const agentEventSink = createAgentEventSink({
+		snapshot: () => agentManager.snapshot(),
+		onListenerError: (error) => {
+			void appLogger.warn("agent", "Agent event consumer failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		},
+	});
+	desktopAgentEvents = createElectronAgentEventBridge(agentEventSink);
 	agentManager = new AgentManager(
 		(id) => projectStore.get(id),
 		() => mainWindow,
@@ -1325,6 +1344,7 @@ app.whenReady().then(async () => {
 			trustStore: configManager.trustStore,
 			disableDeveloperRole: (providerName) => configManager.disableDeveloperRole(providerName),
 		},
+		agentEventSink,
 		rpcLogger,
 		appLogger,
 		undefined,
@@ -1338,7 +1358,9 @@ app.whenReady().then(async () => {
 	openSessionSnapshot = new OpenSessionSnapshot(app.getPath("userData"));
 	const crashedRun = openSessionSnapshot.readCrashedRun();
 	openSessionSnapshot.beginRun();
-	agentManager.addStateListener((tabs) => openSessionSnapshot?.recordAgents(tabs));
+	agentManager.eventSink.onEvent((event) => {
+		if (event.kind === "tabs-changed") openSessionSnapshot?.recordAgents(event.tabs);
+	});
 	if (crashedRun) {
 		void appLogger.info("app", "Previous run ended without clean shutdown", {
 			previousPid: crashedRun.pid,

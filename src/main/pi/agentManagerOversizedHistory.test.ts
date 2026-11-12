@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test, vi } from "vitest";
 
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
+import { createNullAgentEventSink } from "./agentEventSink";
 import type { SettingsStore } from "../settings/SettingsStore";
 
 vi.mock("electron", () => ({
@@ -36,7 +37,8 @@ function makeManager(): AgentManager {
 			readOmpDefaultThinkingLevel: async () => undefined,
 			trustStore: { decide: async () => undefined },
 		} as unknown as AgentConfigDeps,
-		undefined,
+		createNullAgentEventSink(),
+		undefined, // rpcLogger：本测试只断言告警
 		{
 			warn: () => {},
 			info: () => {},

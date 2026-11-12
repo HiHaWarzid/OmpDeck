@@ -3,14 +3,13 @@ import { test, vi } from "vitest";
 
 import type {
 	AgentCacheWarmingState,
-	AgentManagerEvent,
 	AgentStatus,
 	AgentSubagent,
 	AgentTab,
 	ChatMessage,
 } from "../../shared/types";
 import { AgentManager, isRpcLogWorthy } from "./AgentManager";
-import { ipcChannels } from "../../shared/ipc";
+import { createAgentEventSink, type AgentEvent } from "./agentEventSink";
 import { showAppNotification } from "../notifications";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
 import { createTranscriptState, type AgentTranscriptState } from "./agentTranscript";
@@ -122,9 +121,18 @@ function makeManager(appLogger?: AppLogger): AgentManager {
 		() => null, // getWindow：不推送 IPC
 		{ get: () => ({}) } as unknown as SettingsStore, // 测试桩：不读写设置
 		{} as unknown as AgentConfigDeps, // 测试桩：不读写配置
+		// 语义事件出口：测试直接订阅它断言「领域发了什么」，不伪造窗口。
+		createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) }),
 		undefined, // rpcLogger：本测试不落 RPC 日志
 		appLogger,
 	);
+}
+
+/** 录制语义事件；返回数组本身即为订阅缓冲。 */
+function recordEvents(manager: AgentManager): AgentEvent[] {
+	const events: AgentEvent[] = [];
+	manager.eventSink.onEvent((event) => events.push(event));
+	return events;
 }
 
 /**
@@ -142,7 +150,6 @@ type ManagerInternals = {
 	): void;
 	handlePiEvent(agentId: string, event: unknown): void;
 	handleUIRequest(runtime: TestRuntime, event: Record<string, unknown>): void;
-	emit: (channel: string, payload: unknown) => void;
 	markIdleIfPiReportsNoWork(agentId: string): Promise<void>;
 	emitRuntimeState(agentId: string): Promise<void>;
 };
@@ -151,12 +158,12 @@ function internals(manager: AgentManager): ManagerInternals {
 	return manager as unknown as ManagerInternals;
 }
 
-// ── onAgentEvent：订阅 / 退订 ───────────────────────────
+// ── eventSink：订阅 / 退订 ───────────────────────────
 
-test("onAgentEvent 收到 messageAppended，退订后不再收到", () => {
+test("订阅收到 message-appended 批，退订后不再收到", () => {
 	const manager = makeManager();
-	const events: AgentManagerEvent[] = [];
-	const unsubscribe = manager.onAgentEvent((event) => events.push(event));
+	const events: AgentEvent[] = [];
+	const unsubscribe = manager.eventSink.onEvent((event) => events.push(event));
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "idle"));
 	inner.agents.set("a1", runtime);
@@ -164,14 +171,15 @@ test("onAgentEvent 收到 messageAppended，退订后不再收到", () => {
 	inner.addMessage(runtime, "user", "你好");
 	assert.equal(events.length, 1);
 	const event = events[0];
-	assert(event.type === "messageAppended");
+	assert(event.kind === "message-appended");
 	assert.equal(event.agentId, "a1");
-	assert.equal(event.message.text, "你好");
-	assert.equal(event.message.role, "user");
-	assert.equal(event.message.agentId, "a1");
-	assert.equal(event.message.id, runtime.transcript.messages[0]?.id);
-	assert.equal(event.message, runtime.transcript.messages[0]); // 与落库对象同构
-	assert.equal(typeof event.message.timestamp, "number");
+	const [message] = event.messages;
+	assert.equal(message.text, "你好");
+	assert.equal(message.role, "user");
+	assert.equal(message.agentId, "a1");
+	assert.equal(message.id, runtime.transcript.messages[0]?.id);
+	assert.equal(message, runtime.transcript.messages[0]); // 与落库对象同构
+	assert.equal(typeof message.timestamp, "number");
 
 	unsubscribe();
 	inner.addMessage(runtime, "assistant", "回复");
@@ -180,8 +188,8 @@ test("onAgentEvent 收到 messageAppended，退订后不再收到", () => {
 
 test("退订函数可重复调用（幂等）", () => {
 	const manager = makeManager();
-	const events: AgentManagerEvent[] = [];
-	const unsubscribe = manager.onAgentEvent((event) => events.push(event));
+	const events: AgentEvent[] = [];
+	const unsubscribe = manager.eventSink.onEvent((event) => events.push(event));
 	unsubscribe();
 	unsubscribe();
 	const inner = internals(manager);
@@ -189,60 +197,57 @@ test("退订函数可重复调用（幂等）", () => {
 	assert.equal(events.length, 0);
 });
 
-// ── statusChanged：emitStateNow 聚合点 diff ─────────────
+// ── status-changed：emitStateNow 聚合点 diff ─────────────
 
-test("statusChanged 只在 status 实际变化时发（同一状态重复聚合不发）", () => {
+test("status-changed 只在 status 实际变化时发（同一状态重复聚合不发）", () => {
 	const manager = makeManager();
-	const events: AgentManagerEvent[] = [];
-	manager.onAgentEvent((event) => events.push(event));
+	const changes: Array<Extract<AgentEvent, { kind: "status-changed" }>> = [];
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "status-changed") changes.push(event);
+	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "idle"));
 	inner.agents.set("a1", runtime);
 
 	inner.emitStateNow();
-	assert.equal(events.length, 1);
-	assert(events[0].type === "statusChanged");
-	assert.equal(events[0].agentId, "a1");
-	assert.equal(events[0].status, "idle");
-	assert.equal(events[0].tab, runtime.tab);
+	assert.equal(changes.length, 1);
+	assert.equal(changes[0].agentId, "a1");
+	assert.equal(changes[0].status, "idle");
+	assert.equal(changes[0].tab, runtime.tab);
 
 	// 同一状态再次聚合：不发重复事件
 	inner.emitStateNow();
-	assert.equal(events.length, 1);
+	assert.equal(changes.length, 1);
 
 	// 状态变化时只发变化的 agent；新出现的 agent 发首次状态，未变化的 agent 不发。
 	// 注意：list() 按 createdAt 倒序，同毫秒创建的顺序不保证，因此按 agentId 取事件而不按下标。
 	runtime.tab.status = "running";
 	inner.agents.set("a2", makeRuntime(makeTab("a2", "idle")));
 	inner.emitStateNow();
-	assert.equal(events.length, 3);
-	// events[0] 是首次聚合的 a1/idle；这里只看状态变化后新增的两个事件
-	const changed = events.slice(1);
-	const byAgent = new Map<string, Extract<AgentManagerEvent, { type: "statusChanged" }>>();
-	for (const event of changed) {
-		if (event.type === "statusChanged") byAgent.set(event.agentId, event);
-	}
-	assert.equal(changed.length, 2);
+	assert.equal(changes.length, 3);
+	const byAgent = new Map(changes.slice(1).map((event) => [event.agentId, event]));
+	assert.equal(byAgent.size, 2);
 	assert.equal(byAgent.get("a1")?.status, "running");
 	assert.equal(byAgent.get("a2")?.status, "idle");
 });
 
 // ── 异常隔离 ───────────────────────────────────────────
 
-test("listener 抛异常不影响其它监听器", () => {
+test("消费者抛异常不影响其它消费者", () => {
 	const manager = makeManager();
-	const received: AgentManagerEvent[] = [];
-	manager.onAgentEvent(() => {
+	const changes: Array<Extract<AgentEvent, { kind: "status-changed" }>> = [];
+	manager.eventSink.onEvent(() => {
 		throw new Error("boom");
 	});
-	manager.onAgentEvent((event) => received.push(event));
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "status-changed") changes.push(event);
+	});
 	const inner = internals(manager);
 	inner.agents.set("a1", makeRuntime(makeTab("a1", "idle")));
 
 	inner.emitStateNow();
-	assert.equal(received.length, 1);
-	assert(received[0].type === "statusChanged");
-	assert.equal(received[0].agentId, "a1");
+	assert.equal(changes.length, 1);
+	assert.equal(changes[0].agentId, "a1");
 });
 
 // ── settled：agent_settled 事件（旧 pi）与兜底检查（omp）──
@@ -250,8 +255,8 @@ test("listener 抛异常不影响其它监听器", () => {
 test("agent_settled 事件触发 settled；重复收到时幂等不发", () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"));
@@ -269,8 +274,8 @@ test("agent_settled 事件触发 settled；重复收到时幂等不发", () => {
 test("omp 无 agent_settled：markIdleIfPiReportsNoWork 兜底同样发 settled", async () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -286,8 +291,8 @@ test("omp 无 agent_settled：markIdleIfPiReportsNoWork 兜底同样发 settled"
 test("兜底检查仍有排队消息时不发 settled", async () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -303,8 +308,8 @@ test("兜底检查仍有排队消息时不发 settled", async () => {
 test("session_settled 事件（新 pi）与 agent_settled 走同一收口路径", () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"));
@@ -324,8 +329,8 @@ test("兜底轮询采信 pi 自报 isSettled：陈旧 isStreaming/isCompacting �
 	// 旧实现只认忙碌标志 → 保持 running 且不再复查，UI 三点指示器永久不停。
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -381,8 +386,8 @@ test("静默兜底强制收口时记 warn 日志（保留陈旧标志证据）�
 		} as unknown as AppLogger;
 		const manager = makeManager(appLogger);
 		const settled: string[] = [];
-		manager.onAgentEvent((event) => {
-			if (event.type === "settled") settled.push(event.agentId);
+		manager.eventSink.onEvent((event) => {
+			if (event.kind === "settled") settled.push(event.agentId);
 		});
 		const inner = internals(manager);
 		const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -418,8 +423,8 @@ test("静默兜底强制收口时记 warn 日志（保留陈旧标志证据）�
 test("静默兜底：自动重试窗口与等待回答的 UI 请求期间不收口", async () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -452,8 +457,8 @@ test("静默兜底：自动重试窗口与等待回答的 UI 请求期间不收�
 test("轮询往返期间已被事件路径收口：不重复发 settled", async () => {
 	const manager = makeManager();
 	const settled: string[] = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "settled") settled.push(event.agentId);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "settled") settled.push(event.agentId);
 	});
 	const inner = internals(manager);
 	let created: TestRuntime | undefined;
@@ -473,11 +478,11 @@ test("轮询往返期间已被事件路径收口：不重复发 settled", async 
 
 // ── runtimeStateChanged ───────────────────────────────
 
-test("emitRuntimeState 完成时发 runtimeStateChanged（与 IPC 同一份 state）", async () => {
+test("emitRuntimeState 完成时发 runtime-changed（与 IPC 同一份 state）", async () => {
 	const manager = makeManager();
 	const states: Array<{ agentId: string; state: unknown }> = [];
-	manager.onAgentEvent((event) => {
-		if (event.type === "runtimeStateChanged") states.push(event);
+	manager.eventSink.onEvent((event) => {
+		if (event.kind === "runtime-changed") states.push(event);
 	});
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
@@ -681,10 +686,9 @@ test("isRpcLogWorthy: send 方向与阶段/响应事件全记，流式增量跳�
 
 test("native ask 转发结构化问题，回答走 answers 数组", () => {
 	const manager = makeManager();
-	const emitted: Array<{ channel: string; payload: any }> = [];
+	const events = recordEvents(manager);
 	const sent: Array<Record<string, unknown>> = [];
 	const inner = internals(manager);
-	inner.emit = (channel, payload) => emitted.push({ channel, payload });
 	const runtime = makeRuntime(makeTab("a1", "running"), {
 		request: async () => ({ success: true }),
 		sendRaw: (payload) => sent.push(payload),
@@ -710,12 +714,15 @@ test("native ask 转发结构化问题，回答走 answers 数组", () => {
 		],
 	});
 
-	const ask = emitted.find((item) => item.payload?.requestId === "r1");
-	assert.equal(ask?.payload.method, "ask");
-	assert.equal(ask?.payload.askQuestions[0].id, "q1");
-	assert.equal(ask?.payload.askQuestions[0].options[0].description, "IPC 与进程管理");
-	assert.equal(ask?.payload.askQuestions[0].recommended, 1);
-	assert.equal(ask?.payload.timeout, 60_000);
+	const ask = events.find((event) => event.kind === "ui-request" && event.request.requestId === "r1");
+	assert(ask && ask.kind === "ui-request");
+	const questions = ask.request.askQuestions;
+	assert(questions);
+	assert.equal(ask.request.method, "ask");
+	assert.equal(questions[0].id, "q1");
+	assert.equal(questions[0].options?.[0]?.description, "IPC 与进程管理");
+	assert.equal(questions[0].recommended, 1);
+	assert.equal(ask.request.timeout, 60_000);
 	assert.equal(runtime.pendingUIRequests.get("r1")?.method, "ask");
 
 	manager.sendUIResponse("a1", "r1", {
@@ -732,9 +739,8 @@ test("native ask 转发结构化问题，回答走 answers 数组", () => {
 
 test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () => {
 	const manager = makeManager();
-	const emitted: Array<{ channel: string; payload: any }> = [];
+	const events = recordEvents(manager);
 	const inner = internals(manager);
-	inner.emit = (channel, payload) => emitted.push({ channel, payload });
 	const runtime = makeRuntime(makeTab("a1", "running"), {
 		request: async () => ({ success: true }),
 		sendRaw: () => undefined,
@@ -758,11 +764,12 @@ test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () =>
 
 	assert.equal(runtime.pendingUIRequests.size, 0);
 	assert.ok(
-		emitted.some(
-			(item) =>
-				item.payload?.requestId === "r2" &&
-				item.payload?.completed === true &&
-				item.payload?.cancelled === true,
+		events.some(
+			(event) =>
+				event.kind === "ui-request" &&
+				event.request.requestId === "r2" &&
+				event.request.completed === true &&
+				event.request.cancelled === true,
 		),
 	);
 });
@@ -774,7 +781,7 @@ test("会话结束通知在 2.5s 静默窗口后触发，期间重新开跑则�
 		() => null,
 		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
 		{} as unknown as AgentConfigDeps,
-		undefined,
+		createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) }),
 		undefined,
 	);
 	const inner = internals(manager);
@@ -810,7 +817,7 @@ test("会话结束通知的静默窗口不被标题等元数据事件刷新", ()
 		() => null,
 		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
 		{} as unknown as AgentConfigDeps,
-		undefined,
+		createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) }),
 		undefined,
 	);
 	const inner = internals(manager);
@@ -841,7 +848,7 @@ test("窗口结束时仍在执行工具则不弹通知，等收尾后重新计�
 		() => null,
 		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
 		{} as unknown as AgentConfigDeps,
-		undefined,
+		createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) }),
 		undefined,
 	);
 	const inner = internals(manager);
@@ -867,10 +874,9 @@ test("窗口结束时仍在执行工具则不弹通知，等收尾后重新计�
 
 test("native ask 载荷有坏题时整体取消，避免 answers 与问题错位", () => {
 	const manager = makeManager();
-	const emitted: Array<{ channel: string; payload: any }> = [];
+	const events = recordEvents(manager);
 	const sent: Array<Record<string, unknown>> = [];
 	const inner = internals(manager);
-	inner.emit = (channel, payload) => emitted.push({ channel, payload });
 	const runtime = makeRuntime(makeTab("a1", "running"), {
 		request: async () => ({ success: true }),
 		sendRaw: (payload) => sent.push(payload),
@@ -891,8 +897,8 @@ test("native ask 载荷有坏题时整体取消，避免 answers 与问题错位
 	});
 	assert.equal(runtime.pendingUIRequests.size, 0);
 	assert.ok(
-		!emitted.some(
-			(item) => item.payload?.requestId === "r3" && item.payload?.method === "ask",
+		!events.some(
+			(event) => event.kind === "ui-request" && event.request.requestId === "r3" && event.request.method === "ask",
 		),
 	);
 });
@@ -932,13 +938,12 @@ test("command_output 落成 commandOutput 系统消息，同一命令多帧沿�
 
 // ── 命令目录推送 ──────────────────────────────────────
 
-test("available_commands_update 归一化后推送到 agents:command-catalog，不落时间线", () => {
+test("available_commands_update 归一化后发 command-catalog 事件，不落时间线", () => {
 	const manager = makeManager();
+	const events = recordEvents(manager);
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "idle"));
 	inner.agents.set("a1", runtime);
-	const emit = vi.fn();
-	inner.emit = emit;
 
 	inner.handlePiEvent("a1", {
 		type: "available_commands_update",
@@ -954,11 +959,12 @@ test("available_commands_update 归一化后推送到 agents:command-catalog，�
 		],
 	});
 
-	assert.equal(emit.mock.calls.length, 1);
-	const [channel, payload] = emit.mock.calls[0] as [string, { agentId: string; commands: unknown[] }];
-	assert.equal(channel, ipcChannels.agentsCommandCatalog);
-	assert.equal(payload.agentId, "a1");
-	assert.deepEqual(payload.commands, [
+	const catalogs = events.filter((event) => event.kind === "command-catalog");
+	assert.equal(catalogs.length, 1);
+	const catalog = catalogs[0];
+	assert(catalog.kind === "command-catalog");
+	assert.equal(catalog.agentId, "a1");
+	assert.deepEqual(catalog.commands, [
 		{
 			name: "fast",
 			description: "Toggle priority service tier",
@@ -975,7 +981,7 @@ test("available_commands_update 归一化后推送到 agents:command-catalog，�
 
 test("subagent_lifecycle/progress 合并进 registry，终态保留进度统计且可重置", async () => {
 	const manager = makeManager();
-	const emit = vi.spyOn(internals(manager), "emit").mockImplementation(() => undefined);
+	const events = recordEvents(manager);
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "running"), {
 		request: async () => ({ success: true, data: {} }),
@@ -1019,7 +1025,10 @@ test("subagent_lifecycle/progress 合并进 registry，终态保留进度统计�
 	assert.equal(running?.lastIntent, "grep for handlers");
 	assert.equal(running?.recentTools?.[0]?.tool, "grep");
 	assert.equal(running?.sessionFile, "C:/sessions/sub-1.jsonl");
-	assert.equal(emit.mock.calls.at(-1)?.[0], ipcChannels.agentsSubagents);
+	const subagentChanges = events.filter((event) => event.kind === "subagents-changed");
+	const lastChange = subagentChanges.at(-1);
+	assert(lastChange && lastChange.kind === "subagents-changed");
+	assert.equal(lastChange.subagents[0]?.id, "sub-1");
 
 	// 终态 lifecycle 只有 id/status；不能把 progress 的统计和 description 清空。
 	inner.handlePiEvent("a1", {
@@ -1054,7 +1063,7 @@ test("subagent_lifecycle/progress 合并进 registry，终态保留进度统计�
 
 test("会话切换清空子代理 registry，避免把旧会话的子代理带进新会话", async () => {
 	const manager = makeManager();
-	const emit = vi.spyOn(internals(manager), "emit").mockImplementation(() => undefined);
+	const events = recordEvents(manager);
 	const inner = internals(manager);
 	const runtime = makeRuntime(makeTab("a1", "idle"), {
 		request: async () => ({ success: true, data: {} }),
@@ -1071,9 +1080,8 @@ test("会话切换清空子代理 registry，避免把旧会话的子代理带�
 	};
 	await internalsWithRefresh.refreshRuntimeAfterSessionReplacement("a1");
 	assert.equal(runtime.subagents.size, 0);
-	const subagentEmits = emit.mock.calls.filter(([channel]) => channel === ipcChannels.agentsSubagents);
-	assert.deepEqual(
-		(subagentEmits.at(-1)?.[1] as { subagents: unknown[] } | undefined)?.subagents,
-		[],
-	);
+	const subagentChanges = events.filter((event) => event.kind === "subagents-changed");
+	const lastChange = subagentChanges.at(-1);
+	assert(lastChange && lastChange.kind === "subagents-changed");
+	assert.deepEqual(lastChange.subagents, []);
 });

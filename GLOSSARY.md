@@ -130,3 +130,21 @@ config.yml 的 `modelRoles.<role>`（default/smol/slow/vision/plan/commit/tiny/t
 
 ### TrustStore（信任决策存储）
 trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` 开头小写、posix 保大小写），父目录决策继承到子目录。`decide()` 编排：干净项目自动写信任；true 放行；false/未记录 → **ask 注入**（弹窗适配器在 AgentManager：requestId/60s/headless 拒绝），remember 落盘 / session 本次 approve / deny 本次 no-approve（false 永不落盘，下次可重选）。
+
+---
+
+# Agent 事件出口（主进程术语）
+
+> 第四领域：`AgentManager` 的推送出口（源自架构评审候选 A）。
+> 维护规则同上：术语敲定时更新。
+
+## 术语
+
+### AgentEventSink（事件出口）
+`AgentManager` 唯一的事件出口接缝：领域事件（会话流 / 生命周期 / 交互请求 / 子代理·命令目录·思考文本）以**语义事件**形式送出，不携带 IPC 通道名。通道名映射、窗口引用、序列化都留在适配器（Electron 适配器 = `webContents.send`；HTTP 适配器 = 后续手机推送）。**排除** RPC 日志（原始帧镜像，`emit` 直发）、宠物、飞书镜像、`perf`：它们是进程内工具，不是客户端消费者。
+
+### Sink 接口形状
+`snapshot()` 一次拿到全部 agent 的当前状态（tab 列表 + 每 agent runtime / 子代理 / 在途思考），`onEvent(listener)` 之后接增量；单回调 + 判别联合，不按事件种类拆方法。监听者抛错被隔离（记日志），不回流到 `publish` 调用点。
+
+### 节奏（cadence）
+合并语义（“同一 agent 的一次状态收敛”）留在领域内：消息/思考/状态 50ms、运行态 150ms 的 latest-wins 窗口不变，语义事件是合并后的结果，不是每个 RPC delta；适配器只做映射，不改节奏。
