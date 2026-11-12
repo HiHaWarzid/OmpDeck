@@ -1382,15 +1382,15 @@ app.whenReady().then(async () => {
 		stopAgent: (agentId) => agentManager.stop(agentId),
 		abortAgent: async (agentId) => agentManager.abort(agentId),
 		sendUiResponse: async (agentId, requestId, response) => {
-			agentManager.sendUIResponse(agentId, requestId, response);
+			agentManager.interactions.respond(agentId, requestId, response);
 		},
 		respondTrustRequest: async (requestId, choice) => {
-			agentManager.respondTrustRequest(requestId, choice);
+			agentManager.interactions.respondTrust(requestId, choice);
 		},
 		getHistoryPage: (agentId, before, limit) => agentManager.history.webPage(agentId, before, limit),
 		readMessageFullText: (agentId, messageId, entryId) =>
 			agentManager.history.fullText(agentId, messageId, entryId),
-		listTrustRequests: () => agentManager.listPendingTrustRequests(),
+		listTrustRequests: () => agentManager.interactions.listTrust(),
 		persistWebToken: async (patch) => {
 			await settingsStore.update(patch);
 		},

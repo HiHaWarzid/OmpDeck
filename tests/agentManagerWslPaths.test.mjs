@@ -193,6 +193,8 @@ function loadAgentManager() {
 	registry["./agentControl"] = loadModule("src/main/pi/agentControl.ts", "agentControl.ts");
 	// 历史读取模块（翻页/全文）；依赖 agentTranscript 与 messageTimeline，两者已在上方注入。
 	registry["./agentHistory"] = loadModule("src/main/pi/agentHistory.ts", "agentHistory.ts");
+	// 交互请求代理（ctx.ui.* / 信任询问）；依赖已注入的 askQuestionCard。
+	registry["./agentInteractions"] = loadModule("src/main/pi/agentInteractions.ts", "agentInteractions.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {

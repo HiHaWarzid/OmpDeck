@@ -40,6 +40,7 @@ import {
 } from "./followUpQueue";
 import { AgentControl, normalizeTodoPhases } from "./agentControl";
 import { AgentHistory, HISTORY_PAGE_TURNS } from "./agentHistory";
+import { AgentInteractions } from "./agentInteractions";
 import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
@@ -198,8 +199,8 @@ export type AgentConfigDeps = {
 	disableDeveloperRole?: (providerName: string) => Promise<boolean>;
 };
 
-/** 项目信任确认弹窗的用户选择 */
-export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
+/** 项目信任确认弹窗的用户选择（定义在交互模块，此处转发避免旧导入路径失效） */
+export type { ProjectTrustChoice } from "./agentInteractions";
 
 /**
  * 「IPC 基线截断」告警的最小间隔（每 agent）：getMessages 被渲染层状态拉取、
@@ -271,11 +272,6 @@ export class AgentManager {
 	 * 变更流（AFK 编排器按增量消费）；diff 上次已发表值，只发实际变化的 agent。
 	 */
 	private readonly lastEmittedTabStatus = new Map<string, AgentStatus>();
-	/** 待处理的项目信任确认请求。key 为 requestId，用于在 Agent 启动前等待用户的信任决策。 */
-	private readonly pendingTrustRequests = new Map<
-		string,
-		{ resolve: (choice: ProjectTrustChoice) => void; cwd: string; projectName: string; createdAt: number }
-	>();
 	/**
 	 * emitRuntimeState 并发合并：工具密集循环（tool_start/end 交替）每个边沿都会
 	 * 触发一次 get_state + get_session_stats RPC 与文件尾部读取；同一时刻只允许
@@ -338,6 +334,11 @@ export class AgentManager {
 	readonly control: AgentControl;
 	/** 会话历史读取模块：向前翻页（字节/下标两套游标）与按需取全文。 */
 	readonly history: AgentHistory;
+	/**
+	 * 交互请求代理：扩展 ctx.ui.* 分发、应答、abort 取消、本地超时与项目信任询问。
+	 * 应答协议形状（select 用 value:null、ask 用 cancelled）集中在此，不再散落各调用点。
+	 */
+	readonly interactions: AgentInteractions;
 
 	constructor(
 		private readonly getProject: (id: string) => Project | undefined,
@@ -385,6 +386,31 @@ export class AgentManager {
 			runtime: (agentId) => this.requireRuntime(agentId),
 			jsonl: this.sessionJsonl,
 			log: this.appLogger,
+		});
+		this.interactions = new AgentInteractions({
+			runtime: (agentId) => this.agents.get(agentId),
+			publishUiRequest: (request) => this.events.publish({ kind: "ui-request", request }),
+			publishTrustRequest: (request) => this.events.publish({ kind: "trust-request", ...request }),
+			// 卡片读写仍在 transcript 侧（脏标记/批量 emit 调度与渲染预算耦合），
+			// 这里只暴露三个最小回调，交互模块负责「插哪张、何时删、标成什么状态」。
+			addCard: (agentId, title, uiRequest) => {
+				const runtime = this.agents.get(agentId);
+				if (!runtime) return;
+				this.addMessage(runtime, "system", title, { type: "askQuestion", status: "pending", uiRequest });
+			},
+			markDirty: (agentId, fromIndex) => {
+				const runtime = this.agents.get(agentId);
+				if (runtime) this.markMessagesDirty(runtime, fromIndex);
+			},
+			markMessageDirty: (agentId, message) => {
+				const runtime = this.agents.get(agentId);
+				if (runtime) this.markMessageDirty(runtime, message);
+			},
+			scheduleEmit: (agentId) => {
+				const runtime = this.agents.get(agentId);
+				if (runtime) this.scheduleMessageEmit(runtime, false);
+			},
+			hasUiResponders: () => this.events.hasUiResponders(),
 		});
 	}
 
@@ -1773,21 +1799,10 @@ export class AgentManager {
 
 		// pi 在等待 extension_ui_response 时（如 ask_question），不发 abort 也能处理，
 		// 但必须解除 pending 请求的阻塞，否则 pi 不会继续读取 stdin 中的后续命令。
-		// 发 cancelled: true 会导致 pi 返回 undefined，ask_question 工具默认选第一个；
-		// 改发 value: null（不带 cancelled 标记），select parser 返回 null，
-		// 工具 result 的 answer = null，answered 为 false → 卡片显示"已取消"。
-		const pending = runtime.pendingUIRequests;
-		if (pending.size > 0) {
+		// 逐条应答的协议形状（select 用 value:null、原生 ask 用 cancelled）收在
+		// AgentInteractions.cancelForAbort，避免与正常应答路径各写一套。
+		if (this.interactions.cancelForAbort(agentId) > 0) {
 			runtime.run.abortedDuringAsk = true;
-			for (const [requestId, info] of pending) {
-				// 原生 ask 的解析器只认 cancelled；发 value:null 会落进
-				// "must carry N answers" 分支触发 ToolAbortError。旧 select 仍用 value:null。
-				runtime.slot.process.client.sendRaw({
-					type: "extension_ui_response",
-					id: requestId,
-					...(info.method === "ask" ? { cancelled: true } : { value: null }),
-				});
-			}
 		}
 
 		// 标记最近中止的 agent，用于抑制 auto-retry/compaction 把状态重新标为 running；
@@ -1802,28 +1817,7 @@ export class AgentManager {
 			.catch(() => undefined);
 
 		// 立即清理 pending UI 记录并移除 ask_question 卡片，不等待 abort 返回
-		if (pending.size > 0) {
-			const messages = runtime.transcript.messages;
-			for (const [requestId] of pending) {
-				const idx = messages.findIndex(
-					(msg) =>
-						msg.role === "system" &&
-						msg.meta?.type === "askQuestion" &&
-						(msg.meta as Record<string, unknown>).uiRequest &&
-						((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === requestId,
-				);
-				if (idx !== -1) {
-					messages.splice(idx, 1);
-					this.markMessagesDirty(runtime, idx);
-				}
-				// 让渲染层立刻收起内联问答条；不能等 pi 回 cancelled（abort 路径不一定回）。
-				this.events.publish({
-					kind: "ui-request",
-					request: { agentId, requestId, completed: true, cancelled: true },
-				});
-			}
-			pending.clear();
-		}
+		// （已由 interactions.cancelForAbort 完成）。
 		// abort 时必须清除所有流式状态，防止后续 pi 的延迟事件（text_delta、thinking_delta、tool_execution_* 等）
 		// 修改上次会话的旧消息，导致新会话消息混入被中止的旧输出。
 		resetTranscriptRun(runtime.transcript);
@@ -4562,7 +4556,7 @@ export class AgentManager {
 		}
 
 		if (typed.type === "extension_ui_request") {
-			this.handleUIRequest(runtime, typed);
+			this.interactions.open(runtime.tab.id, typed);
 		}
 
 		if (typed.type === "extension_error") {
@@ -4575,284 +4569,9 @@ export class AgentManager {
 	}
 
 	/**
-	 * 处理 pi 扩展发起的 UI 请求。
-	 * 对话类请求写入消息流等待用户回答；fire-and-forget 请求只转发给渲染进程或忽略。
-	 */
-	private handleUIRequest(runtime: AgentRuntime, typed: Record<string, any>) {
-		const agentId = runtime.tab.id;
-		const method = String(typed.method ?? "");
-		const requestId = String(typed.id ?? "");
-		// pi 在 abort/超时后发 method:"cancel" + targetId 关闭已结算的对话框。
-		// 必须按 targetId 清理，否则桌面端会留下一个永远不会被回答的问答条。
-		if (method === "cancel") {
-			const targetId = String(typed.targetId ?? "");
-			if (!targetId) return;
-			runtime.pendingUIRequests.delete(targetId);
-			const messages = runtime.transcript.messages;
-			const idx = messages.findIndex(
-				(msg) =>
-					msg.role === "system" &&
-					msg.meta?.type === "askQuestion" &&
-					(msg.meta as Record<string, unknown>).uiRequest &&
-					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === targetId,
-			);
-			if (idx !== -1) {
-				messages.splice(idx, 1);
-				this.markMessagesDirty(runtime, idx);
-				this.scheduleMessageEmit(runtime, false);
-			}
-			this.events.publish({
-				kind: "ui-request",
-				request: { agentId, requestId: targetId, completed: true, cancelled: true },
-			});
-			return;
-		}
-		// pi RPC 协议将 setWidget / dialog 字段放在顶层，不嵌套 params
-		if (method === "notify") {
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method,
-					title: "",
-					message: String(typed.message ?? ""),
-					notifyType: typed.notifyType,
-				},
-			});
-			return;
-		}
-
-		if (method === "set_editor_text") {
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method,
-					title: "",
-					text: String(typed.text ?? ""),
-				},
-			});
-			return;
-		}
-
-		if (method === "setWidget") {
-			// Plan Mode 等扩展会频繁刷新 widget；只走 IPC 状态，不落入会话消息，避免 JSONL 被进度噪声污染。
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method,
-					title: "",
-					widgetKey: String(typed.widgetKey ?? requestId),
-					widgetLines: Array.isArray(typed.widgetLines) ? typed.widgetLines : undefined,
-					widgetPlacement: typed.widgetPlacement,
-				},
-			});
-			return;
-		}
-
-		// omp 原生 OAuth：浏览器地址必须交给宿主打开；桌面端由登录浮层展示/打开。
-		if (method === "open_url") {
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method,
-					title: "",
-					url: typeof typed.url === "string" ? typed.url : undefined,
-					launchUrl: typeof typed.launchUrl === "string" ? typed.launchUrl : undefined,
-					instructions:
-						typeof typed.instructions === "string" ? typed.instructions : undefined,
-					loginFlow: runtime.loginFlowProviderId !== undefined,
-					loginProviderId: runtime.loginFlowProviderId,
-				},
-			});
-			return;
-		}
-
-		// 其他非对话 UI 方法暂不占用桌面 UI 空间。
-		if (["setStatus", "setTitle"].includes(method)) return;
-
-		// omp 原生 ask（ctx.ui.askDialog）：questions 是结构化数组，不是扩展 envelope。
-		// 它只能通过 ask 协议回答（answers 数组），不能降级成 select/input。
-		if (method === "ask") {
-			const questions = normalizeAskQuestions(typed.questions);
-			if (questions.length === 0) {
-				// 没有可回答的问题就立即取消，避免 pi 侧一直等待。
-				this.sendUIResponse(agentId, requestId, { cancelled: true });
-				return;
-			}
-			const title =
-				questions.length === 1
-					? questions[0].question
-					: `提问（${questions.length} 题）`;
-			runtime.pendingUIRequests.set(requestId, { method, title });
-			// 原生 ask 由渲染层的常驻内联问答条承载，不插入时间线 system 卡片，
-			// 避免与工具调用卡片重复展示同一个问题。
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method: "ask",
-					title,
-					askQuestions: questions,
-					timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
-				},
-			});
-			// 超时/abort 由 pi 主动发 method:"cancel" 关闭，桌面端不再自建超时，
-			// 避免两端计时竞争导致问答条提前消失。
-			return;
-		}
-
-		if (!["select", "confirm", "input", "editor"].includes(method)) return;
-
-		// select 无选项时对任何流程都无法作答：先自动取消，避免登录浮层渲染空选择器。
-		if (method === "select" && (!Array.isArray(typed.options) || typed.options.length === 0)) {
-			this.sendUIResponse(agentId, requestId, { cancelled: true });
-			return;
-		}
-
-		// 登录流程的粘贴回调/确认不进入时间线，由登录浮层承接；否则会留下
-		// 一张永远无人回答的 askQuestion 卡片。
-		if (runtime.loginFlowProviderId) {
-			const loginTitle = String(typed.title ?? typed.question ?? "");
-			runtime.pendingUIRequests.set(requestId, { method, title: loginTitle });
-			this.events.publish({
-				kind: "ui-request",
-				request: {
-					agentId,
-					requestId,
-					method,
-					title: loginTitle,
-					options: typed.options as string[] | undefined,
-					placeholder: typed.placeholder as string | undefined,
-					prefill: typed.prefill as string | undefined,
-					allowOther: typed.allowOther === true,
-					timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
-					loginFlow: true,
-					loginProviderId: runtime.loginFlowProviderId,
-				},
-			});
-			return;
-		}
-
-		// 批量 ask envelope：扩展把 questions JSON 塞进 input 的 title；
-		// 桌面端识别后渲染 Tab 问卷，而不是把整段 JSON 当普通输入题。
-		const rawTitle = String(typed.title ?? typed.question ?? "");
-		const batchEnvelope = tryParseBatchAskEnvelope(rawTitle);
-		const request = batchEnvelope
-			? {
-					agentId,
-					requestId,
-					method: "batch_ask" as const,
-					title: `问卷（${batchEnvelope.questions.length} 题）`,
-					batchQuestions: batchEnvelope.questions,
-					batchReview: batchEnvelope.review === true,
-			  }
-			: {
-					agentId,
-					requestId,
-					method,
-					title: rawTitle,
-					options: typed.options as string[] | undefined,
-					placeholder: typed.placeholder as string | undefined,
-					prefill: typed.prefill as string | undefined,
-					allowOther: typed.allowOther === true,
-			  };
-
-		// 记录 pending UI 请求，用于 abort 时自动 cancel
-		runtime.pendingUIRequests.set(requestId, { method, title: request.title });
-
-		// 插入 system 消息作为卡片占位
-		this.addMessage(runtime, "system", request.title, {
-			type: "askQuestion",
-			status: "pending",
-			uiRequest: request,
-		});
-
-		// 通知渲染进程显示交互卡片
-		this.events.publish({ kind: "ui-request", request });
-		this.scheduleUIRequestTimeout(agentId, requestId, typed.timeout);
-	}
-
-	/**
-	 * 发送 Extension UI 响应（extension_ui_response）到 pi 的 stdin。
-	 * 同时更新对应卡片消息的状态。
-	 */
-	sendUIResponse(agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) {
-		const runtime = this.agents.get(agentId);
-		if (!runtime) return;
-
-		// 写入 extension_ui_response 到 pi 的 stdin
-
-		// 写入 extension_ui_response。
-		// 注意：普通 select 取消应走 value:null（见 abort / 渲染层 respondCancel），
-		// 不要对 select 误发 cancelled:true，否则 pi 返回 undefined，旧 ask 扩展会选第一项。
-		const extPayload: Record<string, unknown> = {
-			type: "extension_ui_response",
-			id: requestId,
-		};
-		// value 允许显式 null（取消 select）；undefined 表示字段未提供则不写入。
-		if ("value" in response) extPayload.value = response.value;
-		// pi 的 ctx.ui.confirm() 检查 confirmed 字段
-		if ("confirmed" in response) extPayload.confirmed = response.confirmed;
-		// omp 原生 ask：answers 必须按请求顺序携带全部问题，pi 会校验 id/数量。
-		if ("answers" in response) extPayload.answers = response.answers;
-		if (response.cancelled) extPayload.cancelled = true;
-		runtime.slot.process.client.sendRaw(extPayload);
-
-		// 清理 pending 记录
-		const pending = runtime.pendingUIRequests;
-		pending.delete(requestId);
-
-		// 更新卡片消息状态为 answered 或 cancelled；cancelled 时从消息流移除，不留痕迹
-		const messages = runtime.transcript.messages;
-		if (response.cancelled) {
-			// 取消交互：从消息流中移除对应的 askQuestion 卡片，不在时间线上留下痕迹
-			const idx = messages.findIndex(
-				(msg) =>
-					msg.role === "system" &&
-					msg.meta?.type === "askQuestion" &&
-					(msg.meta as Record<string, unknown>).uiRequest &&
-					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === requestId,
-			);
-			if (idx !== -1) {
-				messages.splice(idx, 1);
-				this.markMessagesDirty(runtime, idx);
-			}
-		} else {
-			for (const msg of messages) {
-				if (
-					msg.role === "system" &&
-					msg.meta?.type === "askQuestion" &&
-					(msg.meta as Record<string, unknown>).uiRequest &&
-					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === requestId
-				) {
-					(msg.meta as Record<string, string>).status = "answered";
-					(msg.meta as Record<string, unknown>).response = response;
-					this.markMessageDirty(runtime, msg);
-					break;
-				}
-			}
-		}
-		this.scheduleMessageEmit(runtime, false);
-
-		// 通知渲染进程 UI 请求已完成
-		this.events.publish({
-			kind: "ui-request",
-			request: { agentId, requestId, completed: true, ...response },
-		});
-	}
-
-	/**
 	 * 启动 pi 前完成项目信任确认（决策矩阵收敛于 TrustStore.decide——探测/存储/
-	 * 编排全部模块化，本类只供弹窗适配器：requestId 注册表 + 60s/headless 拒绝，
-	 * 见 requestProjectTrust）。返回需传给 pi 的信任覆盖指令：
+	 * 编排全部模块化，本类只供弹窗适配器：交互模块的 requestId 注册表 + 60s/headless
+	 * 拒绝（见 AgentInteractions.requestTrust）。返回需传给 pi 的信任覆盖指令：
 	 * "approve"（trust-session 本次覆盖，不落盘）| "no-approve"（deny 不信任模式
 	 * 启动）| undefined（放行：已信任/remember 已落盘/干净项目自动信任）。
 	 */
@@ -4870,58 +4589,10 @@ export class AgentManager {
 			hostCwd,
 			projectName: project.name,
 			windowsHome: this.wslEnvironment?.windowsHome,
-			ask: async () => this.requestProjectTrust(cwd, project.name),
+			ask: async () => this.interactions.requestTrust(cwd, project.name),
 		});
 		void this.appLogger?.info("agent", "Agent trust decision completed", { cwd, result });
 		return result;
-	}
-
-	/**
-	 * 通过事件出口请求用户（桌面弹窗/后续手机端）弹出项目信任确认，等待用户选择。
-	 * 无消费者在线（headless、窗口已关闭）或 60 秒未响应时默认拒绝（安全优先）。
-	 */
-	private requestProjectTrust(cwd: string, projectName: string): Promise<ProjectTrustChoice> {
-		const requestId = randomUUID();
-		// 没有消费者就没有人能回答：直接拒绝，不把启动流程挂在 60 秒超时上。
-		if (!this.events.hasUiResponders()) {
-			return Promise.resolve<ProjectTrustChoice>("deny");
-		}
-		return new Promise<ProjectTrustChoice>((resolve) => {
-			const timer = setTimeout(() => {
-				if (this.pendingTrustRequests.delete(requestId)) {
-					resolve("deny");
-				}
-			}, 60_000);
-			this.pendingTrustRequests.set(requestId, {
-				resolve: (choice) => {
-					clearTimeout(timer);
-					resolve(choice);
-				},
-				cwd,
-				projectName,
-				createdAt: Date.now(),
-			});
-			this.events.publish({ kind: "trust-request", requestId, cwd, projectName });
-		});
-	}
-
-	/** 渲染进程回传用户对信任确认弹窗的选择，唤醒等待中的 Agent 创建流程。 */
-	respondTrustRequest(requestId: string, choice: ProjectTrustChoice): void {
-		const pending = this.pendingTrustRequests.get(requestId);
-		if (pending) {
-			this.pendingTrustRequests.delete(requestId);
-			pending.resolve(choice);
-		}
-	}
-
-	/** 手机端状态轮询用：列出仍在等待确认的项目信任请求（不含 resolve 函数）。 */
-	listPendingTrustRequests(): Array<{ requestId: string; cwd: string; projectName: string; createdAt: number }> {
-		return [...this.pendingTrustRequests].map(([requestId, pending]) => ({
-			requestId,
-			cwd: pending.cwd,
-			projectName: pending.projectName,
-			createdAt: pending.createdAt,
-		}));
 	}
 
 	private handleAssistantMessageEvent(runtime: AgentRuntime, event: Record<string, any>) {
@@ -5147,39 +4818,6 @@ export class AgentManager {
 		this.markMessageDirty(runtime, message);
 
 		this.scheduleMessageEmit(runtime, true);
-	}
-
-	private scheduleUIRequestTimeout(agentId: string, requestId: string, timeout: unknown) {
-		if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return;
-
-		const timer = setTimeout(() => {
-			const runtime = this.agents.get(agentId);
-			if (!runtime) return;
-			const pending = runtime.pendingUIRequests;
-			if (!pending.has(requestId)) return;
-
-			pending.delete(requestId);
-
-			const messages = runtime.transcript.messages;
-			const idx = messages.findIndex(
-				(msg) =>
-					msg.role === "system" &&
-					msg.meta?.type === "askQuestion" &&
-					(msg.meta as Record<string, unknown>).uiRequest &&
-					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === requestId,
-			);
-			if (idx !== -1) {
-				messages.splice(idx, 1);
-				this.markMessagesDirty(runtime, idx);
-				this.scheduleMessageEmit(runtime, false);
-			}
-
-			this.events.publish({
-				kind: "ui-request",
-				request: { agentId, requestId, completed: true, cancelled: true },
-			});
-		}, Math.floor(timeout));
-		timer.unref?.();
 	}
 
 	private scheduleIdleCheckAfterExtensionCommand(agentId: string) {
@@ -5691,8 +5329,10 @@ export class AgentManager {
  *
  * 仍保留为类级字段的 per-agent 协调结构：
  * - `creatingSessionAgents`（按 sessionKey 索引，runtime 尚未创建前用于去重并发 create）
- * - `pendingTrustRequests`（按 requestId 索引，不属于某个 agent）
  * - `thinkingEmitter`（共享节流发射器，内部按 agentId 维度）
+ *
+ * 交互请求的待答账本（`pendingUIRequests`）与项目信任注册表分别归入
+ * AgentRuntime 和 AgentInteractions，不再由本类各写一份。
  */
 type AgentRuntime = {
 	// 身份与进程
@@ -5800,58 +5440,6 @@ type AgentRuntime = {
 	queue: FollowUpQueue;
 };
 
-/**
- * 清洗 omp ask 的 questions 载荷。pi 端已做类型校验，但 RPC 输入是 unknown：
- * 这里只放宽展示/回答必需字段，丢弃无 question 或非法 option 的条目，
- * 保证 answer 数组与 id 顺序不会因为脏字段错位。
- */
-function normalizeAskQuestions(raw: unknown): AgentUiAskQuestion[] {
-	if (!Array.isArray(raw)) return [];
-	const questions: AgentUiAskQuestion[] = [];
-	for (const [index, item] of raw.entries()) {
-		if (!item || typeof item !== "object") continue;
-		const source = item as Record<string, unknown>;
-		const question = typeof source.question === "string" ? source.question : "";
-		if (!question) continue;
-		const options: AgentUiAskOption[] = [];
-		if (Array.isArray(source.options)) {
-			for (const option of source.options) {
-				if (typeof option === "string") {
-					options.push({ label: option });
-					continue;
-				}
-				if (!option || typeof option !== "object") continue;
-				const opt = option as Record<string, unknown>;
-				if (typeof opt.label !== "string") continue;
-				options.push({
-					label: opt.label,
-					description: typeof opt.description === "string" ? opt.description : undefined,
-					preview: typeof opt.preview === "string" ? opt.preview : undefined,
-				});
-			}
-		}
-		const recommended =
-			typeof source.recommended === "number" &&
-			Number.isInteger(source.recommended) &&
-			source.recommended >= 0 &&
-			source.recommended < options.length
-				? source.recommended
-				: undefined;
-		questions.push({
-			id: typeof source.id === "string" && source.id ? source.id : `q${index + 1}`,
-			question,
-			header: typeof source.header === "string" ? source.header : undefined,
-			options,
-			multi: source.multi === true,
-			recommended,
-		});
-	}
-	// 任何一道题被丢弃都会让 answers 数量与 pi 的 questions 错位（pi 会拒绝整包），
-	// 因此宁可整体取消，也不提交半份问卷。
-	return questions.length === raw.length ? questions : [];
-}
-
-/** 创建一个带有全部 per-agent 状态默认值的 AgentRuntime。 */
 function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRuntime {
 	return {
 		tab,

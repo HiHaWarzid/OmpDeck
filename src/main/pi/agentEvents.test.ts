@@ -140,6 +140,7 @@ function recordEvents(manager: AgentManager): AgentEvent[] {
  * TS 的 private 仅是编译期约束，这里经 unknown 双断言收窄到本测试所需形状。
  */
 type ManagerInternals = {
+	interactions: { open(agentId: string, event: Record<string, unknown>): void };
 	agents: Map<string, TestRuntime>;
 	emitStateNow(): void;
 	addMessage(
@@ -149,7 +150,6 @@ type ManagerInternals = {
 		meta?: Record<string, unknown>,
 	): void;
 	handlePiEvent(agentId: string, event: unknown): void;
-	handleUIRequest(runtime: TestRuntime, event: Record<string, unknown>): void;
 	markIdleIfPiReportsNoWork(agentId: string): Promise<void>;
 	emitRuntimeState(agentId: string): Promise<void>;
 };
@@ -698,7 +698,7 @@ test("native ask 转发结构化问题，回答走 answers 数组", () => {
 	});
 	inner.agents.set("a1", runtime);
 
-	inner.handleUIRequest(runtime, {
+	inner.interactions.open("a1", {
 		type: "extension_ui_request",
 		id: "r1",
 		method: "ask",
@@ -728,7 +728,7 @@ test("native ask 转发结构化问题，回答走 answers 数组", () => {
 	assert.equal(ask.request.timeout, 60_000);
 	assert.equal(runtime.pendingUIRequests.get("r1")?.method, "ask");
 
-	manager.sendUIResponse("a1", "r1", {
+	manager.interactions.respond("a1", "r1", {
 		answers: [{ id: "q1", selectedOptions: ["渲染层"] }],
 	});
 
@@ -738,6 +738,30 @@ test("native ask 转发结构化问题，回答走 answers 数组", () => {
 		answers: [{ id: "q1", selectedOptions: ["渲染层"] }],
 	});
 	assert.equal(runtime.pendingUIRequests.size, 0);
+});
+
+test("handlePiEvent 把 extension_ui_request 交给交互模块处理", () => {
+	const manager = makeManager();
+	const events = recordEvents(manager);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"));
+	inner.agents.set("a1", runtime);
+
+	inner.handlePiEvent("a1", {
+		type: "extension_ui_request",
+		id: "r9",
+		method: "select",
+		title: "选一个",
+		options: ["a", "b"],
+	});
+
+	const card = runtime.transcript.messages.at(-1);
+	assert.equal(card?.meta?.type, "askQuestion");
+	assert.equal(runtime.pendingUIRequests.get("r9")?.method, "select");
+	assert.equal(
+		events.some((event) => event.kind === "ui-request" && event.request.requestId === "r9"),
+		true,
+	);
 });
 
 test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () => {
@@ -750,7 +774,7 @@ test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () =>
 	});
 	inner.agents.set("a1", runtime);
 
-	inner.handleUIRequest(runtime, {
+	inner.interactions.open("a1", {
 		type: "extension_ui_request",
 		id: "r2",
 		method: "ask",
@@ -758,7 +782,7 @@ test("native ask 被 pi 取消时清理 pending 并通知渲染层收起", () =>
 	});
 	assert.equal(runtime.pendingUIRequests.size, 1);
 
-	inner.handleUIRequest(runtime, {
+	inner.interactions.open("a1", {
 		type: "extension_ui_request",
 		id: "cancel-1",
 		method: "cancel",
@@ -886,7 +910,7 @@ test("native ask 载荷有坏题时整体取消，避免 answers 与问题错位
 	});
 	inner.agents.set("a1", runtime);
 
-	inner.handleUIRequest(runtime, {
+	inner.interactions.open("a1", {
 		type: "extension_ui_request",
 		id: "r3",
 		method: "ask",

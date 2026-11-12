@@ -360,7 +360,8 @@ export type AgentUiRequest = {
 	/** pi 侧超时（毫秒）：超时后自动选择 recommended，桌面端仅用于提示。 */
 	timeout?: number;
 	completed?: boolean;
-	value?: string;
+	/** 应答值：confirm 回 boolean，取消 select 回 null（pi 的 parser 以 null 表示未选择）。 */
+	value?: string | boolean | null;
 	cancelled?: boolean;
 	message?: string;
 	notifyType?: "info" | "warning" | "error";

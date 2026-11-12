@@ -422,16 +422,16 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 					return [];
 				}
 			},
-			/** 用户通过 UI 响应了扩展的 ask_question 请求，转发给 AgentManager 发送 extension_ui_response */
+			/** 用户通过 UI 响应了扩展的 ask_question 请求，转发给交互模块发送 extension_ui_response */
 			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) => {
-				await agentManager.sendUIResponse(agentId, requestId, response);
+				await agentManager.interactions.respond(agentId, requestId, response);
 			},
 			/** 回传项目信任确认弹窗的用户选择，唤醒等待中的 Agent 创建流程（TrustStore.decide 的 ask 适配器）。 */
 			respondTrustRequest: async (
 				_event,
 				requestId: string,
 				choice: "trust-remember" | "trust-session" | "deny",
-			) => agentManager.respondTrustRequest(requestId, choice),
+			) => agentManager.interactions.respondTrust(requestId, choice),
 		},
 	};
 }
