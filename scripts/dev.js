@@ -80,6 +80,10 @@ function getElectronViteInvocation({
 		args: [
 			electronViteBinPath,
 			"dev",
+			// electron-vite 4 的 dev 默认不监听主进程/preload，必须显式 --watch；
+			// 否则合并或改 preload 源码后运行的仍是旧 preload，渲染层 HMR 到新 API
+			// 就会因 onChanged 等成员缺失被错误边界整页接管。
+			"--watch",
 			...withDefaultElectronArgs(args, { platform, env }),
 		],
 	};

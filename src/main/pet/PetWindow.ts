@@ -3,7 +3,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { is } from "@electron-toolkit/utils";
 import type { PetWindowCaps } from "../../shared/types";
-import { preparePreloadPath } from "../preloadPath";
 import { readElectronChromiumSandboxPreference } from "../settings/SettingsStore";
 
 /** 三端宠物窗能力探测；Wayland 降级 */
@@ -77,8 +76,7 @@ export class PetWindow {
 		const rawY = persisted?.y ?? wa.y + wa.height - h - 24;
 		const x = Math.round(Math.min(maxX, Math.max(wa.x, rawX)));
 		const y = Math.round(Math.min(maxY, Math.max(wa.y, rawY)));
-		const sourcePreloadPath = join(__dirname, "../preload/index.js");
-		const preloadPath = await preparePreloadPath(sourcePreloadPath, "pet-preload.js");
+		const preloadPath = join(__dirname, "../preload/index.js");
 
 		this.win = new BrowserWindow({
 			width: w, height: h, x, y,
@@ -98,7 +96,7 @@ export class PetWindow {
 		this.win.webContents.on("preload-error", (_event, failedPreloadPath, error) => {
 			console.warn("[PetWindow] preload failed", {
 				preloadPath: failedPreloadPath,
-				sourcePreloadPath,
+				expectedPreloadPath: preloadPath,
 				message: error.message,
 				stack: error.stack,
 			});

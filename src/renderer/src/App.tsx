@@ -659,6 +659,15 @@ export function App() {
   const sessionsByProjectRef = useRef(sessionsByProject);
   sessionsByProjectRef.current = sessionsByProject;
   useEffect(() => {
+    // 开发态 preload 是独立构建产物：合并/HMR 期间渲染层可能先于 preload 更新，
+    // 此时 onChanged 尚不存在。跳过订阅并记录日志，避免整页被错误边界接管；
+    // preload 重建后 electron-vite 会整页 reload，届时会重新执行本 effect。
+    if (typeof api.sessions.onChanged !== "function") {
+      void api.app
+        .rendererLog("warn", "renderer", "sessions.onChanged 不可用，跳过会话列表订阅")
+        .catch(() => undefined);
+      return;
+    }
     return api.sessions.onChanged(() => {
       // 已经加载过列表的项目（侧栏/活动项目）都要补一次完整快照；
       // 只认 expanded 会漏掉当前活动但尚未展开的项目。

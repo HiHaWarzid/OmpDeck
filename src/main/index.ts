@@ -233,7 +233,6 @@ import { ProjectResourceManager } from "./projects/ProjectResourceManager";
 import { WebServiceManager } from "./web/WebServiceManager";
 import { RemoteAccessManager } from "./remote/RemoteAccessManager";
 import { createCommandRunner } from "./utils/CommandRunner";
-import { preparePreloadPath } from "./preloadPath";
 import { AppLogger } from "./logging/AppLogger";
 import { registerLogHandlers } from "./ipc/logHandlers";
 import { registerSkillHandlers } from "./ipc/skillHandlers";
@@ -731,11 +730,6 @@ function printStartupInfo() {
 	`);
 }
 
-async function prepareMainPreloadPath() {
-	const sourcePath = join(__dirname, "../preload/index.js");
-	return preparePreloadPath(sourcePath, "main-preload.js");
-}
-
 async function createWindow() {
 	// 重建窗口时重置加载健康状态，让新窗口重新尝试 dev URL（若仍失联则再次回退构建产物）
 	mainFrameLoadFailed = false;
@@ -744,12 +738,12 @@ async function createWindow() {
 	applyNativeThemeSource(settingsStore.get());
 	const windowOptions = settingsStore.createWindowOptions();
 	const showMainWindowImmediately = shouldShowMainWindowImmediately();
-	const sourcePreloadPath = join(__dirname, "../preload/index.js");
-	const mainPreloadPath = await prepareMainPreloadPath();
+	// 直接使用构建产物路径。dev 下 electron-vite 重建 preload 后会整页 reload，
+	// 页面重新执行同一路径的 preload 就能拿到新 API；不要把 preload 复制到 userData——
+	// 复制件只在主进程重启时刷新，合并/HMR 期间渲染层先更新会因 API 缺失整页崩溃。
+	const mainPreloadPath = join(__dirname, "../preload/index.js");
 	void appLogger.info("app", "Main window preload configured", {
-		sourcePreloadPath,
 		preloadPath: mainPreloadPath,
-		sourceExists: existsSync(sourcePreloadPath),
 		exists: existsSync(mainPreloadPath),
 		appPath: app.getAppPath(),
 		userDataPath: app.getPath("userData"),

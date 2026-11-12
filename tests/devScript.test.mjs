@@ -80,6 +80,7 @@ test("runs electron-vite dev and forwards extra arguments", () => {
 	assert.deepEqual(invocation.args, [
 		"/repo/node_modules/electron-vite/bin/electron-vite.js",
 		"dev",
+		"--watch",
 		"--debug",
 		"main",
 		"--",
@@ -105,6 +106,7 @@ test("does not override an explicit Chromium log level", () => {
 	assert.deepEqual(invocation.args, [
 		"/repo/node_modules/electron-vite/bin/electron-vite.js",
 		"dev",
+		"--watch",
 		"--",
 		"--log-level=1",
 		"--ozone-platform=x11",
