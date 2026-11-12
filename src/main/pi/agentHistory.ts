@@ -17,7 +17,7 @@ export type HistoryJsonl = {
 		beforeOffset: number | undefined,
 		maxTurns: number,
 	): Promise<{ messages: unknown[]; entryIds: string[]; cursor: number; hasMore: boolean }>;
-	readDisplayMessages(sessionPath: string, agentId: string, sessionContent?: string): Promise<ChatMessage[]>;
+	readDisplayMessages(sessionPath: string, agentId: string, preloadedEntries?: readonly unknown[]): Promise<ChatMessage[]>;
 	readEntryTextById(sessionPath: string, entryId: string): Promise<string | null>;
 };
 

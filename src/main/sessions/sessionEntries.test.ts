@@ -25,6 +25,7 @@ import { SessionFileOps } from "./SessionFileOps";
 import { SessionScanner } from "./SessionScanner";
 import { extractSessionSummaryFacts } from "./sessionSummaryFacts";
 import {
+  isJsonRecord,
   nodeEntriesIo,
   parseSessionText,
   readEntries,
@@ -340,6 +341,38 @@ test("尾窗覆盖文件头且文件无结尾换行时保留第一行", async ()
   const tail = await readTailEntries(createCountingIo().io, filePath, { minLines: 100, maxBytes: 1024 * 1024 });
   assert.deepEqual(tail.entries.map((entry) => (entry as { id?: string }).id), ["m0", "m1"]);
   assert.equal(tail.startOffset, 0);
+});
+
+test("lines 偏移是字节精确的绝对位置（含多字节与 CRLF，尾窗已抬升）", async () => {
+  const home = await createHome();
+  // 多字节 + CRLF + 损坏行混排：偏移必须按 UTF-8 字节算，且指向该行的起始字节。
+  const first = JSON.stringify({ id: "m0", type: "message", message: { role: "user", content: [{ type: "text", text: "你好" }] } });
+  const second = JSON.stringify({ id: "m1", type: "message", message: { role: "assistant", content: "🙂" } });
+  const raw = `${first}\r\n{broken\r\n${second}\n`;
+  const filePath = await writeSessionFile(home, "offsets.jsonl", raw);
+  const bytes = Buffer.from(raw, "utf8");
+  const idOf = (value: unknown): string | undefined =>
+    isJsonRecord(value) && typeof value.id === "string" ? value.id : undefined;
+
+  const whole = await readEntries(nodeEntriesIo, filePath);
+  assert.deepEqual(whole.lines.map((line) => line.offset), [
+    0,
+    Buffer.byteLength(`${first}\r\n{broken\r\n`, "utf8"),
+  ]);
+  for (const line of whole.lines) {
+    // 从偏移处按字节切回去，必须正好是这一行（换行前）的 JSON
+    const rest = bytes.subarray(line.offset).toString("utf8");
+    const text = rest.slice(0, rest.indexOf("\n")).trim();
+    assert.equal(JSON.parse(text).id, idOf(line.value));
+  }
+
+  // 尾窗：偏移抬到文件绝对位置，且与整读结果一致（分页 cursor 依赖这个等价性）
+  const tail = await readTailEntries(createCountingIo().io, filePath, { minLines: 2, maxBytes: 1024 });
+  const wholeById = new Map(whole.lines.map((line) => [idOf(line.value), line.offset]));
+  for (const line of tail.lines) {
+    assert.equal(line.offset, wholeById.get(idOf(line.value)));
+  }
+  assert.deepEqual(tail.lines.map((line) => idOf(line.value)), ["m0", "m1"]);
 });
 
 // ── 摘要事实提取与 worker 路径 ─────────────────────────

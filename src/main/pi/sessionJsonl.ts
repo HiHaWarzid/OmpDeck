@@ -19,12 +19,13 @@ import {
 import {
 	isJsonRecord,
 	nodeEntriesIo,
-	parseSessionText,
 	readEntries,
 	readTailEntries,
 	TAIL_READ_MAX_BYTES,
+	type SessionLine,
 	type SessionTailEntriesIo,
 } from "../sessions/sessionEntries";
+import { asMessageEntry, messageLines, selectActiveBranch } from "../sessions/sessionTranscript";
 
 /**
  * 会话 JSONL 文件读写模块 —— 把 pi 会话文件（.jsonl）的所有磁盘 IO 与纯行级定位
@@ -144,9 +145,9 @@ export class SessionJsonl {
 		hostPath: string,
 		minLines: number,
 		maxBytes: number,
-	): Promise<string[]> {
-		const { raw } = await readTailEntries(this.io, hostPath, { minLines, maxBytes });
-		return raw.split("\n").map((line) => line.trim()).filter(Boolean);
+	): Promise<SessionLine[]> {
+		const { lines } = await readTailEntries(this.io, hostPath, { minLines, maxBytes });
+		return lines;
 	}
 
 	// ── 读取 ───────────────────────────────────────────────
@@ -180,21 +181,9 @@ export class SessionJsonl {
 			throw error;
 		}
 
-		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
-		let offset = tail.startOffset;
-		for (const line of tail.raw.split("\n")) {
-			const lineOffset = offset;
-			offset += Buffer.byteLength(line, "utf8") + 1;
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
-				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
-					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
-				}
-			} catch {
-				// 跳过单行解析失败，不影响后续行
-			}
-		}
+		// 消息行识别与行偏移都由 sessionEntries/sessionTranscript 提供，
+		// 此处不再 split + JSON.parse（分页四个方法此前各写一遍同样的循环）。
+		const messageEntries = messageLines(tail.lines);
 
 		// 只保留最近 maxTurns 轮对话；先裁剪再还原 blob，避免为已丢弃的历史图片读盘
 		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), maxTurns);
@@ -227,7 +216,7 @@ export class SessionJsonl {
 			data: {
 				messages: trimmed,
 				entryIds: kept.map((item) => item.entryId),
-				cursor: kept[0]?.startOffset ?? 0,
+				cursor: kept[0]?.offset ?? 0,
 				hasOlder,
 			},
 		};
@@ -250,17 +239,9 @@ export class SessionJsonl {
 				endOffset,
 			});
 			if (!tail.raw) return undefined;
-			let offset = tail.startOffset;
-			for (const line of tail.raw.split("\n")) {
-				const lineOffset = offset;
-				offset += Buffer.byteLength(line, "utf8") + 1;
-				if (!line.trim()) continue;
-				try {
-					const entry = JSON.parse(line) as { id?: unknown };
-					if (entry.id === entryId) return lineOffset;
-				} catch {
-					// 损坏行跳过，继续扫描
-				}
+			for (const line of tail.lines) {
+				const entry = line.value;
+				if (isJsonRecord(entry) && entry.id === entryId) return line.offset;
 			}
 			if (tail.startOffset <= 0) return undefined;
 			endOffset = tail.startOffset;
@@ -293,22 +274,9 @@ export class SessionJsonl {
 		});
 		if (!tail.raw) return { messages: [], entryIds: [], cursor: 0, hasMore: false };
 
-		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
-		let offset = tail.startOffset;
-		for (const line of tail.raw.split("\n")) {
-			const lineOffset = offset;
-			// +1 为换行符；最后一行即使没有换行，也不会被当作下一页 cursor 的起点。
-			offset += Buffer.byteLength(line, "utf8") + 1;
-			if (!line.trim()) continue;
-			try {
-				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
-				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
-					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
-				}
-			} catch {
-				// 损坏行跳过；cursor 仍按字节推进，避免分页卡死
-			}
-		}
+		// 行偏移已由 sessionEntries 抬到绝对位置：最后一行即使没有换行符，
+		// 也不会被当作下一页 cursor 的起点（下一页从该行起点严格向前）。
+		const messageEntries = messageLines(tail.lines);
 
 		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), turns);
 		const trimStart = trimmed.length > 0
@@ -320,7 +288,7 @@ export class SessionJsonl {
 
 		// 没有消息条目时继续以上的窗口起点为 cursor；有消息则从本页第一条开始，
 		// 这样下一次读取严格只包含更早的行。
-		const cursor = kept.length > 0 ? kept[0].startOffset : tail.startOffset;
+		const cursor = kept.length > 0 ? kept[0].offset : tail.startOffset;
 		return {
 			messages: messagesOut,
 			entryIds: kept.map((item) => item.entryId),
@@ -336,75 +304,23 @@ export class SessionJsonl {
 	 * 因此压缩归档必须参与进来——pi 压缩后上下文 = summary + firstKeptEntryId 起的保留消息
 	 * + 后续消息，只取 compaction 之后会漏掉明确保留的尾部消息。
 	 *
-	 * @param sessionContent 已读到的原文（渲染层已经读过一次时复用，避免重复整读）。
+	 * @param preloadedEntries 调用方已解析的条目（查看器路径先经 SessionFileOps 读盘时复用，
+	 * 避免同一份原文在主进程里 JSON.parse 两遍）；不传则本方法整读文件。
 	 */
 	async readDisplayMessages(
 		sessionPath: string,
 		agentId: string,
-		sessionContent?: string,
+		preloadedEntries?: readonly unknown[],
 	): Promise<ChatMessage[]> {
-		// 调用方已读入原文时直接复用；否则整读走 sessionEntries（编码守卫与逐行解析的唯一实现）。
-		// 只保留解析后的条目：归档解析直接复用这些条目，不再对同一份原文二次 JSON.parse。
-		let parsedEntries: unknown[];
-		if (sessionContent === undefined) {
-			parsedEntries = (await readEntries(this.io, this.resolve(sessionPath))).entries;
-		} else {
-			parsedEntries = parseSessionText(sessionContent).entries;
-		}
-		const entries: Array<{
-			id: string;
-			parentId: string | null;
-			type: string;
-			message?: unknown;
-			summary?: string;
-			firstKeptEntryId?: string;
-			tokensBefore?: number;
-			timestamp?: string;
-		}> = [];
-
-		for (const entry of parsedEntries) {
-			// 单行损坏已被 sessionEntries 隔离；这里只收窄字段，缺 id 的条目无法参与分支回溯。
-			if (!isJsonRecord(entry) || typeof entry.id !== "string") continue;
-			entries.push({
-				id: entry.id,
-				parentId: typeof entry.parentId === "string" ? entry.parentId : null,
-				type: typeof entry.type === "string" ? entry.type : "",
-				message: entry.message,
-				summary: typeof entry.summary === "string" ? entry.summary : undefined,
-				firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
-				tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
-				timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
-			});
-		}
-		if (entries.length === 0) return [];
-
-		// JSONL 最后一个 entry 是 pi 当前叶节点；沿 parentId 回溯得到与 get_messages 一致的活动分支。
-		const byId = new Map(entries.map((entry) => [entry.id, entry]));
-		const activeBranch: typeof entries = [];
-		const seen = new Set<string>();
-		let current: (typeof entries)[number] | undefined = entries[entries.length - 1];
-		while (current && !seen.has(current.id)) {
-			seen.add(current.id);
-			activeBranch.push(current);
-			current = current.parentId ? byId.get(current.parentId) : undefined;
-		}
-		activeBranch.reverse();
-
-		const lastCompactionIndex = activeBranch.findLastIndex((entry) => entry.type === "compaction");
-		const lastCompaction = lastCompactionIndex >= 0 ? activeBranch[lastCompactionIndex] : undefined;
-		const firstKeptIndex = lastCompaction?.firstKeptEntryId
-			? activeBranch.findIndex((entry) => entry.id === lastCompaction.firstKeptEntryId)
-			: -1;
-		// pi 压缩后上下文由 summary + firstKeptEntryId 起的保留消息 + 后续消息组成；
-		// 不能只取 compaction entry 之后，否则会漏掉压缩时明确保留的尾部消息。
-		const currentStartIndex = firstKeptIndex >= 0
-			? firstKeptIndex
-			: lastCompactionIndex >= 0
-				? lastCompactionIndex + 1
-				: 0;
-		const currentEntries = activeBranch
-			.slice(currentStartIndex)
-			.filter((entry) => entry.type === "message" && entry.message);
+		// 解析只有一处（sessionEntries）：调用方传条目就完全不再读盘/解析。
+		const parsedEntries: readonly unknown[] = preloadedEntries
+			?? (await readEntries(this.io, this.resolve(sessionPath))).entries;
+		// 活动分支与压缩窗口是「会话语义」，由 sessionTranscript 独占（纯函数，可单独测）；
+		// 本方法只负责把选出的条目转成时间线，并处理 blob 图片与归档卡片。
+		const branch = selectActiveBranch(parsedEntries);
+		if (branch.branch.length === 0) return [];
+		const currentEntries = branch.currentMessages;
+		const lastCompaction = branch.lastCompaction;
 		const rawMessages = currentEntries.map((entry) => entry.message);
 		const trimmed = trimHistoryMessages(rawMessages);
 		// blob 图片是引用串，只还原真正会进入时间线的那部分（与 readRecentMessages 同一策略）：
@@ -418,7 +334,7 @@ export class SessionJsonl {
 			const compactionEntry = lastCompaction;
 			// 复用上面已解析的 parsedEntries：此前 parseArchives 会把同一份全文
 			// 再 JSON.parse 一遍，35MB 会话在 Viewer 路径上等于双倍主线程 CPU。
-			const archiveData = extractSessionArchivesFromEntries(parsedEntries, agentId, (detail) => {
+			const archiveData = extractSessionArchivesFromEntries([...parsedEntries], agentId, (detail) => {
 				void this.deps.logger?.warn("agent", "Failed to convert archived messages", {
 					agentId,
 					compactionId: detail.compactionId,
@@ -460,19 +376,11 @@ export class SessionJsonl {
 		const prompts: string[] = [];
 		// 文件行序为旧→新，倒序扫描即可拿到最新在前的用户文本，收集够即停
 		for (let i = lines.length - 1; i >= 0 && prompts.length < limit; i--) {
-			const line = lines[i].trim();
-			if (!line) continue;
-			try {
-				const entry = JSON.parse(line) as {
-					type?: unknown;
-					message?: { role?: unknown; content?: unknown };
-				};
-				if (entry.type === "message" && entry.message?.role === "user") {
-					const text = extractMessageText(entry.message.content)?.trim();
-					if (text) prompts.push(text);
-				}
-			} catch {
-				// 单行解析失败（如写入中的残行）跳过，不影响后续行
+			const entry = asMessageEntry(lines[i].value);
+			const message = entry && isJsonRecord(entry.message) ? entry.message : undefined;
+			if (message?.role === "user") {
+				const text = extractMessageText(message.content)?.trim();
+				if (text) prompts.push(text);
 			}
 		}
 		void this.deps.logger?.info("agent", "Recent user prompts read from session file", {
@@ -536,23 +444,19 @@ export class SessionJsonl {
 			const lines = await this.readTailLines(this.resolve(sessionPath), 32, TAIL_READ_MAX_BYTES);
 			// 从后往前遍历，找到最后一条 assistant 消息
 			for (let i = lines.length - 1; i >= 0; i--) {
-				const line = lines[i].trim();
-				if (!line) continue;
-				try {
-					const entry = JSON.parse(line) as Record<string, any>;
-					if (entry?.message?.role === "assistant" && entry.message?.usage) {
-						const usage = entry.message.usage;
-						const input = usage.input ?? 0;
-						const cacheRead = usage.cacheRead ?? 0;
-						const cacheWrite = usage.cacheWrite ?? 0;
-						const promptTokens = input + cacheRead + cacheWrite;
-						if (promptTokens > 0) {
-							value = (cacheRead / promptTokens) * 100;
-						}
-						break;
+				const entry = lines[i].value;
+				if (!isJsonRecord(entry)) continue;
+				const message = isJsonRecord(entry.message) ? entry.message : undefined;
+				const usage = message && isJsonRecord(message.usage) ? message.usage : undefined;
+				if (message?.role === "assistant" && usage) {
+					const input = typeof usage.input === "number" ? usage.input : 0;
+					const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
+					const cacheWrite = typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0;
+					const promptTokens = input + cacheRead + cacheWrite;
+					if (promptTokens > 0) {
+						value = (cacheRead / promptTokens) * 100;
 					}
-				} catch {
-					// 单行解析失败忽略，继续往前找
+					break;
 				}
 			}
 		} catch {

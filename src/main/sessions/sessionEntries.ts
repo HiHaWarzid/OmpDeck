@@ -53,6 +53,12 @@ export interface SessionTailEntriesIo extends SessionEntriesIo {
 export interface SessionEntriesFile {
   /** 逐行 JSON.parse 成功的值（含非对象 JSON，调用方按需收窄） */
   entries: unknown[];
+  /**
+   * 与 entries 一一对应的行级信息，offset 为该行在文件中的绝对起始字节偏移。
+   * 分页游标（readOlderMessages 的 cursor、findEntryOffset）与「按字节定位」都消费它，
+   * 不必再各自 split + JSON.parse + 累加 Buffer.byteLength。
+   */
+  lines: SessionLine[];
   /** 解码后的原文（截断时只含完整行；不可读时为空串） */
   raw: string;
   /** 是否受字节预算/尾窗限制丢掉了部分内容 */
@@ -67,6 +73,12 @@ export interface SessionEntriesFile {
   startOffset: number;
   /** 本次尾窗结束的绝对字节偏移（默认等于文件大小） */
   endOffset: number;
+}
+
+/** 一行会话 JSONL：解析后的值与它相对 parseSessionText 入参的起始字节偏移。 */
+export interface SessionLine {
+  value: unknown;
+  offset: number;
 }
 
 export interface ReadEntriesOptions {
@@ -110,29 +122,40 @@ function decodeSessionText(raw: string): { text: string; unreadable: boolean } {
  * 逐行解析：跳过空行、隔离单行解析失败。
  * 单行 JSON 损坏（进程中断导致的截断写入、并发写竞争）不应拖垮整个会话，
  * 因此失败只计数不抛出，由调用方决定是否隐藏/标记 degraded。
+ *
+ * 同时产出每行的起始字节偏移（相对入参 raw）：分页游标与「按字节定位」都基于它，
+ * 调用方不再自己 split + 累加字节数（三处重复实现曾对 \r\n 各自估算）。
  */
 export function parseSessionText(raw: string): {
   entries: unknown[];
+  lines: SessionLine[];
   malformedLines: number;
   unreadable: boolean;
   text: string;
 } {
   const decoded = decodeSessionText(raw);
   if (decoded.unreadable) {
-    return { entries: [], malformedLines: 0, unreadable: true, text: "" };
+    return { entries: [], lines: [], malformedLines: 0, unreadable: true, text: "" };
   }
   const entries: unknown[] = [];
+  const lines: SessionLine[] = [];
   let malformedLines = 0;
-  for (const line of decoded.text.split(/\r?\n/)) {
+  let offset = 0;
+  for (const line of decoded.text.split("\n")) {
+    const lineOffset = offset;
+    // +1 为换行符本身；\r\n 时 \r 已计入该行字节数，偏移仍然精确。
+    offset += Buffer.byteLength(line, "utf8") + 1;
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      entries.push(JSON.parse(trimmed));
+      const value: unknown = JSON.parse(trimmed);
+      entries.push(value);
+      lines.push({ value, offset: lineOffset });
     } catch {
       malformedLines += 1;
     }
   }
-  return { entries, malformedLines, unreadable: false, text: decoded.text };
+  return { entries, lines, malformedLines, unreadable: false, text: decoded.text };
 }
 
 /**
@@ -159,6 +182,7 @@ export async function readEntries(
     const parsed = parseSessionText(lastBreak >= 0 ? head.slice(0, lastBreak + 1) : "");
     return {
       entries: parsed.entries,
+      lines: parsed.lines,
       raw: parsed.text,
       truncated: true,
       fingerprint,
@@ -171,6 +195,7 @@ export async function readEntries(
   const parsed = parseSessionText(await io.read(filePath, options.signal));
   return {
     entries: parsed.entries,
+    lines: parsed.lines,
     raw: parsed.text,
     truncated: false,
     fingerprint,
@@ -197,6 +222,7 @@ export async function readTailEntries(
   const end = Math.min(size, Math.max(0, options.endOffset ?? size));
   const empty: SessionEntriesFile = {
     entries: [],
+    lines: [],
     raw: "",
     truncated: false,
     fingerprint,
@@ -224,8 +250,11 @@ export async function readTailEntries(
       const completeCount = window.split("\n").length - 1;
       if (start === 0 || completeCount >= options.minLines || readSize >= limit) {
         const parsed = parseSessionText(window);
+        const windowStart = end - Buffer.byteLength(window, "utf8");
         return {
           entries: parsed.entries,
+          // 行偏移相对 window，这里一次性抬到文件绝对位置，调用方直接当游标用。
+          lines: parsed.lines.map((line) => ({ value: line.value, offset: windowStart + line.offset })),
           raw: parsed.text,
           // start > 0 说明窗口前还有更早内容没有读入；endOffset 截断的尾部是调用方
           // 显式指定的分页边界，不算「被动丢弃」。
@@ -235,7 +264,7 @@ export async function readTailEntries(
           malformedLines: parsed.malformedLines,
           // 从窗口结束位置反推原始行起点，避免 start 落在 UTF-8 字符中间时按字符数
           // 估算字节偏移。window 总是从换行后开始，字节边界精确。
-          startOffset: end - Buffer.byteLength(window, "utf8"),
+          startOffset: windowStart,
           endOffset: end,
         };
       }

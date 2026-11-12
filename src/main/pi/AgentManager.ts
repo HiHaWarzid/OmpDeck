@@ -536,9 +536,9 @@ export class AgentManager {
 	async readSessionDisplayMessages(
 		sessionPath: string,
 		agentId = "_viewer",
-		sessionContent?: string,
+		preloadedEntries?: readonly unknown[],
 	): Promise<ChatMessage[]> {
-		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, sessionContent);
+		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, preloadedEntries);
 	}
 
 	recordHostExchange(agentId: string, userText: string, assistantText: string) {

@@ -165,3 +165,10 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 ### AgentControl（运行控制）
 每个 agent 的运行控制入口（`main/pi/agentControl.ts`）：模型 / 思考档 / 服务档 / 自动压缩 / todo 五类开关。对外的形状是 `apply(agentId, change)` + `models` / `thinkingLevels` / `refresh` 四个入口，`change` 是判别联合，写操作统一以 `get_state` 回读值返回（不返回乐观值）。`service-tier` / `auto-compaction` / `todos` 的 `success:false` 在模块内转成异常，避免"模型没有优先通道"被静默当成成功；`model` 会记录 `lastModelSelection`，供 developer-role 自愈定位 provider。IPC handler、Web 适配器、飞书桥只做参数校验与日志，不再各自拼「取运行时 → 发请求 → 读状态」。
+
+### SessionEntries / SessionTranscript（会话投影）
+主进程读会话 JSONL 的两层深模块，读写路径共用：
+- `main/sessions/sessionEntries.ts`：**字节层唯一实现**。负责读盘（头部预算 / 尾部窗口 / 按偏移翻页）、BOM 与 UTF-16 判废、逐行解析隔离损坏行，并产出 `lines: { value, offset }[]`——`offset` 是该行起始的**绝对字节偏移**，尾窗读也抬到文件绝对位置，因此分页 cursor、条目定位是同一套坐标。
+- `main/sessions/sessionTranscript.ts`：**会话语义唯一实现**。`selectActiveBranch` 沿 parentId 回溯活动分支并应用压缩窗口（`firstKeptEntryId`），`messageLines` 是「可渲染消息条目（id + message + 偏移）」的唯一谓词，`asMessageEntry` 负责单条收窄。
+
+规则：任何新的会话读取（扫描摘要、查看器时间线、尾部最近消息、历史分页、prompt history、缓存命中率）都必须消费这两层的结果，不得再对 `raw.split("\n")` 手写 `JSON.parse` 循环或自行实现分支回溯。

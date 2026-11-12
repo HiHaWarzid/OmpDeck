@@ -106,7 +106,8 @@ export function registerSessionHandlers(deps: SessionHandlerDeps): SessionHandle
 							? Math.floor(maxBytes)
 							: SESSION_READ_MAX_BYTES,
 				});
-				const messages = await agentManager.readSessionDisplayMessages(filePath, "_viewer", file.raw);
+				// 传解析后的条目而不是原文：readDisplayMessages 不必对同一份字节二次 JSON.parse。
+				const messages = await agentManager.readSessionDisplayMessages(filePath, "_viewer", file.entries);
 				return { messages, truncated: file.truncated };
 			},
 			readMessageFullText: async (_event, agentId, messageId, entryId?) => {
