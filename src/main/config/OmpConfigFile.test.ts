@@ -110,12 +110,35 @@ describe("OmpRolesStore config file resolution", () => {
 		const yaml = join(dir, "config.yaml");
 		await writeFile(yaml, "modelRoles:\n  default: openai/gpt-4o\n");
 
-		const roles = new OmpRolesStore({ resolveConfigDir: () => dir });
+		const roles = new OmpRolesStore({
+			resolveConfigDir: () => dir,
+			configFile: new OmpConfigFile({ resolveConfigDir: () => dir }),
+		});
 		expect((await roles.applyDefault("anthropic/claude-sonnet-4-5")).valid).toBe(true);
 
 		expect(await readFile(join(dir, "config.yml"), "utf8")).toContain(
 			"anthropic/claude-sonnet-4-5",
 		);
 		expect(await readFile(yaml, "utf8")).toBe("modelRoles:\n  default: openai/gpt-4o\n");
+	});
+
+	it("settings patch and role write interleave without losing keys", async () => {
+		await writeFile(join(dir, "config.yml"), "retry:\n  maxRetries: 3\n");
+		const configFile = new OmpConfigFile({ resolveConfigDir: () => dir });
+		const roles = new OmpRolesStore({ resolveConfigDir: () => dir, configFile });
+
+		// 同一个 config.yml 的两类写者并发：都经 OmpConfigFile 的按路径队列，
+		// 各自的 read-modify-write 不会基于旧快照互相覆盖。
+		const [patchResult, roleResult] = await Promise.all([
+			configFile.patch({ set: [{ path: "compaction.keepRecentTokens", value: 7000 }] }),
+			roles.applyRole("default", "anthropic/claude-sonnet-4-5"),
+		]);
+		expect(patchResult).toEqual({ valid: true });
+		expect(roleResult).toEqual({ valid: true });
+
+		const parsed = (await configFile.read()).parsed;
+		expect(parsed.retry).toEqual({ maxRetries: 3 });
+		expect(parsed.compaction).toEqual({ keepRecentTokens: 7000 });
+		expect(parsed.modelRoles).toEqual({ default: "anthropic/claude-sonnet-4-5" });
 	});
 });

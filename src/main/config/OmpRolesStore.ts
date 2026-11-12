@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { parseDocument, type Document } from "yaml";
+import type { Document } from "yaml";
 import {
 	isValidOmpModelPresetName,
 	isValidOmpRoleSelector,
@@ -16,8 +16,7 @@ import {
 	type OmpModelRoleStorage,
 	type OmpRolesState,
 } from "../../shared/types/ompRoles";
-import { JsonFileStore } from "../storage/JsonFileStore";
-import { resolveOmpConfigFileName } from "./OmpConfigFile";
+import { OmpConfigFile } from "./OmpConfigFile";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
@@ -40,11 +39,14 @@ import type { ConfigValidationResult } from "./ConfigManager";
  * 4. 写前 mkdir configDir；default 角色清空时同步清顶层 defaultThinkingLevel
  *    （与原 writeOmpModelRole 语义一致），避免残留旧默认档。
  *
- * configDir 通过 accessor 注入：ConfigManager.configureWsl 可切换 WSL home，
- * 每次调用现取，保证指针跟随。
+ * config.yml 的读写全部委托 OmpConfigFile（唯一所有者）：本类只决定写哪些键。
+ * configDir 仍经 accessor 注入，供 legacy settings.json 迁移与路径相关判断使用；
+ * ConfigManager.configureWsl 可切换 WSL home，每次调用现取，保证指针跟随。
  */
 export interface OmpRolesStoreDeps {
 	resolveConfigDir: () => string;
+	/** config.yml 所有者（与设置页键级补丁共用同一把按路径串行锁）。 */
+	configFile: OmpConfigFile;
 }
 
 export type DefaultModelInfo = {
@@ -130,49 +132,25 @@ export class OmpRolesStore {
 		return this.deps.resolveConfigDir();
 	}
 
-	/** config.yml/yaml 的原子/串行 store（原文；YAML 解析与变更由本类负责）。 */
-	private readonly configFiles = new Map<string, JsonFileStore<string>>();
-
-	private yamlFile(filePath: string): JsonFileStore<string> {
-		const existing = this.configFiles.get(filePath);
-		if (existing) return existing;
-		const created = JsonFileStore.text(filePath);
-		this.configFiles.set(filePath, created);
-		return created;
+	/**
+	 * config.yml 的唯一所有者。本类只声明「角色/预设/回退链要写成什么形状」，
+	 * 文件名解析、损坏拒绝、按路径串行与原子写全部由 OmpConfigFile 承担——
+	 * 此前本类自建 JsonFileStore 与解析器，两套 RMW 只能靠「共享队列」的约定保证不丢键。
+	 */
+	private get configFile(): OmpConfigFile {
+		return this.deps.configFile;
 	}
 
-	/** 读取当前生效的 config.yml(config.yaml) 原文；不存在返回 null。 */
-	private async readRawConfigYaml(): Promise<string | null> {
-		try {
-			return await this.yamlFile(
-				join(this.configDir, this.ompConfigYamlName()),
-			).readRaw();
-		} catch {
-			// 读取失败按缺失处理：不基于不可读内容做迁移/合并
-			return null;
-		}
-	}
-
-	/** 写入文件名与读取文件保持一致（见 resolveOmpConfigFileName 的优先级说明）。 */
-	private ompConfigYamlName(): string {
-		return resolveOmpConfigFileName(this.configDir);
-	}
-
-	private async parseDoc(): Promise<Record<string, unknown> | null> {
-		const raw = await this.readRawConfigYaml();
-		if (raw === null) return null;
-		try {
-			const value = parseDocument(raw).toJS() as Record<string, unknown> | null;
-			return value && typeof value === "object" && !Array.isArray(value) ? value : null;
-		} catch {
-			return null; // 解析失败按空处理（与原 readOmpModelRoles catch 语义一致）
-		}
+	/** 当前配置映射；文件缺失或损坏返回 null（调用方按「无配置」处理）。 */
+	private async readMapping(): Promise<Record<string, unknown> | null> {
+		const { mapping } = await this.configFile.readDocument();
+		return mapping;
 	}
 
 	/** 读取全部角色的当前值（未配置角色返回空 assignment）。 */
 	async readRolesState(): Promise<OmpRolesState> {
 		const rolesState = emptyRoles();
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		if (!parsed) return rolesState;
 		const roles =
 			parsed.modelRoles && typeof parsed.modelRoles === "object" && !Array.isArray(parsed.modelRoles)
@@ -187,7 +165,7 @@ export class OmpRolesStore {
 
 	/** 默认模型角色（config.yml modelRoles.default），附顶层 defaultThinkingLevel 回退。 */
 	async readDefaultModel(): Promise<DefaultModelInfo> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		if (!parsed) return {};
 		const topLevel =
 			typeof parsed.defaultThinkingLevel === "string"
@@ -212,7 +190,7 @@ export class OmpRolesStore {
 
 	/** 顶层 defaultThinkingLevel（桌面端 post-ready 强推与 SettingsTab 展示的数据源）。 */
 	async readDefaultThinkingLevel(): Promise<string | undefined> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		return parsed && typeof parsed.defaultThinkingLevel === "string"
 			? parsed.defaultThinkingLevel
 			: undefined;
@@ -223,7 +201,7 @@ export class OmpRolesStore {
 	 * 条目仍保留在文件里（raw 编辑器可修），但不会出现在应用/删除 UI 中。
 	 */
 	async readModelPresets(): Promise<OmpModelPresets> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		const presets = asRecord(parsed?.modelPresets);
 		const result: OmpModelPresets = {};
 		if (!presets) return result;
@@ -237,7 +215,7 @@ export class OmpRolesStore {
 
 	/** `cycleOrder`：未配置返回空数组（UI 展示 omp 默认顺序）。 */
 	async readCycleOrder(): Promise<string[]> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		const raw = parsed?.cycleOrder;
 		if (!Array.isArray(raw)) return [];
 		return raw
@@ -250,7 +228,7 @@ export class OmpRolesStore {
 	 * 未配置返回空数组（omp 内置顺序）。
 	 */
 	async readProviderOrder(): Promise<string[]> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		const raw = parsed?.modelProviderOrder;
 		if (!Array.isArray(raw)) return [];
 		return raw
@@ -273,7 +251,7 @@ export class OmpRolesStore {
 
 	/** `modelRoleStorage`：决定 omp 把角色写入全局还是项目 config.yml。 */
 	async readRoleStorage(): Promise<OmpModelRoleStorage> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		return parsed?.modelRoleStorage === "project" ? "project" : "global";
 	}
 
@@ -287,7 +265,7 @@ export class OmpRolesStore {
 
 	/** `retry.fallbackChains`（缺失/损坏按空处理）。 */
 	async readFallbackChains(): Promise<OmpFallbackChains> {
-		const parsed = await this.parseDoc();
+		const parsed = await this.readMapping();
 		return readStringArrayRecord(asRecord(parsed?.retry)?.fallbackChains);
 	}
 
@@ -377,44 +355,31 @@ export class OmpRolesStore {
 
 	/** 通用写盘：一次 parse-mutate-write（队列内），保留注释与无关键。 */
 	private async writeDoc(mutate: (doc: Document) => void): Promise<ConfigValidationResult> {
-		try {
-			const filePath = join(this.configDir, this.ompConfigYamlName());
-			// 队列内 read-modify-write：并发的角色写入基于同一份最新文档变更，不互相覆盖；
-			// 写失败时旧文件保持完整（tmp 写完后才 rename 替换）
-			await this.yamlFile(filePath).update((current) => {
-				const doc = parseDocument(current ?? "", { prettyErrors: true });
-				mutate(doc);
-				// modelRoles 被清空时删除整块，避免写残留空对象
-				const rolesNode: unknown = doc.get("modelRoles");
+		return this.configFile.mutateDocument((doc) => {
+			mutate(doc);
+			// modelRoles 被清空时删除整块，避免写残留空对象
+			const rolesNode: unknown = doc.get("modelRoles");
+			if (
+				rolesNode &&
+				typeof rolesNode === "object" &&
+				!Array.isArray(rolesNode) &&
+				Object.keys(rolesNode).length === 0
+			) {
+				doc.delete("modelRoles");
+			}
+			// 预设/回退链删除后同理，避免 `modelPresets: {}`、`retry: {}` 残壳
+			for (const key of ["modelPresets", "retry"] as const) {
+				const node: unknown = doc.get(key);
 				if (
-					rolesNode &&
-					typeof rolesNode === "object" &&
-					!Array.isArray(rolesNode) &&
-					Object.keys(rolesNode).length === 0
+					node &&
+					typeof node === "object" &&
+					!Array.isArray(node) &&
+					Object.keys(node).length === 0
 				) {
-					doc.delete("modelRoles");
+					doc.delete(key);
 				}
-				// 预设/回退链删除后同理，避免 `modelPresets: {}`、`retry: {}` 残壳
-				for (const key of ["modelPresets", "retry"] as const) {
-					const node: unknown = doc.get(key);
-					if (
-						node &&
-						typeof node === "object" &&
-						!Array.isArray(node) &&
-						Object.keys(node).length === 0
-					) {
-						doc.delete(key);
-					}
-				}
-				return doc.toString();
-			});
-			return { valid: true };
-		} catch (e) {
-			return {
-				valid: false,
-				error: `config.yml 写入失败：${e instanceof Error ? e.message : String(e)}`,
-			};
-		}
+			}
+		});
 	}
 
 	/**
@@ -559,7 +524,7 @@ export class OmpRolesStore {
 		if (this.legacyMigrated) return;
 		this.legacyMigrated = true;
 		try {
-			const parsed = await this.parseDoc();
+			const parsed = await this.readMapping();
 			if (parsed && typeof parsed.defaultThinkingLevel === "string") return; // 权威源已有
 			const settingsPath = join(this.configDir, "settings.json");
 			if (!existsSync(settingsPath)) return;

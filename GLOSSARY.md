@@ -120,7 +120,10 @@ worktree 只继承项目仓库**已提交**的 `AGENTS.md`/`.omp/skills`。AFK *
 ## 术语
 
 ### OmpRoles（模型角色分配）
-config.yml 的 `modelRoles.<role>`（default/smol/slow/vision/plan/commit/tiny/task/advisor）。值 = Selector（可含档位后缀）。由 `OmpRolesStore` 独占读写；`ConfigManager` 只做委托。
+config.yml 的 `modelRoles.<role>`（default/smol/slow/vision/plan/commit/tiny/task/advisor）。值 = Selector（可含档位后缀）。键的形状由 `OmpRolesStore` 独占决定；落盘一律经 `OmpConfigFile`（config.yml 唯一所有者）。
+
+### OmpConfigFile（config.yml 唯一所有者）
+config.yml/config.yaml 的唯一读写者：文件名解析（`resolveOmpConfigFileName`）、损坏拒绝、按路径串行、原子写、注释保留都在这里；对外是 `read` / `readDocument` / `patch`（点路径）/ `mutateDocument`（文档级变更）/ `writeRaw`。设置页键级写入与 `OmpRolesStore` 的角色整块写入共用 `mutateDocument`，因此"不丢键"由结构保证，而不是靠两个 store 各自遵守共享队列的约定。`SettingsStore` 的同步读（showThinking）只借 `resolveOmpConfigFileName` 定位文件。
 
 ### Selector（选择器）
 落盘格式 `provider/modelId[:thinkingLevel]`（冒号后缀 = 显式档，该角色生效时优先于顶层 defaultThinkingLevel；default 无后缀才回退顶层键）。解析/拼装为 shared 契约 `parseRoleSelector`/`formatRoleSelector`（`shared/types/ompRoles.ts`），双端共用。**config.yml 是 omp 全局权威源**；settings.json 仅当 config.yml 缺失时被 omp 一次性消费（迁移后改名 .bak）——OmpDeck 的旧 defaultThinkingLevel 只填空迁移进 config.yml，此后停写 settings.json 档位。

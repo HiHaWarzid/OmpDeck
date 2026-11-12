@@ -6,7 +6,7 @@ import { JsonFileStore } from "../storage/JsonFileStore";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
- * OmpConfigFile -- omp 全局设置权威源 config.yml 的通用读写（原文 + 点路径补丁）。
+ * OmpConfigFile -- omp 全局设置权威源 config.yml 的唯一所有者（读写 + 文档级变更）。
  *
  * 领域语义（见 docs/research/omp-feature-coverage.md P0-3）：
  * - omp 18 只把 config.yml/config.yaml 当全局 settings 权威源；settings.json 仅在
@@ -16,11 +16,12 @@ import type { ConfigValidationResult } from "./ConfigManager";
  *   retry.maxRetries、compaction.keepRecentTokens、enabledModels ...
  *
  * 不变式：
- * 1. 一次补丁 = 一次 parse-mutate-write（JsonFileStore 按路径串行，外部并发写不丢键）；
- * 2. YAML round-trip 保留注释与 schema 外其它键（模型角色等由 OmpRolesStore 写，
- *    两者共享同一路径队列，不会互相覆盖）；
+ * 1. 一次用户意图 = 一次 parse-mutate-write（JsonFileStore 按路径串行）；设置页补丁
+ *    与模型角色写入走同一个 mutateDocument funnel，不存在第二份 RMW 实现；
+ * 2. YAML round-trip 保留注释与 schema 外其它键（角色整块由 OmpRolesStore 决定形状，
+ *    但它只通过 mutateDocument 落地，本模块仍是唯一写盘者）；
  * 3. 文件名由 resolveOmpConfigFileName 决定：已存在的 config.yml 优先，其次
- *    config.yaml，都不存在则新建 config.yml（与 OmpRolesStore 共用同一函数）；
+ *    config.yaml，都不存在则新建 config.yml（读写与 OmpRolesStore 共用同一函数）；
  * 4. 永不抛错：形状/解析/写盘失败都以 {valid:false} 返回，且不落盘覆盖；
  * 5. 空文件 = 空映射（合法），顶层非映射（数组/标量）视为损坏。
  */
@@ -164,6 +165,30 @@ export class OmpConfigFile {
 		const set = patch.set ?? [];
 		const unset = patch.unset ?? [];
 		if (set.length === 0 && unset.length === 0) return { valid: true };
+		return this.mutateDocument((doc) => {
+			for (const entry of set) {
+				const keys = splitPath(entry.path);
+				if (entry.value === undefined) {
+					doc.deleteIn(keys);
+					pruneEmptyAncestors(doc, keys);
+				} else {
+					doc.setIn(keys, entry.value);
+				}
+			}
+			for (const path of unset) {
+				const keys = splitPath(path);
+				doc.deleteIn(keys);
+				pruneEmptyAncestors(doc, keys);
+			}
+		});
+	}
+
+	/**
+	 * 文档级变更：唯一的写盘 funnel。角色/预设/回退链（OmpRolesStore）与键级补丁
+	 * 都经这里，因此「文件名解析、损坏拒绝、按路径串行、注释保留」只实现一次。
+	 * 变更函数在路径队列内执行，看到的是最新磁盘文档。
+	 */
+	async mutateDocument(mutate: (doc: Document) => void): Promise<ConfigValidationResult> {
 		try {
 			await this.store(this.filePath()).update((current) => {
 				const doc = parseDocument(current ?? "", { prettyErrors: false });
@@ -174,20 +199,7 @@ export class OmpConfigFile {
 				if (root !== null && root !== undefined && !isMapping(root)) {
 					throw new Error("config.yml 顶层必须是映射（key: value）");
 				}
-				for (const entry of set) {
-					const keys = splitPath(entry.path);
-					if (entry.value === undefined) {
-						doc.deleteIn(keys);
-						pruneEmptyAncestors(doc, keys);
-					} else {
-						doc.setIn(keys, entry.value);
-					}
-				}
-				for (const path of unset) {
-					const keys = splitPath(path);
-					doc.deleteIn(keys);
-					pruneEmptyAncestors(doc, keys);
-				}
+				mutate(doc);
 				return doc.toString();
 			});
 			return { valid: true };
@@ -197,5 +209,21 @@ export class OmpConfigFile {
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
+	}
+
+	/**
+	 * 读取文档用于领域解析（角色/预设等）：缺失返回 raw=null，损坏返回 mapping=null。
+	 * 与 read() 的区别是不生成诊断对象、不做 UI 展示，供内部模块判断「有没有配置」。
+	 */
+	async readDocument(): Promise<{ raw: string | null; mapping: Record<string, unknown> | null }> {
+		let raw: string | null;
+		try {
+			raw = await this.store(this.filePath()).readRaw();
+		} catch {
+			return { raw: null, mapping: null };
+		}
+		if (raw === null) return { raw: null, mapping: null };
+		const parsed = parseMapping(raw);
+		return { raw, mapping: "error" in parsed ? null : parsed.mapping };
 	}
 }

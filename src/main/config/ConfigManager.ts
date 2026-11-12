@@ -112,8 +112,8 @@ export class ConfigManager {
 	/** trust.json 专属存取（信任决策存储/探测/编排），configDir 经 accessor 注入。 */
 	readonly trustStore: TrustStore;
 	/**
-	 * config.yml 通用读写（原文 + 点路径补丁），configDir 经 accessor 注入。
-	 * 公开只读：设置页的键级写入由 OmpConfigFile 承担（与 rolesStore 共享路径队列）。
+	 * config.yml 的唯一所有者（原文 + 点路径补丁 + 文档级变更），configDir 经 accessor 注入。
+	 * 公开只读：设置页键级写入与 rolesStore 的角色写入都经它落盘。
 	 */
 	readonly ompConfig: OmpConfigFile;
 	/** models.json 的原子写与读指纹 store（原文）；configDir 可切换，按完整路径缓存。 */
@@ -121,9 +121,13 @@ export class ConfigManager {
 
 	constructor(configDir?: string) {
 		this.configDir = configDir ?? PI_AGENT_DIR;
-		this.rolesStore = new OmpRolesStore({ resolveConfigDir: () => this.configDir });
-		this.trustStore = new TrustStore({ resolveConfigDir: () => this.configDir });
+		// config.yml 只有一个所有者：角色存储与设置页补丁共用它，不再各持一份 RMW。
 		this.ompConfig = new OmpConfigFile({ resolveConfigDir: () => this.configDir });
+		this.rolesStore = new OmpRolesStore({
+			resolveConfigDir: () => this.configDir,
+			configFile: this.ompConfig,
+		});
+		this.trustStore = new TrustStore({ resolveConfigDir: () => this.configDir });
 	}
 
 	/** 将配置目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */

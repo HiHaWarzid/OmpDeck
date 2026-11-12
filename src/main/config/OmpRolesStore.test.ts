@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { OmpConfigFile } from "./OmpConfigFile";
 import { OmpRolesStore } from "./OmpRolesStore";
 
 let dir: string;
@@ -16,7 +17,10 @@ afterEach(async () => {
 });
 
 function createStore() {
-	return new OmpRolesStore({ resolveConfigDir: () => dir });
+	return new OmpRolesStore({
+		resolveConfigDir: () => dir,
+		configFile: new OmpConfigFile({ resolveConfigDir: () => dir }),
+	});
 }
 
 async function writeConfigYaml(content: string) {
