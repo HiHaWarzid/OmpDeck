@@ -47,6 +47,9 @@ downloads/
 .pi/
 .pi-subagents/
 .omp/
+# 本地教学/词表工作目录，不属于项目产物。
+.teach/
+wordlists/
 
 # docs/ 目录下的本地工作文档不纳入版本控制（已跟踪的历史文件不受影响）。
 docs/*
