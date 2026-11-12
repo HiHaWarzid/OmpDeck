@@ -159,3 +159,6 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 ### FollowUpQueue（排队账本）
 每个 agent 一份的 follow-up 排队账本（`main/pi/followUpQueue.ts`）。负责"omp 收下消息后到底什么时候才落用户气泡"的全部判断：**准入对账**（get_state 快照里还有它 → 压着；没有 → 已投递）、**离队结算**（queue_update 里剩余条数少于本地条数 → 已投递；FIFO，故从尾部保留）、**墓碑**（本进程撤回/中止恢复造成的离队不算投递，TTL 30s）、**中止恢复**（恢复名单内丢弃快照，名单外补气泡；`truncated` 全部丢弃）。只做判断，不落气泡——时间线副作用留在 `AgentManager.bubbleDeliveredFollowUps`，因此规则可脱离 RPC/窗口/时间线单测。
+
+### AgentControl（运行控制）
+每个 agent 的运行控制入口（`main/pi/agentControl.ts`）：模型 / 思考档 / 服务档 / 自动压缩 / todo 五类开关。对外的形状是 `apply(agentId, change)` + `models` / `thinkingLevels` / `refresh` 四个入口，`change` 是判别联合，写操作统一以 `get_state` 回读值返回（不返回乐观值）。`service-tier` / `auto-compaction` / `todos` 的 `success:false` 在模块内转成异常，避免"模型没有优先通道"被静默当成成功；`model` 会记录 `lastModelSelection`，供 developer-role 自愈定位 provider。IPC handler、Web 适配器、飞书桥只做参数校验与日志，不再各自拼「取运行时 → 发请求 → 读状态」。

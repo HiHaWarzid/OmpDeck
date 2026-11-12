@@ -329,9 +329,9 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			subagents: async (_event, agentId: string) =>
 				agentManager.getSubagents(agentId),
 			cycleModel: async (_event, agentId: string) =>
-				agentManager.cycleModel(agentId),
+				agentManager.control.apply(agentId, { kind: "model-cycle" }),
 			availableModels: async (_event, agentId: string) =>
-				agentManager.getAvailableModels(agentId),
+				agentManager.control.models(agentId),
 			getLoginProviders: async (_event, agentId: string) => {
 				try {
 					return await agentManager.getLoginProviders(agentId);
@@ -362,44 +362,50 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				return result;
 			},
 			setModel: async (_event, agentId: string, provider: string, modelId: string) => {
-				const result = await agentManager.setModel(agentId, provider, modelId);
+				const result = await agentManager.control.apply(agentId, { kind: "model", provider, modelId });
 				void appLogger.info("agent", "Agent model changed", { agentId, provider, modelId });
 				return result;
 			},
-			refreshModels: async (_event, agentId: string) => {
-				void appLogger.info("agent", "Agent model refresh requested", { agentId });
-				return agentManager.refreshModels(agentId);
-			},
+			refreshModels: async (_event, agentId: string) =>
+				agentManager.control.refresh(agentId),
 			cycleThinking: async (_event, agentId: string) =>
-				agentManager.cycleThinking(agentId),
+				agentManager.control.apply(agentId, { kind: "thinking-cycle" }),
 			setThinking: async (_event, agentId: string, level: string) => {
-				const result = await agentManager.setThinking(agentId, level);
+				const result = await agentManager.control.apply(agentId, { kind: "thinking", level });
 				void appLogger.info("agent", "Agent thinking level changed", { agentId, level });
 				return result;
 			},
 			availableThinkingLevels: async (_event, agentId: string) =>
-				agentManager.getAvailableThinkingLevels(agentId),
+				agentManager.control.thinkingLevels(agentId),
 			setFastMode: async (_event, agentId: string, enabled: unknown) => {
 				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
-				const result = await agentManager.setFastMode(agentId, enabled);
+				const result = await agentManager.control.apply(agentId, {
+					kind: "service-tier",
+					tier: "fast",
+					enabled,
+				});
 				void appLogger.info("agent", "Agent fast mode changed", { agentId, enabled });
 				return result;
 			},
 			setSlowMode: async (_event, agentId: string, enabled: unknown) => {
 				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
-				const result = await agentManager.setSlowMode(agentId, enabled);
+				const result = await agentManager.control.apply(agentId, {
+					kind: "service-tier",
+					tier: "slow",
+					enabled,
+				});
 				void appLogger.info("agent", "Agent slow mode changed", { agentId, enabled });
 				return result;
 			},
 			setAutoCompaction: async (_event, agentId: string, enabled: unknown) => {
 				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
-				const result = await agentManager.setAutoCompaction(agentId, enabled);
+				const result = await agentManager.control.apply(agentId, { kind: "auto-compaction", enabled });
 				void appLogger.info("agent", "Agent auto compaction changed", { agentId, enabled });
 				return result;
 			},
 			setTodos: async (_event, agentId: string, phases: AgentTodoPhase[]) => {
 				if (!Array.isArray(phases)) throw new Error("phases must be an array");
-				const result = await agentManager.setTodos(agentId, phases);
+				const result = await agentManager.control.apply(agentId, { kind: "todos", phases });
 				// 不记录任务正文：todo 内容属于用户会话数据，只记数量便于排查。
 				void appLogger.info("agent", "Agent todos updated from host", {
 					agentId,

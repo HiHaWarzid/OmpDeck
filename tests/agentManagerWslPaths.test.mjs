@@ -188,6 +188,9 @@ function loadAgentManager() {
 	// follow-up 队列账本（纯状态 + 判断，仅类型导入 shared）；测试文件自身的 require
 	// 同样解析不到 src 目录，必须显式注入。
 	registry["./followUpQueue"] = loadModule("src/main/pi/followUpQueue.ts", "followUpQueue.ts");
+	// 运行控制模块（模型/思考档/服务档/自动压缩/todo）；同样只值导入共享类型，
+	// 无 src 内运行时依赖，注入后 AgentManager 才能解析 `./agentControl`。
+	registry["./agentControl"] = loadModule("src/main/pi/agentControl.ts", "agentControl.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {

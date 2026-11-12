@@ -1141,7 +1141,7 @@ export class FeishuBridge {
 		}
 		const binding = this.chatBindings.get(ctx.chatId);
 		if (!binding) { await this.sendSmartMessage(ctx.chatId, "当前没有绑定的会话，请先发消息创建会话。"); return; }
-		const models = await this.agentManager.getAvailableModels(binding.sessionId).catch(() => [] as AvailableModel[]);
+		const models = await this.agentManager.control.models(binding.sessionId).catch(() => [] as AvailableModel[]);
 		if (!models.length) { await this.sendSmartMessage(ctx.chatId, "没有可用模型。请先在 OmpDeck 中配置模型。"); return; }
 		const state = await this.agentManager.getRuntimeState(binding.sessionId).catch(() => undefined);
 		const current = state ? `${state.provider}/${state.modelId}` : "无";
@@ -1156,13 +1156,13 @@ export class FeishuBridge {
 		if (!action) return;
 		const binding = this.chatBindings.get(event.chatId);
 		if (!binding) { await this.sendSmartMessage(event.chatId, "当前没有绑定的会话。"); return; }
-		const models = await this.agentManager.getAvailableModels(binding.sessionId).catch(() => [] as AvailableModel[]);
+		const models = await this.agentManager.control.models(binding.sessionId).catch(() => [] as AvailableModel[]);
 		if (!models.some((m) => m.provider === action.provider && m.id === action.modelId)) {
 			await this.sendSmartMessage(event.chatId, `❌ 模型不可用: ${action.provider}/${action.modelId}`);
 			return;
 		}
 		try {
-			await this.agentManager.setModel(binding.sessionId, action.provider, action.modelId);
+			await this.agentManager.control.apply(binding.sessionId, { kind: "model", provider: action.provider, modelId: action.modelId });
 			await this.sendSmartMessage(event.chatId, `✅ 已切换模型为: ${action.provider}/${action.modelId}`);
 		} catch (e) {
 			await this.sendSmartMessage(event.chatId, `❌ 切换失败: ${e instanceof Error ? e.message : String(e)}`);
@@ -1179,7 +1179,7 @@ export class FeishuBridge {
 		const binding = this.chatBindings.get(chatId);
 		if (!binding) { await this.sendSmartMessage(chatId, "当前没有绑定的会话。"); return; }
 		try {
-			await this.agentManager.setModel(binding.sessionId, provider, modelId);
+			await this.agentManager.control.apply(binding.sessionId, { kind: "model", provider, modelId });
 			await this.sendSmartMessage(chatId, `✅ 已切换模型为: ${provider}/${modelId}`);
 		} catch (e) {
 			await this.sendSmartMessage(chatId, `❌ 切换失败: ${e instanceof Error ? e.message : String(e)}`);

@@ -1395,17 +1395,21 @@ app.whenReady().then(async () => {
 			await settingsStore.update(patch);
 		},
 		runtimeState: (agentId) => agentManager.getRuntimeState(agentId),
-		cycleModel: (agentId) => agentManager.cycleModel(agentId),
-		availableModels: (agentId) => agentManager.getAvailableModels(agentId),
-		setModel: (agentId, provider, modelId) => agentManager.setModel(agentId, provider, modelId),
-		refreshModels: (agentId) => agentManager.refreshModels(agentId),
-		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
-		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
-		availableThinkingLevels: (agentId) => agentManager.getAvailableThinkingLevels(agentId),
-		setFastMode: (agentId, enabled) => agentManager.setFastMode(agentId, enabled),
-		setSlowMode: (agentId, enabled) => agentManager.setSlowMode(agentId, enabled),
-		setAutoCompaction: (agentId, enabled) => agentManager.setAutoCompaction(agentId, enabled),
-		setTodos: (agentId, phases) => agentManager.setTodos(agentId, phases),
+		cycleModel: (agentId) => agentManager.control.apply(agentId, { kind: "model-cycle" }),
+		availableModels: (agentId) => agentManager.control.models(agentId),
+		setModel: (agentId, provider, modelId) =>
+			agentManager.control.apply(agentId, { kind: "model", provider, modelId }),
+		refreshModels: (agentId) => agentManager.control.refresh(agentId),
+		cycleThinking: (agentId) => agentManager.control.apply(agentId, { kind: "thinking-cycle" }),
+		setThinking: (agentId, level) => agentManager.control.apply(agentId, { kind: "thinking", level }),
+		availableThinkingLevels: (agentId) => agentManager.control.thinkingLevels(agentId),
+		setFastMode: (agentId, enabled) =>
+			agentManager.control.apply(agentId, { kind: "service-tier", tier: "fast", enabled }),
+		setSlowMode: (agentId, enabled) =>
+			agentManager.control.apply(agentId, { kind: "service-tier", tier: "slow", enabled }),
+		setAutoCompaction: (agentId, enabled) =>
+			agentManager.control.apply(agentId, { kind: "auto-compaction", enabled }),
+		setTodos: (agentId, phases) => agentManager.control.apply(agentId, { kind: "todos", phases }),
 		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
 		removeQueuedMessage: (agentId, message, queue) =>
 			agentManager.removeQueuedMessage(agentId, message, queue),

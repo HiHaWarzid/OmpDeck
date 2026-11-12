@@ -13,15 +13,11 @@ import type {
 	AgentStatus,
 	AgentSubagent,
 	AgentTab,
-	AgentTodoItem,
-	AgentTodoPhase,
-	AgentTodoStatus,
 	AgentUsageLimitState,
 	AgentCacheWarmingState,
 	AgentUiAskAnswer,
 	AgentUiAskOption,
 	AgentUiAskQuestion,
-	AvailableModel,
 	OmpLoginProvider,
 	OmpLogoutAccount,
 	ChatMessage,
@@ -43,6 +39,7 @@ import {
 	queuedTexts,
 	type DeferredFollowUp,
 } from "./followUpQueue";
+import { AgentControl, normalizeTodoPhases } from "./agentControl";
 import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
@@ -212,15 +209,6 @@ export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
  */
 const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
 
-/** omp todo 任务的可接受状态；用于把 RPC unknown 收窄为 AgentTodoStatus。 */
-const AGENT_TODO_STATUSES: Record<AgentTodoStatus, true> = {
-	pending: true,
-	in_progress: true,
-	completed: true,
-	abandoned: true,
-	blocked: true,
-};
-
 /** 子代理已收口状态：到达后不再被迟到的 progress("running") 覆盖。 */
 const SUBAGENT_TERMINAL_STATUSES = new Set([
 	"completed",
@@ -346,6 +334,12 @@ export class AgentManager {
 	 * 路径解析闭包读取「当前」wslEnvironment，以支持运行时 configureWsl 切换。
 	 */
 	private readonly sessionJsonl: SessionJsonl;
+	/**
+	 * 运行控制模块：模型 / 思考档 / 服务档 / 自动压缩 / todo 的唯一入口。
+	 * 11 个同级方法收成一个 `apply(change)` + 两个能力查询 + 一次配置刷新探测，
+	 * IPC handler 与本类都不再各自拼「取运行时 → 发请求 → 读状态」。
+	 */
+	readonly control: AgentControl;
 
 	constructor(
 		private readonly getProject: (id: string) => Project | undefined,
@@ -372,6 +366,15 @@ export class AgentManager {
 		private readonly notificationIcon?: NativeImage,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
+		this.control = new AgentControl({
+			runtime: (agentId) => this.requireRuntime(agentId),
+			readState: (agentId) => this.getRuntimeState(agentId),
+			reloadTranscript: async (agentId) => {
+				await this.loadMessages(agentId);
+			},
+			emitState: () => this.emitState(),
+			log: this.appLogger,
+		});
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
 			createArchiveWorker,
@@ -2465,7 +2468,7 @@ export class AgentManager {
 			// 撤回/提升都回服务端执行，本地不再维护第二份 pending 队列。
 			queuedMessages: this.normalizeQueuedMessages(state?.queuedMessages),
 			// todo 的权威快照来自 get_state；工具时间线只保留历史卡片，不再充当面板数据源。
-			todoPhases: this.normalizeTodoPhases(state?.todoPhases),
+			todoPhases: normalizeTodoPhases(state?.todoPhases),
 			tokensPerSecond: this.pickNumber(state?.tokensPerSecond),
 			autoCompactionEnabled: normalizePiBoolean(state?.autoCompactionEnabled),
 			usageLimit: this.normalizeUsageLimit(state?.usageLimit),
@@ -2486,43 +2489,6 @@ export class AgentManager {
 			steering: readList(record.steering),
 			followUp: readList(record.followUp),
 		};
-	}
-
-	/**
-	 * get_state.todoPhases / set_todos 入参共用的五态归一化。
-	 * omp 的 TodoItem 还带 blocker/details/notes；这里完整保留，避免用户点击
-	 * 切换状态后再次下发时把 blocked 任务的等待原因丢掉。
-	 */
-	private normalizeTodoPhases(value: unknown): AgentTodoPhase[] {
-		if (!Array.isArray(value)) return [];
-		const phases: AgentTodoPhase[] = [];
-		for (const rawPhase of value) {
-			if (!rawPhase || typeof rawPhase !== "object") continue;
-			const phase = rawPhase as Record<string, unknown>;
-			if (typeof phase.name !== "string") continue;
-			const tasks: AgentTodoItem[] = [];
-			if (Array.isArray(phase.tasks)) {
-				for (const rawTask of phase.tasks) {
-					if (!rawTask || typeof rawTask !== "object") continue;
-					const task = rawTask as Record<string, unknown>;
-					if (typeof task.content !== "string" || !task.content) continue;
-					if (typeof task.status !== "string") continue;
-					if (AGENT_TODO_STATUSES[task.status as AgentTodoStatus] !== true) continue;
-					const notes = Array.isArray(task.notes)
-						? task.notes.filter((note): note is string => typeof note === "string")
-						: undefined;
-					tasks.push({
-						content: task.content,
-						status: task.status as AgentTodoStatus,
-						...(typeof task.blocker === "string" ? { blocker: task.blocker } : {}),
-						...(typeof task.details === "string" ? { details: task.details } : {}),
-						...(notes && notes.length > 0 ? { notes } : {}),
-					});
-				}
-			}
-			phases.push({ name: phase.name, tasks });
-		}
-		return phases;
 	}
 
 	/** get_state.usageLimit 容错：字段缺失/类型非法时视为无限制状态，不猜 stage。 */
@@ -2779,24 +2745,6 @@ export class AgentManager {
 		return Math.max(0, Math.min(100, value));
 	}
 
-	async cycleModel(agentId: string) {
-		const runtime = this.requireRuntime(agentId);
-		await runtime.slot.process.client.request({ type: "cycle_model" }, 60_000);
-		return this.getRuntimeState(agentId);
-	}
-
-	async getAvailableModels(agentId: string): Promise<AvailableModel[]> {
-		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "get_available_models" },
-			60_000,
-		);
-		const models = ((response.data as any)?.models ?? []) as AvailableModel[];
-		// 目录包含 embedding/vision 等非对话条目；omp 的 kind 只在 chat 时可被
-		// set_model/模型角色选择使用。旧版没有 kind 字段，按可对话处理。
-		return models.filter((model) => !model.kind || model.kind === "chat");
-	}
-
 	/** omp 原生 OAuth provider 列表（登录动作必须绑定一个运行中的 agent）。 */
 	async getLoginProviders(agentId: string): Promise<OmpLoginProvider[]> {
 		const runtime = this.requireRuntime(agentId);
@@ -2945,193 +2893,13 @@ export class AgentManager {
 			: {};
 	}
 
-	async setModel(agentId: string, provider: string, modelId: string) {
-		const runtime = this.requireRuntime(agentId);
-		await runtime.slot.process.client.request(
-			{ type: "set_model", provider, modelId },
-			60_000,
-		);
-		// 记录用户显式选择：若之后进程在 developer-role 失败中退出，
-		// 自愈仍能定位到该 provider 并关闭不兼容项。
-		runtime.lastModelSelection = { provider, modelId };
-		return this.getRuntimeState(agentId);
-	}
-
 	/**
-	 * 刷新模型配置：让运行中的 agent 重新加载 models.json，无需完全重启。
+	 * 用 pi 的 switch_session RPC 重载当前会话，而不是新建进程。
+	 * 流程：改写 JSONL 第一行 JSON，写入 _reloadMarker 字段 → switch_session
+	 * → pi 发现首条记录变化 → 缓存失效 → 重新读取 → 摘下 _reloadMarker。
 	 *
-	 * 当前仅支持轻量级 reload_config RPC（策略 1）。
-	 * 策略 2（进程重启）已注释，等待 pi 官方支持 reload_config RPC 后再考虑：
-	 *   - 运行中的 Agent 重启进程会打断正在进行的对话/工具执行
-	 *   - 进程重启涉及 exit 事件竞态、模型恢复等复杂边界条件
-	 *
-	 * RPC 提案：https://github.com/earendil-works/pi/issues/6890
-	 * pi 合并 reload_config 后，本方法将自动生效，无需任何修改。
-	 */
-	async refreshModels(agentId: string): Promise<AgentRuntimeState> {
-		const runtime = this.requireRuntime(agentId);
-		const startTime = Date.now();
-
-		void this.appLogger?.info("agent", "Model refresh requested", { agentId });
-
-		// 策略 1：尝试 reload_config RPC（轻量级，无需重启进程）
-		// 该命令在 pi model-runtime 中已实现为 reloadConfig()，会重新读取 models.json
-		// 并重建所有 provider。当前 pi 0.80.10 的 RPC 协议尚未暴露此命令，
-		// 待 pi 合并 https://github.com/earendil-works/pi/issues/6890 后自动生效。
-		try {
-			const response = await runtime.slot.process.client.request(
-				{ type: "reload_config" },
-				8_000,
-			);
-			if (response.success) {
-				await this.loadMessages(agentId).catch(() => undefined);
-				void this.appLogger?.info("agent", "Model refresh succeeded via reload_config RPC", {
-					agentId,
-					elapsedMs: Date.now() - startTime,
-				});
-				this.emitState();
-				return this.getRuntimeState(agentId);
-			}
-		} catch {
-			// reload_config 尚不支持，当前 pi 版本无轻量级刷新路径
-		}
-
-		// 策略 2（已注释）：进程重启方案。
-		// 原因：运行中重启会打断用户对话、工具执行，且涉及 exit 事件竞态。
-		// 等 pi 官方支持 reload_config RPC 后，策略 1 自动生效，无需回退到策略 2。
-		//
-		// const sessionPath = runtime.tab.sessionPath;
-		// if (!sessionPath) {
-		// 	throw new Error("Cannot refresh models: agent has no session path");
-		// }
-		// this.modelRefreshing = true;
-	// try {
-	// 	const previousState = await this.getRuntimeState(agentId).catch(() => null);
-	// 	runtime.slot.process.stop();
-	// 	await new Promise<void>((resolve) => setTimeout(resolve, 600));
-	// 	await this.reattachProcess(agentId, sessionPath);
-	// 	if (previousState?.provider && previousState?.modelId) {
-	// 		try { await this.setModel(agentId, previousState.provider, previousState.modelId); } catch {}
-	// 	}
-	// 	runtime.tab.status = "idle";
-	// 	await this.loadMessages(agentId).catch(() => undefined);
-	// } finally {
-	// 	runtime.modelRefreshing = false;
-	// }
-
-		void this.appLogger?.info("agent", "Model refresh: reload_config not supported by current pi version, skipping", {
-			agentId,
-			elapsedMs: Date.now() - startTime,
-		});
-		this.emitState();
-		return this.getRuntimeState(agentId);
-	}
-
-	async cycleThinking(agentId: string) {
-		const runtime = this.requireRuntime(agentId);
-		await runtime.slot.process.client.request(
-			{ type: "cycle_thinking_level" },
-			60_000,
-		);
-		return this.getRuntimeState(agentId);
-	}
-
-	async setThinking(agentId: string, level: string) {
-		const runtime = this.requireRuntime(agentId);
-		await runtime.slot.process.client.request(
-			{ type: "set_thinking_level", level },
-			60_000,
-		);
-		return this.getRuntimeState(agentId);
-	}
-
-	/**
-	 * 当前模型的可用思考档位（omp `get_available_thinking_levels`）。
-	 * 老版本没有该命令时返回空数组，渲染层回退到内置档位表。
-	 */
-	async getAvailableThinkingLevels(agentId: string): Promise<string[]> {
-		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "get_available_thinking_levels" },
-			15_000,
-		);
-		const levels = (response.data as { levels?: unknown } | undefined)?.levels;
-		if (!Array.isArray(levels)) return [];
-		return levels.filter((level): level is string => typeof level === "string" && !!level);
-	}
-
-	/** 切换 fast/priority 服务档；模型不支持时 omp 返回 success:false，需交给渲染层提示。 */
-	async setFastMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
-		const runtime = this.requireRuntime(agentId);
-		// PiRpcClient 只在超时/断连时 reject，omp 的业务错误以 success:false 返回；
-		// 不检查会把“模型无优先通道”静默当成成功。
-		const response = await runtime.slot.process.client.request(
-			{ type: "set_fast_mode", enabled },
-			30_000,
-		);
-		if (!response.success) {
-			throw new Error(response.error?.trim() || "set_fast_mode failed");
-		}
-		return this.getRuntimeState(agentId);
-	}
-
-	/** 切换 slow/thinking 服务档；scope 由 omp 持久化设置决定。 */
-	async setSlowMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
-		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "set_slow_mode", enabled },
-			30_000,
-		);
-		if (!response.success) {
-			throw new Error(response.error?.trim() || "set_slow_mode failed");
-		}
-		return this.getRuntimeState(agentId);
-	}
-
-	/**
-	 * 切换会话自动压缩（omp `set_auto_compaction`）。
-	 * 该开关只影响后续上下文溢出时的自动压缩，不立即触发压缩；omp 响应无 data，
-	 * 生效值统一回读 get_state.autoCompactionEnabled。
-	 */
-	async setAutoCompaction(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
-		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "set_auto_compaction", enabled },
-			30_000,
-		);
-		if (!response.success) {
-			throw new Error(response.error?.trim() || "set_auto_compaction failed");
-		}
-		return this.getRuntimeState(agentId);
-	}
-
-	/**
-	 * 下发会话 todo（omp `set_todos`）。宿主 UI 的勾选/推进走这里，
-	 * 而不是只把 todo 当 tool 结果只读展示；omp 会同步给模型并广播 todo 更新。
-	 * 入参经过五态归一化，防止渲染层脏数据把非法状态写进会话。
-	 */
-	async setTodos(agentId: string, phases: AgentTodoPhase[]): Promise<AgentRuntimeState> {
-		if (!Array.isArray(phases)) {
-			throw new Error("set_todos: phases must be an array");
-		}
-		const runtime = this.requireRuntime(agentId);
-		const response = await runtime.slot.process.client.request(
-			{ type: "set_todos", phases: this.normalizeTodoPhases(phases) },
-			30_000,
-		);
-		if (!response.success) {
-			throw new Error(response.error?.trim() || "set_todos failed");
-		}
-		return this.getRuntimeState(agentId);
-	}
-
-	/**
-	 * 使用 pi �� switch_session RPC ���ص�ǰ�Ự���������½��̡�
-	 * ���̣��༭ JSONL → �ĵ�һ�� JSON ������ _reloadMarker �ֶ� → switch_session
-	 * → pi ���ֵ�һ�����ݱ仯→������Ч→���¶�ȡ → �Ƴ� _reloadMarker �ֶΡ�
-	 *
-	 * ��ȣ��ɷ������б�ǩ�У����� _reloadMarker ��Ϊ�ֶ�д���һ�е� JSON �У�
-	 * ���ı��ļ��нṹ������ marker δ��������ļ���Ȼ�ǺϷỰ���ɱ� pi ������
+	 * 安全性：只改第一行内部的 JSON 内容，不改文件行结构，因此 marker 若残留，
+	 * 文件仍是合法会话，可被 pi 正常打开。
 	 */
 	private async reloadSession(agentId: string) {
 		const startTime = Date.now();

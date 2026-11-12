@@ -74,8 +74,8 @@ test("FeishuBridge registers and handles Feishu model picker card actions", () =
 	assert.match(source, /"card\.action\.trigger"/);
 	assert.match(source, /this\.handleCardAction/);
 	assert.match(method, /parseModelActionValue/);
-	assert.match(method, /this\.agentManager\.getAvailableModels\(binding\.sessionId\)/);
-	assert.match(method, /this\.agentManager\.setModel\(binding\.sessionId, action\.provider, action\.modelId\)/);
+	assert.match(method, /this\.agentManager\.control\.models\(binding\.sessionId\)/);
+	assert.match(method, /this\.agentManager\.control\.apply\(binding\.sessionId, \{ kind: "model"/);
 });
 
 test("FeishuBridge does not keep unreachable workspace/resume command code", () => {

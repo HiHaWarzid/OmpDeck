@@ -581,15 +581,18 @@ test("setTodos 下发前过滤非法状态，再从 get_state 回读生效值", 
 	});
 	internals(manager).agents.set("a1", runtime);
 
-	const state = await manager.setTodos("a1", [
-		{
-			name: "P",
-			tasks: [
-				{ content: "X", status: "pending" },
-				{ content: "Y", status: "bogus" as never },
-			],
-		},
-	]);
+	const state = await manager.control.apply("a1", {
+		kind: "todos",
+		phases: [
+			{
+				name: "P",
+				tasks: [
+					{ content: "X", status: "pending" },
+					{ content: "Y", status: "bogus" as never },
+				],
+			},
+		],
+	});
 
 	assert.deepEqual(requests[0], {
 		type: "set_todos",
