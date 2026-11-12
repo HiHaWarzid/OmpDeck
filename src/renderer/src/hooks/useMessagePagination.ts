@@ -66,6 +66,11 @@ export type WindowAnchorInput = {
   followTail: boolean;
   initialPageSize: number;
   maxVisible: number;
+  /**
+   * 本次变化在消息数组头部新增的条数（历史分页）。>0 时不按尾部锚定：
+   * 窗口从顶部纳入新页并保持已有内容位置，避免 bulk 规则把视图打回最新消息。
+   */
+  prependCount?: number;
 };
 
 const DEFAULT_INITIAL_PAGE_SIZE = 100; // 首屏加载最近100条消息
@@ -101,9 +106,16 @@ function tailWindow(len: number, size: number): MessageWindow {
  * 只有"贴底跟随 + 少量新增"会扩窗（先扩到上限，再自动从顶部上收）。
  */
 export function nextWindowAfterCountChange(input: WindowAnchorInput): MessageWindow {
-  const { prev, prevLen, len, followTail, initialPageSize, maxVisible } = input;
+  const { prev, prevLen, len, followTail, initialPageSize, maxVisible, prependCount = 0 } = input;
   if (len === prevLen) return prev;
   const delta = len - prevLen;
+  // 历史分页在头部插入：窗口从顶部纳入新页，已有内容整体下移但位置不变。
+  // 不能走 bulk 规则（会 tailWindow 跳回最新消息），也不能走流式扩窗。
+  if (prependCount > 0) {
+    const start = prev.start === 0 ? 0 : prev.start + prependCount;
+    const size = Math.min(prev.size + prependCount, maxVisible);
+    return clampWindow({ start, size }, len, initialPageSize, maxVisible);
+  }
   // 消息变短（容量裁剪/压缩）：只做夹取，不改锚定策略。
   if (delta < 0) return clampWindow(prev, len, initialPageSize, maxVisible);
   // 批量灌入：跟随尾部，窗口大小不变（打开旧会话仍只渲染首屏一页）。
@@ -148,11 +160,29 @@ export function useMessagePagination({
 
   // 跟踪上一次的完整消息数量，用于区分"新增消息（流式追加）"与"基线重推/裁剪"。
   const prevMessageCountRef = useRef(messages.length);
+  /** 最新消息数组：仅在长度变化时读取首条 id，用于识别历史分页的头部插入。 */
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const prevFirstIdRef = useRef<string | undefined>(messages[0]?.id);
+
+  // 会话切换时同步锚点引用。否则新会话消息数与旧会话相同时，下一次历史页插入会拿
+  // 旧会话的首条 id 去 findIndex，识别不出头部插入，窗口可能跳回尾部。
+  useEffect(() => {
+    prevMessageCountRef.current = messages.length;
+    prevFirstIdRef.current = messages[0]?.id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在会话标识变化时重置锚点
+  }, [resetKey]);
 
   useEffect(() => {
     const len = messages.length;
     const prevLen = prevMessageCountRef.current;
     prevMessageCountRef.current = len;
+    const current = messagesRef.current;
+    const oldFirstId = prevFirstIdRef.current;
+    const oldFirstIndex = len > prevLen && oldFirstId
+      ? current.findIndex((message) => message.id === oldFirstId)
+      : -1;
+    prevFirstIdRef.current = current[0]?.id;
     setWin((prev) =>
       nextWindowAfterCountChange({
         prev,
@@ -161,6 +191,7 @@ export function useMessagePagination({
         followTail: followTailRef.current,
         initialPageSize,
         maxVisible: maxVisibleMessages,
+        prependCount: oldFirstIndex > 0 ? oldFirstIndex : 0,
       }),
     );
   }, [messages.length, enabled, initialPageSize, maxVisibleMessages]);

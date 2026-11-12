@@ -11,7 +11,6 @@ const base = {
 	hasTarget: true,
 	message: "hello",
 	imageCount: 0,
-	isBusy: false,
 };
 
 describe("parseCompactCommand", () => {
@@ -53,25 +52,23 @@ describe("decideComposerSubmit", () => {
 		).toBe("submit");
 	});
 
-	it("/compact 优先于 busy：忙也走压缩而非入队", () => {
+	it("/compact 命中压缩路线", () => {
 		expect(
-			decideComposerSubmit({ ...base, message: "/compact focus", isBusy: true }),
+			decideComposerSubmit({ ...base, message: "/compact focus" }),
 		).toEqual({ action: "compact", compactPrompt: "focus" });
 	});
 
-	it("空模板即使忙也拦截，不入队", () => {
+	it("空模板拦截，不发送", () => {
 		expect(
 			decideComposerSubmit({
 				...base,
 				message: "/emptyTpl",
 				emptyTemplateName: "emptyTpl",
-				isBusy: true,
 			}),
 		).toEqual({ action: "block-empty-template", templateName: "emptyTpl" });
 	});
 
-	it("忙则入队、闲则直发", () => {
-		expect(decideComposerSubmit({ ...base, isBusy: true })).toEqual({ action: "enqueue" });
+	it("忙闲都直发：待投递队列归 omp 服务端", () => {
 		expect(decideComposerSubmit(base)).toEqual({ action: "submit" });
 	});
 
@@ -88,10 +85,9 @@ describe("decideComposerSubmit", () => {
 				...base,
 				message: "/emptyTpl",
 				emptyTemplateName: "emptyTpl",
-				isBusy: true,
 				commandRoutes: false,
 			}),
-		).toEqual({ action: "enqueue" });
+		).toEqual({ action: "submit" });
 	});
 });
 
@@ -106,7 +102,7 @@ describe("expandPromptTemplates empty body", () => {
 		expect(res.message).toContain("/emptyTpl");
 	});
 
-	it("空模板 + busy 仍走 block-empty-template（不入队）", () => {
+	it("空模板仍走 block-empty-template", () => {
 		const templates = [
 			{ name: "emptyTpl", path: "/t/emptyTpl.md", description: "", content: "---\ndescription: x\n---\n" },
 		];
@@ -119,7 +115,6 @@ describe("expandPromptTemplates empty body", () => {
 				message: "/emptyTpl",
 				imageCount: 0,
 				emptyTemplateName: res.emptyTemplateName,
-				isBusy: true,
 			}),
 		).toEqual({ action: "block-empty-template", templateName: "emptyTpl" });
 	});

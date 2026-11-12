@@ -22,7 +22,6 @@ import {
 import type { ExtensionManager } from "../extensions/ExtensionManager";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { AppLogger } from "../logging/AppLogger";
-import type { ConfigManager } from "../config/ConfigManager";
 
 /** 智能查找 wsl.exe：优先绝对路径（含 32-bit Sysnative 绕过），全部不存在时回退到 PATH */
 const wslExeResolved = (() => {
@@ -43,7 +42,6 @@ interface PiHandlerDeps {
 	settingsStore: SettingsStore;
 	extensionManager: ExtensionManager;
 	appLogger: AppLogger;
-	configManager: ConfigManager;
 }
 
 type PiHandlerMaps = {
@@ -53,13 +51,87 @@ type PiHandlerMaps = {
 };
 
 export function registerPiHandlers(deps: PiHandlerDeps): PiHandlerMaps {
-	const { piLocator, settingsStore, extensionManager, appLogger, configManager } = deps;
+	const { piLocator, settingsStore, extensionManager, appLogger } = deps;
 
 	// 模型目录：命令形态（`models --json` / 旧 `--list-models`）按 pi 版本探测一次并长期缓存，
 	// 目录内容首次拉取后缓存，避免每次打开选择器都 fork 子进程。
 	let cachedListModels: AvailableModel[] | null = null;
 	let cachedListModelsPending: Promise<AvailableModel[]> | null = null;
+	/** `includeNonChat` 的第二份缓存：模型中心角色页需要 image/tts/stt 等条目。 */
+	let cachedAllModels: AvailableModel[] | null = null;
+	let cachedAllModelsPending: Promise<AvailableModel[]> | null = null;
 	let cachedModelListCommand: ModelListCommand | undefined;
+
+	/**
+	 * fork 一次 `omp models` 读目录。`includeNonChat` 时向新版命令追加
+	 * `--kind all`（image/tts/stt/judge 角色需要），旧版表格没有 kind 维度，
+	 * 只能返回 chat 条目。
+	 */
+	async function loadModelCatalog(includeNonChat: boolean): Promise<AvailableModel[]> {
+		const settings = settingsStore.get();
+		const runPi = (args: string[], timeoutMs: number) => {
+			const command = piLocator.resolveCommand(
+				settings.customPiPath,
+				settings.wslEnabled,
+				settings.wslDistro,
+				settings.wslUser,
+			);
+			const invocation = piLocator.createInvocation(command, args);
+			return new Promise<{ stdout: string }>((resolve, reject) => {
+				execFile(invocation.command, invocation.args, {
+					env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
+					shell: invocation.shell,
+					windowsHide: true,
+					timeout: timeoutMs,
+					encoding: "utf8",
+					windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+				}, (error, stdout, stderr) => {
+					if (error) {
+						reject(new Error((stderr || error.message).slice(0, 300)));
+					} else {
+						resolve({ stdout });
+					}
+				});
+			});
+		};
+
+		// 先探测命令形态（读 --help，不可能挂起）：新版 pi 把未知参数 `--list-models`
+		// 当交互式启动处理，直接跑会在 15s 后被 timeout 杀掉并静默降级成空列表。
+		if (!cachedModelListCommand) {
+			const help = await runPi(["--help"], 20_000);
+			cachedModelListCommand = detectModelListCommand(help.stdout);
+			if (!cachedModelListCommand) {
+				void appLogger.warn("pi", "pi help exposes no model list command", {
+					helpHead: help.stdout.slice(0, 200),
+				});
+				return [];
+			}
+			void appLogger.info("pi", "pi model list command detected", {
+				mode: cachedModelListCommand.mode,
+				args: cachedModelListCommand.args.join(" "),
+			});
+		}
+
+		const args =
+			includeNonChat && cachedModelListCommand.mode === "json"
+				? [...cachedModelListCommand.args, "--kind", "all"]
+				: cachedModelListCommand.args;
+		// 目录刷新可能走网络（实测冷启动 11s），超时给足；结果只取一次，之后走内存缓存。
+		const result = await runPi(args, 60_000);
+		const models =
+			cachedModelListCommand.mode === "json"
+				? parseModelsJson(result.stdout, includeNonChat)
+				: parseLegacyModelTable(result.stdout);
+		if (models.length === 0) {
+			void appLogger.warn("pi", "pi model list returned no parsable entries", {
+				mode: cachedModelListCommand.mode,
+				includeNonChat,
+				stdoutBytes: result.stdout.length,
+				stdoutHead: result.stdout.slice(0, 200),
+			});
+		}
+		return models;
+	}
 
 	return {
 		pi: {
@@ -277,82 +349,37 @@ export function registerPiHandlers(deps: PiHandlerDeps): PiHandlerMaps {
 			},
 		},
 		projects: {
-			listModels: async (_event, _projectId?: string) => {
-				try {
-					if (cachedListModels) return cachedListModels;
-					// 已有在途请求时复用同一个 Promise，避免并发 fork 多个 pi 进程
-					if (cachedListModelsPending) return cachedListModelsPending;
+			listModels: async (_event, _projectId?: string, includeNonChat?: boolean) => {
+				const chatCache = includeNonChat ? cachedAllModels : cachedListModels;
+				if (chatCache) return chatCache;
+				// 已有在途请求时复用同一个 Promise，避免并发 fork 多个 pi 进程。
+				if (includeNonChat) {
+					if (cachedAllModelsPending) return cachedAllModelsPending;
+				} else if (cachedListModelsPending) {
+					return cachedListModelsPending;
+				}
 
-					cachedListModelsPending = (async () => {
-						const settings = settingsStore.get();
-						const runPi = (args: string[], timeoutMs: number) => {
-							const command = piLocator.resolveCommand(
-								settings.customPiPath,
-								settings.wslEnabled,
-								settings.wslDistro,
-								settings.wslUser,
-							);
-							const invocation = piLocator.createInvocation(command, args);
-							return new Promise<{ stdout: string }>((resolve, reject) => {
-								execFile(invocation.command, invocation.args, {
-									env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
-									shell: invocation.shell,
-									windowsHide: true,
-									timeout: timeoutMs,
-									encoding: "utf8",
-									windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-								}, (error, stdout, stderr) => {
-									if (error) {
-										reject(new Error((stderr || error.message).slice(0, 300)));
-									} else {
-										resolve({ stdout });
-									}
-								});
-							});
-						};
-
-						// 先探测命令形态（读 --help，不可能挂起）：新版 pi 把未知参数 `--list-models`
-						// 当交互式启动处理，直接跑会在 15s 后被 timeout 杀掉并静默降级成空列表。
-						if (!cachedModelListCommand) {
-							const help = await runPi(["--help"], 20_000);
-							cachedModelListCommand = detectModelListCommand(help.stdout);
-							if (!cachedModelListCommand) {
-								void appLogger.warn("pi", "pi help exposes no model list command", {
-									helpHead: help.stdout.slice(0, 200),
-								});
-								return [];
-							}
-							void appLogger.info("pi", "pi model list command detected", {
-								mode: cachedModelListCommand.mode,
-								args: cachedModelListCommand.args.join(" "),
-							});
-						}
-
-						// 目录刷新可能走网络（实测冷启动 11s），超时给足；结果只取一次，之后走内存缓存。
-						const result = await runPi(cachedModelListCommand.args, 60_000);
-						const models =
-							cachedModelListCommand.mode === "json"
-								? parseModelsJson(result.stdout)
-								: parseLegacyModelTable(result.stdout);
-						if (models.length === 0) {
-							void appLogger.warn("pi", "pi model list returned no parsable entries", {
-								mode: cachedModelListCommand.mode,
-								stdoutBytes: result.stdout.length,
-								stdoutHead: result.stdout.slice(0, 200),
-							});
-							return [];
-						}
-						cachedListModels = await configManager.filterConfiguredModels(models);
-						return cachedListModels;
-					})();
-					const models = await cachedListModelsPending;
+				const pending = (async () => {
+					const models = await loadModelCatalog(includeNonChat === true);
+					if (includeNonChat) cachedAllModels = models;
+					else cachedListModels = models;
 					return models;
+				})();
+				if (includeNonChat) cachedAllModelsPending = pending;
+				else cachedListModelsPending = pending;
+				try {
+					return await pending;
 				} catch (error) {
-					cachedListModelsPending = null;
+					if (includeNonChat) cachedAllModelsPending = null;
+					else cachedListModelsPending = null;
 					void appLogger.warn("pi", "Failed to list models", {
+						includeNonChat: includeNonChat === true,
 						error: error instanceof Error ? error.message : String(error),
 					});
 					return [];
+				} finally {
+					if (includeNonChat) cachedAllModelsPending = null;
+					else cachedListModelsPending = null;
 				}
 			},
 		},

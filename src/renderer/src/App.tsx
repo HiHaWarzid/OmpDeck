@@ -1,6 +1,5 @@
 import {
   Fragment,
-  lazy,
   Suspense,
   useEffect,
   useLayoutEffect,
@@ -13,10 +12,9 @@ import {
   useSyncExternalStore,
   type PointerEvent,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   Settings,
   Sliders,
@@ -26,7 +24,6 @@ import {
   ChevronDown,
   Code,
   MessageCircle,
-  MessageSquare,
   Search,
   Play,
   Plus,
@@ -34,6 +31,8 @@ import {
   Wrench,
   FileText,
   ListChecks,
+  ListTodo,
+  SendHorizontal,
   Paperclip,
   Minus,
   FolderCog,
@@ -56,24 +55,33 @@ import {
   PanelRight,
 } from "lucide-react";
 import { showNotice } from "./utils/notice";
+import { lazyWithReload } from "./utils/lazyWithReload";
 import { createPreviewApi } from "./previewApi";
 import { createBrowserApi } from "./browserApi";
-const ConfigModal = lazy(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
+const ConfigModal = lazyWithReload(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
 import { isTextFile } from "./utils/isTextFile";
 import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
+import { NativeLoginModal } from "./components/app/modals/NativeLoginModal";
 // 懒加载：@xterm/xterm（含 FitAddon + 主题 CSS）约数百 KB，终端 Dock 按需打开，
 // 不应在首屏解析执行（此前 xterm 完整打进 1.8MB 入口 chunk）。
-const TerminalDock = lazy(() =>
+const TerminalDock = lazyWithReload(() =>
   import("./components/terminal/TerminalDock").then((m) => ({
     default: m.TerminalDock,
   })),
+);
+// Markdown/KaTeX 栈（react-markdown + remark + katex CSS）不应进入首屏 modulepreload：
+// 只有真正打开更新说明或会话消息时才加载。ScratchPad 同样只在草稿本打开时加载。
+const LazyMarkdownText = lazyWithReload(() =>
+  import("./components/app/timeline/MarkdownBody").then((m) => ({ default: m.MarkdownText })),
+);
+const ScratchPadPanel = lazyWithReload(() =>
+  import("./components/scratchPad/ScratchPadPanel").then((m) => ({ default: m.ScratchPadPanel })),
 );
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
 import { Button } from "./components/ui/Button";
-import { pickTimelineAnchorIndex } from "./utils/timelineAnchor";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
@@ -106,12 +114,10 @@ import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
-  canDiscardQueuedPrompt,
-  canRetractQueuedPromptToInput,
-  QUEUED_PROMPT_LIMIT,
-  QUEUED_PROMPT_VISIBLE,
-  type QueuedPromptSnapshot,
-} from "./utils/queuedPromptQueue";
+  buildQueueRows,
+  type QueuePanelRow,
+  type UncertainPrompt,
+} from "./utils/queueChips";
 import { usePersistedState } from "./hooks/usePersistedState";
 import {
   TERMINAL_HEIGHT_STORAGE_KEY,
@@ -121,7 +127,6 @@ import {
   terminalOwnerKey,
   type TerminalDockStateByOwner,
 } from "./terminalDockState";
-import { useMessagePagination } from "./hooks/useMessagePagination";
 import { useScratchPad } from "./hooks/useScratchPad";
 import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
@@ -129,7 +134,7 @@ import { useSessionImport } from "./hooks/useSessionImport";
 import { reconcileAgentState, sameAgentTabList } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
-import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState } from "./workspace/agentRuntime";
+import { applyAgentRuntimeState, getAgentRuntimeState, ingestAgentRuntimeState, ingestAgentSubagents } from "./workspace/agentRuntime";
 import { dispatchToAgent } from "./workspace/dispatch";
 import { createTranscriptRuntime, reconcileTranscriptEntries, type TranscriptRuntime } from "./workspace/transcriptRuntime";
 import { composerActions } from "./workspace/slices/composerSlice";
@@ -137,7 +142,6 @@ import { extensionWidgetActions } from "./workspace/slices/extensionWidgetsSlice
 import { rpcLogActions } from "./workspace/slices/rpcLogSlice";
 import { thinkingActions } from "./workspace/slices/thinkingSlice";
 import { SessionReferenceModal, type SessionReferenceResult } from "./components/app/SessionReferenceModal";
-import { ScratchPadPanel } from "./components/scratchPad/ScratchPadPanel";
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
@@ -147,15 +151,11 @@ import {
   SessionContextMenu,
 } from "./components/app/menus/ContextMenus";
 import { ConversationOutline } from "./components/app/drawers/ConversationOutline";
-import { FilesDrawer } from "./components/app/drawers/FilesDrawer";
-import { SessionsDrawer } from "./components/app/drawers/SessionsDrawer";
 import {
   AgentStatusIndicator,
   BrandLockup,
-  EmptyState,
   ProjectAvatar,
 } from "./components/app/brand/Brand";
-import { EnvironmentDialog } from "./components/app/modals/EnvironmentDialog";
 import { ImagePreviewModal } from "./components/app/timeline/TurnRow";
 import {
   ComposerModePicker,
@@ -164,22 +164,23 @@ import {
   ThinkingPicker,
 } from "./components/app/composer/ComposerPickers";
 import { PromptSuggestions } from "./components/app/composer/PromptSuggestions";
-import { SessionManagerModal } from "./components/app/modals/SessionManagerModal";
+import { ComposerDock, DockSection } from "./components/app/composer/ComposerDock";
+import {
+	NativeTodoPanel,
+	summarizeTodoPhases,
+} from "./components/app/composer/NativeTodoPanel";
 import { SessionStatus } from "./components/app/composer/ComposerToolbar";
-import { BatchAskInlineBar } from "./components/app/tools/AskQuestionCard";
+import { BatchAskInlineBar, NativeAskInlineBar } from "./components/app/tools/AskQuestionCard";
+import { SubagentDockSection } from "./components/app/subagents/SubagentDockSection";
 import { ExtensionWidgetCard } from "./components/app/widgets/ExtensionWidgets";
 import {
   MERGED_TASK_WIDGET_KEY,
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
 } from "./components/app/widgets/widgetKeys";
-import { MultiSelectModal } from "./components/app/modals/MultiSelectModal";
-import { WorktreeCreateDialog } from "./components/app/modals/WorktreeCreateDialog";
-import { stripMarkdown } from "./components/app/format";
-import type { DrawerPanel, SessionModifiedFile, WidgetLine } from "./components/app/types";
-import { GitPanel } from "./components/app/GitPanel";
-import { BrowserPanel, navigateTo } from "./components/app/BrowserPanel";
-import { MessageListContent } from "./components/app/MessageListContent";
+import type { DrawerPanel, WidgetLine } from "./components/app/types";
+import { BROWSER_HOME_URL, navigateTo } from "./components/app/browserNavigation";
+import { ConversationOutlineHost, ConversationPane, type ConversationPaneHandle } from "./components/app/ConversationPane";
 import { SidebarTree } from "./components/app/sidebar/SidebarTree";
 import { isChatProject } from "./components/app/sidebar/sidebarDisplay";
 import {
@@ -187,21 +188,15 @@ import {
   SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
-import { buildStreamState } from "./components/app/streamStateSelector";
 import {
-  groupToolMessages,
-  getMultiSelectImageCaptureIds,
   applySuggestion,
-  buildOutline,
+  buildModifiedFiles,
   buildSuggestionItems,
   detectTrigger,
   displayPath,
   flattenFiles,
   matches,
-  mergeCommands,
-  getToolFilePath,
-  getToolNewContent,
-  getToolChangedLineCount,
+  filterVisibleCommands,
   countTextLines,
   type MessageItem,
 } from "./components/app/AppUtils";
@@ -215,16 +210,26 @@ import {
 	type RichInputChip,
 } from "./components/app/RichInput";
 // 懒加载：Monaco Editor（~17.6MB Web Worker）仅在用户打开 diff 时才加载
-const FileDiffViewer = lazy(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
+const FileDiffViewer = lazyWithReload(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
 // 懒加载模态框，减少首屏 JS 体积
-const SettingsModal = lazy(() => import("./components/app/SettingsModal").then((m) => ({ default: m.SettingsModal })));
+const SettingsModal = lazyWithReload(() => import("./components/app/SettingsModal").then((m) => ({ default: m.SettingsModal })));
 // AFK 中心：按需懒加载（与 SettingsModal 同策略，减少首屏 JS）
-const AfkPanel = lazy(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
+const AfkPanel = lazyWithReload(() => import("./components/app/AfkPanel").then((m) => ({ default: m.AfkPanel })));
 
-const SessionImportModal = lazy(() => import("./components/app/SessionImportModal").then((m) => ({ default: m.SessionImportModal })));
-const ProjectResourcesModal = lazy(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
-const UpdateErrorModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
-const UpToDateModalLazy = lazy(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
+const SessionImportModal = lazyWithReload(() => import("./components/app/SessionImportModal").then((m) => ({ default: m.SessionImportModal })));
+const ProjectResourcesModal = lazyWithReload(() => import("./components/app/ProjectResourcesModal").then((m) => ({ default: m.ProjectResourcesModal })));
+const UpdateErrorModalLazy = lazyWithReload(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpdateErrorModal })));
+const UpToDateModalLazy = lazyWithReload(() => import("./components/app/UpdateModals").then((m) => ({ default: m.UpToDateModal })));
+// 右侧抽屉面板与低频弹框：默认不挂载，静态导入会把 GitPanel/图标表/面板样式
+// 整块拖进首屏。改为 lazy 后由抽屉/弹框的打开状态触发加载。
+const GitPanel = lazyWithReload(() => import("./components/app/GitPanel").then((m) => ({ default: m.GitPanel })));
+const BrowserPanel = lazyWithReload(() => import("./components/app/BrowserPanel").then((m) => ({ default: m.BrowserPanel })));
+const FilesDrawer = lazyWithReload(() => import("./components/app/drawers/FilesDrawer").then((m) => ({ default: m.FilesDrawer })));
+const SessionsDrawer = lazyWithReload(() => import("./components/app/drawers/SessionsDrawer").then((m) => ({ default: m.SessionsDrawer })));
+const EnvironmentDialog = lazyWithReload(() => import("./components/app/modals/EnvironmentDialog").then((m) => ({ default: m.EnvironmentDialog })));
+const SessionManagerModal = lazyWithReload(() => import("./components/app/modals/SessionManagerModal").then((m) => ({ default: m.SessionManagerModal })));
+const WorktreeCreateDialog = lazyWithReload(() => import("./components/app/modals/WorktreeCreateDialog").then((m) => ({ default: m.WorktreeCreateDialog })));
+const LazyPanelFallback = <div className="drawer-panel-loading">{t("common.loading")}</div>;
 import { createDefaultExternalEditorSettings } from "../../shared/types";
 import type {
   AgentRuntimeState,
@@ -236,7 +241,6 @@ import type {
   AvailableModel,
   PiCliUpdateResult,
   ExternalEditor,
-  FeedbackEnvironment,
   ChatMessage,
   FileTreeNode,
   GitBranchInfo,
@@ -246,7 +250,6 @@ import type {
   WorktreeEntry,
   ImageContent,
   PiCommand,
-  PiSkillSummary,
   PiInstallStatus,
   PiInstallExecResult,
   NpmAvailabilityResult,
@@ -254,7 +257,10 @@ import type {
   Project,
   SessionSummary,
   ComposerAgentMode,
+  AgentTodoPhase,
   AgentUiRequest,
+  CrashedRun,
+  RestoredQueuedMessage,
   ThinkingUpdate,
   WidgetLineItem,
 } from "../../shared/types";
@@ -313,18 +319,21 @@ const api =
     : isLanWeb
       ? createBrowserApi()
       : createPreviewApi());
-// 输入框默认高度增加,提供更好的输入体验,适合多行输入和代码片段
-const COMPOSER_MIN_HEIGHT = 175;
+// 输入框高度：151px = 4 行正文（--line-height-input 22px）+ 输入框上下 padding 20px
+// + 底部工具条 41px + 边框 2px，刚好放下四行；输入框本身固定高度（不再随内容长高，
+// 超出滚动），用户可向上拖动放大。CSS .composer-box 的 min-height 112px 是最后兜底。
+const COMPOSER_MIN_HEIGHT = 151;
 const COMPOSER_DEFAULT_TERMINAL_HEIGHT = 220;
 const COMPOSER_MIN_TIMELINE_HEIGHT = 160;
+// composer dock 常驻的 chip 行：26px chip + 8px 与展开块的间距（见 styles.css .composer-dock）。
+// dock 展开块的高度预算必须扣掉它，否则展开到上限时总高仍会超出。
+const COMPOSER_DOCK_CHIP_ROW_HEIGHT = 34;
+// dock 展开块的可用性下限；与 chip 行一起构成终端高度预算里给 dock 预留的空间。
+const COMPOSER_DOCK_MIN_BODY_HEIGHT = 120;
+const COMPOSER_DOCK_MIN_HEIGHT = COMPOSER_DOCK_CHIP_ROW_HEIGHT + COMPOSER_DOCK_MIN_BODY_HEIGHT;
 const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
-// 共享空数组：无焦点 agent / 条目尚未 join 时的消息默认值。必须是稳定引用——
-// useMessagePagination 与 renderedRuns 的记忆化依赖 messages 的引用相等，
-// 每次渲染新建 [] 会让这些派生全部失效；冻结防止任何路径写坏这份共享默认值。
-const EMPTY_MESSAGES: ChatMessage[] = Object.freeze([]) as unknown as ChatMessage[];
-
 // 共享空分支信息：GitPanel / composer 分支栏都读这份默认值，且 GitPanel 的 memo 判据
 // 比较 initialBranchInfo 的引用——若这里每次渲染新建对象，面板的 memo 会永久失效，
 // 于是每次 App 重渲染（流式期间每秒十余次）都要重渲染整棵数千行的资源列表，
@@ -486,9 +495,6 @@ function getEditorLogoUrl(editorId: string) {
   return EDITOR_LOGO_URLS[editorId];
 }
 
-/** Agent 运行时暂存在 renderer、尚未提交给 pi 的消息。 */
-type QueuedPrompt = QueuedPromptSnapshot;
-
 class PromptDeliveryUnknownError extends Error {
   constructor(message: string) {
     super(message);
@@ -518,6 +524,10 @@ export function App() {
   }
 
   const [projects, setProjects] = useState<Project[]>([]);
+  // createAgent 等异步路径需要「最新项目列表」：崩溃恢复会在 refreshProjects 之后
+  // 立刻打开会话，那时闭包里的 projects state 还是空数组，按 state 查项目会直接返回。
+  const projectsRef = useRef<Project[]>([]);
+  projectsRef.current = projects;
   // 项目的 git worktree 列表：{ parentId -> WorktreeEntry[] }
   const [worktreesByProject, setWorktreesByProject] = useState<
     Record<string, WorktreeEntry[]>
@@ -568,17 +578,15 @@ export function App() {
     activeProjectId,
     onSessionsByProjectChanged: handleSessionsByProjectChanged,
   });
-  // Agent 生命周期 per-agent 状态：prompt/images/queuedPrompts/terminalDock/
-  // drawerPinned/promptHistory/queueFlush，以及 agent 替换时的原子迁移方法。
-  // prompt 的 ref/state 双写、images 的 ref 镜像与终端 Dock 的函数式更新
-  // 都收敛为 hook 内 op（setLivePrompt / setNativePrompt / stageLivePrompt 等）。
+  // Agent 生命周期 per-agent 状态：prompt/images/dock/drawer/promptHistory，
+  // 以及 agent 替换时的原子迁移方法。queuedPrompts 已删除——待投递队列
+  // 以 omp get_state.queuedMessages 为唯一事实来源。
   const {
     getLivePrompt, setLivePrompt, setNativePrompt, stageLivePrompt,
     attachedImagesByAgent, setAttachedImagesForAgent,
-    queuedPrompts, queuedPromptStore,
     terminalDockStateByOwner, setTerminalDockOpen, setTerminalDockCollapsed, pruneTerminalDock,
     drawerPinnedByProject, setDrawerPinnedByProject,
-    promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef, queueFlushByAgentRef,
+    promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef,
     migratePerAgentState, commitPendingToReal,
   } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
   // ── 会话工作区：结构订阅在根，切片订阅在真正渲染它的组件 ─────────────────
@@ -592,15 +600,10 @@ export function App() {
   const activeWorkspaceComposer = useWorkspaceSlice(activeAgentId, "composer");
   const currentComposerAgentMode = activeWorkspaceComposer?.mode ?? "normal";
   const activeBusyDraft = activeWorkspaceComposer?.busyDraft ?? false;
-  // 当前会话的消息与运行态：根只订阅「当前 agent」这两条切片。
-  // 迁出根 state 的意义在后台 agent——原来 messagesByAgent / runtimeStateByAgent 是
-  // 整张 record 落在根 state 上，任何 agent 的 50ms 消息增量、≤150ms 工具循环都
-  // 唤醒整个 App（9k 行组件体 + 内联侧栏）。现在后台条目的变化只唤醒订阅它的叶子。
-  // 当前会话仍会重渲染根：分页窗口（useMessagePagination）、renderedRuns、流式
-  // 滚动等派生链都在根上，本批次不动这条链（行为与迁移前一致）。
-  const activeTranscript = useWorkspaceSlice(activeAgentId, "transcript");
-  const activeMessages = activeTranscript?.messages ?? EMPTY_MESSAGES;
+  // 当前会话的运行态：根仍需它驱动输入框/忙碌态；消息本身由 ConversationPane 订阅，
+  // transcript 的 50ms 流式增量不再唤醒 9k 行的 App 根。
   const agentRuntimeState = useWorkspaceSlice(activeAgentId, "runtime");
+  const conversationRef = useRef<ConversationPaneHandle>(null);
   // Extension widget（批次 5d）：按 agent 隔离的 setWidget 内容。键 = 条目键，
   // agent 离场即随条目 dispose；后台 agent 推 widget 只唤醒它自己的订阅者。
   const activeExtensionWidgets = useWorkspaceSlice(activeAgentId, "extensionWidgets");
@@ -649,14 +652,32 @@ export function App() {
   );
   const expandedSidebarProjectsRef = useRef(expandedSidebarProjects);
   expandedSidebarProjectsRef.current = expandedSidebarProjects;
+  // 冷扫描先返回部分摘要，完整扫描结束后主进程推送 sessions:changed。
+  // 用 ref 取最新 refresh 函数，避免事件监听随每次渲染重绑定。
+  const refreshProjectSessionsRef = useRef(refreshProjectSessions);
+  refreshProjectSessionsRef.current = refreshProjectSessions;
+  const sessionsByProjectRef = useRef(sessionsByProject);
+  sessionsByProjectRef.current = sessionsByProject;
+  useEffect(() => {
+    return api.sessions.onChanged(() => {
+      // 已经加载过列表的项目（侧栏/活动项目）都要补一次完整快照；
+      // 只认 expanded 会漏掉当前活动但尚未展开的项目。
+      const projectIds = new Set(Object.keys(sessionsByProjectRef.current));
+      for (const projectId of expandedSidebarProjectsRef.current) projectIds.add(projectId);
+      const active = activeProjectIdRef.current;
+      if (active) projectIds.add(active);
+      for (const projectId of projectIds) {
+        // silent：这是补全已有部分列表，不应重新显示 loading 骨架。
+        void refreshProjectSessionsRef.current(projectId, true).catch(() => undefined);
+      }
+    });
+  }, []);
   /** 已从 settings.json 合并过展开状态，避免被后续 settings 刷新覆盖用户刚点的展开 */
   const expandedSidebarFromSettingsRef = useRef(false);
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [commands, setCommands] = useState<PiCommand[]>([]);
-  // 全局 + 项目级 skills 合成的斜线命令（/skill:<name>），注入 / 建议与 chip 白名单。
-  // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充，让用户输入 / 即可见到 skills。
-  const [skillCommands, setSkillCommands] = useState<PiCommand[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+  const [modelProviderOrder, setModelProviderOrder] = useState<string[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [promptTemplatePickerOpen, setPromptTemplatePickerOpen] = useState(false);
   const [promptTemplateList, setPromptTemplateList] = useState<
@@ -664,8 +685,39 @@ export function App() {
   >([]);
   const [composerModePickerOpen, setComposerModePickerOpen] = useState(false);
   const [thinkingPickerOpen, setThinkingPickerOpen] = useState(false);
+  const [availableThinkingLevels, setAvailableThinkingLevels] = useState<string[]>([]);
+  const [serviceTierBusy, setServiceTierBusy] = useState(false);
+  const [autoCompactionBusy, setAutoCompactionBusy] = useState(false);
+  const [todoBusy, setTodoBusy] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 大会话历史分页：App 持有旧页，切换会话/文件时按 key 自动失效。
+  // 不用 transcript 承载旧页，否则流式基线重推会把它们覆盖掉。
+  type OlderHistoryState = {
+    key: string;
+    messages: ChatMessage[];
+    cursor: number;
+    hasMore: boolean;
+  };
+  const [olderHistory, setOlderHistory] = useState<OlderHistoryState>({
+    key: "",
+    messages: [],
+    cursor: 0,
+    hasMore: true,
+  });
+  const [olderHistoryLoadingKey, setOlderHistoryLoadingKey] = useState<string | null>(null);
+  /**
+   * 基线代号：进程重连/压缩重载会替换 transcript 基线，此前的旧页可能与新基线
+   * 之间出现缺口。代号进入 key 后，旧页连同在途响应一起失效。
+   */
+  const [olderHistoryEpoch, setOlderHistoryEpoch] = useState(0);
+  // 点击瞬间 state 还没刷新，必须用 ref 挡住同一会话的重复请求，否则两次翻页会并发。
+  const olderHistoryLoadingRef = useRef<string | null>(null);
+  // 请求代号：切会话/基线重建后，晚到的旧响应必须丢弃，不能覆盖新会话的页。
+  const olderHistoryRequestRef = useRef(0);
+  // 菜单外层容器：用于「点击外部关闭」判定；chevron 引用用于 Escape 关闭后还焦。
+  const sendBehaviorMenuWrapRef = useRef<HTMLDivElement | null>(null);
+  const sendBehaviorChevronRef = useRef<HTMLButtonElement | null>(null);
   const [sessionFeishuBotId, setSessionFeishuBotId] = useState<
     string | undefined
   >(undefined);
@@ -746,10 +798,18 @@ export function App() {
   const GOAL_MAX_CONTINUATIONS = 5;
   /** 上一次 isAgentBusy 状态,用于检测 busy→idle 转换 */
   const prevIsAgentBusyRef = useRef(false);
-  const activeQueuedPrompts = activeAgentId ? (queuedPrompts[activeAgentId] ?? []) : [];
+  /**
+   * 待发送轨道 = omp 服务端队列（runtimeState.queuedMessages）+ 本地未知投递提示。
+   * omp 队列经 runtime 切片订阅唤醒，服务端增删/提升后自动重渲染。
+   */
+  const [uncertainPrompts, setUncertainPrompts] = useState<
+    Record<string, UncertainPrompt[]>
+  >({});
+  const activeQueueRows: QueuePanelRow[] = buildQueueRows(
+    agentRuntimeState?.queuedMessages,
+    activeAgentId ? uncertainPrompts[activeAgentId] : undefined,
+  );
 
-  /** 当前 agent 流式思考的实时文本,agent_end 时清空 */
-  const [multiSelectOpen, setMultiSelectOpen] = useState(false);
   const [sessionRefPickerOpen, setSessionRefPickerOpen] = useState(false);
   const [sessionRefPickerTarget, setSessionRefPickerTarget] = useState<SessionSummary | null>(null);
   /** & 会话引用选择缓存：key = chip raw（如 "&My Session"），value = 选中的消息列表 */
@@ -995,9 +1055,6 @@ export function App() {
     (url: string) => api.app.openExternal(url),
     [],
   );
-  const handleEnterMultiSelect = useCallback(() => {
-    setMultiSelectOpen(true);
-  }, []);
   /** AskQuestionCard 应答回调（从时间线内联箭头提为稳定回调）。
    *  cancelled 通过 sendUiResponse 正常发送；select/input/editor：cancelled 或 value:null → undefined/null。
    *  原生 confirm：pi 会把 cancelled 解析成 false（与「否」同值）；ask_question 扩展已把 confirm
@@ -1329,23 +1386,8 @@ export function App() {
   const [piUpdateCheck, setPiUpdateCheck] = useState<PiUpdateCheckResult | null>(null);
   const [piUpdateResult, setPiUpdateResult] = useState<PiCliUpdateResult | null>(null);
   const [configOpen, setConfigOpen] = useState(false);
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [windowAlwaysOnTop, setWindowAlwaysOnTop] = useState(false);
   const [_debugOpen, _setDebugOpen] = useState(false);
-  /** 是否自动滚动到最新消息 */
-  const [autoScroll, setAutoScroll] = useState(true);
-  /** 用 ref 同步 autoScroll，供 ResizeObserver 回调读取最新值，避免响应式时序间隙导致滚动抢跑。 */
-  const autoScrollRef = useRef(true);
-  autoScrollRef.current = autoScroll;
-  /** 标记当前滚动是否由程序触发（ResizeObserver / scrollToBottom 等），
-   *  用于在 scroll 事件中区分用户手动滚动，防止竞态误关 autoScroll。 */
-  const programmaticScrollRef = useRef(false);
-  /** 是否显示"移动到最新"按钮 */
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
-  /** 会话定位跳转到尚未加载的旧消息时，先扩展分页再在 effect 中滚动定位；此状态保存待跳转的消息 id。 */
-  const [pendingJumpId, setPendingJumpId] = useState<string | null>(null);
-  /** 加载更多历史消息前的滚动锚点（窗口首条消息的 id + 视口坐标），用于渲染后按元素位移恢复滚动位置。 */
-  const loadMoreAnchorRef = useRef<{ id: string; top: number } | null>(null);
 
   const [settings, setSettings] = useState<AppSettings>({
     useNativeTitleBar: true,
@@ -1412,7 +1454,14 @@ export function App() {
     piRpcNoSkills: false,
     afk: { enabled: false, targetProjectIds: [], pollIntervalMs: 60_000, timeoutMs: 30 * 60_000 },
   });
-  /* settingsNotice 已改用 showToast (app-notice) 实现 */
+  // 事件订阅在挂载时建立，闭包不能直接读 settings（会永久停留在首帧默认值）；
+  // 通知开关需要实时值，因此镜像到 ref。
+  const settingsRef = useRef(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+  // 后台 ask 通知去重：同一 requestId 只弹一次（扩展可能重发同一请求）。
+  const notifiedAskRequestIdsRef = useRef<Set<string>>(new Set());
   const [piProxyNotice, setPiProxyNotice] = useState("");
   const [piProxyNoticeTone, setPiProxyNoticeTone] = useState<
     "info" | "success" | "error"
@@ -1526,9 +1575,10 @@ export function App() {
   /** composer 外壳高度（footer.offsetHeight - 编辑区.offsetHeight），rAF 中更新；
    *  渲染路径用它计算 maxHeight，避免每次渲染同步读 DOM 触发强制布局。 */
   const [composerChrome, setComposerChrome] = useState(0);
+  /** composer dock 的实际高度；从 chrome 里扣掉后得到“其它面板”占用的空间。 */
+  const [dockHeight, setDockHeight] = useState(0);
+  const dockRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLElement | null>(null);
-  const queuedTrackRef = useRef<HTMLDivElement | null>(null);
-  const timelineRef = useRef<HTMLElement | null>(null);
   const composerBoxRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
   // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
@@ -1539,6 +1589,12 @@ export function App() {
    * 用触发功能）时复位（见 handleComposerKeyDown）。
    */
   const suggestionsDismissedRef = useRef(false);
+  /**
+   * 「↓ + Enter」排队到下一轮的按键状态：Enter 的 KeyboardEvent 不会携带
+   * 另一个键是否按住，只能自己记录 ArrowDown 的按下/抬起。失焦时复位，
+   * 避免切走再回来时误判为组合键。
+   */
+  const arrowDownHeldRef = useRef(false);
   const projectDragPreventClickRef = useRef(false);
 
   // ===== 飞书桥接 =====
@@ -1769,7 +1825,15 @@ export function App() {
     ? drawerPinnedByProject[activeProjectId]
     : undefined;
   const drawerPinned = Boolean(drawerPinnedPanel);
+  // dock chip 的 TODO 进度；任务列表本体仍由 NativeTodoPanel 渲染，计数与“上一轮”判定
+  // 走同一个 helper，避免 chip 标签和列表里的来源提示各算一套。
   const activeRuntimeState = agentRuntimeState;
+  const todoPhases = activeRuntimeState?.todoPhases ?? [];
+  const {
+    total: todoTotal,
+    done: todoDone,
+    settled: todoSettled,
+  } = summarizeTodoPhases(todoPhases);
   // 活跃项目是否还有忙碌 agent：来自跨条目运行态订阅（subscribeSliceChange），
   // 只在布尔翻转时 setState——运行态热路径（工具循环 ≤150ms）不再唤醒根渲染。
   const [activeProjectHasBusyAgent, setActiveProjectHasBusyAgent] = useState(false);
@@ -1790,105 +1854,6 @@ export function App() {
     recompute();
     return sessionWorkspaceStore.subscribeSliceChange("runtime", recompute);
   }, [activeProjectId, displayAgents]);
-  // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
-  // 窗口上限（默认 200 条）在 hook 内：超过后从顶部上收，避免长会话把上千条消息全量渲染进 DOM。
-  const {
-    visibleMessages: paginatedMessages,
-    hasMore: hasMoreMessages,
-    messagesAbove: messagesAboveWindow,
-    messagesBelow: messagesBelowWindow,
-    loadMore: loadMoreMessages,
-    loadUntilIncluded: loadMessagesUntilIncluded,
-    jumpToLatest: jumpMessagesToLatest,
-    isLoading: isLoadingMoreMessages,
-  } = useMessagePagination({
-    messages: activeMessages,
-    initialPageSize: 50,
-    pageSize: 50,
-    enabled: activeMessages.length > 50,
-    resetKey: activeAgentId ?? undefined,
-    // 贴底跟随：autoScroll=false（用户在看历史）时冻结窗口，新消息不再塞进 DOM 顶走阅读位置。
-    followTail: autoScroll,
-  });
-
-  /** 最后一条用户消息的 id，用于决定重发按钮只在最新消息上显示。 */
-  /**
-   * 将分页消息按 agent run 分组，用于 TurnRow 渲染。
-   * 用户/错误/系统消息保持独立条目，assistant + tool 消息聚合为 agnet-run。
-   */
-  const renderedRuns = useMemo(
-    () => groupToolMessages(paginatedMessages),
-    [paginatedMessages],
-  );
-
-  // 多选分享：图片只克隆已勾选的可见消息，避免截到整屏会话或被滚动容器裁掉。
-  const handleMultiSelectCopy = useCallback(async (selectedIds: Set<string>, kind: "text" | "markdown" | "image") => {
-    if (kind === "image") {
-      try {
-        const { toBlob: toBlobImg } = await import("html-to-image");
-        const source = document.querySelector(".message-list") as HTMLElement | null;
-        if (!source) return;
-
-        const captureIds = getMultiSelectImageCaptureIds(renderedRuns, selectedIds);
-        const clone = source.cloneNode(true) as HTMLElement;
-        for (const item of Array.from(clone.children)) {
-          if (!(item instanceof HTMLElement)) continue;
-          const id = item.dataset.messageId;
-          if (!id || !captureIds.has(id)) item.remove();
-        }
-        clone.classList.add("multi-select-image-export");
-        clone.style.width = `${Math.max(source.clientWidth, source.scrollWidth)}px`;
-        clone.style.padding = "24px";
-        clone.style.background = getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || "#fff";
-        document.body.appendChild(clone);
-        let blob: Blob | null = null;
-        try {
-          blob = await toBlobImg(clone, {
-            pixelRatio: Math.min(2, window.devicePixelRatio || 1),
-            backgroundColor: getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || undefined,
-            filter: (node) =>
-              !(node instanceof HTMLElement) ||
-              (!node.classList.contains("turn-row-actions") &&
-                !node.classList.contains("user-turn-actions") &&
-                !node.classList.contains("copy-menu-popover")),
-          });
-        } finally {
-          clone.remove();
-        }
-        if (blob) {
-          await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
-          showToast(t("copy.asImageCopied"));
-        }
-      } catch {
-        showToast(t("copy.failed"));
-      }
-      setMultiSelectOpen(false);
-      return;
-    }
-
-    const selected = activeMessages
-      .filter((m) => selectedIds.has(m.id))
-      .sort((a, b) => a.timestamp - b.timestamp);
-    if (selected.length === 0) return;
-
-    const separator = "\n\n---\n\n";
-    const content = kind === "text"
-      ? selected.map((m) => {
-          let text = m.text;
-          text = text.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
-          text = text.replace(/<thinking>[\s\S]*?<\/thinking>/g, "");
-          text = text.replace(/<skill\s+name="[^"]*"[^>]*>[\s\S]*?<\/skill>/gi, "");
-          return stripMarkdown(text);
-        }).join(separator)
-      : selected.map((m) => m.text).join(separator);
-
-    await writeClipboard(content);
-    showToast(kind === "text" ? t("copy.asTextCopied") : t("copy.asMarkdownCopied"));
-    setMultiSelectOpen(false);
-  }, [activeMessages, renderedRuns]);
-
-
-
   // 从 activeUiRequest 提取正在进行的交互式请求（select/confirm/input/editor/batch_ask）
   // 这是 ask_question 在 pi RPC 模式下的表现方式：pi 通过 extension_ui_request 将
   // 等待用户回答的对话框发送到桌面端，包含 requestId、title、options 等完整信息。
@@ -1899,7 +1864,7 @@ export function App() {
       (req) =>
         !req.completed &&
         req.agentId === activeAgentId &&
-        ["select", "confirm", "input", "editor", "batch_ask"].includes(req.method),
+        ["select", "confirm", "input", "editor", "batch_ask", "ask"].includes(req.method),
     );
   }, [activeUiRequest, activeAgentId]);
   // dialog 显示条件：仅当有活跃的交互式 UI 请求时
@@ -1909,27 +1874,6 @@ export function App() {
     document.body.classList.toggle("ask-bar-active", showAskDialog);
     return () => document.body.classList.remove("ask-bar-active");
   }, [showAskDialog]);
-
-  const isAwaitingAssistant = Boolean(
-    activeAgent &&
-    !cancellingUi &&
-    isAgentStreaming(activeAgent, activeRuntimeState) &&
-    activeMessages.at(-1)?.role !== "assistant",
-  );
-  /** 正在流式追加的最后一条 assistant 消息的 id（agent 处于运行/流式状态时才有值）。
-   *  用于让对应 AssistantText 走轻量渲染路径，避免每个 token 都对不断增长的全量正文
-   *  反复运行 KaTeX 数学解析导致渲染主线程卡死；回答结束后切回完整渲染。 */
-  const streamingMessageId = useMemo(() => {
-    if (!activeAgent || !isAgentExactlyRunning(activeAgent)) return undefined;
-    if (!(activeRuntimeState?.isStreaming)) return undefined;
-    for (let i = activeMessages.length - 1; i >= 0; i--) {
-      const m = activeMessages[i];
-      if (m.role === "user") break;
-      // 跳过纯 thinking / 工具消息，定位最后一条有实际正文的 assistant 消息
-      if (m.role === "assistant" && (m.text || "").trim()) return m.id;
-    }
-    return undefined;
-  }, [activeAgent, activeRuntimeState, activeMessages]);
 
   // PIDECK_PERF=1 帧率诊断：agent 运行/流式期间采样帧间隔，结束时输出 P50/P95（验收指标）。
   const isStreamingNow = isAgentStreaming(activeAgent, activeRuntimeState);
@@ -1946,24 +1890,22 @@ export function App() {
         ? 34
         : activeTerminalHeight;
   const chatPaneHeight = chatLayoutHeight;
+  // dock 常驻 chip 行 + 展开块下限：终端拖到最高时也要给 dock 留出这块空间，
+  // 否则展开块的下限会把时间线挤没。用常量而不是实测 dockHeight——实测值会随
+  // 终端变矮而变大，形成“dock 越长终端越矮”的正反馈。
+  const dockFloorHeight = activeAgentId ? COMPOSER_DOCK_MIN_HEIGHT : 0;
   const fixedChatHeight =
     chatHeaderHeight +
     COMPOSER_MIN_TIMELINE_HEIGHT +
     COMPOSER_MIN_HEIGHT +
-    28;
-  // Queue chrome includes the track gap, panel padding/header/border, and complete rows.
-  // Keep this in sync with .queued-list so the third row is never clipped by the composer.
-  const queuedChromeBudget =
-    activeQueuedPrompts.length > 0
-      ? 38 + Math.min(activeQueuedPrompts.length, QUEUED_PROMPT_VISIBLE) * 34
-      : 0;
+    28 +
+    dockFloorHeight;
   const terminalRowHeight = terminalCollapsed
     ? requestedTerminalRowHeight
     : Math.min(
         requestedTerminalRowHeight,
-        Math.max(0, chatPaneHeight - fixedChatHeight - queuedChromeBudget),
+        Math.max(0, chatPaneHeight - fixedChatHeight),
       );
-  const visibleQueuedPrompts = activeQueuedPrompts;
   // 渲染路径的输入框最大高度：全部由 state 派生（chatLayoutHeight/chatHeaderHeight/
   // composerChrome 由 ResizeObserver + rAF 更新），避免每次 App 重渲染（流式 ~20Hz）
   // 同步读取 4 个 DOM 节点尺寸触发强制同步布局。
@@ -1978,6 +1920,25 @@ export function App() {
   const resolvedComposerHeight = Math.min(
     composerMaxHeight,
     Math.max(composerHeight, composerAutoHeight),
+  );
+  // dock 展开块的高度上限：先扣掉时间线与输入框的最小高度，再扣掉其它 chrome
+  // （扩展 widget / 图片预览等 = composerChrome - dockHeight）和常驻的 chip 行，
+  // 否则展开到上限时总高仍会超出预算、把时间线吃掉。下限由终端预算里的
+  // COMPOSER_DOCK_MIN_HEIGHT 兜住，终端拖到最高时也不会把时间线挤没。
+  // 变量在渲染路径算，避免在 ResizeObserver 里读闭包中的终端高度（会过期）。
+  const dockMaxHeight = Math.min(
+    260,
+    Math.max(
+      COMPOSER_DOCK_MIN_BODY_HEIGHT,
+      chatPaneHeight -
+        chatHeaderHeight -
+        COMPOSER_MIN_TIMELINE_HEIGHT -
+        COMPOSER_MIN_HEIGHT -
+        terminalRowHeight -
+        28 -
+        COMPOSER_DOCK_CHIP_ROW_HEIGHT -
+        Math.max(0, composerChrome - dockHeight),
+    ),
   );
   // composerMode 基于 composerBangMode（state）而非 prompt（ref），避免每键触发重渲染。
   // composerBangMode 仅在 ! / !! 前缀真正变化时更新。
@@ -2096,44 +2057,6 @@ export function App() {
     settings.fontFamilyMonoCustom,
   ]);
 
-  /** 当前会话中 agent 修改过的文件(从 tool 消息 meta 中提取) */
-  // 优化:只在消息数量变化时才重新计算,减少不必要的遍历
-  const modifiedFiles = useMemo(() => {
-    const byPath = new Map<string, SessionModifiedFile>();
-    for (const msg of activeMessages) {
-      if (msg.role !== "tool") continue;
-      const toolName: string | undefined = msg.meta?.toolName as
-        | string
-        | undefined;
-      const args: any = msg.meta?.args;
-      const status: string = String(msg.meta?.status ?? "done");
-      // 只收集文件写入/编辑类的工具调用，作为右侧 Files 与会话结束摘要的统一数据源。
-      if (!toolName || !/write|edit|create|patch/i.test(toolName)) continue;
-      const filePath = getToolFilePath(args);
-      if (!filePath) continue;
-      const previous = byPath.get(filePath);
-      // 同一路径再次被修改时移动到 Map 末尾，右侧修改清单才能按"最新修改"展示。
-      if (previous) byPath.delete(filePath);
-      // originalContent 不再存储到消息 meta 中（full file 会使会话体积过大）。
-      // diff 展示时使用工具参数（oldText/newText）显示变动区域。
-      byPath.set(filePath, {
-        path: filePath,
-        toolName,
-        status: status === "running" ? "running" : (previous?.status ?? status),
-        changedLines:
-          (previous?.changedLines ?? 0) +
-          getToolChangedLineCount(toolName, args),
-        originalContent: "",
-        content: getToolNewContent(toolName, args) ?? previous?.content,
-      });
-    }
-    return Array.from(byPath.values());
-  }, [activeMessages.length, activeAgentId]);
-  // 优化:轮廓项计算仅在消息数量变化时触发,减少不必要的重计算
-  const outlineItems = useMemo(
-    () => buildOutline(activeMessages),
-    [activeMessages.length, activeAgentId],
-  );
   const flatFiles = useMemo(() => flattenFiles(files), [files]);
   // 优化:建议项计算仅在必要时触发,避免每次输入都重计算导致卡顿
   // 只有当建议框打开时才计算,关闭时返回空数组
@@ -2145,22 +2068,22 @@ export function App() {
   const suggestionItems = useMemo(
     () =>
       suggestionsOpen
-        ? buildSuggestionItems(prompt, composerCursor, [...commands, ...skillCommands], flatFiles, activeProjectSessions)
+        ? buildSuggestionItems(prompt, composerCursor, commands, flatFiles, activeProjectSessions)
         : [],
-    [suggestionsOpen, prompt, composerCursor, commands, skillCommands, flatFiles, activeProjectSessions],
+    [suggestionsOpen, prompt, composerCursor, commands, flatFiles, activeProjectSessions],
   );
 
   /** 有效命令名白名单：仅已知命令渲染为 chip */
-  const mergedCommands = useMemo(
-    () => mergeCommands([...commands, ...skillCommands]),
-    [commands, skillCommands],
+  const visibleCommands = useMemo(
+    () => filterVisibleCommands(commands),
+    [commands],
   );
   const validCommandNames = useMemo(
     () => new Set([
-      ...mergedCommands.map((c) => c.name),
+      ...visibleCommands.map((c) => c.name),
       ...promptTemplateList.map((t) => t.name),
     ]),
-    [mergedCommands, promptTemplateList],
+    [visibleCommands, promptTemplateList],
   );
 
   /** 有效文件路径白名单：仅工作区真实存在的 @ 引用渲染为 chip */
@@ -2307,7 +2230,24 @@ export function App() {
   const canReorderProjects = search.trim().length === 0;
 
   useEffect(() => {
-    window.setTimeout(() => void refreshProjects(), 0);
+    void (async () => {
+      // 快照只能取一次，必须最先取走；但主进程是在窗口显示后才异步 load projects.json，
+      // 挂载瞬间 projects.list() 可能仍是空的，所以取到快照后再等首次非空的项目推送。
+      const crashed = await api.app.takeCrashedSessions().catch(() => null);
+      const loadedProjects = await refreshProjects().catch(() => null);
+      if (!crashed || crashed.sessions.length === 0) return;
+      const readyProjects =
+        loadedProjects && loadedProjects.length > 0
+          ? loadedProjects
+          : await waitForProjectsLoaded();
+      if (!readyProjects) {
+        void api.app.rendererLog("warn", "renderer", "Crash recovery gave up: projects never loaded", {
+          requested: crashed.sessions.length,
+        });
+        return;
+      }
+      await restoreCrashedSessions(crashed, readyProjects);
+    })();
     window.setTimeout(() => void api.agents.list().then(setAgents), 0);
     void api.editors.list().then(setExternalEditors).catch(() => undefined);
     void api.app
@@ -2383,8 +2323,7 @@ export function App() {
       // 让近千行侧栏子树跟着 20Hz 重渲染（见 sameAgentTabList 注释）。
       setAgents((current) => (sameAgentTabList(current, nextAgents) ? current : nextAgents));
       setActiveAgentId(nextActiveAgentId);
-      // 原子迁移所有 per-agent 状态切片（prompt/images/queuedPrompts/
-      // terminalDock/drawerPinned/promptHistory/queueFlush）
+      // 原子迁移所有 per-agent 状态切片（prompt/images/terminalDock/drawerPinned/promptHistory）
       migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
       // transcript 条目对账：迁移重启占位期间的消息、回收已关闭 agent 的条目。
       // liveIds 必须含占位（重启占位参与 liveIds），避免旧进程移除时聊天记录闪空。
@@ -2425,12 +2364,14 @@ export function App() {
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
       // 解码（序号守卫 + 状态合并 + tool true→false 边沿判定）在 workspace/agentRuntime：
-      // 状态落进 runtime 切片（按 agent 精确订阅），边沿直接在原始事件上投递 steer，
-      // 不依赖 React 批处理时机——很快的 tool_start/tool_end 被合并成一次 render 会漏边沿。
-      const resolved = ingestAgentRuntimeState(payload.agentId, payload.state);
-      if (resolved?.isToolCompletionEdge && isAgentCurrentlyBusy(payload.agentId)) {
-        void flushQueuedSteerPrompts(payload.agentId);
-      }
+      // 状态落进 runtime 切片（按 agent 精确订阅）；待投递队列也随快照更新，
+      // steer/followUp 的投递时序完全由 omp 决定，renderer 不再在工具边沿冲刷本地队列。
+      ingestAgentRuntimeState(payload.agentId, payload.state);
+    });
+    // 子代理 registry：独立通道高频推送，写独立 subagents 切片，避免唤醒
+    // 订阅 runtime 的 App 根组件；也不参与 runtimeStateSeq 的旧快照守卫。
+    const offSubagents = api.agents.onSubagents((payload) => {
+      ingestAgentSubagents(payload.agentId, payload.subagents);
     });
     // 监听流式思考内容更新,用于在 agent 响应前展示推理过程
     const offThinking = api.agents.onThinking((payload: ThinkingUpdate) => {
@@ -2448,6 +2389,10 @@ export function App() {
     });
     // 监听 Extension UI 请求：对话类渲染为提问卡片；setWidget 类作为 composer 上方的轻量状态块展示。
     const offUiRequest = api.agents.onUiRequest((request) => {
+      // OAuth 登录流程由 NativeLoginModal 统一处理；这里必须提前返回，
+      // 否则 open_url / login_flow 会被当成时间线里的通用提问卡片。
+      if (request.loginFlow || request.method === "open_url") return;
+
       if (request.method === "notify") {
         const notifyRequest = request;
         if (notifyRequest.message) {
@@ -2509,6 +2454,33 @@ export function App() {
         return;
       }
 
+      // completed 事件到达时释放去重记录，同一 requestId 若被重发仍可再次提醒。
+      if (request.completed) {
+        notifiedAskRequestIdsRef.current.delete(request.requestId);
+      } else if (
+        (request.agentId !== activeAgentIdRef.current || !document.hasFocus()) &&
+        settingsRef.current.enableNotifications &&
+        (request.method === "select" ||
+          request.method === "confirm" ||
+          request.method === "input" ||
+          request.method === "editor" ||
+          request.method === "batch_ask" ||
+          request.method === "ask") &&
+        !notifiedAskRequestIdsRef.current.has(request.requestId)
+      ) {
+        // 通知是副作用，必须放在 setState updater 外：updater 可能重放，
+        // 会造成同一提问弹两次系统通知。
+        notifiedAskRequestIdsRef.current.add(request.requestId);
+        const askTitle = typeof request.title === "string" && request.title.trim()
+          ? request.title
+          : t("app.askPendingTitle");
+        void api.agents.notifyAsk(
+          t("app.askNotificationTitle", { app: "OmpDeck" }),
+          t("app.askNotificationBody", { title: askTitle }),
+          request.agentId,
+        );
+      }
+
       setActiveUiRequest((current) => {
         // completed 事件：只删对应 requestId；其它 pending 请求保留。
         if (request.completed) {
@@ -2517,26 +2489,6 @@ export function App() {
           delete next[request.requestId];
           if (Object.keys(next).length === 0) return null;
           return next;
-        }
-
-        // 非活动 Agent 收到对话类 ask 请求时发系统通知（每 requestId 一次，completed 不重复）：
-        // 用户在别的会话工作时，后台 agent 的提问不应被错过。设置关闭或聚焦时不打扰。
-        if (
-          request.agentId !== activeAgentIdRef.current &&
-          settings.enableNotifications &&
-          (request.method === "select" ||
-            request.method === "confirm" ||
-            request.method === "input" ||
-            request.method === "editor" ||
-            request.method === "batch_ask")
-        ) {
-          const askTitle = typeof request.title === "string" && request.title.trim()
-            ? request.title
-            : t("app.askPendingTitle");
-          void api.agents.notifyAsk(
-            t("app.askNotificationTitle", { app: "OmpDeck" }),
-            t("app.askNotificationBody", { title: askTitle }),
-          );
         }
 
         /*
@@ -2623,6 +2575,7 @@ export function App() {
       offUpdateProgress();
       offOpenInBrowser?.();
       offRuntimeState();
+      offSubagents();
       offThinking();
       offNotice();
       offUiRequest();
@@ -2651,6 +2604,23 @@ export function App() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [scratchPadToggle, scratchPadClose, scratchPadIsOpen]);
+
+  // ArrowDown 只用于判定「↓ + Enter」组合键，不拦截事件本身；
+  // 在 window 上监听 keyup/blur，保证输入框失焦或按键在别处释放时状态不会卡住。
+  useEffect(() => {
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.key === "ArrowDown") arrowDownHeldRef.current = false;
+    };
+    const handleBlur = () => {
+      arrowDownHeldRef.current = false;
+    };
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+    return () => {
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+    };
+  }, []);
 
   // 桌面宠物点击跳转：主进程通知激活某 Agent，切到对应 project + agent tab
   useEffect(() => {
@@ -2904,77 +2874,13 @@ export function App() {
     ensureComposerTailVisible();
   }
 
-  // 待发送轨道高度变化会改变 composer 的 chrome 高度；队列增删后重新 clamp，
+  // 待发送队列在 dock 里，队列增删会改变 chip 行/展开块的高度；重新 clamp 输入框，
   // 保证大量卡片出现时输入框仍留在可视区域，撤回后也不会保留过高尺寸。
   useLayoutEffect(() => {
     const maxHeight = getComposerMaxHeight();
     setComposerHeight((current) => Math.min(current, maxHeight));
     setComposerAutoHeight((current) => Math.min(current, maxHeight));
-  }, [activeAgentId, activeQueuedPrompts.length]);
-
-  function scrollToBottom() {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    // 回看历史时窗口可能冻结在旧位置，最新消息尚未渲染：先把窗口复位到尾部，再滚到底。
-    // 复位后 DOM 会变高，由 ResizeObserver(programmaticScrollRef/autoScroll) 二次校准到真正的底部。
-    jumpMessagesToLatest();
-    programmaticScrollRef.current = true;
-    timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-  }
-
-  // 给定位命中的消息元素加一个短暂的高亮动画，方便用户在长会话中快速识别跳转落点。
-  function highlightMessageElement(el: HTMLElement) {
-    el.classList.remove("message-jump-highlight");
-    // 强制 reflow 以便重复跳转同一条消息时仍能重新触发动画。
-    void el.offsetWidth;
-    el.classList.add("message-jump-highlight");
-    window.setTimeout(() => el.classList.remove("message-jump-highlight"), 2000);
-  }
-
-  // 点击“加载更多历史消息”：先记录窗口首条消息的视口位置，再触发分页加载，
-  // 渲染后的 effect 按该锚点位移补偿 scrollTop，保持视图稳定。
-  // 用元素位移而不是高度差：窗口到上限后翻页是“顶部加、底部收”，高度差 ≠ 视图位移。
-  function handleLoadMoreMessages() {
-    loadMoreAnchorRef.current = captureTimelineAnchor();
-    loadMoreMessages();
-  }
-
-  /**
-   * 记录一个"视口内的稳定行"的 id 与视口坐标，供翻页/滑窗后恢复滚动位置使用。
-   * 选取规则与原因见 `utils/timelineAnchor.ts`。
-   */
-  function captureTimelineAnchor(): { id: string; top: number } | null {
-    const timeline = timelineRef.current;
-    if (!timeline) return null;
-    const rows = Array.from(timeline.querySelectorAll<HTMLElement>("[data-message-id]")).map((row) => {
-      const rect = row.getBoundingClientRect();
-      return { id: row.dataset.messageId ?? "", rectTop: rect.top, rectBottom: rect.bottom };
-    });
-    const index = pickTimelineAnchorIndex(rows, timeline.getBoundingClientRect().top);
-    const picked = index >= 0 ? rows[index] : undefined;
-    if (!picked?.id) return null;
-    return { id: picked.id, top: picked.rectTop };
-  }
-
-  // 会话定位跳转：若目标消息已在当前分页内则直接滚动定位；
-  // 否则先扩展分页窗口把它包含进来，交给 pendingJumpId effect 在渲染后定位。
-  function handleOutlineJump(id: string) {
-    const el = document.querySelector(
-      `[data-message-id="${CSS.escape(id)}"]`,
-    ) as HTMLElement | null;
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-      highlightMessageElement(el);
-      return;
-    }
-    const index = activeMessages.findIndex((m) => m.id === id);
-    if (index < 0) return;
-    loadMessagesUntilIncluded(index);
-    setPendingJumpId(id);
-  }
+  }, [activeAgentId, activeQueueRows.length]);
 
   useEffect(() => {
     let frame = 0;
@@ -3000,6 +2906,12 @@ export function App() {
           const next = Math.max(0, footerEl.offsetHeight - boxEl.offsetHeight);
           setComposerChrome((current) => (current === next ? current : next));
         }
+        // dock 高度单独测量：展开块的高度上限要扣掉“其它 chrome”（扩展 widget 等），
+        // 否则 dock + 其它面板会一起把时间线挤到 0。dock 不存在时归零，
+        // 避免切换/关闭 Agent 后残留旧值把“其它 chrome”算少。
+        const dockEl = dockRef.current;
+        const nextDockHeight = dockEl?.offsetHeight ?? 0;
+        setDockHeight((current) => (current === nextDockHeight ? current : nextDockHeight));
       });
     };
 
@@ -3018,6 +2930,8 @@ export function App() {
     if (footer) observer?.observe(footer);
     if (chatPane) observer?.observe(chatPane);
     if (header) observer?.observe(header);
+    const dockEl = dockRef.current;
+    if (dockEl) observer?.observe(dockEl);
 
     window.addEventListener("resize", scheduleSync);
     scheduleSync();
@@ -3061,39 +2975,17 @@ export function App() {
         .catch(() => setCommands([]));
     else setCommands([]);
   }, [activeAgentId]);
-  // 拉取全局 + 当前项目 skills，转为 /skill:<name> 命令注入斜线建议与 chip 白名单。
-  // runtime 的 get_commands 不保证返回 skill 命令，这里主动补充。
-  // 只收 enabled 的 skill；disabled 的不发，避免建议出无法执行的命令。
+  // omp 的 available_commands_update 是命令目录的唯一事实源：启动后、/reload-plugins、
+  // 扩展/技能热加载都会推送新目录。只靠切 Agent 时拉取会让运行中变化的命令不可见。
   useEffect(() => {
-    if (!activeAgentId || isPendingAgentId(activeAgentId)) {
-      setSkillCommands([]);
-      return;
-    }
-    const activeProject = activeProjectId
-      ? projects.find((p) => p.id === activeProjectId)
-      : undefined;
-    void Promise.all([
-      api.skills.list().then((res) => res.skills).catch(() => [] as PiSkillSummary[]),
-      activeProject
-        ? api.projectResources.list(activeProject.id).then((res) => res.skills).catch(() => [] as PiSkillSummary[])
-        : Promise.resolve([] as PiSkillSummary[]),
-    ]).then(([globalSkills, projectSkills]) => {
-      const seen = new Set<string>();
-      const cmds: PiCommand[] = [];
-      for (const skill of [...globalSkills, ...projectSkills]) {
-        if (!skill.enabled || !skill.valid) continue;
-        const name = skill.name.toLowerCase();
-        if (seen.has(name)) continue; // 全局与项目同名去重，保留先出现的
-        seen.add(name);
-        cmds.push({
-          name: `skill:${skill.name}`,
-          description: skill.description || "",
-          source: "skill",
-        });
-      }
-      setSkillCommands(cmds);
+    return api.agents.onCommandCatalog((payload) => {
+      if (payload.agentId !== activeAgentId) return;
+      setCommands(payload.commands);
     });
-  }, [activeAgentId, activeProjectId, projects]);
+  }, [activeAgentId]);
+  // skill 命令（/skill:<name>）不在这里本地扫描：omp 会把已加载的 skill 作为
+  // source:"skill" 的命令发布在同一份目录里（全局与项目级都在内），本地扫描既会
+  // 与 runtime 重复，也无法跟随 /reload-plugins 更新。
 
   useEffect(() => {
     // 默认选中第一项（目录树根级目录），便于浏览项目结构
@@ -3108,133 +3000,6 @@ export function App() {
       // 静默失败
     }
   }, [sessionSourceFilter]);
-
-  // 切换 Agent 时重置滚动状态，确保回到该 Agent 时自动滚到底部。
-  // 历史命令已由当前分支按 Agent 隔离，不恢复 dev 旧的全局 commandHistory 持久化。
-  useEffect(() => {
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-    const frame = requestAnimationFrame(() => {
-      const timeline = timelineRef.current;
-      if (timeline) {
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      }
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeAgentId]);
-
-  // 监听用户滚动,判断是否需要显示"移动到最新"按钮
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-
-    const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = timeline;
-      const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
-
-      // 程序触发的滚动（ResizeObserver / scrollToBottom 等）只允许开启 autoScroll，
-      // 不允许关闭。防止竞态：scrollTo(bottom) 后、scroll 事件触发前，scrollHeight
-      // 可能已大幅变化（思考块折叠、代码块/工具输出出现），导致误判为"用户滚离了底部"。
-      if (programmaticScrollRef.current) {
-        programmaticScrollRef.current = false;
-        if (isAtBottom) {
-          setAutoScroll(true);
-          autoScrollRef.current = true;
-          setShowScrollToBottom(false);
-        }
-        // 非底部也不关 autoScroll — 交给后续事件重新判断。
-        return;
-      }
-
-      if (isAtBottom) {
-        setAutoScroll(true);
-        autoScrollRef.current = true;
-        setShowScrollToBottom(false);
-      } else {
-        setAutoScroll(false);
-        // 同步更新 ref，确保 ResizeObserver 回调在 React 状态更新生效前读到最新值，
-        // 避免用户已滚到上方但 DOM 增长触发的 observer 因闭包旧值抢滚动到底部。
-        autoScrollRef.current = false;
-        setShowScrollToBottom(true);
-      }
-    };
-
-    // 初始化时检查一次
-    handleScroll();
-
-    timeline.addEventListener("scroll", handleScroll);
-    return () => timeline.removeEventListener("scroll", handleScroll);
-  }, [activeAgentId]);
-
-  // 用 ResizeObserver 监控消息列表内容的 DOM 高度变化，自动滚动到底部。
-  // 流式回答时最后一条 assistant 消息原地增长但 messages.length 不变，
-  // 依赖 length 的 effect 不会及时触发；通过 ResizeObserver 准确感知容器扩张。
-  // autoScroll 在依赖中确保开关变化时重建 observer（同时触发一次初始滚动）。
-  // activeAgent?.status 让 agent 从 starting→idle/errored 时重建 observer
-  // 并触发一次滚动，解决状态切换后才出现 .message-list 时不会自动滚到底部的问题。
-  useEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
-    const messageList = timeline.querySelector(".message-list");
-    if (!messageList) return;
-
-    // 使用 ref 而非闭包值，防止 DOM 变化与 React 状态更新之间的时序间隙造成滚动抢跑：
-    // 用户已滚到上方（autoScroll=false），但状态更新尚未生效，observer 闭包中的 autoScroll 仍为 true。
-    // rAF 合并：流式期间内容每 50ms 增长触发一次 observer，同一帧内多次触发只执行一次
-    // scrollTo，避免每次 token 都做同步布局读取 + 滚动（虚拟显卡上这是滚动卡顿源）。
-    let scrollFrame = 0;
-    const scrollIfNeeded = () => {
-      if (scrollFrame) return;
-      scrollFrame = requestAnimationFrame(() => {
-        scrollFrame = 0;
-        if (!autoScrollRef.current) return;
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      });
-    };
-    // 重建 observer 时先主动滚一次，处理 autoScroll 从 false→true 但列表高度未变的场景。
-    scrollIfNeeded();
-
-    const resizeObserver = new ResizeObserver(scrollIfNeeded);
-    resizeObserver.observe(messageList);
-
-    return () => {
-      if (scrollFrame) cancelAnimationFrame(scrollFrame);
-      resizeObserver.disconnect();
-    };
-  }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length]);
-
-  // 加载更多历史消息/滑窗后恢复滚动位置：翻页会在窗口顶部插入内容（滑窗还会在底部收起内容），
-  // 浏览器保持 scrollTop 不变会让正在看的内容上下跳动。这里按锚点消息的视口位移做补偿，
-  // 让同一批消息停在原来的位置。用 useLayoutEffect 在绘制前同步补偿，避免中间帧抖动。
-  useLayoutEffect(() => {
-    const anchor = loadMoreAnchorRef.current;
-    if (!anchor) return;
-    loadMoreAnchorRef.current = null;
-    const el = timelineRef.current;
-    if (!el) return;
-    const target = el.querySelector(
-      `[data-message-id="${CSS.escape(anchor.id)}"]`,
-    ) as HTMLElement | null;
-    if (!target) return;
-    const delta = target.getBoundingClientRect().top - anchor.top;
-    if (delta !== 0) el.scrollTop += delta;
-  }, [paginatedMessages]);
-
-  // 会话定位跳转到尚未加载的消息时，先通过 loadMessagesUntilIncluded 扩展分页窗口；
-  // 该消息被渲染进 DOM 后，在此 effect 中真正滚动定位并短暂高亮，提示用户落点。
-  useEffect(() => {
-    if (!pendingJumpId) return;
-    const el = document.querySelector(
-      `[data-message-id="${CSS.escape(pendingJumpId)}"]`,
-    ) as HTMLElement | null;
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
-    highlightMessageElement(el);
-    setPendingJumpId(null);
-  }, [pendingJumpId, paginatedMessages.length]);
 
   // 追踪 agent 会话开始/结束时间,计算会话时长
   // 点击外部区域自动关闭会话组合下拉
@@ -3622,8 +3387,9 @@ export function App() {
     }
   }
 
-  async function refreshProjects() {
+  async function refreshProjects(): Promise<Project[]> {
     const next = await api.projects.list();
+    projectsRef.current = next;
     setProjects(next);
     if (!activeProjectId && next.length > 0) setActiveProjectId(next[0].id);
     // 启动时刷新所有 worktree 项目的分支列表
@@ -3632,6 +3398,7 @@ export function App() {
         void refreshWorktrees(p.id);
       }
     }
+    return next;
   }
 
   async function refreshWorktrees(projectId: string) {
@@ -3733,7 +3500,11 @@ export function App() {
   function diffFilePath(path: string, originalContent?: string, content?: string) {
     // 工具 diff 展示：write = 空白→全量内容，edit = oldText→newText（变动区域）
     // originalContent 不再存储 full file，使用工具参数中的变动文本作为对比基准。
-    const modified = modifiedFiles.find((f) => f.path === path);
+    // 按需读 transcript 快照：根不再为了这段偶发逻辑订阅消息切片。
+    const messages = activeAgentId
+      ? sessionWorkspaceStore.getSlice(activeAgentId, "transcript")?.messages ?? []
+      : [];
+    const modified = buildModifiedFiles(messages).find((f) => f.path === path);
     const resolvedOriginal = originalContent ?? modified?.originalContent ?? "";
     const resolvedModified = content ?? modified?.content ?? undefined;
     // 工具 diff 与 Git diff 共享弹窗层；打开普通 diff 时先关闭 Git 快照，避免两个 backdrop 叠加。
@@ -4011,8 +3782,7 @@ export function App() {
       setActiveProjectId(projectId);
       setActiveAgentId(existingAgent.id);
       ensureAgentMessagesLoaded(existingAgent.id);
-      setAutoScroll(true);
-      autoScrollRef.current = true;
+      conversationRef.current?.resetAndScrollToBottom();
       return;
     }
     return createAgent(projectId, session.filePath, session.name);
@@ -4195,9 +3965,11 @@ export function App() {
     sessionPath?: string,
     title?: string,
     noSession?: boolean,
+    options?: { silent?: boolean },
   ): Promise<AgentTab | undefined> {
     if (!projectId) return;
-    const project = projects.find((item) => item.id === projectId);
+    // 走 ref 而不是闭包里的 projects：崩溃恢复在项目列表刚落库时就要打开会话。
+    const project = projectsRef.current.find((item) => item.id === projectId);
     if (!project) return;
     const existing = sessionPath
       ? [...displayAgents, ...pendingAgentsRef.current].find(
@@ -4209,8 +3981,7 @@ export function App() {
     if (existing) {
       setActiveProjectId(existing.projectId);
       setActiveAgentId(existing.id);
-      setAutoScroll(true);
-      autoScrollRef.current = true;
+      conversationRef.current?.resetAndScrollToBottom();
       return existing;
     }
     // 新建 agent / 从历史会话恢复：点选当下就给品牌 logo 反馈，不必等进程真正 ready。
@@ -4284,8 +4055,8 @@ export function App() {
       // 全新创建的会话需要刷新历史列表以显示新文件；从已有历史会话打开的 agent 跳过刷新，避免文件 mtime 被不必要地读/写导致排序提前
       if (!sessionPath) {
         void refreshProjectSessions(projectId).catch(() => undefined);
-        showToast(t("app.agentCreated"), 2000);
-      } else {
+        if (!options?.silent) showToast(t("app.agentCreated"), 2000);
+      } else if (!options?.silent) {
         showToast(t("app.sessionOpened"), 2000);
       }
       void refreshRuntimeState(tab.id);
@@ -4319,6 +4090,75 @@ export function App() {
       // 创建失败或超时时回退乐观占位，避免停留在不存在的 pending agent。
       return undefined;
     }
+  }
+
+  /**
+   * 等主进程项目库首次加载完成（`projects:changed` 推送非空列表）。
+   * 主进程为缩短白屏把 `projectStore.load()` 放在窗口显示之后，所以挂载早期 `projects.list()`
+   * 是空数组；崩溃恢复必须等到真实列表，否则会把有效快照误判成「项目已删除」。
+   * 先查一次当前列表再订阅，覆盖「推送已经发生过」的先后顺序；超时返回 null。
+   */
+  function waitForProjectsLoaded(): Promise<Project[] | null> {
+    const { promise, resolve } = Promise.withResolvers<Project[] | null>();
+    let settled = false;
+    let timer: number | undefined;
+    let off: () => void = () => undefined;
+    const finish = (value: Project[] | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      off();
+      resolve(value);
+    };
+    off = api.projects.onChanged((next) => {
+      if (next.length > 0) finish(next);
+    });
+    timer = window.setTimeout(() => finish(null), 10000);
+    void api.projects
+      .list()
+      .then((current) => {
+        if (current.length > 0) finish(current);
+      })
+      .catch(() => undefined);
+    return promise;
+  }
+
+  /**
+   * 崩溃/强杀后的会话恢复。
+   * 主进程只交付一次快照（app.takeCrashedSessions），所以这里不需要额外的去重状态；
+   * 恢复出来的 tab 静默打开（不逐个弹「会话已打开」），末尾只给一条汇总提示。
+   */
+  async function restoreCrashedSessions(crashed: CrashedRun, availableProjects: Project[]) {
+    if (crashed.sessions.length === 0) return;
+    // projectsRef 每次渲染都会被 projects state 覆盖，恢复期间以启动时这次加载结果为准，
+    // 否则 createAgent 里的项目查表可能读到尚未刷新的空列表。
+    projectsRef.current = availableProjects;
+    // 项目可能已被删除 / 当前 WSL 环境不可见：只恢复仍在列表里的项目会话。
+    const available = new Set(availableProjects.map((project) => project.id));
+    const targets = crashed.sessions.filter((session) => available.has(session.projectId));
+    if (targets.length === 0) {
+      void api.app.rendererLog("warn", "renderer", "Crash recovery skipped: projects missing", {
+        requested: crashed.sessions.length,
+        projectIds: [...new Set(crashed.sessions.map((session) => session.projectId))],
+      });
+      return;
+    }
+    let restored = 0;
+    for (const session of targets) {
+      // 顺序恢复：并发 create 会互相抢 activeAgentId，且模型/配置探测本身要排队。
+      const tab = await createAgent(session.projectId, session.sessionPath, session.title, false, {
+        silent: true,
+      });
+      if (tab) restored += 1;
+    }
+    if (restored === 0) return;
+    showToast(t("app.sessionsRestored", { count: restored }), 4000);
+    void api.app.rendererLog("info", "renderer", "Restored sessions after unclean exit", {
+      restored,
+      requested: crashed.sessions.length,
+      previousPid: crashed.pid,
+      previousStartedAt: crashed.startedAt,
+    });
   }
 
   function getProjectFilter(projectId: string) {
@@ -4362,6 +4202,11 @@ export function App() {
   const [defaultModelKey, setDefaultModelKey] = useState<string | undefined>(undefined);
 
   async function openModelPicker() {
+    // 供应商排序随时可能被设置页改写；打开时刷新，失败保持上一次值。
+    void api.config
+      .getOmpProviderOrder()
+      .then(setModelProviderOrder)
+      .catch(() => undefined);
     // 顺路读取 omp 默认模型（config.yml 的 modelRoles.default = "provider/modelId"），
     // 供弹框内“设为默认”按钮标记当前默认项；未设置/无法解析时视为无默认。
     try {
@@ -4506,12 +4351,92 @@ export function App() {
       } catch (error) {
         showToast(
           t("app.thinkingSwitchFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    } else {
+      setThinkingPickerOpen(false);
+    }
+  }
+
+  /** 打开思考档位选择器前向 omp 查询当前模型实际支持的档位。 */
+  async function openThinkingPicker() {
+    setThinkingPickerOpen(true);
+    setAvailableThinkingLevels([]);
+    const agentId = activeAgentId;
+    if (!agentId || isPendingAgentId(agentId)) return;
+    try {
+      const levels = await api.agents.availableThinkingLevels(agentId);
+      // RPC 有 15s 超时窗口：期间切会话后，旧 agent 的档位不能覆盖当前 Picker。
+      if (levels.length > 0 && activeAgentIdRef.current === agentId) {
+        setAvailableThinkingLevels(levels);
+      }
+    } catch {
+      // 旧版 omp 没有该 RPC：保留空数组，Picker 回退到内置档位表。
+    }
+  }
+
+  /** fast/slow 服务档切换。失败信息来自 omp（模型不支持时返回明确原因）。 */
+  async function toggleServiceTier(kind: "fast" | "slow", enabled: boolean) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setServiceTierBusy(true);
+    try {
+      const state =
+        kind === "fast"
+          ? await api.agents.setFastMode(activeAgentId, enabled)
+          : await api.agents.setSlowMode(activeAgentId, enabled);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.serviceTierFailed", {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
+    } finally {
+      setServiceTierBusy(false);
     }
-    } else {
-      setThinkingPickerOpen(false);
+  }
+
+  /**
+   * 会话自动压缩开关。omp 没有独立的“设置页”入口，且该开关是会话级状态，
+   * 因此和 fast/slow 一起放在模型选择器 footer，由 get_state 回读生效值。
+   */
+  async function toggleAutoCompaction(enabled: boolean) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setAutoCompactionBusy(true);
+    try {
+      const state = await api.agents.setAutoCompaction(activeAgentId, enabled);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.autoCompactionFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setAutoCompactionBusy(false);
+    }
+  }
+
+  /**
+   * 宿主侧 todo 操作：点击原生 TODO 面板推进状态后整份回写 omp。
+   * 使用服务端返回的状态覆盖本地，避免连续点击时基于旧快照拼出错误状态。
+   */
+  async function updateTodos(phases: AgentTodoPhase[]) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) return;
+    setTodoBusy(true);
+    try {
+      const state = await api.agents.setTodos(activeAgentId, phases);
+      applyAgentRuntimeState(activeAgentId, state);
+    } catch (error) {
+      showToast(
+        t("app.todoPanelUpdateFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      setTodoBusy(false);
     }
   }
 
@@ -4561,72 +4486,57 @@ export function App() {
     }
     // thinking 切片：清空文本 + 移除起点（reducer 对已空状态空转）
     dispatchToAgent(agentId, thinkingActions.update(""));
-    await api.agents.abort(agentId);
+    // Esc 语义：先撤回 omp 服务端队列，再停止。普通 abort 会把排队消息排进新一轮，
+    // 用户点「停止」后仍会继续执行；这里把草稿拿回输入框，停止就是真的停止。
+    try {
+      const restored = await api.agents.abortAndRestoreQueue(agentId);
+      const messages = [...restored.steering, ...restored.followUp];
+      if (messages.length > 0) {
+        appendDraftToComposer(agentId, messages);
+        showToast(t("app.queueRestored", { count: String(messages.length) }), 3000);
+      }
+      if (restored.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
+      if (restored.truncated) showToast(t("app.queuedRestoreTruncated"), 5000);
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : String(error),
+        4000,
+      );
+    }
     // 不调用 refreshRuntimeState：AgentManager.abort() 会通过 emitState 推送正确状态，
     // 避免后端 get_state 返回过时的 isStreaming: true 覆盖前端立刻设的 false。
   }
 
   /**
-   * 队列唯一事实来源是 queuedPromptStore：所有队列变更（claim/enqueue/resolve/
-   * retract/discard/migrate）都经 store 原子 op，onUpdate 自动回填 React state，
-   * 不再需要 ref/state 双写（见 useAgentLifecycle）。
+   * 队列事实来源是 omp：chip 文本、顺序都来自 runtimeState.queuedMessages。
+   * 本地只保留「投递结果未知」提示（未知 = 可能已写入 omp，不能重试、不能伪造撤回）。
    */
 
-  /** 入队；满员时返回 false，调用方应保留输入框内容并 toast。 */
-  function enqueueQueuedPrompt(agentId: string, queuedPrompt: QueuedPrompt): boolean {
-    const before = queuedPromptStore.state[agentId]?.length ?? 0;
-    if (before >= QUEUED_PROMPT_LIMIT) return false;
-    // store.enqueue 的 FSM 门禁与上限判断一致；返回是否真的入队。
-    return queuedPromptStore.enqueue(agentId, queuedPrompt, QUEUED_PROMPT_LIMIT);
-  }
-
-  function appendUnknownQueuedPrompt(
+  /** 追加恢复的草稿：文字在前、图片在前，光标落到末尾，与撤回编辑的交互保持一致。 */
+  function appendDraftToComposer(
     agentId: string,
-    queuedPrompt: QueuedPrompt,
-    error?: string,
+    messages: RestoredQueuedMessage[],
   ) {
-    queuedPromptStore.enqueue(
-      agentId,
-      { ...queuedPrompt, status: "unknown", error },
-      QUEUED_PROMPT_LIMIT,
-    );
-  }
-
-  /** 撤回输入框：仅 pending/failed 可撤回；sending/unknown 拒绝（防双发/误导）。 */
-  function retractQueuedPrompt(agentId: string, promptId: string) {
-    queuedPromptStore.retract(agentId, promptId);
-  }
-
-  /** 丢弃：sending 拒绝；pending/failed 移除，unknown 仅清提示（不重发）。 */
-  function discardQueuedPrompt(agentId: string, promptId: string) {
-    queuedPromptStore.discard(agentId, promptId);
-  }
-
-  function retractQueuedPromptForEdit(agentId: string, queuedPrompt: QueuedPrompt) {
-    const livePrompt = queuedPromptStore.state[agentId]?.find(
-      (promptItem) => promptItem.id === queuedPrompt.id,
-    );
-    if (
-      !livePrompt ||
-      livePrompt.status === "sending" ||
-      livePrompt.status === "unknown"
-    ) return;
-    retractQueuedPrompt(agentId, livePrompt.id);
-    const currentDraft = getLivePrompt(agentId);
-    const restoredPrompt = [livePrompt.displayText, currentDraft]
+    const restoredText = messages
+      .map((item) => item.text)
       .filter((text) => text.trim())
       .join("\n\n");
-    setLivePrompt(agentId, restoredPrompt);
-    if (livePrompt.images?.length) {
+    const restoredImages = messages.flatMap((item) => item.images ?? []);
+    if (!restoredText && restoredImages.length === 0) return;
+    const currentDraft = getLivePrompt(agentId);
+    const nextPrompt = [restoredText, currentDraft]
+      .filter((text) => text.trim())
+      .join("\n\n");
+    setLivePrompt(agentId, nextPrompt);
+    if (restoredImages.length > 0) {
       setAttachedImagesForAgent(agentId, (current) => [
-        ...livePrompt.images!,
+        ...restoredImages,
         ...current,
       ]);
     }
-    setComposerAgentModeForAgent(agentId, livePrompt.agentMode);
     if (activeAgentIdRef.current === agentId) {
-      setComposerCursor(restoredPrompt.length);
-      pendingComposerCaretRef.current = restoredPrompt.length;
+      setComposerCursor(nextPrompt.length);
+      pendingComposerCaretRef.current = nextPrompt.length;
       requestAnimationFrame(() => {
         const editor = composerTextareaRef.current;
         editor?.focus();
@@ -4635,105 +4545,71 @@ export function App() {
     }
   }
 
-  function isAgentCurrentlyBusy(agentId: string) {
-    const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    return agentBusy(agent, getAgentRuntimeState(agentId));
+  function addUncertainPrompt(agentId: string, text: string, error?: string) {
+    const entry: UncertainPrompt = {
+      id: crypto.randomUUID(),
+      text,
+      error: error ?? t("app.queuedUnknown"),
+    };
+    setUncertainPrompts((current) => ({
+      ...current,
+      [agentId]: [...(current[agentId] ?? []), entry],
+    }));
   }
 
-  function canFlushQueuedPrompt(agentId: string) {
-    const agent = displayAgentsRef.current.find((item) => item.id === agentId);
-    return isAgentIdle(agent) && !isAgentCurrentlyBusy(agentId);
+  function dismissUncertainPrompt(agentId: string, promptId: string) {
+    setUncertainPrompts((current) => {
+      const next = (current[agentId] ?? []).filter((item) => item.id !== promptId);
+      if (next.length === 0) {
+        const { [agentId]: _removed, ...rest } = current;
+        return rest;
+      }
+      return { ...current, [agentId]: next };
+    });
   }
 
-  async function flushQueuedSteerPrompts(agentId: string) {
-    if (queueFlushByAgentRef.current.has(agentId) || !isAgentCurrentlyBusy(agentId)) return;
-    queueFlushByAgentRef.current.add(agentId);
+  /**
+   * 撤回/丢弃只认服务端 removed:true。removed:false 说明消息刚被投递，
+   * 此时既不重发也不猜结果，只刷新一次队列。
+   */
+  async function removeServerQueuedPrompt(
+    agentId: string,
+    row: { queue: "steering" | "followUp"; text: string },
+    restoreDraft: boolean,
+  ) {
     try {
-      // Keep one lock for the whole ordered batch. Releasing it between items would let a second
-      // tool-end/idle event claim the next snapshot while this loop is still advancing.
-      while (isAgentCurrentlyBusy(agentId)) {
-        const claimed = queuedPromptStore.claimNextSteer(agentId);
-        if (!claimed.prompt) break;
-        const queuedPrompt = claimed.prompt;
-
-        try {
-          await dispatchPromptSnapshot(
-            agentId,
-            queuedPrompt.message,
-            queuedPrompt.images,
-            "steer",
-            queuedPrompt.agentMode,
-            queuedPrompt.templateDescription,
-          );
-          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-            type: "accepted",
-          });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-          queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-            type: deliveryUnknown ? "unknown" : "failed",
-            error: errorMessage,
-          });
-          showToast(
-            deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
-            deliveryUnknown ? 6000 : 4000,
-          );
-          // Explicit failure and unknown delivery are ordering barriers. Later steer snapshots
-          // stay local until the user resolves this entry.
-          break;
-        }
+      const result = await api.agents.removeQueuedMessage(agentId, row.text, row.queue);
+      if (!result.removed) {
+        showToast(t("app.queuedGone"), 3000);
+        void refreshRuntimeState(agentId);
+        return;
       }
-    } finally {
-      queueFlushByAgentRef.current.delete(agentId);
-      // agent_settled may arrive while the RPC is in flight. Once the ordered batch unlocks,
-      // continue through the normal serial idle drain rather than leaving the queue stranded.
-      if (canFlushQueuedPrompt(agentId)) {
-        void flushNextQueuedPrompt(agentId);
+      if (result.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
+      if (restoreDraft) {
+        appendDraftToComposer(agentId, [
+          { text: row.text, ...(result.images ? { images: result.images } : {}) },
+        ]);
       }
+    } catch (error) {
+      showToast(
+        error instanceof Error ? error.message : String(error),
+        4000,
+      );
     }
   }
 
-  /** Paseo 同款串行策略：agent 每次空闲只发送队首，其余消息继续可撤回。 */
-  async function flushNextQueuedPrompt(agentId: string) {
-    if (queueFlushByAgentRef.current.has(agentId) || !canFlushQueuedPrompt(agentId)) return;
-    const claimed = queuedPromptStore.claimIdleHead(agentId);
-    if (!claimed.prompt) return;
-    const queuedPrompt = claimed.prompt;
-
-    queueFlushByAgentRef.current.add(agentId);
+  async function promoteServerQueuedPrompt(agentId: string, text: string) {
     try {
-      await dispatchPromptSnapshot(
-        agentId,
-        queuedPrompt.message,
-        queuedPrompt.images,
-        queuedPrompt.behavior === "direct" ? undefined : queuedPrompt.behavior,
-        queuedPrompt.agentMode,
-        queuedPrompt.templateDescription,
-      );
-      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-        type: "accepted",
-      });
+      const result = await api.agents.promoteQueuedMessage(agentId, text);
+      if (!result.promoted) {
+        showToast(t("app.queuedGone"), 3000);
+        void refreshRuntimeState(agentId);
+      }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const deliveryUnknown = error instanceof PromptDeliveryUnknownError;
-      queuedPromptStore.resolve(agentId, queuedPrompt.id, {
-        type: deliveryUnknown ? "unknown" : "failed",
-        error: errorMessage,
-      });
       showToast(
-        deliveryUnknown ? t("app.queuedUnknown") : errorMessage,
-        deliveryUnknown ? 6000 : 4000,
+        error instanceof Error ? error.message : String(error),
+        4000,
       );
-    } finally {
-      queueFlushByAgentRef.current.delete(agentId);
-      // 扩展命令可能预检成功后仍保持 idle；等待主进程 running/idle 推送落地后再判断，
-      // 避免 IPC 事件尚未渲染时把多条普通 prompt 一次性并发发送。
-      window.setTimeout(() => {
-        if (canFlushQueuedPrompt(agentId)) {
-          void flushNextQueuedPrompt(agentId);
-        }
-      }, 150);
     }
   }
 
@@ -4776,6 +4652,16 @@ export function App() {
   function handleComposerKeyDown(
     event: React.KeyboardEvent<HTMLDivElement>,
   ) {
+    if (
+      event.key === "ArrowDown" &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !(event.nativeEvent as KeyboardEvent).isComposing
+    ) {
+      arrowDownHeldRef.current = true;
+    }
     // ESC 关闭后 suppressed：用户再次按下 @/& 触发键 = 明确开始一条新查询，
     // 复位 dismissed，让本次输入的面板正常弹出。
     // IME 合成中（key 为 Process/Dead）与普通字符编辑不算；只认触发键本身。
@@ -4916,6 +4802,24 @@ export function App() {
         dismissSuggestions();
       }
     }
+    // 「↓ + Enter」：跳过 steer，直接把这条消息排到下一轮。
+    // 放在建议面板/历史导航分支之后，避免抢占它们对 Enter/ArrowDown 的语义。
+    if (
+      event.key === "Enter" &&
+      arrowDownHeldRef.current &&
+      !event.shiftKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !(event.nativeEvent as KeyboardEvent).isComposing &&
+      event.keyCode !== 229
+    ) {
+      event.preventDefault();
+      // 连按 Enter 时 keyup 还没到达：立刻清掉，防止重复排队。
+      arrowDownHeldRef.current = false;
+      void sendPromptAsFollowUp();
+      return;
+    }
     const enterIntent = getComposerEnterIntent(event, settings.sendShortcut);
     if (enterIntent === "send") {
       event.preventDefault();
@@ -4942,6 +4846,92 @@ export function App() {
     activeAgentId && hasComposerContent && activeBusyDraft,
   );
   const showBusySendControls = isAgentBusy || keepBusyDraftControls;
+  // 旧页 key 绑定「agent + sessionPath + 基线代号」：切会话文件或重连重建基线后，
+  // 旧页自动失配，不再显示错文件内容或跨基线拼接出缺口。
+  const olderHistoryKey = activeAgentId
+    ? `${activeAgentId}\u0000${activeAgent?.sessionPath ?? ""}\u0000${olderHistoryEpoch}`
+    : "";
+  const olderHistoryMatches = olderHistory.key === olderHistoryKey;
+  const olderHistoryForActive = olderHistoryMatches ? olderHistory.messages : undefined;
+  const hasOlderHistory = Boolean(
+    activeAgentId
+    && activeAgent?.sessionPath
+    && activeAgent.historyHasOlder === true
+    && (!olderHistoryMatches || olderHistory.hasMore),
+  );
+  const olderHistoryLoading = olderHistoryLoadingKey === olderHistoryKey;
+
+  const loadOlderHistory = useCallback(async () => {
+    if (!activeAgentId || !activeAgent?.sessionPath) return;
+    const key = olderHistoryKey;
+    if (olderHistoryLoadingRef.current === key) return;
+    olderHistoryLoadingRef.current = key;
+    const requestId = ++olderHistoryRequestRef.current;
+    setOlderHistoryLoadingKey(key);
+    // cursor 必须来自同一 key；切会话后的旧 cursor 属于另一个文件，绝不复用。
+    const cursor = olderHistoryMatches ? olderHistory.cursor : undefined;
+    try {
+      const page = await api.agents.getHistoryPage(activeAgentId, cursor);
+      // 切会话/重连后旧请求才返回：直接丢弃，否则会覆盖新会话的旧页状态。
+      if (olderHistoryRequestRef.current !== requestId) return;
+      setOlderHistory((prev) => {
+        const base = prev.key === key ? prev.messages : [];
+        // 同一条消息可能同时出现在基线尾窗和文件页里（entryId/行边界历史遗留），
+        // 按稳定 message id 去重，避免重复气泡和 React key 冲突。
+        const seen = new Set(base.map((message) => message.id));
+        const incoming = page.messages.filter((message) => {
+          if (seen.has(message.id)) return false;
+          seen.add(message.id);
+          return true;
+        });
+        return {
+          key,
+          messages: [...incoming, ...base],
+          cursor: page.cursor,
+          hasMore: page.hasMore,
+        };
+      });
+    } catch (error) {
+      if (olderHistoryRequestRef.current !== requestId) return;
+      showToast(
+        t("app.loadOlderHistoryFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } finally {
+      if (olderHistoryLoadingRef.current === key) olderHistoryLoadingRef.current = null;
+      setOlderHistoryLoadingKey((prev) => (prev === key ? null : prev));
+    }
+  }, [
+    activeAgentId,
+    activeAgent?.sessionPath,
+    olderHistoryKey,
+    olderHistoryMatches,
+    olderHistory.cursor,
+    olderHistoryLoadingKey,
+  ]);
+  // 重连/压缩会把 transcript 替换成新的尾窗基线；继续拼接旧页会在两者之间留下空洞。
+  // 清掉旧页并递增代号，避免在途请求返回后把已失效的页重新写回当前 key。
+  useEffect(() => {
+    if (!agentStarting) return;
+    setOlderHistory((prev) => (
+      prev.key === "" && prev.messages.length === 0
+        ? prev
+        : { key: "", messages: [], cursor: 0, hasMore: true }
+    ));
+    setOlderHistoryEpoch((epoch) => epoch + 1);
+    olderHistoryRequestRef.current += 1;
+    olderHistoryLoadingRef.current = null;
+    setOlderHistoryLoadingKey(null);
+  }, [agentStarting]);
+
+  // 菜单里的 steer 快捷键跟随设置；↓ + Enter 是固定组合，不随设置变化。
+  const sendShortcutKeys =
+    settings.sendShortcut === "ctrl-enter-send"
+      ? ["Ctrl", "Enter"]
+      : settings.sendShortcut === "shift-enter-send"
+        ? ["Shift", "Enter"]
+        : ["Enter"];
 
   // 图片附件等非文本输入同样应锁定忙碌草稿控件；内容清空后再释放锁定。
   useEffect(() => {
@@ -4957,40 +4947,6 @@ export function App() {
   useEffect(() => {
     prevIsAgentBusyRef.current = isAgentBusy;
   }, [isAgentBusy]);
-
-  /** 流式/运行相关的时间线展示状态：App 侧聚合为单一对象传给 MessageListContent，
-   *  用 useMemo 保证只有任一输入真正变化时才重建引用——流式期间 App 每次重渲染
-   *  （~50ms delta + 侧栏等无关状态变化）不能让对象每帧新建，否则 memo 失效整树重渲染。
-   *  聚合与内容比较器同处 streamStateSelector 模块（buildStreamState /
-   *  areStreamStatesEqual），字段形状与比较逻辑不跨文件漂移。
-   *  注意：thinking 文本不在此处——它由 MessageListContent 自己订阅 thinking 切片，
-   *  否则 20Hz 思考更新会经这里把整个 App 根组件一起唤醒。 */
-  const streamState = useMemo(
-    () =>
-      buildStreamState({
-        streamingMessageId,
-        agentRunning: isAgentBusy,
-        statusRunning: isAgentExactlyRunning(activeAgent),
-        isAwaitingAssistant,
-        showThinking: settings.showThinking,
-        isExecutingTool: activeRuntimeState?.isExecutingTool,
-        isStreaming: activeRuntimeState?.isStreaming,
-        cancellingUi,
-        activeUiAskRequestId: activeUiAsk?.requestId,
-      }),
-    [
-      streamingMessageId,
-      isAgentBusy,
-      activeAgent?.status,
-      isAwaitingAssistant,
-      settings.showThinking,
-      activeAgentId,
-      activeRuntimeState?.isExecutingTool,
-      activeRuntimeState?.isStreaming,
-      cancellingUi,
-      activeUiAsk?.requestId,
-    ],
-  );
 
   /** 解析消息中的 & 会话引用，将 chip 替换为引用上下文 */
   async function resolveSessionRefs(message: string): Promise<string> {
@@ -5032,22 +4988,6 @@ export function App() {
     return resolved;
   }
 
-  // 处理所有 agent 的 idle 队列：隐藏会话也不会因切换选中项而卡住。
-  // tool-end 的 steer 投递直接在 onRuntimeState 原始事件上处理，避免批量 render 漏边沿。
-  // 运行态不再住根 state，这里改用跨条目切片订阅（命令式，不触发渲染）——
-  // 若改回 root state 依赖，任一 agent 的工具循环都会唤醒整个 App（5b 要消除的开销）。
-  useEffect(() => {
-    const flushIdleQueues = () => {
-      for (const agentId of Object.keys(queuedPrompts)) {
-        if (canFlushQueuedPrompt(agentId)) {
-          void flushNextQueuedPrompt(agentId);
-        }
-      }
-    };
-    flushIdleQueues();
-    return sessionWorkspaceStore.subscribeSliceChange("runtime", flushIdleQueues);
-  }, [agents, queuedPrompts]);
-
   useEffect(() => {
     return () => {
       if (sendBehaviorMenuCloseTimerRef.current) {
@@ -5073,6 +5013,51 @@ export function App() {
       setSendBehaviorMenuOpen(false);
       sendBehaviorMenuCloseTimerRef.current = null;
     }, 160);
+  }
+
+  // hover 打开不会移动焦点，焦点仍可能留在输入框：补上全局「点击外部关闭」
+  // 和 Escape，否则菜单只能靠鼠标移出时的 160ms 延迟关闭。
+  useEffect(() => {
+    if (!sendBehaviorMenuOpen) return;
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      if (sendBehaviorMenuWrapRef.current?.contains(event.target as Node)) return;
+      setSendBehaviorMenuOpen(false);
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // 捕获阶段拦下，避免同时触发输入框的 Esc（历史导航/关闭建议）分支。
+      event.preventDefault();
+      event.stopPropagation();
+      // 先还焦再关闭：chevron 的 onFocus 会重新打开菜单，同批次内以关闭收尾。
+      sendBehaviorChevronRef.current?.focus();
+      setSendBehaviorMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [sendBehaviorMenuOpen]);
+
+  /** 菜单内上下键循环移动焦点；菜单项本身不参与 Tab 序列。 */
+  function handleSendBehaviorMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    );
+    if (items.length === 0) return;
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const delta = event.key === "ArrowDown" ? 1 : -1;
+    // 焦点还在 chevron（index -1）时：ArrowDown 进首项，ArrowUp 进末项。
+    const nextIndex =
+      current < 0
+        ? delta > 0
+          ? 0
+          : items.length - 1
+        : (current + delta + items.length) % items.length;
+    items[nextIndex]?.focus();
   }
 
   async function sendPrompt(override?: {
@@ -5102,7 +5087,6 @@ export function App() {
       message: livePrompt,
       imageCount: attachedImagesSnapshot.length,
       emptyTemplateName,
-      isBusy: isAgentBusy,
     });
     if (decision.action === "ignore") return;
     const agentId = targetAgentId as string; // ignore 已排除无 target，后续分支必有值
@@ -5154,8 +5138,7 @@ export function App() {
     // 发送前先保留快照,再立即清空 composer;运行中发送会走官方 steer 队列,
     // 由 pi runtime 保证在当前工具调用结束后、下一次 LLM 调用前注入。
     // 不论之前是否滚动回看，发新消息都强制自动滚到底，确保能看到 agent 的回答。
-    setAutoScroll(true);
-    autoScrollRef.current = true;
+    conversationRef.current?.resetAndScrollToBottom();
     // Viewer 首条是独立快照，不消费恢复期间新写入真实 Agent 的第二条草稿。
     if (!override) {
       setLivePrompt(agentId, "");
@@ -5172,31 +5155,8 @@ export function App() {
     // 让输入框保持固定大小，超出部分滚动显示
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
 
-    const queuedPromptSnapshot: QueuedPrompt = {
-      id: crypto.randomUUID(),
-      message: expandedMessage,
-      displayText: message,
-      images,
-      behavior: "steer",
-      agentMode,
-      templateDescription,
-      timestamp: Date.now(),
-
-    };
-    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
-    if (decision.action === "enqueue") {
-      if (!enqueueQueuedPrompt(agentId, queuedPromptSnapshot)) {
-        setLivePrompt(agentId, (current) =>
-          [message, current].filter((text) => text.trim()).join("\n\n"),
-        );
-        if (images) {
-          setAttachedImagesForAgent(agentId, (current) => [...images, ...current]);
-        }
-        showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
-      }
-      return;
-    }
-
+    // 忙时由 omp 官方 steer 队列接管（runtime 保证工具结束后、下次 LLM 调用前注入），
+    // renderer 不再自建待发队列；队列快照经 runtimeState.queuedMessages 回显。
     const accepted = await submitPromptSnapshot(
       agentId,
       expandedMessage,
@@ -5206,10 +5166,8 @@ export function App() {
       templateDescription,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(agentId, {
-        ...queuedPromptSnapshot,
-        behavior: "direct",
-      });
+      // 写 stdin 后超时/断开：omp 可能已收下，重试会重复执行，只能挂一条本地未知提示。
+      addUncertainPrompt(agentId, message);
       return;
     }
     if (!accepted) {
@@ -5223,13 +5181,9 @@ export function App() {
       return;
     }
     // 此时用户消息已经渲染到 DOM（状态在 await 前已提交），直接滚到底部确保用户看不到消息开头。
-    // 后续流式渲染靠 ResizeObserver（已有 useEffect）自动追踪容器高度变化持续滚动。
+    // 后续流式渲染靠 ConversationPane 的 ResizeObserver 自动追踪容器高度变化持续滚动。
     requestAnimationFrame(() => {
-      const el = timelineRef.current;
-      if (el && autoScrollRef.current) {
-        programmaticScrollRef.current = true;
-        el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
-      }
+      conversationRef.current?.scrollToBottomIfFollowing();
     });
   }
 
@@ -5244,7 +5198,6 @@ export function App() {
       hasTarget: Boolean(targetAgentId),
       message: livePrompt,
       imageCount: attachedImages.length,
-      isBusy: isAgentBusy,
       commandRoutes: false,
     });
     if (followUpDecision.action === "ignore") return;
@@ -5253,11 +5206,7 @@ export function App() {
     // 在任何 await 之前清掉实时草稿，防止双击/Enter 连发读取同一份消息。
     stageLivePrompt(followUpAgentId);
     const images = attachedImages.length > 0 ? attachedImages : undefined;
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    programmaticScrollRef.current = true;
-    const scrollTimeline = timelineRef.current;
-    if (scrollTimeline) scrollTimeline.scrollTo({ top: scrollTimeline.scrollHeight, behavior: "instant" });
+    conversationRef.current?.resetAndScrollToBottom();
     setPrompt("");
     setAttachedImages([]);
     // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
@@ -5281,30 +5230,6 @@ export function App() {
     setSendBehaviorMenuOpen(false);
     setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
 
-
-    const queuedPromptSnapshot: QueuedPrompt = {
-      id: crypto.randomUUID(),
-      message,
-      displayText: message,
-      images,
-      behavior: "followUp",
-      agentMode: currentComposerAgentMode,
-      timestamp: Date.now(),
-    };
-    // 忙闲分流走判定结果（decision 已含 isBusy）：忙则入队，满员回填输入框并 toast。
-    if (followUpDecision.action === "enqueue") {
-      if (!enqueueQueuedPrompt(followUpAgentId, queuedPromptSnapshot)) {
-        setLivePrompt(followUpAgentId, (current) =>
-          [message, current].filter((text) => text.trim()).join("\n\n"),
-        );
-        if (images) {
-          setAttachedImagesForAgent(followUpAgentId, (current) => [...images, ...current]);
-        }
-        showToast(t("app.queuedFull", { count: QUEUED_PROMPT_LIMIT }), 3000);
-      }
-      return;
-    }
-
     const accepted = await submitPromptSnapshot(
       followUpAgentId,
       message,
@@ -5313,7 +5238,7 @@ export function App() {
       currentComposerAgentMode,
     );
     if (accepted === "unknown") {
-      appendUnknownQueuedPrompt(followUpAgentId, queuedPromptSnapshot);
+      addUncertainPrompt(followUpAgentId, message);
       return;
     }
     if (!accepted) {
@@ -5326,22 +5251,10 @@ export function App() {
       }
       return;
     }
-    // 用 MutationObserver 监听消息列表 DOM 变化
-
-    const scrollOnNewMessage = () => {
-      const timeline = timelineRef.current;
-      if (!timeline) return;
-      const list = timeline.querySelector(".message-list");
-      if (!list) return;
-      const observer = new MutationObserver(() => {
-        if (!autoScrollRef.current) return;
-        programmaticScrollRef.current = true;
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      });
-      observer.observe(list, { childList: true, subtree: false });
-      setTimeout(() => observer.disconnect(), 8000);
-    };
-    requestAnimationFrame(scrollOnNewMessage);
+    // 用户消息提交后若仍贴底则跟随；后续增长交给 pane 的 ResizeObserver。
+    requestAnimationFrame(() => {
+      conversationRef.current?.scrollToBottomIfFollowing();
+    });
   }
 
   // 已删除内置 /goal 与 startNewGoal 实现。
@@ -5389,8 +5302,8 @@ export function App() {
     /** prompt 模板匹配到的 description，作为元数据发给 pi agent 标识意图 */
     templateDescription?: string,
   ) {
-    // 非队列入口继续保持原有行为：当前选中 agent 忙碌时默认 steer。
-    // 客户端队列 drain 直接调用 dispatchPromptSnapshot，并显式指定其投递语义。
+    // 运行中发送默认 steer：omp 在工具结束后、下次 LLM 调用前注入；
+    // follow-up 入口显式传 "followUp" 走排队语义。
     const behavior =
       streamingBehavior ??
       (agentId === activeAgentId && isAgentBusy ? "steer" : undefined);
@@ -6307,6 +6220,109 @@ export function App() {
     setDrawerCollapsed(false);
   };
 
+  /** 侧栏官网入口：走内置浏览器面板，不再把用户甩到系统默认浏览器 */
+  const handleOpenHomepageInBrowser = () => {
+    navigateTo(BROWSER_HOME_URL);
+    lastToolDrawerRef.current = "browser";
+    setDrawer("browser");
+    setDrawerCollapsed(false);
+  };
+
+  // SidebarTree 是 memo 边界，但这些处理函数每次 App 渲染都会重新声明；
+  // 直接把函数传进去会让浅比较恒失败，流式/输入等无关更新都会重算整棵侧栏。
+  // 通过 ref 转发到最新实现，保持传入引用的恒定（与 GitPanel 的 stable* 同策略）。
+  const latestSidebarHandlersRef = useRef({
+    addProject,
+    toggleListCollapsed,
+    setProjectSidebarExpanded,
+    handleProjectDragStart,
+    handleProjectDragOver,
+    handleProjectDragLeave,
+    handleProjectDrop,
+    finishProjectDrag,
+    refreshProjectSessions,
+    ensureAgentMessagesLoaded,
+    openSidebarSession,
+    createAgent,
+    showToast,
+    requestRemoveWorktree,
+    toggleSubagentGroup,
+    adjustMenuPos,
+    openHomepageInBrowser: handleOpenHomepageInBrowser,
+  });
+  latestSidebarHandlersRef.current = {
+    addProject,
+    toggleListCollapsed,
+    setProjectSidebarExpanded,
+    handleProjectDragStart,
+    handleProjectDragOver,
+    handleProjectDragLeave,
+    handleProjectDrop,
+    finishProjectDrag,
+    refreshProjectSessions,
+    ensureAgentMessagesLoaded,
+    openSidebarSession,
+    createAgent,
+    showToast,
+    requestRemoveWorktree,
+    toggleSubagentGroup,
+    adjustMenuPos,
+    openHomepageInBrowser: handleOpenHomepageInBrowser,
+  };
+  const stableSidebarHandlers = useMemo(
+    () => ({
+      addProject: () => latestSidebarHandlersRef.current.addProject(),
+      toggleListCollapsed: () => latestSidebarHandlersRef.current.toggleListCollapsed(),
+      setProjectSidebarExpanded: (projectId: string, forceExpand?: boolean) =>
+        latestSidebarHandlersRef.current.setProjectSidebarExpanded(projectId, forceExpand),
+      handleProjectDragStart: (
+        event: React.DragEvent<HTMLButtonElement>,
+        projectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDragStart(event, projectId),
+      handleProjectDragOver: (
+        event: React.DragEvent<HTMLButtonElement>,
+        projectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDragOver(event, projectId),
+      handleProjectDragLeave: (projectId: string) =>
+        latestSidebarHandlersRef.current.handleProjectDragLeave(projectId),
+      handleProjectDrop: (
+        event: React.DragEvent<HTMLButtonElement>,
+        targetProjectId: string,
+      ) => latestSidebarHandlersRef.current.handleProjectDrop(event, targetProjectId),
+      finishProjectDrag: () => latestSidebarHandlersRef.current.finishProjectDrag(),
+      refreshProjectSessions: (projectId: string, silent?: boolean) =>
+        latestSidebarHandlersRef.current.refreshProjectSessions(projectId, silent),
+      ensureAgentMessagesLoaded: (agentId: string) =>
+        latestSidebarHandlersRef.current.ensureAgentMessagesLoaded(agentId),
+      openSidebarSession: (projectId: string, session: SessionSummary) =>
+        latestSidebarHandlersRef.current.openSidebarSession(projectId, session),
+      createAgent: (
+        projectId?: string,
+        sessionPath?: string,
+        title?: string,
+        noSession?: boolean,
+      ) => latestSidebarHandlersRef.current.createAgent(projectId, sessionPath, title, noSession),
+      showToast: (message: string, duration?: number) =>
+        latestSidebarHandlersRef.current.showToast(message, duration),
+      requestRemoveWorktree: (
+        parentProjectId: string,
+        worktreePath: string,
+        childProject: Project | undefined,
+      ) =>
+        latestSidebarHandlersRef.current.requestRemoveWorktree(
+          parentProjectId,
+          worktreePath,
+          childProject,
+        ),
+      toggleSubagentGroup: (key: string) =>
+        latestSidebarHandlersRef.current.toggleSubagentGroup(key),
+      adjustMenuPos: (x: number, y: number, width?: number, height?: number) =>
+        latestSidebarHandlersRef.current.adjustMenuPos(x, y, width, height),
+      openHomepageInBrowser: () => latestSidebarHandlersRef.current.openHomepageInBrowser(),
+    }),
+    [],
+  );
+
   return (
     <div
       className={[
@@ -6421,14 +6437,7 @@ export function App() {
         projectDragPreventClickRef={projectDragPreventClickRef}
         api={api}
         setSearch={setSearch}
-        addProject={addProject}
-        toggleListCollapsed={toggleListCollapsed}
-        setProjectSidebarExpanded={setProjectSidebarExpanded}
-        handleProjectDragStart={handleProjectDragStart}
-        handleProjectDragOver={handleProjectDragOver}
-        handleProjectDragLeave={handleProjectDragLeave}
-        handleProjectDrop={handleProjectDrop}
-        finishProjectDrag={finishProjectDrag}
+        {...stableSidebarHandlers}
         setProjectMenu={setProjectMenu}
         setSessionMenu={setSessionMenu}
         setAgentMenu={setAgentMenu}
@@ -6441,16 +6450,7 @@ export function App() {
         setActiveAgentId={setActiveAgentId}
         setSettingsOpen={setSettingsOpen}
         setConfigOpen={setConfigOpen}
-        setFeedbackOpen={setFeedbackOpen}
         setAfkOpen={setAfkOpen}
-        refreshProjectSessions={refreshProjectSessions}
-        ensureAgentMessagesLoaded={ensureAgentMessagesLoaded}
-        openSidebarSession={openSidebarSession}
-        createAgent={createAgent}
-        showToast={showToast}
-        requestRemoveWorktree={requestRemoveWorktree}
-        toggleSubagentGroup={toggleSubagentGroup}
-        adjustMenuPos={adjustMenuPos}
       />
 
       <div
@@ -6557,15 +6557,8 @@ export function App() {
                           disabled={
                             isAgentStarting(activeAgent) ||
                             restartingAgentId === activeAgentId ||
-                            Boolean(
-                              activeAgentId &&
-                              (queueFlushByAgentRef.current.has(activeAgentId) ||
-                                (queuedPrompts[activeAgentId] ?? []).some(
-                                  (queuedPrompt) =>
-                                    queuedPrompt.status === "sending" ||
-                                    queuedPrompt.status === "unknown",
-                                )),
-                            )
+                            // 重启会丢掉 omp 内存里的待投递队列：先把 chip 撤回或等它投递完。
+                            activeQueueRows.length > 0
                           }
                           onClick={async () => {
                             if (!activeAgentId || !activeAgent) return;
@@ -6644,76 +6637,42 @@ export function App() {
           </div>
         </header>
 
-        <section className="message-timeline" ref={timelineRef}>
-          {/* 加载更多历史消息按钮：计数取"窗口上方未渲染的条数"，滑窗后仍准确。 */}
-          {hasMoreMessages && activeAgent && activeAgent.status !== "starting" && (
-            <div className="timeline-load-more">
-              <Button
-                buttonSize="sm"
-                variant="secondary"
-                onClick={handleLoadMoreMessages}
-                loading={isLoadingMoreMessages}
-              >
-                {t("app.loadMoreHistory", { count: messagesAboveWindow })}
-              </Button>
-            </div>
-          )}
+        {/* 时间线订阅/分页/滚动跟随都在 ConversationPane 内：根不再订阅 transcript，
+            流式 50ms 增量不会唤醒 9k 行的 App。 */}
+        <ConversationPane
+          ref={conversationRef}
+          activeAgentId={activeAgentId}
+          activeAgent={activeAgent}
+          activeProjectId={activeProjectId}
+          runtimeState={activeRuntimeState}
+          isAgentBusy={isAgentBusy}
+          cancellingUi={cancellingUi}
+          activeUiAskRequestId={activeUiAsk?.requestId}
+          showThinking={settings.showThinking}
+          forkingMessageId={forkingMessageId}
+          validCommandNames={validCommandNames}
+          validFilePaths={validFilePaths}
+          hasProject={Boolean(activeProjectId)}
+          terminalRowHeight={terminalRowHeight}
+          composerOffsetHeight={composerOffsetHeight}
+          olderHistoryMessages={olderHistoryForActive}
+          hasOlderHistory={hasOlderHistory}
+          loadingOlderHistory={olderHistoryLoading}
+          onLoadOlderHistory={loadOlderHistory}
+          onCreateAgent={() => {
+            void createAgent();
+          }}
+          onPreviewImage={setPreviewImage}
+          onOpenFile={stableOpenFilePath}
+          onDiffFile={stableDiffFilePath}
+          onEditMessage={editMessage}
+          onDeleteMessage={deleteMessage}
+          onForkMessage={forkFromUserMessage}
+          onOpenExternal={handleOpenExternal}
+          onRespondAsk={handleRespondAsk}
+        />
 
-          {/* Agent 启动时显示骨架屏；消息尚未到达时继续展示，避免闪空
-               Agent 状态已是 idle 时不再显示，即使消息还未到达，
-               避免 "正在启动 Agent" 在启动完成后仍卡住。 */}
-          {(isAgentStarting(activeAgent) || (!isAgentIdle(activeAgent) && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id))) ? (
-            <div className="history-loading">
-              <div className="history-loading-placeholder">
-                <div className="skeleton-bubble" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <div className="history-loading-placeholder">
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <div className="history-loading-placeholder">
-                <div className="skeleton-line" />
-                <div className="skeleton-line" />
-              </div>
-              <span style={{ paddingTop: "16px", alignSelf: "center", fontSize: "var(--font-size-small)" }}>{t("app.agentStarting")}</span>
-            </div>
-          ) : null}
-          {!activeAgent && (
-            <EmptyState
-              hasProject={Boolean(activeProjectId)}
-              onCreate={() => createAgent()}
-            />
-          )}
-          {(activeAgent && activeAgent.status !== "starting" && activeMessages.length > 0) ? (
-            <MessageListContent
-              renderedRuns={renderedRuns}
-              streamState={streamState}
-              activeAgentId={activeAgentId}
-              forkingMessageId={forkingMessageId}
-              validCommandNames={validCommandNames}
-              validFilePaths={validFilePaths}
-              onPreviewImage={setPreviewImage}
-              onOpenFile={stableOpenFilePath}
-              onDiffFile={stableDiffFilePath}
-              onEditMessage={editMessage}
-              onDeleteMessage={deleteMessage}
-              onForkMessage={forkFromUserMessage}
-              onEnterMultiSelect={handleEnterMultiSelect}
-              onOpenExternal={handleOpenExternal}
-              onRespondAsk={handleRespondAsk}
-            />
-          ) : null}
-
-          {/* 多选分享弹框：会话树 */}
-          {multiSelectOpen && (
-            <MultiSelectModal renderedRuns={renderedRuns} onClose={() => setMultiSelectOpen(false)} onCopy={handleMultiSelectCopy} />
-          )}
-
-          {sessionRefPickerOpen && sessionRefPickerTarget && (
+        {sessionRefPickerOpen && sessionRefPickerTarget && (
             <SessionReferenceModal
               session={sessionRefPickerTarget}
               initialSelected={
@@ -6736,34 +6695,6 @@ export function App() {
               loadMessages={async (fp: string) => api.sessions.readMessages(fp)}
             />
           )}
-
-        </section>
-
-          {/* 回看历史时窗口冻结，较新的消息没有渲染进 DOM（否则每条流式增量都会顶走阅读位置）：
-              用「还有 N 条新消息」入口替代单纯的回到最新箭头，位置与箭头一致（悬浮在输入框上方，
-              不随滚动内容飘走），让用户知道下方仍在新消息并一键回到最新。 */}
-          {messagesBelowWindow > 0 ? (
-            <div
-              className="timeline-newer-strip"
-              // 与 scroll-to-bottom-btn 同一锚点：由 composer 实际高度 + 终端高度决定 bottom。
-              style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
-            >
-              <Button buttonSize="sm" variant="secondary" onClick={scrollToBottom} title={t("app.jumpToNewest")}>
-                <ChevronDown size={14} aria-hidden="true" />
-                {t("app.newerMessagesHint", { count: messagesBelowWindow })}
-              </Button>
-            </div>
-          ) : showScrollToBottom ? (
-            <button
-              className="scroll-to-bottom-btn"
-              // 按钮脱离滚动容器后，由 composer 实际高度 + 终端高度决定 bottom，避免输入框增高或终端打开时遮挡。
-              style={{ bottom: Math.max(24, terminalRowHeight + composerOffsetHeight + 18) }}
-              onClick={scrollToBottom}
-              title={t("app.scrollToBottom")}
-            >
-              <ChevronDown size={18} />
-            </button>
-          ) : null}
 
         {activeAgent && (
         <footer ref={composerRef} className="composer">
@@ -6864,6 +6795,149 @@ export function App() {
               </div>
             );
           })()}
+          {/* omp 会话 todo 的权威快照（get_state.todoPhases）；与扩展 widget 独立，
+              避免用户扩展产出的 TODO 卡片和模型真实 todo 被混成一份。
+              dock：TODO / 子代理 / 待发送共享一行 chip，手风琴展开一块——三块各自撑高
+              最坏叠加 ~700px 会把时间线压没，统一收口后时间线始终保有最小高度。 */}
+          {activeAgentId && (
+            <ComposerDock
+              maxBodyHeight={dockMaxHeight}
+              containerRef={dockRef}
+            >
+              <DockSection
+                id="todo"
+                icon={<ListTodo size={13} strokeWidth={1.8} />}
+                label={t("app.widgetTodo")}
+                meta={
+                  todoTotal > 0
+                    ? todoSettled
+                      ? `${t("app.todoChipLastRound")} ${todoDone}/${todoTotal}`
+                      : `${todoDone}/${todoTotal}`
+                    : undefined
+                }
+                hidden={todoTotal === 0}
+              >
+                <NativeTodoPanel
+                  phases={todoPhases}
+                  busy={todoBusy}
+                  disabled={
+                    isAgentBusy ||
+                    agentStarting ||
+                    Boolean(activeRuntimeState?.isCompacting)
+                  }
+                  onSetTodos={(phases) => void updateTodos(phases)}
+                />
+              </DockSection>
+              <SubagentDockSection
+                key={activeAgentId}
+                agentId={activeAgentId}
+                agents={api.agents}
+              />
+              <DockSection
+                id="queue"
+                icon={<SendHorizontal size={13} strokeWidth={1.8} />}
+                label={t("app.queuedMessagesLabel")}
+                meta={String(activeQueueRows.length)}
+                tone={activeQueueRows.some((row) => row.kind === "uncertain") ? "danger" : "neutral"}
+                hidden={activeQueueRows.length === 0}
+              >
+                <div className="queued-list">
+                  {activeQueueRows.map((row, index) => {
+                    if (row.kind === "uncertain") {
+                      // 未知投递：不在 omp 队列里，没有可撤回的副本，只允许关闭提示。
+                      return (
+                        <div
+                          key={row.key}
+                          className="queued-row unknown"
+                          title={[row.text, row.error].filter(Boolean).join("\n")}
+                        >
+                          <span className="queued-index" aria-hidden="true">
+                            {index + 1}
+                          </span>
+                          <span className="queued-text">
+                            {row.text.trim() || t("app.queuedImageMessage")}
+                          </span>
+                          <span className="queued-meta unknown">
+                            {t("app.queuedUnknownShort")}
+                          </span>
+                          <div className="queued-actions">
+                            <button
+                              type="button"
+                              className="queued-icon-btn danger"
+                              title={t("app.queuedDismiss")}
+                              aria-label={t("app.queuedDismiss")}
+                              onClick={() =>
+                                dismissUncertainPrompt(activeAgentId, row.id)
+                              }
+                            >
+                              <X size={13} strokeWidth={2} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    const isFollowUp = row.queue === "followUp";
+                    return (
+                      <div
+                        key={row.key}
+                        className={`queued-row queued-behavior-${isFollowUp ? "followUp" : "steer"}`}
+                        title={row.text}
+                      >
+                        <span className="queued-index" aria-hidden="true">
+                          {index + 1}
+                        </span>
+                        <span className="queued-text">
+                          {row.text.trim() || t("app.queuedImageMessage")}
+                        </span>
+                        <span className="queued-meta">
+                          {isFollowUp
+                            ? t("app.queuedFollowUp")
+                            : t("app.queuedSteer")}
+                        </span>
+                        <div className="queued-actions">
+                          <button
+                            type="button"
+                            className="queued-icon-btn"
+                            title={t("app.retractToInput")}
+                            aria-label={t("app.retractToInput")}
+                            onClick={() =>
+                              void removeServerQueuedPrompt(activeAgentId, row, true)
+                            }
+                          >
+                            <Pencil size={13} strokeWidth={2} />
+                          </button>
+                          <button
+                            type="button"
+                            className="queued-icon-btn danger"
+                            title={t("app.retractDiscard")}
+                            aria-label={t("app.retractDiscard")}
+                            onClick={() =>
+                              void removeServerQueuedPrompt(activeAgentId, row, false)
+                            }
+                          >
+                            <X size={13} strokeWidth={2} />
+                          </button>
+                          {isFollowUp ? (
+                            <button
+                              type="button"
+                              className="queued-icon-btn"
+                              title={t("app.promoteQueued")}
+                              aria-label={t("app.promoteQueued")}
+                              onClick={() =>
+                                void promoteServerQueuedPrompt(activeAgentId, row.text)
+                              }
+                            >
+                              <ArrowUp size={13} strokeWidth={2} />
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </DockSection>
+            </ComposerDock>
+          )}
           {/* 图片预览作为输入框上方的附件栏,避免占用 textarea 的可输入区域。 */}
           {attachedImages.length > 0 && (
             <div className="image-preview-area">
@@ -6893,106 +6967,41 @@ export function App() {
               </button>
             </div>
           )}
-          {activeQueuedPrompts.length > 0 && activeAgentId && (
-            <div
-              ref={queuedTrackRef}
-              className="queued-track"
-              aria-label={t("app.queuedMessagesLabel")}
-            >
-              <div className="queued-panel">
-                <div className="queued-panel-header">
-                  <span>{t("app.queuedMessagesLabel")}</span>
-                  <span className="queued-panel-count">
-                    {activeQueuedPrompts.length}
-                  </span>
-                </div>
-                <div className="queued-list">
-                  {visibleQueuedPrompts.map((queuedPrompt, index) => {
-                    const status = queuedPrompt.status ?? "pending";
-                    const canRetractToInput = canRetractQueuedPromptToInput(status);
-                    const canDiscard = canDiscardQueuedPrompt(status);
-                    const previewText =
-                      queuedPrompt.displayText.trim() ||
-                      t("app.queuedImageMessage");
-                    const rowTitle = [
-                      previewText,
-                      queuedPrompt.error,
-                      status === "unknown" ? t("app.queuedUnknown") : "",
-                    ]
-                      .filter(Boolean)
-                      .join("\n");
-                    return (
-                      <div
-                        key={queuedPrompt.id}
-                        className={`queued-row ${status} queued-behavior-${queuedPrompt.behavior}`}
-                        title={rowTitle}
-                      >
-                        <span className="queued-index" aria-hidden="true">
-                          {index + 1}
-                        </span>
-                        <span className="queued-text">{previewText}</span>
-                        {queuedPrompt.images?.length ? (
-                          <span className="queued-meta">
-                            {t("app.queuedImageCount", {
-                              count: String(queuedPrompt.images.length),
-                            })}
-                          </span>
-                        ) : null}
-                        {status === "sending" ? (
-                          <span className="queued-meta">
-                            {t("app.queuedSending")}
-                          </span>
-                        ) : status === "failed" ? (
-                          <span className="queued-meta failed">
-                            {t("app.queuedFailed")}
-                          </span>
-                        ) : status === "unknown" ? (
-                          <span className="queued-meta unknown">
-                            {t("app.queuedUnknownShort")}
-                          </span>
-                        ) : null}
-                        <div className="queued-actions">
-                          <button
-                            type="button"
-                            className="queued-icon-btn"
-                            disabled={!canRetractToInput}
-                            title={t("app.retractToInput")}
-                            aria-label={t("app.retractToInput")}
-                            onClick={() =>
-                              retractQueuedPromptForEdit(
-                                activeAgentId,
-                                queuedPrompt,
-                              )
-                            }
-                          >
-                            <Pencil size={13} strokeWidth={2} />
-                          </button>
-                          <button
-                            type="button"
-                            className="queued-icon-btn danger"
-                            disabled={!canDiscard}
-                            title={t("app.retractDiscard")}
-                            aria-label={t("app.retractDiscard")}
-                            onClick={() =>
-                              discardQueuedPrompt(
-                                activeAgentId,
-                                queuedPrompt.id,
-                              )
-                            }
-                          >
-                            <X size={13} strokeWidth={2} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
+          {/* omp 原生 ask：结构化问题 + answers 数组，工作区常驻内联条 */}
+          {showAskDialog && activeUiAsk && activeUiAsk.method === "ask" && (
+            <NativeAskInlineBar
+              key={activeUiAsk.requestId}
+              questions={activeUiAsk.askQuestions ?? []}
+              timeout={activeUiAsk.timeout}
+              onCancel={() => {
+                if (!activeUiAsk.requestId || !activeAgentId) return;
+                showToast(t("ask.cancelBatchHint"));
+                setActiveUiRequest((current) => {
+                  if (!current) return null;
+                  const next = { ...current };
+                  delete next[activeUiAsk.requestId];
+                  if (Object.keys(next).length === 0) return null;
+                  return next;
+                });
+                api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
+              }}
+              onSubmit={(answers) => {
+                if (!activeUiAsk.requestId || !activeAgentId) return;
+                setActiveUiRequest((current) => {
+                  if (!current) return null;
+                  const next = { ...current };
+                  delete next[activeUiAsk.requestId];
+                  if (Object.keys(next).length === 0) return null;
+                  return next;
+                });
+                api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { answers });
+              }}
+            />
           )}
           {/* 批量 ask（batch_ask）：Tab 标签页问卷 */}
           {showAskDialog && activeUiAsk && activeUiAsk.method === "batch_ask" && (
             <BatchAskInlineBar
+              key={activeUiAsk.requestId}
               uiRequest={activeUiAsk}
               activeAgentId={activeAgentId}
               onCancel={() => {
@@ -7024,7 +7033,7 @@ export function App() {
             />
           )}
           {/* 传统单问（select/confirm/input/editor） */}
-          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && (() => {
+          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && activeUiAsk.method !== "ask" && (() => {
             // Plan 结束后的「下一步」选单：关闭=退出计划模式，绝不是「默认第一项」。
             // 扩展用标题前缀 [PI_DECK_PLAN_NEXT] 标记；选项用「标题|说明」编码，桌面端拆主副文案。
             const PLAN_NEXT_MARKER = "[PI_DECK_PLAN_NEXT]";
@@ -7534,8 +7543,10 @@ export function App() {
                   isAgentBusy={isAgentBusy}
                   isAgentStarting={agentStarting}
                   compacting={compacting}
+                  serviceTierBusy={serviceTierBusy}
                   onOpenModelPicker={openModelPicker}
-                  onOpenThinkingPicker={() => setThinkingPickerOpen(true)}
+                  onOpenThinkingPicker={() => void openThinkingPicker()}
+                  onToggleServiceTier={toggleServiceTier}
                   onCompact={() => void compactAgent()}
                 />
               </div>
@@ -7555,7 +7566,16 @@ export function App() {
                 )}
                 {/* 队列/发送按钮：有内容时才显示行为选择器（靠左） */}
                 {showBusySendControls && hasComposerContent && (
-                  <div style={{ position: "relative" }}>
+                  <div
+                    className="send-behavior-menu-wrap"
+                    ref={sendBehaviorMenuWrapRef}
+                    onKeyDown={handleSendBehaviorMenuKeyDown}
+                    onBlur={(event) => {
+                      if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                      setSendBehaviorMenuOpen(false);
+                    }}
+                    onMouseLeave={scheduleSendBehaviorMenuClose}
+                  >
                     <div className="send-behavior-toggle">
                       <button
                         type="button"
@@ -7569,6 +7589,7 @@ export function App() {
                       <button
                         type="button"
                         className="send-behavior-chevron"
+                        ref={sendBehaviorChevronRef}
                         title={t("app.sendBehaviorTitle")}
                         aria-label={t("app.sendBehaviorTitle")}
                         aria-haspopup="menu"
@@ -7580,19 +7601,57 @@ export function App() {
                         <ChevronDown size={12} strokeWidth={2.2} />
                       </button>
                     </div>
-                    {/* 行为选择下拉菜单 */}
+                    {/* 行为选择下拉菜单：标题 + 生效时机 + 快捷键，避免只有一行文案难以区分语义 */}
                     {sendBehaviorMenuOpen && (
-                      <div className="send-behavior-menu" role="menu"
+                      <div
+                        className="send-behavior-menu"
+                        role="menu"
+                        aria-label={t("app.sendBehaviorTitle")}
                         onMouseEnter={keepSendBehaviorMenuOpen}
                         onMouseLeave={scheduleSendBehaviorMenuClose}
                       >
-                        <button className="send-behavior-option steer" type="button" role="menuitem" onClick={() => void sendPrompt()}>
+                        <button
+                          className="send-behavior-option steer"
+                          type="button"
+                          role="menuitem"
+                          tabIndex={-1}
+                          aria-keyshortcuts={sendShortcutKeys.join("+")}
+                          onClick={() => {
+                            setSendBehaviorMenuOpen(false);
+                            void sendPrompt();
+                          }}
+                        >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
-                          <span>{t("app.sendSteerTitle")}</span>
+                          <span className="send-behavior-option-text">
+                            <span className="send-behavior-option-title">{t("app.sendSteerTitle")}</span>
+                            <span className="send-behavior-option-desc">{t("app.sendSteerDesc")}</span>
+                          </span>
+                          <span className="send-behavior-option-keys" aria-hidden="true">
+                            {sendShortcutKeys.map((key) => (
+                              <kbd key={key}>{key}</kbd>
+                            ))}
+                          </span>
                         </button>
-                        <button className="send-behavior-option follow-up" type="button" role="menuitem" onClick={sendPromptAsFollowUp}>
+                        <button
+                          className="send-behavior-option follow-up"
+                          type="button"
+                          role="menuitem"
+                          tabIndex={-1}
+                          aria-keyshortcuts="ArrowDown+Enter"
+                          onClick={() => {
+                            setSendBehaviorMenuOpen(false);
+                            void sendPromptAsFollowUp();
+                          }}
+                        >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
-                          <span>{t("app.sendFollowUpTitle")}</span>
+                          <span className="send-behavior-option-text">
+                            <span className="send-behavior-option-title">{t("app.sendFollowUpTitle")}</span>
+                            <span className="send-behavior-option-desc">{t("app.sendFollowUpDesc")}</span>
+                          </span>
+                          <span className="send-behavior-option-keys" aria-hidden="true">
+                            <kbd>↓</kbd>
+                            <kbd>Enter</kbd>
+                          </span>
                         </button>
                       </div>
                     )}
@@ -7663,8 +7722,7 @@ export function App() {
                   chatHeaderHeight -
                   COMPOSER_MIN_TIMELINE_HEIGHT -
                   COMPOSER_MIN_HEIGHT -
-                  28 -
-                  queuedChromeBudget,
+                  28,
               );
               updateTerminalHeight(Math.min(height, maxHeight));
             }}
@@ -7674,43 +7732,48 @@ export function App() {
         )}
       </main>
 
-        <ConversationOutline
-            items={outlineItems}
-            onJump={handleOutlineJump}
-            extraAction={{
-              active: scratchPad.isOpen,
-              label: t("scratchPad.openTooltip"),
-              onClick: () => scratchPad.toggle(),
-              icon: <Pencil size={17} />,
-            }}
-            terminalAction={activeTerminalOwnerKey ? {
-              active: terminalOpen,
-              label: t("app.terminal"),
-              onClick: () => {
-                setTerminalOpenForOwner(!terminalOpen);
-              },
-              icon: <Terminal size={17} />,
-            } : undefined}
-            editorsAction={{
-              active: editorsOpen,
-              label: t("app.openWithEditor"),
-              onClick: (e) => {
-                const projectPath =
-                  activeAgent?.cwd ||
-                  (activeProject && !isChatProject(activeProject)
-                    ? activeProject.path
-                    : null);
-                setEditorsTargetPath(projectPath);
-                setEditorsOpen((open) => !open);
-                const btn = (e?.currentTarget as HTMLElement)?.closest("button");
-                if (btn) {
-                  const rect = btn.getBoundingClientRect();
-                  setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
-                }
-              },
-              icon: <Code size={17} />,
-            }}
-          />
+        {/* 大纲自己订阅 transcript：消息增量不会经 App 根重算 buildOutline。 */}
+        <ConversationOutlineHost activeAgentId={activeAgentId}>
+          {(outlineItems) => (
+            <ConversationOutline
+              items={outlineItems}
+              onJump={(id) => conversationRef.current?.jumpToMessage(id)}
+              extraAction={{
+                active: scratchPad.isOpen,
+                label: t("scratchPad.openTooltip"),
+                onClick: () => scratchPad.toggle(),
+                icon: <Pencil size={17} />,
+              }}
+              terminalAction={activeTerminalOwnerKey ? {
+                active: terminalOpen,
+                label: t("app.terminal"),
+                onClick: () => {
+                  setTerminalOpenForOwner(!terminalOpen);
+                },
+                icon: <Terminal size={17} />,
+              } : undefined}
+              editorsAction={{
+                active: editorsOpen,
+                label: t("app.openWithEditor"),
+                onClick: (e) => {
+                  const projectPath =
+                    activeAgent?.cwd ||
+                    (activeProject && !isChatProject(activeProject)
+                      ? activeProject.path
+                      : null);
+                  setEditorsTargetPath(projectPath);
+                  setEditorsOpen((open) => !open);
+                  const btn = (e?.currentTarget as HTMLElement)?.closest("button");
+                  if (btn) {
+                    const rect = btn.getBoundingClientRect();
+                    setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
+                  }
+                },
+                icon: <Code size={17} />,
+              }}
+            />
+          )}
+        </ConversationOutlineHost>
 
       {/* 右侧分隔条常驻 grid 列 4，宽度由 --drawer-splitter-w 驱动（0/6px）；
           关闭/折叠时宽度 0 且 pointer-events:none，避免遮挡会话区。 */}
@@ -7788,11 +7851,13 @@ export function App() {
 
             {drawerContentPanel === "browser" && (
               <div className="drawer-content-frame">
-                <BrowserPanel
-                  hideChromeClose
-                  onClose={() => setDrawer(null)}
-                  onToggleFullscreen={() => setBrowserFullscreen(true)}
-                />
+                <Suspense fallback={LazyPanelFallback}>
+                  <BrowserPanel
+                    hideChromeClose
+                    onClose={() => setDrawer(null)}
+                    onToggleFullscreen={() => setBrowserFullscreen(true)}
+                  />
+                </Suspense>
               </div>
             )}
 
@@ -7801,16 +7866,18 @@ export function App() {
                 {activeProjectId ? (
                   <div className="git-drawer-stack" data-detail-open={Boolean(gitDrawerDiff && gitDiffDisplayMode === "drawer")}>
                     <div className="git-drawer-source" aria-hidden={Boolean(gitDrawerDiff && gitDiffDisplayMode === "drawer")}>
-                      <GitPanel
-                        projectId={activeProjectId}
-                        projectRoot={activeProject?.path}
-                        git={api.git}
-                        onOpenCommitFileDiff={stableOpenCommitFileDiff}
-                        onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
-                        initialBranchInfo={activeGitInfo}
-                        onSwitchBranch={stableSwitchBranch}
-                        onCreateBranch={stableCreateBranch}
-                      />
+                      <Suspense fallback={LazyPanelFallback}>
+                        <GitPanel
+                          projectId={activeProjectId}
+                          projectRoot={activeProject?.path}
+                          git={api.git}
+                          onOpenCommitFileDiff={stableOpenCommitFileDiff}
+                          onOpenWorkspaceFileDiff={stableOpenWorkspaceFileDiff}
+                          initialBranchInfo={activeGitInfo}
+                          onSwitchBranch={stableSwitchBranch}
+                          onCreateBranch={stableCreateBranch}
+                        />
+                      </Suspense>
                     </div>
                     {gitDrawerDiff && gitDrawerDiff.projectId === activeProjectId && gitDiffDisplayMode === "drawer" && (
                       <div className="git-drawer-detail">
@@ -7870,6 +7937,7 @@ export function App() {
                         </div>
                       }
                     >
+                      <Suspense fallback={LazyPanelFallback}>
                       <FilesDrawer
                         files={files}
                         expandedDirs={expandedDirs}
@@ -7934,6 +8002,7 @@ export function App() {
                         }}
                         projectRoot={projects.find((p) => p.id === activeProjectId)?.path}
                       />
+                      </Suspense>
                     </LazyWrapper>
                   </div>
                   {editorMode === "drawer" && activeTab && (
@@ -7986,6 +8055,7 @@ export function App() {
               </div>
             }
           >
+            <Suspense fallback={LazyPanelFallback}>
             <SessionsDrawer
               project={sessionsProject}
               sessions={(sessionsProjectId && sessionSourceFilter[sessionsProjectId]) ? sessions.filter(
@@ -8019,6 +8089,7 @@ export function App() {
               onExportSession={exportHistorySession}
               onDeleteSession={deleteHistorySession}
             />
+            </Suspense>
           </LazyWrapper>
         ) : null}
       </aside>
@@ -8393,29 +8464,31 @@ export function App() {
         </div>
       )}
       {sessionManagerProject && (
-        <SessionManagerModal
-          sessions={sessionsByProject[sessionManagerProject.id] ?? []}
-          onClose={() => setSessionManagerProject(null)}
-          onRename={(session) => {
-            setSessionManagerProject(null);
-            openSessionRename(sessionManagerProject.id, session);
-          }}
-          onExport={(session) => {
-            setSessionManagerProject(null);
-            void exportHistorySession(session);
-          }}
-          onDelete={async (sessions) => {
-            for (const session of sessions) {
-              await api.sessions.delete(session.filePath);
-            }
-            showToast(t("app.sessionDeleted"), 2200);
-            const projectId = sessionManagerProject.id;
-            // 先关闭弹框，避免列表数据在刷新期间显示不一致
-            setSessionManagerProject(null);
-            await refreshSessions(projectId);
-            await refreshProjectSessions(projectId);
-          }}
-        />
+        <Suspense fallback={null}>
+          <SessionManagerModal
+            sessions={sessionsByProject[sessionManagerProject.id] ?? []}
+            onClose={() => setSessionManagerProject(null)}
+            onRename={(session) => {
+              setSessionManagerProject(null);
+              openSessionRename(sessionManagerProject.id, session);
+            }}
+            onExport={(session) => {
+              setSessionManagerProject(null);
+              void exportHistorySession(session);
+            }}
+            onDelete={async (sessions) => {
+              for (const session of sessions) {
+                await api.sessions.delete(session.filePath);
+              }
+              showToast(t("app.sessionDeleted"), 2200);
+              const projectId = sessionManagerProject.id;
+              // 先关闭弹框，避免列表数据在刷新期间显示不一致
+              setSessionManagerProject(null);
+              await refreshSessions(projectId);
+              await refreshProjectSessions(projectId);
+            }}
+          />
+        </Suspense>
       )}
       {projectResourcesProject && (
         <Suspense fallback={null}>
@@ -8485,22 +8558,25 @@ export function App() {
 
 
       {worktreeCreateDialog && (
-        <WorktreeCreateDialog
-          projectId={worktreeCreateDialog.projectId}
-          creating={worktreeCreating}
-          onCreate={async (branchName) => {
-            try {
-              await createWorktree(worktreeCreateDialog.projectId, branchName);
-              setWorktreeCreateDialog(null);
-            } catch {
-              // createWorktree 内部已通过 toast 反馈错误，这里只阻止关闭弹框，
-              // 便于用户修改名称后重试。
-            }
-          }}
-          onClose={() => setWorktreeCreateDialog(null)}
-        />
+        <Suspense fallback={null}>
+          <WorktreeCreateDialog
+            projectId={worktreeCreateDialog.projectId}
+            creating={worktreeCreating}
+            onCreate={async (branchName) => {
+              try {
+                await createWorktree(worktreeCreateDialog.projectId, branchName);
+                setWorktreeCreateDialog(null);
+              } catch {
+                // createWorktree 内部已通过 toast 反馈错误，这里只阻止关闭弹框，
+                // 便于用户修改名称后重试。
+              }
+            }}
+            onClose={() => setWorktreeCreateDialog(null)}
+          />
+        </Suspense>
       )}
       {environmentDialog && (
+        <Suspense fallback={null}>
         <EnvironmentDialog
           status={piStatus}
           checking={piChecking}
@@ -8582,6 +8658,7 @@ export function App() {
             showToast(t("environment.checkFlagCleared"));
           }}
         />
+        </Suspense>
       )}
       {promptTemplatePickerOpen && (
         <PromptTemplatePicker
@@ -8600,11 +8677,34 @@ export function App() {
           }}
           onClose={() => setModelPickerOpen(false)}
           onPick={selectModel}
-						  favoriteModels={settings.favoriteModels}
-						  onToggleFavorite={toggleFavoriteModel}
-						  defaultModelKey={defaultModelKey}
-						  onSetDefault={setDefaultModel}
-					/>
+          favoriteModels={settings.favoriteModels}
+          onToggleFavorite={toggleFavoriteModel}
+          defaultModelKey={defaultModelKey}
+          onSetDefault={setDefaultModel}
+          providerOrder={modelProviderOrder}
+          serviceTiers={
+            activeAgentId && !isPendingAgentId(activeAgentId)
+              ? {
+                  fastEnabled: activeRuntimeState?.fastModeEnabled,
+                  fastActive: activeRuntimeState?.fastModeActive,
+                  slowSupported: activeRuntimeState?.slowModeSupported,
+                  slowEnabled: activeRuntimeState?.slowModeEnabled,
+                  slowScope: activeRuntimeState?.slowModeScope,
+                }
+              : undefined
+          }
+          serviceTierBusy={serviceTierBusy}
+          onToggleServiceTier={(kind, enabled) => void toggleServiceTier(kind, enabled)}
+          sessionControls={
+            activeAgentId && !isPendingAgentId(activeAgentId)
+              ? {
+                  autoCompactionEnabled: activeRuntimeState?.autoCompactionEnabled,
+                }
+              : undefined
+          }
+          sessionControlBusy={autoCompactionBusy}
+          onToggleAutoCompaction={(enabled) => void toggleAutoCompaction(enabled)}
+        />
       )}
       {composerModePickerOpen && (
         <ComposerModePicker
@@ -8619,6 +8719,7 @@ export function App() {
       {thinkingPickerOpen && (
         <ThinkingPicker
           current={activeRuntimeState?.thinkingLevel}
+          levels={availableThinkingLevels}
           onClose={() => setThinkingPickerOpen(false)}
           onPick={selectThinking}
         />
@@ -8689,16 +8790,6 @@ export function App() {
             }}
           />
         </Suspense>
-      )}
-      {feedbackOpen && (
-        <FeedbackModal
-          project={activeProject}
-          appInfo={appInfo}
-          onClose={() => setFeedbackOpen(false)}
-          onCopy={() => showToast(t("app.feedbackCopied"))}
-          onOpenExternal={handleOpenExternal}
-          loadEnvironment={api.app.feedbackEnvironment}
-        />
       )}
       {updateInfo && (
         <UpdateModal
@@ -8836,6 +8927,9 @@ filePath={gitDrawerDiff.filePath}
         />
       )}
 
+      {/* omp 原生 OAuth 登录：常驻挂载，接收 open_url / 敏感输入请求 */}
+      <NativeLoginModal />
+
       {renamingFile && (
         <div className="config-modal-overlay" onClick={() => setRenamingFile(null)}>
           <div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
@@ -8895,6 +8989,7 @@ filePath={gitDrawerDiff.filePath}
       {/* Scratch Pad（草稿本）：根级渲染，避免受 chat-pane grid 影响定位 */}
       {scratchPad.isOpen || scratchPad.isClosing ? (
         <div className={`scratch-pad-overlay${scratchPad.isClosing ? " closing" : ""}`} onClick={() => scratchPad.close()}>
+          <Suspense fallback={null}>
           <ScratchPadPanel
             drafts={scratchPad.drafts}
             currentDraftPath={scratchPad.currentDraftPath}
@@ -8911,6 +9006,7 @@ filePath={gitDrawerDiff.filePath}
             onCreateDraft={scratchPad.createDraft}
             onDeleteDraft={scratchPad.deleteDraft}
           />
+          </Suspense>
         </div>
       ) : null}
 
@@ -8968,16 +9064,18 @@ filePath={gitDrawerDiff.filePath}
       {browserFullscreen && (
         <div className="modal-backdrop" onClick={() => setBrowserFullscreen(false)}>
           <div className="browser-modal" onClick={(e) => e.stopPropagation()}>
-            <BrowserPanel
-              isFullscreen
-              onClose={() => setBrowserFullscreen(false)}
-              onMinimize={() => {
-                setBrowserFullscreen(false);
-                lastToolDrawerRef.current = "browser";
-                setDrawer("browser");
-                setDrawerCollapsed(false);
-              }}
-            />
+            <Suspense fallback={LazyPanelFallback}>
+              <BrowserPanel
+                isFullscreen
+                onClose={() => setBrowserFullscreen(false)}
+                onMinimize={() => {
+                  setBrowserFullscreen(false);
+                  lastToolDrawerRef.current = "browser";
+                  setDrawer("browser");
+                  setDrawerCollapsed(false);
+                }}
+              />
+            </Suspense>
           </div>
         </div>
       )}
@@ -8986,202 +9084,6 @@ filePath={gitDrawerDiff.filePath}
 
     </div>
   );
-}
-
-function FeedbackModal({
-  project,
-  appInfo,
-  onClose,
-  onCopy,
-  onOpenExternal,
-  loadEnvironment,
-}: {
-  project?: Project;
-  appInfo: AppInfo;
-  onClose: () => void;
-  onCopy: () => void;
-  onOpenExternal: (url: string) => Promise<void>;
-  loadEnvironment: () => Promise<FeedbackEnvironment>;
-}) {
-  const [description, setDescription] = useState("");
-  const [steps, setSteps] = useState("");
-  const [environment, setEnvironment] = useState<FeedbackEnvironment | null>(
-    null,
-  );
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    loadEnvironment()
-      .then((next) => {
-        if (!cancelled) setEnvironment(next);
-      })
-      .catch((reason) => {
-        if (!cancelled)
-          setError(reason instanceof Error ? reason.message : String(reason));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [loadEnvironment]);
-
-  const report = buildFeedbackReport({
-    description,
-    steps,
-    project,
-    environment,
-    fallbackVersion: appInfo.version,
-    environmentError: error,
-  });
-
-  // 从用户描述中提取简短摘要作为 issue 标题的一部分
-  const descriptionSummary = description.trim().split('\n')[0].slice(0, 60);
-  const issueTitle = descriptionSummary
-    ? `${t("feedback.issueTitle")}${descriptionSummary}`
-    : t("feedback.issueTitle") + t("feedback.issueTitleEmpty");
-  const issueUrl = `https://github.com/HiHaWarzid/OmpDeck/issues/new?title=${encodeURIComponent(issueTitle)}&body=${encodeURIComponent(report)}`;
-  const authorUrl = "https://github.com/ayuayue";
-
-  async function copyReport() {
-    await writeClipboard(report);
-    onCopy();
-  }
-
-  return (
-    <div className="modal-backdrop feedback-backdrop" onClick={onClose}>
-      <section
-        className="feedback-modal"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="modal-header feedback-header">
-          <div>
-            <strong>{t("feedback.title")}</strong>
-            <small>
-              {t("feedback.intro")}{" "}
-              <strong className="feedback-email">chat@caoayu.eu.org</strong>
-            </small>
-            <small className="feedback-qq">
-              QQ 群：<strong>1026218644</strong>
-            </small>
-          </div>
-          <CloseIconButton label={t("common.close")} onClick={onClose} />
-        </div>
-        <div className="feedback-body">
-          <div className="feedback-form-section">
-            <div className="feedback-section-header">
-              <strong>{t("feedback.descriptionLabel")}</strong>
-              <small>{t("feedback.descriptionHint")}</small>
-            </div>
-            <textarea
-              className="feedback-textarea"
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder={t("feedback.descriptionPlaceholder")}
-            />
-            <div className="feedback-section-header">
-              <strong>{t("feedback.stepsLabel")}</strong>
-              <small>{t("feedback.stepsHint")}</small>
-            </div>
-            <textarea
-              className="feedback-textarea"
-              value={steps}
-              onChange={(event) => setSteps(event.target.value)}
-              placeholder={t("feedback.stepsPlaceholder")}
-            />
-          </div>
-          <div className="feedback-environment-section">
-            <div className="feedback-section-header">
-              <strong>{t("feedback.environmentTitle")}</strong>
-              <small>
-                {loading
-                  ? t("feedback.reportLoading")
-                  : t("feedback.environmentHint")}
-              </small>
-            </div>
-            <pre className="feedback-environment-content">{report}</pre>
-          </div>
-        </div>
-        <div className="feedback-actions">
-          <button onClick={copyReport}>{t("feedback.copyReport")}</button>
-          <button onClick={() => onOpenExternal(authorUrl)}>
-            {t("feedback.authorGithub")}
-          </button>
-          <button className="primary" onClick={() => onOpenExternal(issueUrl)}>
-            {t("feedback.openIssue")}
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function buildFeedbackReport(input: {
-  description: string;
-  steps: string;
-  project?: Project;
-  environment: FeedbackEnvironment | null;
-  fallbackVersion: string;
-  environmentError: string;
-}) {
-  const pi = input.environment?.pi;
-  const projectPath = input.project?.path
-    ? maskHomePath(input.project.path)
-    : t("feedback.report.projectNone");
-  // 反馈报告刻意只展示脱敏路径和运行时版本,避免把用户 home 目录、API key 或会话内容默认发出去。
-  return [
-    t("feedback.report.description"),
-    input.description.trim() || t("feedback.report.descriptionEmpty"),
-    "",
-    t("feedback.report.steps"),
-    input.steps.trim() || t("feedback.report.stepsEmpty"),
-    "",
-    t("feedback.report.environment"),
-    t("feedback.report.piDesktop", {
-      value: input.environment?.appVersion ?? input.fallbackVersion,
-    }),
-    t("feedback.report.system", {
-      value: input.environment
-        ? `${input.environment.platform} ${input.environment.arch}`
-        : t("feedback.report.readFailed"),
-    }),
-    t("feedback.report.electron", {
-      value: input.environment?.electronVersion ?? "-",
-    }),
-    t("feedback.report.chrome", {
-      value: input.environment?.chromeVersion ?? "-",
-    }),
-    t("feedback.report.node", { value: input.environment?.nodeVersion ?? "-" }),
-    t("feedback.report.project", { value: projectPath }),
-    t("feedback.report.piStatus", {
-      value: pi
-        ? pi.installed
-          ? t("feedback.report.piDetected")
-          : t("feedback.report.piMissing")
-        : t("feedback.report.readFailed"),
-    }),
-    t("feedback.report.piCommand", {
-      value: pi?.command ? maskHomePath(pi.command) : "-",
-    }),
-    t("feedback.report.piVersion", { value: pi?.version || "-" }),
-    ...(pi?.error ? [t("feedback.report.piError", { value: pi.error })] : []),
-    ...(input.environmentError
-      ? [
-          t("feedback.report.environmentError", {
-            value: input.environmentError,
-          }),
-        ]
-      : []),
-  ].join("\n");
-}
-
-function maskHomePath(value: string) {
-  return value
-    .replace(/([A-Z]:\\Users\\)[^\\/]+/gi, "$1<user>")
-    .replace(/(\/Users\/)[^/]+/g, "$1<user>");
 }
 
 function formatUpdateBytes(bytes?: number) {
@@ -9260,10 +9162,11 @@ function UpdateModal(props: {
             </div>
           )}
           <div className="update-notes markdown-body">
-            {/* GitHub Release notes 通常是 Markdown;这里复用聊天渲染链路支持标题、列表、链接和代码块。 */}
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {props.info.releaseNotes.trim() || t("update.noReleaseNotes")}
-            </ReactMarkdown>
+            {/* GitHub Release notes 通常是 Markdown;这里复用聊天渲染链路支持标题、列表、链接和代码块。
+                Markdown/KaTeX 栈按需加载,避免进入首屏 modulepreload。 */}
+            <Suspense fallback={null}>
+              <LazyMarkdownText text={props.info.releaseNotes.trim() || t("update.noReleaseNotes")} />
+            </Suspense>
           </div>
         </div>
         <div className="update-actions">

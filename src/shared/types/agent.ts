@@ -1,4 +1,4 @@
-import type { WidgetLineItem } from "./message";
+import type { ImageContent, WidgetLineItem } from "./message";
 
 export type AgentStatus = "starting" | "idle" | "running" | "error" | "closed";
 
@@ -13,16 +13,88 @@ export type AgentTab = {
 	createdAt: number;
 	/** 会话累计压缩次数，由主进程解析会话文件得到，用于前端展示"已压缩 N 次"。 */
 	compactionCount?: number;
+	/**
+	 * 当前消息基线是否只是会话文件的尾部窗口（还有更早历史未下发）。
+	 * 渲染层据此决定是否显示「加载更早的会话历史」；不能用 sessionPath 代替，
+	 * 否则每个有文件的小会话都会出现一个点了才知道是空的按钮。
+	 */
+	historyHasOlder?: boolean;
 	/** 瞬时会话（--no-session），不保存记录，关闭即丢失 */
 	noSession?: boolean;
 	/** 最近一次失败原因（error 状态填充，AFK 详情与列表展示用；见 ADR-0005） */
 	lastError?: string;
 };
 
+/**
+ * 崩溃恢复用的会话身份：只记定位信息，不记消息正文。
+ * 正文由 omp `--resume <sessionPath>` 从会话 JSONL 重建。
+ */
+export type RecoverableSession = {
+	projectId: string;
+	sessionPath: string;
+	title?: string;
+};
+
+/**
+ * 上一次「非正常退出」时仍然打开的会话快照（见 main/sessions/OpenSessionSnapshot.ts）。
+ * cleanExit 为真的正常退出不会产生该快照。
+ */
+export type CrashedRun = {
+	/** 上一次运行的启动时间（ms epoch），用于日志与「崩溃前」提示。 */
+	startedAt: number;
+	/** 上一次运行的主进程 PID。 */
+	pid: number;
+	sessions: RecoverableSession[];
+};
+
+/** 斜线命令的子命令（omp `available_commands_update` 的 subcommands 投影）。 */
+export type PiCommandSubcommand = {
+	name: string;
+	description?: string;
+};
+
 export type PiCommand = {
 	name: string;
 	description?: string;
 	source?: string;
+	/** 参数提示，如 `[on|off|status]`（omp 的 input.hint）；建议列表据此展示用法。 */
+	inputHint?: string;
+	subcommands?: PiCommandSubcommand[];
+};
+
+/**
+ * omp 子代理（task 工具派生的子会话）在父会话里的实时投影。
+ *
+ * 事实源是 omp RPC 的 `subagent_lifecycle` / `subagent_progress` 帧：
+ * progress 帧会带上 registry 的完整行（含 status/durationMs/model 等），
+ * 而 lifecycle 帧只带身份与终态，所以字段全部可选、按帧合并。
+ * 子代理 transcript 不进这里：卡片只展示进度摘要，正文按需从会话文件读取。
+ */
+export type AgentSubagent = {
+	id: string;
+	/** 子代理类型（omp agent 名，如 task / scout），不是 UI 角色。 */
+	agent?: string;
+	description?: string;
+	/** omp registry 原始状态：started/running/completed/aborted/failed。 */
+	status: string;
+	index?: number;
+	/** 子会话 JSONL 路径（宿主机路径），用于按需读取 transcript。 */
+	sessionFile?: string;
+	task?: string;
+	assignment?: string;
+	/** 子代理最近一次自述意图（progress.lastIntent），用于卡片副标题。 */
+	lastIntent?: string;
+	recentTools?: AgentSubagentTool[];
+	toolCount?: number;
+	tokens?: number;
+	durationMs?: number;
+	resolvedModel?: string;
+};
+
+export type AgentSubagentTool = {
+	tool: string;
+	args?: string;
+	isError?: boolean;
 };
 
 export type AgentRuntimeState = {
@@ -50,16 +122,144 @@ export type AgentRuntimeState = {
 	cacheTotal?: number;
 	cacheHitPercent?: number | null;
 	cost?: number;
+	/** fast 服务档：enabled 是持久化偏好，active 是当前模型实际使用中。 */
+	fastModeEnabled?: boolean;
+	fastModeActive?: boolean;
+	/** slow 服务档是否受当前模型支持。 */
+	slowModeSupported?: boolean;
+	slowModeEnabled?: boolean;
+	/** slow 档的作用域（global/session 等，由 omp 返回）。 */
+	slowModeScope?: string;
+	/**
+	 * omp 服务端待投递队列（steering / followUp 的 chip 文本）。
+	 * 渲染层必须以它作为队列唯一事实来源；本地只保留投递结果未知的提示。
+	 */
+	queuedMessages?: AgentQueuedMessages;
+	/** `get_state.todoPhases`：会话 todo 的权威快照（不只是 todo 工具的最后一次结果）。 */
+	todoPhases?: AgentTodoPhase[];
+	/** `get_state.tokensPerSecond`：omp 侧统计的当前输出速度。 */
+	tokensPerSecond?: number;
+	/** `get_state.autoCompactionEnabled`：会话自动压缩开关。 */
+	autoCompactionEnabled?: boolean;
+	/** `get_state.usageLimit`：限流/额度收口阶段（低优先级或 wrap-up）。 */
+	usageLimit?: AgentUsageLimitState;
+	/**
+	 * cache warming 状态。omp 的 get_state 不暴露该字段，只能由
+	 * cache_warming_start/end 事件维护；hit/miss 不展示，只有 warming/失败展示。
+	 */
+	cacheWarming?: AgentCacheWarmingState;
+};
+
+/** omp todo 单项的五态（set_todos/get_state 使用的原生状态集）。 */
+export type AgentTodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
+
+export type AgentTodoItem = {
+	content: string;
+	status: AgentTodoStatus;
+	/** blocked 任务等待的对象。 */
+	blocker?: string;
+	details?: string;
+	notes?: string[];
+};
+
+export type AgentTodoPhase = {
+	name: string;
+	tasks: AgentTodoItem[];
+};
+
+/**
+ * omp `get_state.usageLimit` 的投影。
+ * low_priority 会带 low-priority 额度余量；wrap_up 会带是否已启用付费附加额度。
+ */
+export type AgentUsageLimitState =
+	| {
+			stage: "low_priority";
+			/** 限制重置的 epoch 秒（omp 上报时才有）。 */
+			resetsAtSec?: number;
+			/** 低优先级额度剩余百分比（omp 上报时才有）。 */
+			allowanceLeftPercent?: number;
+	  }
+	| {
+			stage: "wrap_up";
+			/** 若上报，为限制重置的 epoch 秒。 */
+			resetsAtSec?: number;
+			/** 额度耗尽后是否由付费附加额度继续服务。 */
+			extraUsage: boolean;
+	  };
+
+/** omp `cache_warming_start/end` 事件投影。 */
+export type AgentCacheWarmingState = {
+	/** warming = 后台预热进行中；done = 本轮结束（结果见 outcome）。 */
+	phase: "warming" | "done";
+	outcome?: "hit" | "miss" | "error" | "aborted";
+	provider?: string;
+	model?: string;
+	/** 事件到达时刻（毫秒），用于诊断与避免把旧结果当当前状态。 */
+	updatedAt: number;
+};
+
+/** omp `get_state.queuedMessages` / `queue_update` 的投影。 */
+export type AgentQueuedMessages = {
+	steering: string[];
+	followUp: string[];
+};
+
+/** `remove_queued_message` / `abort_and_restore_queue` 返回的草稿（含附件）。 */
+export type RestoredQueuedMessage = {
+	text: string;
+	images?: ImageContent[];
+};
+
+export type RemoveQueuedMessageResult = {
+	removed: boolean;
+	/** 撤回消息携带的图片；文本消息、removed:false 时缺省。 */
+	images?: ImageContent[];
+	/** 图片超出传输上限被省略（消息仍已撤回）。 */
+	imagesDropped?: boolean;
+};
+
+export type PromoteQueuedMessageResult = { promoted: boolean };
+
+export type AbortAndRestoreQueueResult = {
+	steering: RestoredQueuedMessage[];
+	followUp: RestoredQueuedMessage[];
+	imagesDropped?: boolean;
+	truncated?: boolean;
 };
 
 export type AvailableModel = {
 	id: string;
 	name?: string;
 	provider: string;
+	/** omp 目录条目的用途；仅 `chat` 可用于 set_model / 模型角色。旧版无此字段。 */
+	kind?: string;
+	/** omp 目录给出的完整选择器（通常是 `provider/id`），供需要原样 selector 的入口使用。 */
+	selector?: string;
 	contextWindow?: number;
 	reasoning?: boolean;
 	/** 是否支持图片输入（pi --list-models 的 images 列）。缺省 = 能力未知（目录未收录/未上报）。 */
 	supportsImages?: boolean;
+};
+
+/** omp 原生 OAuth 登录供应商标记（RPC `get_login_providers`）。 */
+export type OmpLoginProvider = {
+	id: string;
+	name: string;
+	/** 本机是否具备该 provider 的登录实现。 */
+	available: boolean;
+	/** 是否已有存储的 OAuth 凭据。 */
+	authenticated: boolean;
+};
+
+/** omp `get_logout_accounts` 返回的一条可移除凭据。 */
+export type OmpLogoutAccount = {
+	credentialId: number;
+	provider: string;
+	label: string;
+	detail: string;
+	type: "api_key" | "oauth";
+	/** 当前会话可能正在使用该凭据。 */
+	active: boolean;
 };
 
 export type CreateAgentInput = {
@@ -92,6 +292,35 @@ export type AgentUiBatchQuestion = {
 };
 
 /**
+ * omp 原生 ask 对话框选项：label 是回传给 pi 的精确值，description/preview 仅用于展示。
+ * 与 batch_ask（扩展把 JSON 塞进 input title）不同，这套结构来自 pi 的 `method: "ask"` 协议。
+ */
+export type AgentUiAskOption = {
+	label: string;
+	description?: string;
+	preview?: string;
+};
+
+/** omp 原生 ask 协议的单个问题（method 为 ask）。 */
+export type AgentUiAskQuestion = {
+	id: string;
+	question: string;
+	header?: string;
+	options: AgentUiAskOption[];
+	/** true 时允许勾选多个选项；false/省略为单选。 */
+	multi?: boolean;
+	/** 推荐选项下标；pi 超时会自动选择它。 */
+	recommended?: number;
+};
+
+/** omp ask 的回答项，必须与请求中的 questions 顺序、id 一一对应。 */
+export type AgentUiAskAnswer = {
+	id: string;
+	selectedOptions: string[];
+	customInput?: string;
+};
+
+/**
  * Agent 扩展 UI 请求（ctx.ui.select/confirm/input/editor/notify/setWidget）。
  * 主进程 AgentManager 发出、preload 原样透传、渲染层渲染卡片——三侧共用同一类型，
  * 避免各自内联声明导致字段漂移（历史教训：batchQuestions/widgetLines 曾只存在于渲染层）。
@@ -109,6 +338,10 @@ export type AgentUiRequest = {
 	batchQuestions?: AgentUiBatchQuestion[];
 	/** 批量是否强制 Submit 审阅 tab */
 	batchReview?: boolean;
+	/** omp 原生 ask（method === "ask"）的问题列表；与 batch_ask 的扩展 envelope 不同。 */
+	askQuestions?: AgentUiAskQuestion[];
+	/** pi 侧超时（毫秒）：超时后自动选择 recommended，桌面端仅用于提示。 */
+	timeout?: number;
 	completed?: boolean;
 	value?: string;
 	cancelled?: boolean;
@@ -119,4 +352,18 @@ export type AgentUiRequest = {
 	/** widget 行元素：兼容老协议的 string 和新协议的 WidgetLineItem（结构化三态）。 */
 	widgetLines?: Array<string | WidgetLineItem>;
 	widgetPlacement?: "aboveEditor" | "belowEditor";
+	/** 宿主发起的 OAuth 登录流程：这些请求不进入时间线，由登录浮层处理。 */
+	loginFlow?: boolean;
+	/** 登录供应商标识（loginFlow 时存在）。 */
+	loginProviderId?: string;
+	/** 登录流程状态：started / succeeded / failed（method === "login_flow"）。 */
+	loginStatus?: "started" | "succeeded" | "failed";
+	/** open_url 的目标地址。 */
+	url?: string;
+	/** 推荐复制的短 loopback 跳转地址（终端截断安全的复制目标）。 */
+	launchUrl?: string;
+	/** 登录 provider 给出的操作说明。 */
+	instructions?: string;
+	/** 登录失败原因。 */
+	error?: string;
 };

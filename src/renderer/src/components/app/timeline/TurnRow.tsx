@@ -9,7 +9,6 @@ import {
 	type CSSProperties,
 	type ReactNode,
 } from "react";
-import { toBlob } from "html-to-image";
 import {
 	type ToolGroupItem,
 	type MessageItem,
@@ -39,6 +38,7 @@ import type { ChatMessage, ImageContent } from "../../../../../shared/types";
 import { parseRichInputChips, unwrapFileChipPath } from "../RichInput";
 import { formatDuration, formatTime, stripAnsi, stripMarkdown, stripThinkingTags } from "../format";
 import { AssistantText } from "./AssistantText";
+import { MessageImages } from "./MessageImages";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolGroupCard } from "../tools/ToolCards";
 import type { DiffFileHandler } from "../types";
@@ -58,6 +58,8 @@ async function copyElementAsPng(element: HTMLElement) {
 	}
 	let blob: Blob | null = null;
 	try {
+		// 截图库只在用户点击“复制为图片”时加载，避免 28KB 依赖进入首屏。
+		const { toBlob } = await import("html-to-image");
 		blob = await toBlob(clone, {
 			cacheBust: true,
 			pixelRatio: Math.min(2, window.devicePixelRatio || 1),
@@ -398,7 +400,7 @@ export const TurnRow = memo(function TurnRow(props: {
 			);
 		}
 		if (item.kind === "tool-group") {
-			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
+			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} onPreviewImage={props.onPreviewImage} />;
 		}
 		if (item.kind === "message" && item.message.role === "assistant") {
 			const txt = sanitizedMessageText(item.message);
@@ -677,9 +679,12 @@ export const UserBubble = memo(function UserBubble(props: {
 	onEnterMultiSelect?: () => void;
 }) {
 	const { message } = props;
+	// 旧分页消息只读：它们不在 pi 运行态的当前尾窗里，编辑/删除会因定位不到而失败。
+	// 复制/分享仍然保留，用户回看历史最常见的就是取内容。
+	const readOnlyHistory = message.meta?.historyPage === true;
 	// 空闲时始终展示 fork 入口；entryId 解析放到点击时做（meta 缺失时会走 getForkMessages 回退）。
 	// 忙碌中与编辑/删除一致隐藏，避免半完成回合上 fork。
-	const canFork = Boolean(props.onForkMessage) && !props.agentRunning;
+	const canFork = Boolean(props.onForkMessage) && !props.agentRunning && !readOnlyHistory;
 	const rowRef = useRef<HTMLElement | null>(null);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
@@ -742,19 +747,12 @@ export const UserBubble = memo(function UserBubble(props: {
 				</div>
 			)}
 			{message.images && message.images.length > 0 && (
-				<div className="user-turn-attachments">
-					{message.images.map((img, index) => (
-						<img
-							key={index}
-							src={`data:${img.mimeType};base64,${img.data}`}
-							alt={t("app.imageAlt", { index: index + 1 })}
-							className="user-turn-attachment"
-							loading="lazy"
-							decoding="async"
-							onClick={() => props.onPreviewImage(img)}
-						/>
-					))}
-				</div>
+				<MessageImages
+					images={message.images}
+					onPreviewImage={props.onPreviewImage}
+					className="user-turn-attachments"
+					imageClassName="user-turn-attachment"
+				/>
 			)}
 			{cleanText && !editing && (
 				<div className="user-turn-bubble">
@@ -813,7 +811,7 @@ export const UserBubble = memo(function UserBubble(props: {
 						>
 							<Share size={14} />
 						</button>
-				{!editing && !props.agentRunning && (
+				{!editing && !props.agentRunning && !readOnlyHistory && (
 					<>
 						{canFork && (
 							<button

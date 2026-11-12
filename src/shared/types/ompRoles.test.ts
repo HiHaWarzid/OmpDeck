@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatRoleSelector, parseRoleSelector } from "./ompRoles";
+import {
+  formatRoleSelector,
+  isValidOmpRoleSelector,
+  parseRoleSelector,
+  sortProvidersByOrder,
+} from "./ompRoles";
 
 describe("parseRoleSelector", () => {
   it("parses provider/model with thinking suffix", () => {
@@ -37,6 +42,50 @@ describe("parseRoleSelector", () => {
       modelId: "gpt-4o",
       thinkingLevel: undefined,
     });
+  });
+
+  it("keeps role aliases and candidate lists whole (no provider split)", () => {
+    expect(parseRoleSelector("@slow:high")).toEqual({
+      selector: "@slow:high",
+      provider: "",
+      modelId: "",
+      thinkingLevel: undefined,
+    });
+    expect(parseRoleSelector("openai/gpt-4o,anthropic/claude:high")).toEqual({
+      selector: "openai/gpt-4o,anthropic/claude:high",
+      provider: "",
+      modelId: "",
+      thinkingLevel: undefined,
+    });
+  });
+});
+
+describe("isValidOmpRoleSelector", () => {
+  it("accepts provider/model, aliases, candidates, and thinking suffixes", () => {
+    for (const selector of [
+      "openai/gpt-4o",
+      "@slow",
+      "pi/default",
+      "*",
+      "gpt-4o",
+      "openai/gpt-4o:high",
+      "openai/gpt-4o,anthropic/claude:max",
+    ]) {
+      expect(isValidOmpRoleSelector(selector), selector).toBe(true);
+    }
+  });
+
+  it("rejects empty slots, whitespace, and dangling separators", () => {
+    for (const selector of ["", "  ", "openai/", "/gpt-4o", "@", ",", "a/b,", "a b"]) {
+      expect(isValidOmpRoleSelector(selector), selector).toBe(false);
+    }
+  });
+});
+
+describe("sortProvidersByOrder", () => {
+  it("ranks configured providers first and sorts the rest alphabetically", () => {
+    expect(sortProvidersByOrder(["zeta", "openai", "alpha", "anthropic"], ["anthropic", "openai"]))
+      .toEqual(["anthropic", "openai", "alpha", "zeta"]);
   });
 });
 

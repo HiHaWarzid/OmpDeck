@@ -63,6 +63,10 @@ export interface SessionEntriesFile {
   unreadable: boolean;
   /** 解析失败的行数：>0 时调用方可标记 degraded */
   malformedLines: number;
+  /** raw 在文件中的起始绝对字节偏移（截断掉落的前缀不计入） */
+  startOffset: number;
+  /** 本次尾窗结束的绝对字节偏移（默认等于文件大小） */
+  endOffset: number;
 }
 
 export interface ReadEntriesOptions {
@@ -78,6 +82,11 @@ export interface ReadTailEntriesOptions {
   minLines: number;
   /** 尾窗总上限：单行 JSON 超过它时不再扩展 */
   maxBytes: number;
+  /**
+   * 窗口结束的绝对字节偏移（默认文件末尾）。历史分页用前页首行偏移作为下一页
+   * 的 endOffset，逐字节向前翻，避免重复读取/解析尾部窗口。
+   */
+  endOffset?: number;
 }
 
 /**
@@ -155,6 +164,8 @@ export async function readEntries(
       fingerprint,
       unreadable: parsed.unreadable,
       malformedLines: parsed.malformedLines,
+      startOffset: 0,
+      endOffset: Buffer.byteLength(parsed.text, "utf8"),
     };
   }
   const parsed = parseSessionText(await io.read(filePath, options.signal));
@@ -165,6 +176,8 @@ export async function readEntries(
     fingerprint,
     unreadable: parsed.unreadable,
     malformedLines: parsed.malformedLines,
+    startOffset: 0,
+    endOffset: fingerprint.size,
   };
 }
 
@@ -181,6 +194,7 @@ export async function readTailEntries(
 ): Promise<SessionEntriesFile> {
   const fingerprint = await io.stat(filePath);
   const size = fingerprint.size;
+  const end = Math.min(size, Math.max(0, options.endOffset ?? size));
   const empty: SessionEntriesFile = {
     entries: [],
     raw: "",
@@ -188,18 +202,22 @@ export async function readTailEntries(
     fingerprint,
     unreadable: false,
     malformedLines: 0,
+    startOffset: end,
+    endOffset: end,
   };
-  if (size === 0) return empty;
+  if (end === 0) return empty;
 
-  const limit = Math.min(size, options.maxBytes);
+  const limit = Math.min(end, options.maxBytes);
   let readSize = Math.min(TAIL_READ_INITIAL_BYTES, limit);
   for (;;) {
-    const start = size - readSize;
+    const start = end - readSize;
     const text = await io.readRange(filePath, start, readSize);
     const firstBreak = text.indexOf("\n");
     // 窗口内首个换行之前的部分可能跨窗口边界（不完整行），丢弃；
     // 整个文件就是一个超长行时（start===0），它就是唯一且完整的行。
-    const completeFrom = firstBreak === -1 ? (start === 0 ? 0 : -1) : firstBreak + 1;
+    // 只有从文件中段开始读时，首个换行前的片段才可能截断；从 0 开始说明窗口
+    // 覆盖文件头，第一行同样完整，不能丢（否则首条消息在整文件读取时静默消失）。
+    const completeFrom = start === 0 ? 0 : (firstBreak === -1 ? -1 : firstBreak + 1);
     if (completeFrom >= 0) {
       const window = text.slice(completeFrom);
       // 已确认完整的行数（最后一段可能残，不计数）
@@ -209,11 +227,16 @@ export async function readTailEntries(
         return {
           entries: parsed.entries,
           raw: parsed.text,
-          // start > 0 说明文件头部还有更早的内容没有进窗口
+          // start > 0 说明窗口前还有更早内容没有读入；endOffset 截断的尾部是调用方
+          // 显式指定的分页边界，不算「被动丢弃」。
           truncated: start > 0,
           fingerprint,
           unreadable: parsed.unreadable,
           malformedLines: parsed.malformedLines,
+          // 从窗口结束位置反推原始行起点，避免 start 落在 UTF-8 字符中间时按字符数
+          // 估算字节偏移。window 总是从换行后开始，字节边界精确。
+          startOffset: end - Buffer.byteLength(window, "utf8"),
+          endOffset: end,
         };
       }
     }

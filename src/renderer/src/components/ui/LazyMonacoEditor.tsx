@@ -1,9 +1,10 @@
-import { lazy, Suspense, memo } from "react";
+import { Suspense, memo } from "react";
 import type { MonacoEditorProps } from "./MonacoEditor";
+import { lazyWithReload } from "../../utils/lazyWithReload";
 
 // 动态加载 MonacoEditor（7.8MB vendor-monaco + 4.3MB workers）。
 // 仅当用户打开编辑器面板（配置弹窗、项目资源编辑器）时才会下载对应 chunk。
-const MonacoEditorLazy = lazy(
+const MonacoEditorLazy = lazyWithReload(
   () =>
     import("./MonacoEditor").then((m) => ({
       default: m.MonacoEditor,

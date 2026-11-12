@@ -7,6 +7,7 @@ import type {
 	SendPromptResult,
 } from "../../shared/types";
 import { t } from "./i18n";
+import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import { createPreviewApi } from "./previewApi";
 
 type WebState = {
@@ -71,7 +72,10 @@ async function refreshState() {
 	connected = true;
 	for (const listener of stateListeners) listener(state.agents);
 	for (const [agentId, messages] of Object.entries(state.messagesByAgent)) {
-		const key = JSON.stringify(messages);
+		// 只比较流式版本（长度/末条 id/时间戳/文本长度），不序列化整份 transcript；
+		// 与 WebServiceManager 的指纹语义一致，避免 Web 模式每轮轮询在主线程
+		// 对全部消息做 JSON.stringify。
+		const key = messageStreamVersion(messages);
 		if (lastMessages.get(agentId) === key) continue;
 		lastMessages.set(agentId, key);
 		for (const listener of messageListeners) listener({ agentId, replaceFrom: 0, messages });
@@ -85,7 +89,7 @@ function ensurePolling() {
 	void refreshState().catch(() => undefined);
 	pollTimer = window.setInterval(() => {
 		void refreshState().catch(() => undefined);
-	}, 600);
+	}, 1000);
 }
 
 function subscribe<T>(set: Set<(payload: T) => void>, callback: (payload: T) => void) {
@@ -154,6 +158,36 @@ export function createBrowserApi(): PiDesktopApi {
 				});
 				await refreshState();
 			},
+			abortAndRestoreQueue: async (agentId) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["abortAndRestoreQueue"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/abort-and-restore-queue`, {
+					method: "POST",
+					body: "{}",
+				});
+				await refreshState();
+				return response.result;
+			},
+			removeQueuedMessage: async (agentId, message, queue) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["removeQueuedMessage"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/remove-queued-message`, {
+					method: "POST",
+					body: JSON.stringify({ message, queue }),
+				});
+				await refreshState();
+				return response.result;
+			},
+			promoteQueuedMessage: async (agentId, message) => {
+				const response = await request<{
+					result: Awaited<ReturnType<PiDesktopApi["agents"]["promoteQueuedMessage"]>>;
+				}>(`/api/agents/${encodeURIComponent(agentId)}/promote-queued-message`, {
+					method: "POST",
+					body: JSON.stringify({ message }),
+				});
+				await refreshState();
+				return response.result;
+			},
 			prompt: async (input: SendPromptInput) => {
 				const response = await request<{ result: SendPromptResult }>(
 					`/api/agents/${encodeURIComponent(input.agentId)}/prompt`,
@@ -214,6 +248,26 @@ export function createBrowserApi(): PiDesktopApi {
 				);
 				return result.state;
 			},
+			availableThinkingLevels: async (agentId) => {
+				const result = await request<{ levels: Awaited<ReturnType<PiDesktopApi["agents"]["availableThinkingLevels"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/thinking-levels`,
+				);
+				return result.levels;
+			},
+			setFastMode: async (agentId, enabled) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setFastMode"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/fast-mode`,
+					{ method: "POST", body: JSON.stringify({ enabled }) },
+				);
+				return result.state;
+			},
+			setSlowMode: async (agentId, enabled) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setSlowMode"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/slow-mode`,
+					{ method: "POST", body: JSON.stringify({ enabled }) },
+				);
+				return result.state;
+			},
 			onState: (callback) => subscribe(stateListeners, callback),
 			onMessages: (callback) => subscribe(messageListeners, callback),
 			onThinking: () => () => undefined,
@@ -221,6 +275,7 @@ export function createBrowserApi(): PiDesktopApi {
 			onLog: () => () => undefined,
 			onRpcLog: () => () => undefined,
 			onRuntimeState: () => () => undefined,
+			onCommandCatalog: () => () => undefined,
 			onUiRequest: () => () => undefined,
 			onFocusTarget: () => () => undefined,
 			onTrustRequest: () => () => undefined,

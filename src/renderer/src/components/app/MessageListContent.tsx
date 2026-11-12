@@ -73,9 +73,9 @@ export const MessageListContent = memo(
 			onRespondAsk,
 		} = props;
 		// 流式思考是本应用最高频的更新（20Hz）。在这里订阅 thinking 切片而不是从 App 传
-		// 下来：App 根部因此不会被思考文本唤醒（省掉 9.7k 行组件 + 53 个 effect 的整树重渲染），
-		// 而本组件原本就会随流式内容重渲染，代价不变。
-		const thinking = useWorkspaceSlice(activeAgentId, "thinking");
+		// 下来：App 根部因此不会被思考文本唤醒（省掉 9.7k 行组件 + 53 个 effect 的整树重渲染）。
+		// showThinking 关闭时传 undefined：不订阅该切片，20Hz 思考增量不再唤醒消息列表；
+		// 重新展开时 useWorkspaceSlice 会立即读到当前快照，不需要额外的补拉。
 		const {
 			streamingMessageId,
 			agentRunning,
@@ -87,6 +87,7 @@ export const MessageListContent = memo(
 			cancellingUi,
 			activeUiAskRequestId,
 		} = streamState;
+		const thinking = useWorkspaceSlice(showThinking ? activeAgentId : undefined, "thinking");
 		const activeThinking = thinking?.text ?? "";
 		const thinkingStartedAt = thinking?.startedAt;
 

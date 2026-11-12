@@ -6,16 +6,18 @@
  * 用于飞书会话镜像、文件转发和流式卡片控制。
  * agentsStop / agentsRestart 调用 terminalManager.closeAgent 清理终端会话。
  */
-import { Notification, type BrowserWindow } from "electron";
+import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import type { CreateAgentInput, PiCommand, SendPromptInput, SendPromptResult } from "../../shared/types";
+import type { AgentTodoPhase, AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult } from "../../shared/types";
+import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
 import type { FeishuBridge } from "../feishu/FeishuBridge";
 import { wantsFeishuDoc, wrapHostInstruction } from "../feishu/docActions";
 import { resolveFeishuFileSendIntent } from "../feishu/fileIntent";
+import { showAppNotification } from "../notifications";
 
 interface AgentHandlerDeps {
 	agentManager: AgentManager;
@@ -23,45 +25,56 @@ interface AgentHandlerDeps {
 	appLogger: AppLogger;
 	getFeishuBridge: () => FeishuBridge | null;
 	getMainWindow: () => BrowserWindow | null;
+	/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
+	notificationIcon?: NativeImage;
 }
 
 type AgentHandlerMaps = {
 	agents: Pick<IpcHandlerMap<typeof ipcTable.agents, PiDesktopApi["agents"]>,
-		| "list" | "getMessages" | "create" | "rename" | "stop" | "prompt" | "abort" | "exportHtml"
+		| "list" | "getMessages" | "getHistoryPage" | "create" | "rename" | "stop" | "prompt" | "abort"
+		| "abortAndRestoreQueue" | "removeQueuedMessage" | "promoteQueuedMessage"
+		| "exportHtml"
 		| "getForkMessages" | "forkSession" | "cloneSession" | "switchSession" | "editMessage"
 		| "deleteMessage" | "prepareResend" | "reload" | "restart" | "compact" | "runtimeState"
+		| "cancelSubagent" | "steerSubagent" | "subagentMessages" | "subagents"
 		| "cycleModel" | "availableModels" | "setModel" | "refreshModels" | "cycleThinking"
-		| "setThinking" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "setThinking" | "availableThinkingLevels" | "setFastMode" | "setSlowMode" | "setAutoCompaction" | "setTodos" | "commands" | "sendUiResponse" | "notifyAsk"
+		| "getLoginProviders" | "login" | "getLogoutAccounts" | "logout"
 		| "respondTrustRequest">;
 };
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps {
-	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow } = deps;
+	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow, notificationIcon } = deps;
 
 	return {
 		agents: {
-			notifyAsk: async (_event, title: unknown, body: unknown) => {
-				// 渲染层判定「非活动 agent 收到 ask 请求且设置开启」后请求主进程发系统通知；
-				// 点击通知聚焦主窗口（询问卡片已渲染在会话流中，用户聚焦后可直接作答）。
+			notifyAsk: async (_event, title: unknown, body: unknown, agentId: unknown) => {
+				// 渲染层判定「后台 agent 提问，或窗口未聚焦时收到 ask 且设置开启」后请求发系统通知；
+				// 点击通知聚焦主窗口并切到发起提问的 Agent，用户可直接作答。
 				if (typeof title !== "string" || typeof body !== "string") return;
-				if (!Notification.isSupported()) return;
-				const notification = new Notification({
+				showAppNotification({
 					title: title || "OmpDeck",
 					body,
-					silent: false,
+					icon: notificationIcon,
+					agentId: typeof agentId === "string" ? agentId : undefined,
+					getWindow: getMainWindow,
 				});
-				notification.on("click", () => {
-					const win = getMainWindow();
-					if (!win || win.isDestroyed()) return;
-					if (win.isMinimized()) win.restore();
-					if (!win.isVisible()) win.show();
-					win.focus();
-				});
-				notification.show();
 			},
 			list: async () => agentManager.list(),
 			getMessages: async (_event, agentId: string) =>
 				agentManager.getMessages(agentId),
+			getHistoryPage: async (_event, agentId: string, beforeOffset?: number) => {
+				if (typeof agentId !== "string" || !agentId) {
+					throw new Error("getHistoryPage: agentId is required");
+				}
+				if (
+					beforeOffset !== undefined
+					&& (typeof beforeOffset !== "number" || !Number.isFinite(beforeOffset) || beforeOffset < 0)
+				) {
+					throw new Error("getHistoryPage: beforeOffset must be a non-negative finite number");
+				}
+				return agentManager.readHistoryPage(agentId, beforeOffset);
+			},
 			create: async (_event, input: CreateAgentInput) => {
 				void appLogger.info("agent", "Agent create IPC received", {
 					projectId: input.projectId,
@@ -192,6 +205,39 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				void appLogger.info("agent", "Agent aborted", { agentId });
 				return result;
 			},
+			abortAndRestoreQueue: async (_event, agentId: string) => {
+				const bridge = getFeishuBridge();
+				bridge?.stopSessionMirrorRun(agentId);
+				const result = await agentManager.abortAndRestoreQueue(agentId);
+				void appLogger.info("agent", "Agent aborted and queue restored", {
+					agentId,
+					steering: result.steering.length,
+					followUp: result.followUp.length,
+				});
+				return result;
+			},
+			removeQueuedMessage: async (
+				_event,
+				agentId: string,
+				message: string,
+				queue: "steering" | "followUp",
+			) => {
+				const result = await agentManager.removeQueuedMessage(agentId, message, queue);
+				void appLogger.info("agent", "Queued message removed", {
+					agentId,
+					queue,
+					removed: result.removed,
+				});
+				return result;
+			},
+			promoteQueuedMessage: async (_event, agentId: string, message: string) => {
+				const result = await agentManager.promoteQueuedMessage(agentId, message);
+				void appLogger.info("agent", "Queued message promoted", {
+					agentId,
+					promoted: result.promoted,
+				});
+				return result;
+			},
 			exportHtml: async (_event, agentId: string) =>
 				// pi RPC export_html 返回 { path }（data 未在 AgentManager 侧定型，此处按契约收敛）
 				agentManager.exportHtml(agentId) as Promise<{ path: string }>,
@@ -252,10 +298,65 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 			},
 			runtimeState: async (_event, agentId: string) =>
 				agentManager.getRuntimeState(agentId),
+			cancelSubagent: async (_event, agentId: string, subagentId: string) => {
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				const cancelled = await agentManager.cancelSubagent(agentId, subagentId);
+				void appLogger.info("agent", "Subagent cancel requested", { agentId, subagentId, cancelled });
+				return cancelled;
+			},
+			steerSubagent: async (_event, agentId: string, subagentId: string, message: string) => {
+				// IPC 入参来自渲染层，边界校验后再发给 omp（空消息会被 omp 拒绝）。
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				if (typeof message !== "string" || !message.trim()) {
+					throw new Error("Invalid subagent steering message");
+				}
+				await agentManager.steerSubagent(agentId, subagentId, message.trim());
+			},
+			subagentMessages: async (_event, agentId: string, subagentId: string) => {
+				if (typeof subagentId !== "string" || !subagentId.trim()) {
+					throw new Error("Invalid subagentId");
+				}
+				return agentManager.getSubagentMessages(agentId, subagentId);
+			},
+			subagents: async (_event, agentId: string) =>
+				agentManager.getSubagents(agentId),
 			cycleModel: async (_event, agentId: string) =>
 				agentManager.cycleModel(agentId),
 			availableModels: async (_event, agentId: string) =>
 				agentManager.getAvailableModels(agentId),
+			getLoginProviders: async (_event, agentId: string) => {
+				try {
+					return await agentManager.getLoginProviders(agentId);
+				} catch (error) {
+					// 旧版 omp 没有该命令：返回空列表让 UI 隐藏登录入口，不弹错误。
+					void appLogger.warn("agent", "get_login_providers failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return [];
+				}
+			},
+			login: async (_event, agentId: string, providerId: string) => {
+				const result = await agentManager.login(agentId, providerId);
+				void appLogger.info("agent", "OAuth login completed", { agentId, providerId });
+				return result;
+			},
+			getLogoutAccounts: async (_event, agentId: string, providerId: string) =>
+				agentManager.getLogoutAccounts(agentId, providerId),
+			logout: async (_event, agentId: string, providerId: string, credentialId: number) => {
+				const result = await agentManager.logout(agentId, providerId, credentialId);
+				void appLogger.info("agent", "Credential logged out", {
+					agentId,
+					providerId,
+					credentialId,
+					remainingSource: result.remainingSource,
+				});
+				return result;
+			},
 			setModel: async (_event, agentId: string, provider: string, modelId: string) => {
 				const result = await agentManager.setModel(agentId, provider, modelId);
 				void appLogger.info("agent", "Agent model changed", { agentId, provider, modelId });
@@ -272,17 +373,47 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				void appLogger.info("agent", "Agent thinking level changed", { agentId, level });
 				return result;
 			},
+			availableThinkingLevels: async (_event, agentId: string) =>
+				agentManager.getAvailableThinkingLevels(agentId),
+			setFastMode: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setFastMode(agentId, enabled);
+				void appLogger.info("agent", "Agent fast mode changed", { agentId, enabled });
+				return result;
+			},
+			setSlowMode: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setSlowMode(agentId, enabled);
+				void appLogger.info("agent", "Agent slow mode changed", { agentId, enabled });
+				return result;
+			},
+			setAutoCompaction: async (_event, agentId: string, enabled: unknown) => {
+				if (typeof enabled !== "boolean") throw new Error("enabled must be boolean");
+				const result = await agentManager.setAutoCompaction(agentId, enabled);
+				void appLogger.info("agent", "Agent auto compaction changed", { agentId, enabled });
+				return result;
+			},
+			setTodos: async (_event, agentId: string, phases: AgentTodoPhase[]) => {
+				if (!Array.isArray(phases)) throw new Error("phases must be an array");
+				const result = await agentManager.setTodos(agentId, phases);
+				// 不记录任务正文：todo 内容属于用户会话数据，只记数量便于排查。
+				void appLogger.info("agent", "Agent todos updated from host", {
+					agentId,
+					phases: phases.length,
+				});
+				return result;
+			},
 			commands: async (_event, agentId: string) => {
 				try {
-					// getCommands 返回未定型数组，桌面契约声明 PiCommand[]
-					return (await agentManager.getCommands(agentId)) as PiCommand[];
+					// 与 available_commands_update 推送共用同一归一化，保证两条路径形状一致
+					return normalizePiCommands(await agentManager.getCommands(agentId));
 				} catch {
 					// agent 不存在或 RPC 超时时返回空列表，避免控制台报未处理异常
 					return [];
 				}
 			},
 			/** 用户通过 UI 响应了扩展的 ask_question 请求，转发给 AgentManager 发送 extension_ui_response */
-			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
+			sendUiResponse: async (_event, agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) => {
 				await agentManager.sendUIResponse(agentId, requestId, response);
 			},
 			/** 回传项目信任确认弹窗的用户选择，唤醒等待中的 Agent 创建流程（TrustStore.decide 的 ask 适配器）。 */

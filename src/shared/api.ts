@@ -9,9 +9,13 @@
  * 不要在此文件之外另起一份）。
  */
 import type {
+	AbortAndRestoreQueueResult,
 	AgentMessagesDelta,
 	AgentRuntimeState,
+	AgentSubagent,
 	AgentTab,
+	AgentTodoPhase,
+	AgentUiAskAnswer,
 	AgentUiRequest,
 	AfkState,
 	AfkTask,
@@ -33,7 +37,9 @@ import type {
 	CodexSessionSummary,
 	CommitDetail,
 	CommitEntry,
+	CrashedRun,
 	ConfigFileDiagnostic,
+	ConfigSaveWarning,
 	CreateAgentInput,
 	CreatePiPromptTemplateInput,
 	CreatePiSkillInput,
@@ -42,7 +48,6 @@ import type {
 	ExternalEditor,
 	ExternalEditorId,
 	ExternalEditorSetting,
-	FeedbackEnvironment,
 	FeishuBotConfig,
 	FeishuBridgeStatus,
 	FeishuChatBinding,
@@ -62,7 +67,13 @@ import type {
 	NpmAvailabilityResult,
 	OpenCodeImportReport,
 	OpenCodeSessionSummary,
+	OmpFallbackChains,
+	OmpLoginProvider,
+	OmpLogoutAccount,
+	OmpModelPresets,
 	OmpModelRole,
+	OmpModelRoleStorage,
+	OmpConfigPatch,
 	OmpRolesState,
 	PetAggregateState,
 	PetManifest,
@@ -81,8 +92,10 @@ import type {
 	PiUpdateCheckResult,
 	Project,
 	ProjectResourceListResult,
+	PromoteQueuedMessageResult,
 	PromptStoreItem,
 	PromptStoreSearchResult,
+	RemoveQueuedMessageResult,
 	ScratchPadData,
 	SendPromptInput,
 	SendPromptResult,
@@ -126,7 +139,7 @@ export interface ProjectsApi {
 	 * 三者缓存与用途不同（项目 vs 运行态 vs 配置编辑），语义不等价，合并需先理清
 	 * 缓存层级；留待后续波次评估，这里仅标注重叠。
 	 */
-	listModels: (projectId?: string) => Promise<AvailableModel[]>;
+	listModels: (projectId?: string, includeNonChat?: boolean) => Promise<AvailableModel[]>;
 }
 
 export interface ProjectResourcesApi {
@@ -197,7 +210,9 @@ export interface SessionsApi {
 	 * 展开压缩卡片时才按 compactionId 取回内容——归档可达整个压缩前历史（MB 级），
 	 * 随每次状态推送结构化克隆会直接顶爆渲染进程内存。
 	 */
-	readArchivedMessages: (agentId: string, compactionId: string) => Promise<{ messages: ChatMessage[] }>;
+	readArchivedMessages: (filePath: string, compactionId: string) => Promise<{ messages: ChatMessage[] }>;
+	/** 冷扫描部分结果返回后，完整扫描结束时触发；回调无需参数，重新 list 即可。 */
+	onChanged: (callback: () => void) => () => void;
 }
 
 export interface CodexSessionsApi {
@@ -293,7 +308,6 @@ export interface AppApi {
 	downloadUpdate: (asset: AppUpdateAsset) => Promise<AppUpdateDownloadResult>;
 	installUpdate: (filePath: string) => Promise<void>;
 	onUpdateProgress: (callback: (progress: AppUpdateDownloadProgress) => void) => () => void;
-	feedbackEnvironment: () => Promise<FeedbackEnvironment>;
 	openExternal: (url: string, forceSystem?: boolean) => Promise<void>;
 	onOpenInBrowser: (callback: (url: string) => void) => () => void;
 	restart: () => Promise<void>;
@@ -305,6 +319,11 @@ export interface AppApi {
 	windowControl: (action: "minimize" | "toggle-maximize" | "close") => Promise<void>;
 	toggleAlwaysOnTopWindow: () => Promise<boolean>;
 	toggleDevTools: () => Promise<boolean>;
+	/**
+	 * 取出「上次非正常退出时仍打开的会话」，每次进程启动只交付一次（主进程内一次性消费）。
+	 * 正常退出后返回 null；渲染层据此静默恢复会话并提示，而不是让用户去历史里翻。
+	 */
+	takeCrashedSessions: () => Promise<CrashedRun | null>;
 }
 
 export interface SkillsApi {
@@ -368,10 +387,9 @@ export interface ExtensionsApi {
 
 /**
  * 类型化设置表面：AppSettings 强类型读写（SettingsStore，含热更新副作用：代理/主题/
- * Web 服务/宠物联动）。与 config.getSettings/saveSettings/saveRaw（settings.json 原始
- * JSON 文件级读写，ConfigModal 编辑器用）并行存在 —— 边界：settings.* = 应用语义 +
- * 副作用；config.* = 文件内容编辑。W6-7 记录，不合并（两套都是真实服务面，合并有
- * 回归风险，留待未来波次）。
+ * Web 服务/宠物联动）。与 config.getOmpConfig/saveOmpConfigRaw/patchOmpConfig
+ * （config.yml 文件级读写，ConfigModal 编辑器用）并行存在 —— 边界：settings.* =
+ * 应用语义 + 副作用；config.* = omp 配置文件内容编辑。
  */
 export interface SettingsApi {
 	get: () => Promise<AppSettings>;
@@ -384,16 +402,20 @@ export interface ConfigApi {
 	getModels: () => Promise<{ raw: string; parsed: { providers: Record<string, unknown> }; diagnostic?: ConfigFileDiagnostic }>;
 	getAuth: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	/**
-	 * settings.json 原始文件级读取（ConfigModal 编辑器）。与 settings.get（typed
-	 * AppSettings + 热更新副作用）并行 —— 这边返回 raw/parsed/diagnostic，供编辑器
-	 * 展示与诊断；界别见 SettingsApi 注释（W6-7 记录，不合并）。
+	 * 读取 omp 全局设置权威源 config.yml（原文 + 解析后的映射，供设置页与源文件编辑器）。
+	 * 与 settings.get（typed AppSettings + 热更新副作用）并行 —— 这边是文件级编辑。
 	 */
-	getSettings: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
+	getOmpConfig: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
 	getTrust: () => Promise<{ raw: string; parsed: Record<string, unknown>; diagnostic?: ConfigFileDiagnostic }>;
-	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
-	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string }>;
-	/** 原始 settings.json 写回（编辑器保存）；语义同 getSettings —— 文件级，无类型化副作用。 */
-	saveSettings: (settings: Record<string, unknown>) => Promise<{ valid: boolean; error?: string }>;
+	saveModels: (data: unknown) => Promise<{ valid: boolean; error?: string; warnings?: ConfigSaveWarning[] }>;
+	saveAuth: (data: unknown) => Promise<{ valid: boolean; error?: string; warnings?: ConfigSaveWarning[] }>;
+	/** config.yml 原文写回（源文件编辑器）；校验 YAML 顶层为映射后原子写，失败不落盘。 */
+	saveOmpConfigRaw: (raw: string) => Promise<{ valid: boolean; error?: string }>;
+	/**
+	 * config.yml 键级补丁：只提交用户改动过的点路径键（`retry.maxRetries` 等）。
+	 * 主进程在最新文档上做一次 read-modify-write，注释与未触及的键保持不变。
+	 */
+	patchOmpConfig: (patch: OmpConfigPatch) => Promise<{ valid: boolean; error?: string }>;
 	/**
 	 * 读取 omp 权威全局配置（config.yml）中的默认模型角色与默认思考档。
 	 * 当前 omp 的全局 settings 源是 config.yml（"provider/modelId[:thinkingLevel]"），
@@ -430,6 +452,34 @@ export interface ConfigApi {
 	) => Promise<{ valid: boolean; error?: string }>;
 	/** 清除 config.yml 中某个 omp 模型角色（modelRoles.<role>） */
 	clearOmpRole: (role: OmpModelRole) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 config.yml 的 modelPresets（仅结构合法的条目）。 */
+	getOmpModelPresets: () => Promise<OmpModelPresets>;
+	/** 把当前 modelRoles + defaultThinkingLevel 快照保存为命名预设。 */
+	saveOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 应用预设：整块替换 modelRoles；预设未记录 thinking 时保留当前档位。 */
+	applyOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 删除全局预设。 */
+	deleteOmpModelPreset: (name: string) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取模型循环顺序（未配置返回空数组，表示 omp 默认 smol→default→slow）。 */
+	getOmpCycleOrder: () => Promise<string[]>;
+	/** 写入模型循环顺序；空数组删除该键回到 omp 默认。 */
+	setOmpCycleOrder: (order: string[]) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 modelProviderOrder（裸模型 id 解析时的供应商优先级；空数组为 omp 内置顺序）。 */
+	getOmpProviderOrder: () => Promise<string[]>;
+	/** 写入 modelProviderOrder；空数组删除该键。 */
+	setOmpProviderOrder: (order: string[]) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 modelRoleStorage（global 写全局 config.yml，project 让 omp 写项目 .omp/config.yml）。 */
+	getOmpRoleStorage: () => Promise<OmpModelRoleStorage>;
+	/** 写入 modelRoleStorage。 */
+	setOmpRoleStorage: (
+		value: OmpModelRoleStorage,
+	) => Promise<{ valid: boolean; error?: string }>;
+	/** 读取 retry.fallbackChains。 */
+	getOmpFallbackChains: () => Promise<OmpFallbackChains>;
+	/** 写入 retry.fallbackChains；空映射删除该键。 */
+	setOmpFallbackChains: (
+		chains: OmpFallbackChains,
+	) => Promise<{ valid: boolean; error?: string }>;
 	saveRaw: (fileName: string, rawJson: string) => Promise<{ valid: boolean; error?: string }>;
 	export: () => Promise<string>;
 	import: (packageJson: string) => Promise<{ valid: boolean; error?: string }>;
@@ -457,14 +507,30 @@ export interface ConfigApi {
 	}>;
 }
 
+export type AgentHistoryPage = {
+	messages: ChatMessage[];
+	/** 下一页的字节 cursor；0 表示已到文件头 */
+	cursor: number;
+	hasMore: boolean;
+};
+
 export interface AgentsApi {
 	list: () => Promise<AgentTab[]>;
 	getMessages: (agentId: string) => Promise<ChatMessage[]>;
+	/** 向前读取一页更早的会话历史（大会话 30 轮尾窗之外）。 */
+	getHistoryPage: (agentId: string, beforeOffset?: number) => Promise<AgentHistoryPage>;
 	create: (input: CreateAgentInput) => Promise<AgentTab>;
 	rename: (agentId: string, name: string) => Promise<AgentTab>;
 	stop: (agentId: string) => Promise<void>;
 	prompt: (input: SendPromptInput) => Promise<SendPromptResult>;
 	abort: (agentId: string) => Promise<void>;
+	abortAndRestoreQueue: (agentId: string) => Promise<AbortAndRestoreQueueResult>;
+	removeQueuedMessage: (
+		agentId: string,
+		message: string,
+		queue: "steering" | "followUp",
+	) => Promise<RemoveQueuedMessageResult>;
+	promoteQueuedMessage: (agentId: string, message: string) => Promise<PromoteQueuedMessageResult>;
 	exportHtml: (agentId: string) => Promise<{ path: string }>;
 	getForkMessages: (agentId: string) => Promise<ForkMessage[]>;
 	forkSession: (agentId: string, entryId: string) => Promise<{ text?: string; cancelled?: boolean }>;
@@ -477,30 +543,71 @@ export interface AgentsApi {
 	reload: (agentId: string) => Promise<void>;
 	restart: (agentId: string) => Promise<AgentTab>;
 	/**
-	 * 运行态变更家族（compact/cycleModel/setModel/refreshModels/cycleThinking/setThinking）：
-	 * 每个成员独立保留，不收敛为 agents.runtimeCommand(agentId, cmd, arg?) 动作表（W6-7 决策，
-	 * 证据见下）。六个通道会随 AgentManager 一起变，但合并成动作表会用 union 参数换来
-	 * 更糟的调用面：
+	 * 运行态变更家族（compact/cycleModel/setModel/refreshModels/cycleThinking/setThinking/
+	 * setTodos/setAutoCompaction）：每个成员独立保留，不收敛为
+	 * agents.runtimeCommand(agentId, cmd, arg?) 动作表（W6-7 决策，证据见下）。
+	 * 这些通道会随 AgentManager 一起变，但合并成动作表会用 union 参数换来更糟的调用面：
 	 *  - 参数形态各异：无参（cycle/refresh）、双参（setModel(provider, modelId)）、
-	 *    单参（setThinking(level)）、可选参（compact(prompt?)）——union 动作对象在每个
-	 *    调用点都要构造 payload 对象，丢失按成员命名的可发现性与每个调用点的精确参数类型；
+	 *    单参（setThinking(level)/setAutoCompaction(enabled)）、数组参（setTodos(phases)）、
+	 *    可选参（compact(prompt?)）——union 动作对象在每个调用点都要构造 payload 对象，
+	 *    丢失按成员命名的可发现性与每个调用点的精确参数类型；
 	 *  - browserApi（内置浏览器模式）把每个成员一一映射到独立 REST 端点
 	 *    （/cycle-model、/model、/refresh-models、/cycle-thinking、/thinking，payload 各异），
 	 *    收敛会让 web 客户端从「成员→端点 一对一」退化成动作 switch，且违反 W6-18
 	 *    「不改 web HTTP 行为」约束；
-	 *  - 六者返回值都是 AgentRuntimeState，合并无返回类型收益。
-	 * 已评估，SKIP 收敛 — 保持六成员，改 API 面时与 AgentManager/WebServiceManager 同步。
+	 *  - 返回值统一是 AgentRuntimeState，合并无返回类型收益。
+	 * 已评估，SKIP 收敛 — 保持独立成员，改 API 面时与 AgentManager/WebServiceManager 同步。
 	 */
 	compact: (agentId: string, prompt?: string) => Promise<AgentRuntimeState>;
 	runtimeState: (agentId: string) => Promise<AgentRuntimeState>;
+	/** omp 子代理 registry 推送（progress 帧合并后的完整快照，按父 agent 分组）。 */
+	onSubagents: (callback: (payload: { agentId: string; subagents: AgentSubagent[] }) => void) => () => void;
+	/** 取消运行中的子代理；返回 omp 是否确认取消。 */
+	cancelSubagent: (agentId: string, subagentId: string) => Promise<boolean>;
+	/** 向运行中的子代理追加一条 steering 消息。 */
+	steerSubagent: (agentId: string, subagentId: string, message: string) => Promise<void>;
+	/** 读取子代理会话 transcript（只允许已登记在父 agent registry 的 subagentId）。 */
+	subagentMessages: (agentId: string, subagentId: string) => Promise<ChatMessage[]>;
+	/** 读取当前子代理 registry 快照（渲染层重载后补历史卡片；增量走 onSubagents）。 */
+	subagents: (agentId: string) => Promise<AgentSubagent[]>;
 	cycleModel: (agentId: string) => Promise<AgentRuntimeState>;
 	availableModels: (agentId: string) => Promise<AvailableModel[]>;
+	/** omp 原生 OAuth 登录：列出 provider（登录需要运行中的 agent）。 */
+	getLoginProviders: (agentId: string) => Promise<OmpLoginProvider[]>;
+	/**
+	 * 触发 OAuth 登录。omp 会通过 `agents:ui-request` 推送 `open_url` 和
+	 * 非敏感 input 请求；登录完成或失败后 promise settle。
+	 */
+	login: (agentId: string, providerId: string) => Promise<{ providerId: string }>;
+	/** 列出某 provider 已存储、可登出的凭据（active 在前）。 */
+	getLogoutAccounts: (agentId: string, providerId: string) => Promise<OmpLogoutAccount[]>;
+	/** 移除一条凭据；remainingSource 表示仍能认证该 provider 的来源。 */
+	logout: (
+		agentId: string,
+		providerId: string,
+		credentialId: number,
+	) => Promise<{ remainingSource?: string }>;
 	setModel: (agentId: string, provider: string, modelId: string) => Promise<AgentRuntimeState>;
 	/** 刷新模型配置，让运行中的 agent 重新加载 models.json */
 	refreshModels: (agentId: string) => Promise<AgentRuntimeState>;
 	cycleThinking: (agentId: string) => Promise<AgentRuntimeState>;
 	setThinking: (agentId: string, level: string) => Promise<AgentRuntimeState>;
+	/** 当前模型可用的思考档位；旧版 omp 返回空数组。 */
+	availableThinkingLevels: (agentId: string) => Promise<string[]>;
+	/** 切换 fast/priority 服务档。 */
+	setFastMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 切换 slow/thinking 服务档。 */
+	setSlowMode: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 切换会话自动压缩（omp set_auto_compaction）。 */
+	setAutoCompaction: (agentId: string, enabled: boolean) => Promise<AgentRuntimeState>;
+	/** 下发会话 todo（omp set_todos）；传空数组清空。 */
+	setTodos: (agentId: string, phases: AgentTodoPhase[]) => Promise<AgentRuntimeState>;
 	commands: (agentId: string) => Promise<PiCommand[]>;
+	/**
+	 * omp 的 `available_commands_update` 推送：命令目录以 runtime 为唯一事实源。
+	 * `/reload-plugins` 等操作后目录变化时触发，渲染层据此替换本地列表。
+	 */
+	onCommandCatalog: (callback: (payload: { agentId: string; commands: PiCommand[] }) => void) => () => void;
 	onState: (callback: (tabs: AgentTab[]) => void) => () => void;
 	/** 桌面宠物点击跳转：主进程通知主窗切换到活跃 Agent tab */
 	onFocusTarget: (callback: (target: { agentId: string }) => void) => () => void;
@@ -512,11 +619,11 @@ export interface AgentsApi {
 	onRpcLog: (callback: (payload: { agentId: string; direction: string; summary: string; data: unknown }) => void) => () => void;
 	onRuntimeState: (callback: (payload: { agentId: string; state: AgentRuntimeState }) => void) => () => void;
 	/** 向 Agent 发送扩展 UI 响应（用户回答了 select/confirm/input/editor 对话框） */
-	sendUiResponse: (agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => Promise<void>;
-	/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor） */
+	sendUiResponse: (agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) => Promise<void>;
+	/** 监听 Agent 扩展 UI 请求（模型通过扩展调用了 ctx.ui.select/confirm/input/editor/ask） */
 	onUiRequest: (callback: (request: AgentUiRequest) => void) => () => void;
-	/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关） */
-	notifyAsk: (title: string, body: string) => Promise<void>;
+	/** 非活动 Agent 收到 ask 请求时请求主进程发系统通知（渲染层先判定聚焦与设置开关）；点击通知聚焦该 Agent */
+	notifyAsk: (title: string, body: string, agentId?: string) => Promise<void>;
 	/** 监听项目信任确认请求（主进程在启动 Agent 前对含 .pi 资源的项目发起） */
 	onTrustRequest: (callback: (request: { requestId: string; cwd: string; projectName: string }) => void) => () => void;
 	/** 回传用户对项目信任确认弹窗的选择（trust-remember/trust-session/deny） */

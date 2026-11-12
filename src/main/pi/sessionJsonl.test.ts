@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, test } from "vitest";
 
 import type { ChatMessage } from "../../shared/types";
+import { isJsonRecord } from "../sessions/sessionEntries";
 import { SessionJsonl } from "./sessionJsonl";
 
 /** 构造一个 identity 路径解析的 SessionJsonl（无 WSL），用于文件 IO 测试。 */
@@ -173,10 +174,73 @@ test("readRecentMessages returns message entries as RpcResponse and trims by tur
 	const response = await sj.readRecentMessages(sessionPath, 5);
 	assert.equal(response.success, true);
 	assert.equal(response.command, "get_messages");
-	const messages = (response.data as { messages?: unknown[] }).messages!;
-	assert.equal(messages.length, 10);
+	const data = response.data as {
+		messages: unknown[];
+		entryIds: string[];
+		cursor: number;
+		hasOlder: boolean;
+	};
+	assert.equal(data.messages.length, 10);
 	// 第一条应是 q45（最后 5 轮的起点）
-	assert.equal((messages[0] as { content: Array<{ text: string }> }).content[0].text, "q45");
+	assert.equal((data.messages[0] as { content: Array<{ text: string }> }).content[0].text, "q45");
+	assert.equal(data.hasOlder, true);
+	assert.equal(data.cursor, await sj.findEntryOffset(sessionPath, "u45"));
+
+	// 基线 cursor 必须能被「加载更早」直接使用，且不重复基线首条
+	const older = await sj.readOlderMessages(sessionPath, data.cursor, 5);
+	assert.deepEqual(older.entryIds, ["u40", "a40", "u41", "a41", "u42", "a42", "u43", "a43", "u44", "a44"]);
+	assert.equal(older.hasMore, true);
+});
+
+test("readRecentMessages returns entryIds aligned with trimmed messages", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "recent-ids-"));
+	const sessionPath = join(dir, "session.jsonl");
+	const entries: unknown[] = [];
+	for (let i = 0; i < 8; i++) {
+		entries.push({ id: `u${i}`, type: "message", message: { role: "user", content: [{ type: "text", text: `q${i}` }] } });
+		entries.push({ id: `a${i}`, type: "message", message: { role: "assistant", content: [{ type: "text", text: `a${i}` }] } });
+	}
+	await writeFile(sessionPath, toJsonl(entries), "utf8");
+	const response = await sj.readRecentMessages(sessionPath, 2);
+	const data = response.data as {
+		messages: unknown[];
+		entryIds: string[];
+		cursor: number;
+		hasOlder: boolean;
+	};
+	assert.deepEqual(data.entryIds, ["u6", "a6", "u7", "a7"]);
+	assert.equal(data.entryIds.length, data.messages.length);
+	assert.equal(data.hasOlder, true);
+	assert.equal(data.cursor, await sj.findEntryOffset(sessionPath, "u6"));
+});
+
+test("readOlderMessages pages backward without overlap and reports a byte cursor", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "older-"));
+	const sessionPath = join(dir, "session.jsonl");
+	const entries: unknown[] = [];
+	for (let i = 0; i < 20; i++) {
+		entries.push({ id: `u${i}`, type: "message", message: { role: "user", content: [{ type: "text", text: `q${i}` }] } });
+		entries.push({ id: `a${i}`, type: "message", message: { role: "assistant", content: [{ type: "text", text: `a${i}` }] } });
+	}
+	await writeFile(sessionPath, toJsonl(entries), "utf8");
+
+	const boundary = await sj.findEntryOffset(sessionPath, "u16");
+	assert.equal(typeof boundary, "number");
+	const first = await sj.readOlderMessages(sessionPath, boundary, 4);
+	assert.deepEqual(first.entryIds, ["u12", "a12", "u13", "a13", "u14", "a14", "u15", "a15"]);
+	assert.equal(first.hasMore, true);
+	assert.ok(first.cursor > 0);
+
+	// 以本页首行 cursor 继续向前：严格更早，不重复上一页
+	const second = await sj.readOlderMessages(sessionPath, first.cursor, 4);
+	assert.deepEqual(second.entryIds, ["u8", "a8", "u9", "a9", "u10", "a10", "u11", "a11"]);
+	assert.ok(second.cursor < first.cursor);
+
+	// 到文件头后不再声称还有历史
+	const fromStart = await sj.readOlderMessages(sessionPath, 0, 4);
+	assert.deepEqual(fromStart, { messages: [], entryIds: [], cursor: 0, hasMore: false });
 });
 
 test("readRecentMessages skips non-message entries", async () => {
@@ -192,8 +256,9 @@ test("readRecentMessages skips non-message entries", async () => {
 		"utf8",
 	);
 	const response = await sj.readRecentMessages(sessionPath, 40);
-	const messages = (response.data as { messages?: unknown[] }).messages!;
-	assert.equal(messages.length, 1);
+	const data = response.data as { messages: unknown[]; hasOlder: boolean };
+	assert.equal(data.messages.length, 1);
+	assert.equal(data.hasOlder, false);
 });
 
 test("readRecentMessages rethrows on unreadable file", async () => {
@@ -332,6 +397,117 @@ test("parseArchives ENOENT 竞态只记 debug 不记 warn", async () => {
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0].level, "debug");
 	assert.ok(calls[0].message.includes("ENOENT"));
+});
+
+test("readDisplayMessages 把进入时间线的 blob 图片还原成 base64", async () => {
+	// Viewer 整读路径只还原真正会渲染的消息（活动分支 + 裁剪后的轮次），
+	// 归档卡片只渲染纯文本，因此这里验证活动分支上的工具图片可用。
+	const dir = await mkdtemp(join(tmpRoot, "display-blob-"));
+	const blobsDir = join(dir, "blobs");
+	await mkdir(blobsDir, { recursive: true });
+	const hash = "cd".repeat(32);
+	const bytes = Buffer.from("viewer-image");
+	await writeFile(join(blobsDir, hash), bytes);
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([
+			{ id: "u1", parentId: null, type: "message", message: { role: "user", content: [{ type: "text", text: "look" }] } },
+			{
+				id: "t1",
+				parentId: "u1",
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [{ type: "image", data: `blob:sha256:${hash}`, mimeType: "image/png" }],
+				},
+			},
+		]),
+		"utf8",
+	);
+	const sj = new SessionJsonl({ resolveHostPath: (p) => p, getBlobsDir: () => blobsDir });
+	const messages = await sj.readDisplayMessages(sessionPath, "agent1");
+	const tool = messages.find((message) => message.role === "tool");
+	assert.ok(tool);
+	assert.equal(tool.images?.[0]?.data, bytes.toString("base64"));
+});
+
+test("readDisplayMessages 还原用户附件的 blob 图片", async () => {
+	const dir = await mkdtemp(join(tmpRoot, "display-user-blob-"));
+	const blobsDir = join(dir, "blobs");
+	await mkdir(blobsDir, { recursive: true });
+	const hash = "ef".repeat(32);
+	const bytes = Buffer.from("user-attachment");
+	await writeFile(join(blobsDir, hash), bytes);
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([
+			{
+				id: "u1",
+				parentId: null,
+				type: "message",
+				message: {
+					role: "user",
+					content: [
+						{ type: "text", text: "截图看看" },
+						{ type: "image", data: `blob:sha256:${hash}`, mimeType: "image/png" },
+					],
+				},
+			},
+		]),
+		"utf8",
+	);
+	const sj = new SessionJsonl({ resolveHostPath: (p) => p, getBlobsDir: () => blobsDir });
+	const messages = await sj.readDisplayMessages(sessionPath, "agent1");
+	assert.equal(messages.length, 1);
+	assert.equal(messages[0].images?.[0]?.data, bytes.toString("base64"));
+});
+
+test("readRecentMessages 把持久化的 blob 图片引用还原成 base64", async () => {
+	// omp 落盘时图片内容块是 `blob:sha256:<hash>`，直读会话文件的兜底路径必须
+	// 从 blob store 还原，否则渲染层拿到的是无法解码的引用串。
+	const dir = await mkdtemp(join(tmpRoot, "recent-blob-"));
+	const blobsDir = join(dir, "blobs");
+	await mkdir(blobsDir, { recursive: true });
+	const hash = "ab".repeat(32);
+	const bytes = Buffer.from("fake-png-bytes");
+	await writeFile(join(blobsDir, hash), bytes);
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([
+			{
+				id: "t1",
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [
+						{ type: "text", text: "image" },
+						{ type: "image", data: `blob:sha256:${hash}`, mimeType: "image/png" },
+					],
+				},
+			},
+		]),
+		"utf8",
+	);
+	const sj = new SessionJsonl({ resolveHostPath: (p) => p, getBlobsDir: () => blobsDir });
+	const response = await sj.readRecentMessages(sessionPath, 40);
+	const data = response.data;
+	assert.ok(isJsonRecord(data));
+	const messages = data.messages;
+	assert.ok(Array.isArray(messages));
+	const first = messages[0];
+	assert.ok(isJsonRecord(first));
+	const content = first.content;
+	assert.ok(Array.isArray(content));
+	const image = content[1];
+	assert.ok(isJsonRecord(image));
+	assert.equal(image.data, bytes.toString("base64"));
 });
 
 test("parseArchives accepts pre-read sessionContent", async () => {

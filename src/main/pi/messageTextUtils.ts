@@ -12,6 +12,7 @@
  */
 
 import type { ChatMessage, ImageContent } from "../../shared/types";
+import { isBlobImageRef } from "./sessionBlobs";
 
 /** 工具结果文本截断阈值（字符数）；超出时 meta 标记 truncated 并缓存全文供「查看完整输出」。 */
 export const MAX_TOOL_RESULT_CHARS = 8000;
@@ -31,6 +32,42 @@ export function safeJson(value: unknown): string {
 /** 清理 ANSI 转义码（模型思考内容中常见终端颜色序列）。 */
 export function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+}
+
+/** 工具结果单次保留的图片上限：截图/读图类工具一次通常 1~3 张，超出部分只留文本。 */
+export const MAX_TOOL_RESULT_IMAGES = 8;
+/** 单张图片的 base64 上限（约 3MB 原图），防止一张超大图把 IPC 撑爆。 */
+export const MAX_TOOL_IMAGE_BASE64_CHARS = 4 * 1024 * 1024;
+/**
+ * 单条工具消息的图片总量上限（base64 字符）。
+ *
+ * 时间线总预算是 8MB（`MAX_TRANSCRIPT_BYTES`），裁剪只从头部裁、尾部消息始终保留，
+ * 所以单条消息必须自己设上限：否则 8 张 4MB 的图片能到 32MB，把整段历史挤出预算且
+ * 仍原样过 IPC。4MB 约为预算的一半，同时容得下多张普通截图（单张约 50~200KB）。
+ */
+export const MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS = 4 * 1024 * 1024;
+
+/**
+ * 从工具结果 content 中提取可直接渲染的图片块。
+ *
+ * 与 extractImages 的差异：
+ *   - `blob:sha256:` 引用串不是图片数据，渲染层无法解码，直接丢弃；
+ *     历史读取路径会先用 sessionBlobs 还原，还原失败时这里退化为无图而非坏图。
+ *   - 条数、单张体积、总量都设上限：工具结果图片会随消息一起过 IPC 并计入时间线预算。
+ *     超限时按原顺序保留前面的图片，后面的只留文本。
+ */
+export function extractToolResultImages(content: unknown): ImageContent[] {
+	const images: ImageContent[] = [];
+	let totalChars = 0;
+	for (const image of extractImages(content)) {
+		if (images.length >= MAX_TOOL_RESULT_IMAGES) break;
+		if (isBlobImageRef(image.data)) continue;
+		if (image.data.length > MAX_TOOL_IMAGE_BASE64_CHARS) continue;
+		if (totalChars + image.data.length > MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS) break;
+		images.push(image);
+		totalChars += image.data.length;
+	}
+	return images;
 }
 
 /** 从 pi 历史消息 content 中恢复图片附件，用于历史会话重新打开后的图片展示。 */
@@ -116,6 +153,36 @@ export function compactJsonLength(value: unknown): number {
 }
 
 /**
+ * 嵌套 meta 序列化长度缓存（WeakMap 以 meta 对象为键，每个 meta 最多 3 条）。
+ *
+ * 为什么需要：details / archivedMessages / _askCard 未截断，可能是 MB 级结构；
+ * getMessages 在渲染层流式推送、Web 轮询与 transcript 预算校验中反复估算同一条
+ * 消息，每次都 JSON.stringify 这些嵌套结构是纯重复 CPU。meta 在消息更新时整体
+ * 替换、普通消息的 meta 更是终生不变，因此按对象身份缓存测得长度即可。
+ *
+ * 条目里同时记录嵌套值的引用：同一个 meta 对象上的嵌套值若被就地替换（引用不再
+ * 相等），就重算，保证返回值与不走缓存的路径完全一致。
+ * 只缓存嵌套结构长度，不缓存消息总字节 —— text/thinking 是流式增长的，必须按当前值重算。
+ */
+const nestedMetaLengthCache = new WeakMap<
+	object,
+	Map<string, { value: unknown; length: number }>
+>();
+
+function memoizedNestedMetaLength(meta: object, key: string, value: unknown): number {
+	let perMeta = nestedMetaLengthCache.get(meta);
+	if (!perMeta) {
+		perMeta = new Map();
+		nestedMetaLengthCache.set(meta, perMeta);
+	}
+	const cached = perMeta.get(key);
+	if (cached && cached.value === value) return cached.length;
+	const length = compactJsonLength(value);
+	perMeta.set(key, { value, length });
+	return length;
+}
+
+/**
  * 估算单条消息的驻留 / IPC 体积（字节），作为 transcript 容量预算的度量口径。
  *
  * 只求量级正确：文本按 UTF-16（2 字节/字符）计，图片按 base64 串长计，另加固定开销。
@@ -137,7 +204,7 @@ export function estimateMessageBytes(message: ChatMessage): number {
 	for (const key of NESTED_META_BYTES_KEYS) {
 		const value = meta[key];
 		if (value === undefined || value === null) continue;
-		bytes += compactJsonLength(value) * 2;
+		bytes += memoizedNestedMetaLength(meta, key, value) * 2;
 	}
 	return bytes;
 }

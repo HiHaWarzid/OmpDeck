@@ -13,8 +13,14 @@ import {
 } from "lucide-react";
 import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../../fileIcons";
 import { t } from "../../../i18n";
+import { Button } from "../../ui/Button";
 import { TextField } from "../../ui/TextField";
 import type { FileTreeNode } from "../../../../../shared/types";
+
+/** 每个目录（含根列表）首屏渲染的子项数；「加载更多」每次追加同样的数量。 */
+const FILE_NODE_PAGE_SIZE = 50;
+/** 根列表没有目录路径，用空串作分页键（真实节点路径不会为空）。 */
+const ROOT_PAGE_KEY = "";
 
 /** 文件抽屉：工具面板挂载（无内建 header，由外层 drawer-chrome Tab 接管 chrome）。 */
 export function FilesDrawer(props: {
@@ -91,6 +97,9 @@ function FileNode(props: {
 	onMoveFiles?: (sourcePaths: string[], targetDir: string) => void;
 	dragOverDir?: string | null;
 	onDragOverDirChange?: (path: string | null) => void;
+	/** 各目录已渲染的子项数量（按目录路径分页）；缺省渲染首屏数量。 */
+	visibleChildCounts: Record<string, number>;
+	onLoadMoreChildren: (path: string) => void;
 }) {
 	const { node, expandedDirs, onToggleDirectory, depth = 0 } = props;
 	const expanded = expandedDirs.has(node.path);
@@ -161,6 +170,13 @@ function FileNode(props: {
 			</div>
 		);
 	const isDragOver = props.dragOverDir === node.path;
+	// 只看前 N 个已渲染子项：目录可能上千项，首帧全量挂载会阻塞主线程。
+	const children = node.children ?? [];
+	const shownChildren = children.slice(
+		0,
+		props.visibleChildCounts[node.path] ?? FILE_NODE_PAGE_SIZE,
+	);
+	const remainingChildren = children.length - shownChildren.length;
 	return (
 		<div className="file-node" style={rowStyle}>
 			<button
@@ -180,9 +196,9 @@ function FileNode(props: {
 				</span>
 				<span className="file-node-name">{node.name}</span>
 			</button>
-			{expanded && node.children && node.children.length > 0 && (
+			{expanded && children.length > 0 && (
 				<div className="file-children">
-					{node.children.map((child) => (
+					{shownChildren.map((child) => (
 						<FileNode key={child.path} node={child}
 							expandedDirs={expandedDirs}
 							onToggleDirectory={onToggleDirectory}
@@ -193,8 +209,21 @@ function FileNode(props: {
 							onDropFiles={props.onDropFiles}
 							onMoveFiles={props.onMoveFiles}
 							dragOverDir={props.dragOverDir}
-							onDragOverDirChange={props.onDragOverDirChange} />
+							onDragOverDirChange={props.onDragOverDirChange}
+							visibleChildCounts={props.visibleChildCounts}
+							onLoadMoreChildren={props.onLoadMoreChildren} />
 					))}
+					{remainingChildren > 0 && (
+						<div className="file-load-more">
+							<Button
+								variant="ghost"
+								buttonSize="sm"
+								onClick={() => props.onLoadMoreChildren(node.path)}
+							>
+								{t("drawer.loadMoreFiles", { count: remainingChildren })}
+							</Button>
+						</div>
+					)}
 				</div>
 			)}
 		</div>
@@ -233,6 +262,26 @@ function FilesPanel(props: {
 	const [dragOverDir, setDragOverDir] = useState<string | null>(null);
 	const [dragSourcePath, setDragSourcePath] = useState<string | null>(null);
 	const dragCountRef = useRef(0);
+	/* 分页窗口按目录路径记录，默认 FILE_NODE_PAGE_SIZE：首帧只挂载每层前 50 个子项。
+	   展开/收起不重建这份状态，所以重新展开目录仍保持用户已经「加载更多」的进度。 */
+	const [visibleChildCounts, setVisibleChildCounts] = useState<Record<string, number>>({});
+	const loadMoreChildren = useCallback((path: string) => {
+		setVisibleChildCounts((current) => ({
+			...current,
+			[path]: (current[path] ?? FILE_NODE_PAGE_SIZE) + FILE_NODE_PAGE_SIZE,
+		}));
+	}, []);
+	// 切换项目后旧的路径键不再有意义，顺带释放这棵树的窗口记录。
+	const previousProjectRootRef = useRef(props.currentProjectRoot);
+	useEffect(() => {
+		if (previousProjectRootRef.current === props.currentProjectRoot) return;
+		previousProjectRootRef.current = props.currentProjectRoot;
+		setVisibleChildCounts({});
+	}, [props.currentProjectRoot]);
+
+	const rootVisibleCount = visibleChildCounts[ROOT_PAGE_KEY] ?? FILE_NODE_PAGE_SIZE;
+	const visibleRootNodes = props.files.slice(0, rootVisibleCount);
+	const remainingRootNodes = props.files.length - visibleRootNodes.length;
 
 	// 面板自身接受拖入：落在空白区域视为复制到项目根目录
 	const handlePanelDragOver = useCallback((e: React.DragEvent) => {
@@ -385,7 +434,7 @@ function FilesPanel(props: {
 					<MoveUp size={14} strokeWidth={1.8} aria-hidden="true" />
 				</button>
 			)}
-			{props.files.map((node) => (
+			{visibleRootNodes.map((node) => (
 				<FileNode
 					key={node.path}
 					node={node}
@@ -398,8 +447,21 @@ function FilesPanel(props: {
 					onMoveFiles={props.onMoveFiles}
 					dragOverDir={dragOverDir}
 					onDragOverDirChange={setDragOverDir}
+					visibleChildCounts={visibleChildCounts}
+					onLoadMoreChildren={loadMoreChildren}
 				/>
 			))}
+			{remainingRootNodes > 0 && (
+				<div className="file-load-more">
+					<Button
+						variant="ghost"
+						buttonSize="sm"
+						onClick={() => loadMoreChildren(ROOT_PAGE_KEY)}
+					>
+						{t("drawer.loadMoreFiles", { count: remainingRootNodes })}
+					</Button>
+				</div>
+			)}
 			{showScrollBottom && (
 				<button
 					type="button"

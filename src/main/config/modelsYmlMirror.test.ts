@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	await rm(dir, { recursive: true, force: true });
+	// getModelsConfig 的 yml→json 迁移是刻意非阻塞的；清理可能撞上仍在写临时文件
+	// 的迁移，Windows 下会偶发 ENOTEMPTY，重试到写入结束即可。
+	await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** 每次保存都走真实 rename：残留的 tmp 会以 `<name>.<pid>.tmp` 形式留在同目录。 */
@@ -202,6 +204,7 @@ describe("ConfigManager models.yml 镜像写", () => {
 
 		const read = await manager.getModelsConfig();
 		expect(read.parsed).toEqual({ providers: {} });
+		expect(read.diagnostic?.fileName).toBe("models.yml");
 		// 孤儿化防护：yml 暂不可读时不得把空 providers 固化进 models.json。
 		// 先让事件循环把可能存在的迁移写冲刷掉，再断言文件未产生。
 		await new Promise((resolve) => setTimeout(resolve, 50));
@@ -306,131 +309,5 @@ describe("models.yml 镜像失败必须可见（不再静默吞掉）", () => {
 
 		expect(result.valid).toBe(true);
 		expect(result.warnings?.[0]?.code).toBe("models-yml-mirror-failed");
-	});
-});
-
-describe("saveModelsConfig 同步 apiKey 到 auth.json（内置 provider 401 修复）", () => {
-	function withKey(providerName: string, key: string): PiModelsFile {
-		return {
-			providers: {
-				[providerName]: {
-					baseUrl: `https://${providerName}.example.com/v1`,
-					apiKey: key,
-					models: [{ id: `${providerName}-model` }],
-				},
-			},
-		};
-	}
-
-	async function readAuth(): Promise<Record<string, { type?: string; key?: string }>> {
-		const path = join(dir, "auth.json");
-		if (!existsSync(path)) return {};
-		return JSON.parse(await readFile(path, "utf8")) as Record<string, { type?: string; key?: string }>;
-	}
-
-	it("首次保存带 apiKey 的 provider:auth.json 新增对应条目", async () => {
-		const manager = new ConfigManager(dir);
-		expect((await manager.saveModelsConfig(withKey("commandcode", "user_abc"))).valid).toBe(true);
-
-		const auth = await readAuth();
-		expect(auth.commandcode).toEqual({ type: "api_key", key: "user_abc" });
-	});
-
-	it("已存在的 auth.json 条目 key 不同时,会被新 key 覆盖（用户改 key 后再保存）", async () => {
-		await writeFile(
-			join(dir, "auth.json"),
-			JSON.stringify({ commandcode: { type: "api_key", key: "user_old" } }),
-		);
-		const manager = new ConfigManager(dir);
-		expect((await manager.saveModelsConfig(withKey("commandcode", "user_new"))).valid).toBe(true);
-
-		const auth = await readAuth();
-		expect(auth.commandcode).toEqual({ type: "api_key", key: "user_new" });
-	});
-
-	it("已存在但 key 相同:不触发 auth.json 重写（无 IO）", async () => {
-		await writeFile(
-			join(dir, "auth.json"),
-			JSON.stringify({ commandcode: { type: "api_key", key: "user_same" } }),
-		);
-		const mtimeBefore = statSync(join(dir, "auth.json")).mtimeMs;
-
-		const manager = new ConfigManager(dir);
-		expect((await manager.saveModelsConfig(withKey("commandcode", "user_same"))).valid).toBe(true);
-
-		const mtimeAfter = statSync(join(dir, "auth.json")).mtimeMs;
-		expect(mtimeAfter).toBe(mtimeBefore);
-	});
-
-	it("provider 在 models.json 里没有 apiKey:不动 auth.json 对应条目（保留 disabled provider 的 key）", async () => {
-		await writeFile(
-			join(dir, "auth.json"),
-			JSON.stringify({
-				commandcode: { type: "api_key", key: "user_keep" },
-				openai: { type: "api_key", key: "sk-keep" },
-			}),
-		);
-		const manager = new ConfigManager(dir);
-		// 只保存 openai,不带 apiKey
-		await manager.saveModelsConfig({
-			providers: {
-				openai: { baseUrl: "https://api.openai.com/v1", models: [{ id: "gpt-4o" }] },
-			},
-		});
-
-		const auth = await readAuth();
-		expect(auth.commandcode).toEqual({ type: "api_key", key: "user_keep" });
-		expect(auth.openai).toEqual({ type: "api_key", key: "sk-keep" });
-	});
-
-	it("多 provider 同时写:auth.json 合并所有非空 key", async () => {
-		const manager = new ConfigManager(dir);
-		const data: PiModelsFile = {
-			providers: {
-				commandcode: {
-					baseUrl: "https://api.commandcode.ai/provider",
-					apiKey: "user_1",
-					models: [{ id: "deepseek/deepseek-v4-flash" }],
-				},
-				openai: {
-					baseUrl: "https://api.openai.com/v1",
-					apiKey: "sk-2",
-					models: [{ id: "gpt-4o" }],
-				},
-				noKey: { baseUrl: "https://x.example.com/v1", models: [{ id: "m" }] },
-			},
-		};
-		expect((await manager.saveModelsConfig(data)).valid).toBe(true);
-
-		const auth = await readAuth();
-		expect(auth).toEqual({
-			commandcode: { type: "api_key", key: "user_1" },
-			openai: { type: "api_key", key: "sk-2" },
-		});
-	});
-
-	it("原始 JSON 编辑路径(models.json)同样同步 auth.json", async () => {
-		const manager = new ConfigManager(dir);
-		const raw = JSON.stringify(withKey("commandcode", "user_raw"));
-		expect((await manager.saveRawConfig("models.json", raw)).valid).toBe(true);
-
-		const auth = await readAuth();
-		expect(auth.commandcode).toEqual({ type: "api_key", key: "user_raw" });
-	});
-
-	it("空白/非字符串 apiKey 视为空,不写入 auth.json", async () => {
-		const manager = new ConfigManager(dir);
-		await manager.saveModelsConfig({
-			providers: {
-				x: {
-					baseUrl: "https://x.example.com/v1",
-					apiKey: "   " as unknown as string,
-					models: [{ id: "m" }],
-				},
-			},
-		});
-
-		const auth = await readAuth();
-		expect(auth).toEqual({});
 	});
 });

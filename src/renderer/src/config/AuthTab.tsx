@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Copy, ExternalLink, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, ExternalLink, RefreshCw, Trash2 } from "lucide-react";
 import { t } from "../i18n";
+import { IconButton } from "../components/ui/IconButton";
+import type { OmpLoginProvider, OmpLogoutAccount } from "../../../shared/types";
 import type { AuthFile, ModelsFile } from "./configTypes";
-import { ConfigComboboxInput, SecretInput } from "./ConfigShared";
+import { SecretInput } from "./ConfigShared";
+import { showNotice } from "../utils/notice";
 
-// 根据 pi 官方文档支持的供应商列表 (https://pi.dev/docs/latest/providers#auth-file)
+// 内置供应商预设；凭据写入 models.yml 的 providers.<name>.apiKey，
+// 参考 omp models 文档（不是已废弃的 auth.json）。
 const PRESET_PROVIDERS = [
 	{ value: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY", url: "https://console.anthropic.com/" },
 	{ value: "openai", label: "OpenAI", env: "OPENAI_API_KEY", url: "https://platform.openai.com/api-keys" },
@@ -41,14 +45,6 @@ const PRESET_PROVIDERS = [
 	{ value: "xiaomi-token-plan-sgp", label: "Xiaomi MiMo Token (Singapore)", env: "XIAOMI_TOKEN_PLAN_SGP_API_KEY", url: "" },
 ];
 
-// 认证类型选项，用于 type 字段的下拉选择
-const AUTH_TYPE_OPTIONS = [
-	{ value: "api_key", label: "api_key" },
-	{ value: "oauth2", label: "oauth2" },
-	{ value: "bearer", label: "bearer" },
-	{ value: "basic", label: "basic" },
-];
-
 export function AuthTab(props: {
 	data: AuthFile;
 	expandedAuth: string | null;
@@ -62,10 +58,9 @@ export function AuthTab(props: {
 	onCancelAddAuth: () => void;
 	onChangeNewAuthName: (name: string) => void;
 	onConfirmAddAuth: (name?: string, key?: string) => void;
-	onDuplicateAuth: (provider: string) => void;
 	onDeleteAuth: (provider: string) => void;
 	onDeleteAuths: (providers: string[]) => void;
-	onUpdate: (provider: string, field: string, value: string) => void;
+	onUpdate: (provider: string, field: "key", value: string) => void;
 	onSave: () => void;
 }) {
 	const { data, expandedAuth, saving } = props;
@@ -78,11 +73,190 @@ export function AuthTab(props: {
 	const [batchMode, setBatchMode] = useState(false);
 	const [selectedAuths, setSelectedAuths] = useState(new Set());
 
+	// omp 原生 OAuth：provider 列表和凭据都必须由运行中的 agent 提供，
+	// 因此先解析一个可用 agent；没有会话时只展示提示，不发 RPC。
+	const [oauthProviders, setOauthProviders] = useState<OmpLoginProvider[] | null>(null);
+	const [oauthAgentId, setOauthAgentId] = useState<string | null>(null);
+	const [oauthBusy, setOauthBusy] = useState<string | null>(null);
+	const [oauthAccounts, setOauthAccounts] = useState<Record<string, OmpLogoutAccount[]>>({});
+
+	const findAgent = async () => {
+		const list = await window.piDesktop.agents.list();
+		const running = list.find(
+			(agent) => agent.status === "idle" || agent.status === "running" || agent.status === "starting",
+		);
+		return running ?? null;
+	};
+
+	const loadOauthProviders = async () => {
+		let agent;
+		try {
+			agent = await findAgent();
+		} catch {
+			setOauthAgentId(null);
+			setOauthProviders([]);
+			return;
+		}
+		if (!agent) {
+			setOauthAgentId(null);
+			setOauthProviders([]);
+			return;
+		}
+		setOauthAgentId(agent.id);
+		try {
+			setOauthProviders(await window.piDesktop.agents.getLoginProviders(agent.id));
+		} catch {
+			// Agent 存在但 RPC 失败（旧版 omp 无该命令）：保留 agentId，提示“不支持”
+			// 而不是误报“没有运行中的 Agent”。
+			setOauthProviders([]);
+		}
+	};
+
+	useEffect(() => {
+		void loadOauthProviders();
+	}, []);
+
+	// 配置弹框可能在启动 Agent 之前就打开过，聚焦时重新探测可避免「明明有会话却提示无 Agent」。
+	useEffect(() => {
+		const onFocus = () => void loadOauthProviders();
+		window.addEventListener("focus", onFocus);
+		return () => window.removeEventListener("focus", onFocus);
+	}, []);
+
+	const startLogin = async (provider: OmpLoginProvider) => {
+		if (!oauthAgentId) return;
+		setOauthBusy(provider.id);
+		try {
+			await window.piDesktop.agents.login(oauthAgentId, provider.id);
+			await loadOauthProviders();
+		} catch (error) {
+			showNotice(error instanceof Error ? error.message : String(error), 6000, "error");
+		} finally {
+			setOauthBusy(null);
+		}
+	};
+
+	const loadAccounts = async (providerId: string) => {
+		if (!oauthAgentId) return;
+		try {
+			const accounts = await window.piDesktop.agents.getLogoutAccounts(oauthAgentId, providerId);
+			setOauthAccounts((prev) => ({ ...prev, [providerId]: accounts }));
+		} catch (error) {
+			showNotice(error instanceof Error ? error.message : String(error), 5000, "error");
+		}
+	};
+
+	const logoutAccount = async (providerId: string, account: OmpLogoutAccount) => {
+		if (!oauthAgentId) return;
+		setOauthBusy(providerId);
+		try {
+			await window.piDesktop.agents.logout(oauthAgentId, providerId, account.credentialId);
+			const accounts = await window.piDesktop.agents.getLogoutAccounts(oauthAgentId, providerId);
+			setOauthAccounts((prev) => ({ ...prev, [providerId]: accounts }));
+			await loadOauthProviders();
+		} catch (error) {
+			showNotice(error instanceof Error ? error.message : String(error), 5000, "error");
+		} finally {
+			setOauthBusy(null);
+		}
+	};
+
 	// 从预设列表获取供应商信息
 	const presetProvider = selectedProvider ? PRESET_PROVIDERS.find(p => p.value === selectedProvider) : undefined;
 
 	return (
 		<div className="config-auth-tab">
+			<div className="config-oauth">
+				<div className="config-oauth-header">
+					<div>
+						<strong>{t("config.oauthSection")}</strong>
+						<small>{t("config.oauthSectionDesc")}</small>
+					</div>
+					<IconButton
+						label={t("common.refresh")}
+						onClick={() => void loadOauthProviders()}
+					>
+						<RefreshCw size={14} aria-hidden="true" />
+					</IconButton>
+				</div>
+				{oauthProviders === null ? (
+					<div className="config-oauth-empty">{t("common.loading")}</div>
+				) : oauthProviders.length === 0 ? (
+					<div className="config-oauth-empty">
+						{oauthAgentId ? t("config.oauthUnsupported") : t("config.oauthNoAgent")}
+					</div>
+				) : (
+					<div className="config-oauth-list">
+						{oauthProviders.map((provider) => (
+							<div key={provider.id} className="config-oauth-row">
+								<div className="config-oauth-info">
+									<strong>{provider.name}</strong>
+									<small>
+										{provider.id}
+										{provider.authenticated ? ` · ${t("config.oauthAuthenticated")}` : ""}
+										{!provider.available ? ` · ${t("config.oauthUnavailable")}` : ""}
+									</small>
+								</div>
+								<div className="config-oauth-actions">
+									{provider.authenticated && (
+										<button
+											className="config-btn"
+											onClick={() => {
+												if (oauthAccounts[provider.id]) {
+													setOauthAccounts((prev) => {
+														const next = { ...prev };
+														delete next[provider.id];
+														return next;
+													});
+												} else {
+													void loadAccounts(provider.id);
+												}
+											}}
+											disabled={oauthBusy !== null}
+										>
+											{t("config.oauthManage")}
+										</button>
+									)}
+									<button
+										className="config-btn primary"
+										onClick={() => void startLogin(provider)}
+										disabled={oauthBusy !== null || !provider.available || !oauthAgentId}
+									>
+										{oauthBusy === provider.id
+											? t("common.saving")
+											: provider.authenticated
+												? t("config.oauthRelogin")
+												: t("config.oauthLogin")}
+									</button>
+								</div>
+								{oauthAccounts[provider.id] && (
+									<div className="config-oauth-accounts">
+										{oauthAccounts[provider.id].length === 0 ? (
+											<small>{t("config.oauthNoAccounts")}</small>
+										) : (
+											oauthAccounts[provider.id].map((account) => (
+												<div key={account.credentialId} className="config-oauth-account">
+													<span>
+														{account.label}
+														{account.detail ? ` · ${account.detail}` : ""}
+													</span>
+													<button
+														className="config-btn danger-fill"
+														disabled={oauthBusy !== null}
+														onClick={() => void logoutAccount(provider.id, account)}
+													>
+														{t("config.oauthLogout")}
+													</button>
+												</div>
+											))
+										)}
+									</div>
+								)}
+							</div>
+						))}
+					</div>
+				)}
+			</div>
 			<div className="config-toolbar">
 				<span className="config-count">
 					{t("config.count.auth", { count: providers.length })}
@@ -162,7 +336,7 @@ export function AuthTab(props: {
 						</ul>
 						<p className="config-auth-guide-note">
 							{t("config.authGuideNote")}{" "}
-							<a href="https://pi.dev/docs/latest/providers#auth-file" target="_blank" rel="noreferrer">
+							<a href="https://pi.dev/docs/latest/models" target="_blank" rel="noreferrer">
 								omp docs <ExternalLink size={12} />
 							</a>
 						</p>
@@ -335,23 +509,13 @@ export function AuthTab(props: {
 							{isExpanded && (
 								<div className="config-provider-form">
 									<div className="config-form-row">
-										<label>{t("config.field.type")}</label>
-										<ConfigComboboxInput
-											value={auth.type ?? "api_key"}
-											options={AUTH_TYPE_OPTIONS}
-											onChange={(v) =>
-												props.onUpdate(name, "type", v)
-											}
-										/>
-									</div>
-									<div className="config-form-row">
 										<label>{t("config.field.apiKey")}</label>
 										<SecretInput
 											value={auth.key ?? ""}
 											onChange={(v) => props.onUpdate(name, "key", v)}
 										/>
+										<p className="config-field-hint">{t("config.authKeyHint")}</p>
 									</div>
-
 								</div>
 							)}
 						</div>

@@ -182,6 +182,8 @@ export const ipcTable = {
 		readChatMessages: { channel: "sessions:read-chat-messages", kind: "invoke" },
 		readMessageFullText: { channel: "sessions:read-message-full-text", kind: "invoke" },
 		readArchivedMessages: { channel: "sessions:read-archived-messages", kind: "invoke" },
+		// 冷扫描先返回部分结果，完整扫描结束后由主进程推送一次，渲染层据此重取热缓存列表。
+		onChanged: { channel: "sessions:changed", kind: "subscribe", pushFrom: "main-index" },
 	},
 	codexSessions: {
 		scan: { channel: "codex-sessions:scan", kind: "invoke" },
@@ -271,7 +273,6 @@ export const ipcTable = {
 		downloadUpdate: { channel: "app:download-update", kind: "invoke" },
 		installUpdate: { channel: "app:install-update", kind: "invoke" },
 		onUpdateProgress: { channel: "app:update-progress", kind: "subscribe", pushFrom: "update-manager" },
-		feedbackEnvironment: { channel: "app:feedback-environment", kind: "invoke" },
 		openExternal: { channel: "app:open-external", kind: "invoke" },
 		onOpenInBrowser: { channel: "app:open-in-browser", kind: "subscribe", pushFrom: "link-opener" },
 		restart: { channel: "app:restart", kind: "invoke" },
@@ -280,6 +281,8 @@ export const ipcTable = {
 		windowControl: { channel: "app:window-control", kind: "invoke" },
 		toggleAlwaysOnTopWindow: { channel: "app:window-toggle-always-on-top", kind: "invoke" },
 		toggleDevTools: { channel: "app:toggle-devtools", kind: "invoke" },
+		// 崩溃/强杀后的一次性会话恢复快照（见 main/sessions/OpenSessionSnapshot.ts）
+		takeCrashedSessions: { channel: "app:take-crashed-sessions", kind: "invoke" },
 	},
 	skills: {
 		list: { channel: "skills:list", kind: "invoke" },
@@ -348,11 +351,15 @@ export const ipcTable = {
 	config: {
 		getModels: { channel: "config:get-models", kind: "invoke" },
 		getAuth: { channel: "config:get-auth", kind: "invoke" },
-		getSettings: { channel: "config:get-settings", kind: "invoke" },
+		/** 读取 omp 全局设置权威源 config.yml（原文 + 解析后的映射） */
+		getOmpConfig: { channel: "config:get-omp-config", kind: "invoke" },
 		getTrust: { channel: "config:get-trust", kind: "invoke" },
 		saveModels: { channel: "config:save-models", kind: "invoke" },
 		saveAuth: { channel: "config:save-auth", kind: "invoke" },
-		saveSettings: { channel: "config:save-settings", kind: "invoke" },
+		/** config.yml 原文写回（源文件编辑器；校验 YAML 映射后原子写） */
+		saveOmpConfigRaw: { channel: "config:save-omp-config-raw", kind: "invoke" },
+		/** config.yml 键级补丁（设置页保存：只写改动过的键，保留注释与其它键） */
+		patchOmpConfig: { channel: "config:patch-omp-config", kind: "invoke" },
 		getOmpDefault: { channel: "config:get-omp-default", kind: "invoke" },
 		/** 原子设置 omp 默认供应商/默认模型（主进程 read-merge-write config.yml，避免渲染层并发覆盖） */
 		setDefaultModel: { channel: "config:set-default-model", kind: "invoke" },
@@ -371,6 +378,30 @@ export const ipcTable = {
 		},
 		/** 清除 omp 某个模型角色（config.yml 的 modelRoles.<role>） */
 		clearOmpRole: { channel: "config:clear-omp-role", kind: "invoke" },
+		/** 读取 config.yml 的 modelPresets */
+		getOmpModelPresets: { channel: "config:get-omp-model-presets", kind: "invoke" },
+		/** 保存当前角色快照为命名预设 */
+		saveOmpModelPreset: { channel: "config:save-omp-model-preset", kind: "invoke" },
+		/** 应用命名预设 */
+		applyOmpModelPreset: { channel: "config:apply-omp-model-preset", kind: "invoke" },
+		/** 删除命名预设 */
+		deleteOmpModelPreset: { channel: "config:delete-omp-model-preset", kind: "invoke" },
+		/** 读取模型循环顺序 */
+		getOmpCycleOrder: { channel: "config:get-omp-cycle-order", kind: "invoke" },
+		/** 写入模型循环顺序 */
+		setOmpCycleOrder: { channel: "config:set-omp-cycle-order", kind: "invoke" },
+		/** 读取 modelProviderOrder（裸模型 id 的供应商优先级） */
+		getOmpProviderOrder: { channel: "config:get-omp-provider-order", kind: "invoke" },
+		/** 写入 modelProviderOrder */
+		setOmpProviderOrder: { channel: "config:set-omp-provider-order", kind: "invoke" },
+		/** 读取 modelRoleStorage（global/project） */
+		getOmpRoleStorage: { channel: "config:get-omp-role-storage", kind: "invoke" },
+		/** 写入 modelRoleStorage */
+		setOmpRoleStorage: { channel: "config:set-omp-role-storage", kind: "invoke" },
+		/** 读取 retry.fallbackChains */
+		getOmpFallbackChains: { channel: "config:get-omp-fallback-chains", kind: "invoke" },
+		/** 写入 retry.fallbackChains */
+		setOmpFallbackChains: { channel: "config:set-omp-fallback-chains", kind: "invoke" },
 		saveRaw: { channel: "config:save-raw", kind: "invoke" },
 		export: { channel: "config:export", kind: "invoke" },
 		import: { channel: "config:import", kind: "invoke" },
@@ -398,11 +429,17 @@ export const ipcTable = {
 	agents: {
 		list: { channel: "agents:list", kind: "invoke", web: true },
 		getMessages: { channel: "agents:get-messages", kind: "invoke" },
+		getHistoryPage: { channel: "agents:get-history-page", kind: "invoke" },
 		create: { channel: "agents:create", kind: "invoke", web: true },
 		rename: { channel: "agents:rename", kind: "invoke" },
 		stop: { channel: "agents:stop", kind: "invoke", web: true },
 		prompt: { channel: "agents:prompt", kind: "invoke", web: true },
 		abort: { channel: "agents:abort", kind: "invoke", web: true },
+		/** Esc 语义：撤回服务端待投递队列并停止当前 run，返回可取回的草稿。 */
+		abortAndRestoreQueue: { channel: "agents:abort-and-restore-queue", kind: "invoke" },
+		/** 从 omp steering/followUp 队列撤回一条 chip；结果以服务端确认 removed 为准。 */
+		removeQueuedMessage: { channel: "agents:remove-queued-message", kind: "invoke" },
+		promoteQueuedMessage: { channel: "agents:promote-queued-message", kind: "invoke" },
 		exportHtml: { channel: "agents:export-html", kind: "invoke" },
 		getForkMessages: { channel: "agents:fork-messages", kind: "invoke" },
 		forkSession: { channel: "agents:fork-session", kind: "invoke" },
@@ -417,13 +454,45 @@ export const ipcTable = {
 		compact: { channel: "agents:compact", kind: "invoke" },
 		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），配对见 onRuntimeState
 		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state", web: true },
+		/**
+		 * omp 子代理 registry 推送（订阅 subagent_lifecycle/subagent_progress 后）。
+		 * 与 runtime-state 分开：progress 帧频率高，单独推送避免每次 progress 都触发
+		 * get_state + get_session_stats 两次 RPC。
+		 */
+		onSubagents: {
+			channel: "agents:subagents",
+			kind: "subscribe",
+			pushFrom: "agent-manager",
+			pairKey: "agents:subagents",
+		},
+		/** 同一通道的 invoke 侧：渲染层重载/切 Agent 时拉取主进程 registry 快照。 */
+		subagents: { channel: "agents:subagents", kind: "invoke", pairKey: "agents:subagents" },
+		cancelSubagent: { channel: "agents:cancel-subagent", kind: "invoke" },
+		steerSubagent: { channel: "agents:steer-subagent", kind: "invoke" },
+		/** 按需读取子代理会话 transcript（仅允许 runtime 已登记的 subagentId）。 */
+		subagentMessages: { channel: "agents:subagent-messages", kind: "invoke" },
 		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true },
 		availableModels: { channel: "agents:available-models", kind: "invoke", web: true },
+		// OAuth 登录依赖本机浏览器回跳与系统浏览器进程，LAN-web 无对应 REST 实现，
+		// 因此不标 web（浏览器端沿用 desktop-only 空实现，AuthTab 据此隐藏入口）。
+		/** omp 原生 OAuth 登录 */
+		getLoginProviders: { channel: "agents:get-login-providers", kind: "invoke" },
+		login: { channel: "agents:login", kind: "invoke" },
+		/** omp 原生凭据登出 */
+		getLogoutAccounts: { channel: "agents:get-logout-accounts", kind: "invoke" },
+		logout: { channel: "agents:logout", kind: "invoke" },
 		setModel: { channel: "agents:set-model", kind: "invoke", web: true },
 		refreshModels: { channel: "agents:refresh-models", kind: "invoke", web: true },
 		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
 		setThinking: { channel: "agents:set-thinking", kind: "invoke", web: true },
+		availableThinkingLevels: { channel: "agents:available-thinking-levels", kind: "invoke", web: true },
+		setFastMode: { channel: "agents:set-fast-mode", kind: "invoke", web: true },
+		setSlowMode: { channel: "agents:set-slow-mode", kind: "invoke", web: true },
+		setAutoCompaction: { channel: "agents:set-auto-compaction", kind: "invoke", web: true },
+		setTodos: { channel: "agents:set-todos", kind: "invoke", web: true },
 		commands: { channel: "agents:commands", kind: "invoke" },
+		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
+		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-manager" },
 		onState: { channel: "agents:state", kind: "subscribe", pushFrom: "agent-manager", web: true },
 		onRuntimeState: { channel: "agents:runtime-state", kind: "subscribe", pushFrom: "agent-manager", pairKey: "agents:runtime-state" },
 		onFocusTarget: { channel: "pet:focus-agent-target", kind: "subscribe", pushFrom: "pet-index" },

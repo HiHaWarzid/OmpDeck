@@ -1,26 +1,44 @@
-import { app, type BrowserWindow, Notification } from "electron";
+import type { BrowserWindow, NativeImage } from "electron";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
+import type { Worker } from "node:worker_threads";
 import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type {
+	AbortAndRestoreQueueResult,
 	AgentManagerEvent,
 	AgentManagerEventListener,
+	AgentQueuedMessages,
 	AgentRuntimeState,
 	AgentStatus,
+	AgentSubagent,
 	AgentTab,
+	AgentTodoItem,
+	AgentTodoPhase,
+	AgentTodoStatus,
+	AgentUsageLimitState,
+	AgentCacheWarmingState,
+	AgentUiAskAnswer,
+	AgentUiAskOption,
+	AgentUiAskQuestion,
 	AvailableModel,
+	OmpLoginProvider,
+	OmpLogoutAccount,
 	ChatMessage,
 	CreateAgentInput,
 	ForkMessage,
 	ImageContent,
 	Project,
+	PromoteQueuedMessageResult,
+	RemoveQueuedMessageResult,
+	RestoredQueuedMessage,
 	SendPromptInput,
 	SendPromptResult,
 	ThinkingUpdate,
 } from "../../shared/types";
 import { ipcChannels } from "../../shared/ipc";
+import { normalizePiCommands } from "../../shared/piCommands";
 import {
 	AgentProcessSlot,
 	createRealAgentProcess,
@@ -44,10 +62,12 @@ import { perfEnd, perfStart } from "../perf";
 import {
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
+import { showAppNotification } from "../notifications";
 import {
 	estimateMessageBytes,
 	extractImages,
 	stripAnsi,
+	truncateForDetail,
 } from "./messageTextUtils";
 import {
 	assertResendRootEntry,
@@ -160,21 +180,50 @@ import {
 /**
  * AgentManager 用到的配置能力（窄接口）。
  *
- * 原先整类依赖 862 行的 ConfigManager（实际只用到 3 个能力，且其中多数是
+ * 原先整类依赖 862 行的 ConfigManager（实际只用到少数能力，且其中多数是
  * ConfigManager 对 rolesStore/trustStore 的纯转发）。收窄后依赖面就是这个对象：
- * 角色读取只留一个函数，信任决策拿到 store 本体，模型收敛只留一个函数。
+ * 角色读取只留一个函数，信任决策拿到 store 本体。
  */
 export type AgentConfigDeps = {
 	/** 顶层 defaultThinkingLevel（config.yml，缺省 undefined）。 */
 	readOmpDefaultThinkingLevel: () => Promise<string | undefined>;
-	/** 按 models.json 收敛可用模型（pi 内置目录里未配置的供应商/模型剔除）。 */
-	filterConfiguredModels: (models: AvailableModel[]) => Promise<AvailableModel[]>;
 	/** 项目信任决策存储（探测/decide 注入 ask）。 */
 	trustStore: TrustStore;
+	/**
+	 * 上游明确拒绝 developer 角色时的自愈写入：关闭该 provider 的
+	 * compat.supportsDeveloperRole（models.json + models.yml）。
+	 * 返回 true 表示配置确实被改写；未注入时跳过写配置，仅重启进程。
+	 */
+	disableDeveloperRole?: (providerName: string) => Promise<boolean>;
 };
 
 /** 项目信任确认弹窗的用户选择 */
 export type ProjectTrustChoice = "trust-remember" | "trust-session" | "deny";
+
+/**
+ * 「IPC 基线截断」告警的最小间隔（每 agent）：getMessages 被渲染层状态拉取、
+ * Web 轮询、飞书同步高频调用（≤600ms 一次）。超过 transcript 预算的会话若每次
+ * 调用都 warn，日志会在几秒内被同一条记录刷爆，反而掩盖真正的问题。
+ */
+const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
+
+/** omp todo 任务的可接受状态；用于把 RPC unknown 收窄为 AgentTodoStatus。 */
+const AGENT_TODO_STATUSES: Record<AgentTodoStatus, true> = {
+	pending: true,
+	in_progress: true,
+	completed: true,
+	abandoned: true,
+	blocked: true,
+};
+
+/** 子代理已收口状态：到达后不再被迟到的 progress("running") 覆盖。 */
+const SUBAGENT_TERMINAL_STATUSES = new Set([
+	"completed",
+	"aborted",
+	"cancelled",
+	"failed",
+	"error",
+]);
 
 export class AgentManager {
 	/**
@@ -276,6 +325,22 @@ export class AgentManager {
 	 * 注入更小值以避免 30s 真实等待。
 	 */
 	private readonly emptyResponseTimeoutMs: number;
+	/**
+	 * 会话结束通知的静默窗口。pi 的 session_settled 之后仍可能紧接着到达最终
+	 * message 渲染/收尾事件（用户感知为"对话还没结束"），所以不立即弹窗：
+	 * 回调要求最后一次工作事件距今满 2.5s，仍在流式/工具/压缩/待回答时重新计时，
+	 * 新 run 开始则直接撤销定时器。
+	 */
+	private static readonly SESSION_END_NOTIFY_DELAY_MS = 2_500;
+	private readonly sessionEndNotifyTimers = new Map<string, NodeJS.Timeout>();
+	/**
+	 * 模型/鉴权配置版本号。omp 只在进程启动时读取 models.yml / auth.json，
+	 * 也没有 reload_config RPC（dist 内无该命令），因此配置保存后运行中的会话
+	 * 会一直用旧配置，直到手动重启——本次 422 developer-role 事故正是保存后
+	 * 旧进程继续发 developer。保存配置时递增版本号，进程在下一次发 prompt 前
+	 * 若版本号落后则先重连（保留会话/模型/思考档），避免「改完配置还是报错」。
+	 */
+	private configEpoch = 0;
 	private wslEnvironment: WslEnvironment | null = null;
 	/**
 	 * 会话 JSONL 文件读写模块：从本类抽出的深度模块，负责所有会话文件的磁盘 IO
@@ -298,12 +363,23 @@ export class AgentManager {
 		private readonly processFactory: AgentProcessFactory = createRealAgentProcess,
 		/** 空响应兜底超时（毫秒）；测试可注入更小值。 */
 		emptyResponseTimeoutMs: number = AgentManager.EMPTY_RESPONSE_TIMEOUT_MS,
+		/** 生产注入归档解析 worker；测试缺省时在主线程解析。 */
+		createArchiveWorker?: () => Worker,
+		/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
+		private readonly notificationIcon?: NativeImage,
 	) {
 		this.emptyResponseTimeoutMs = emptyResponseTimeoutMs;
 		this.sessionJsonl = new SessionJsonl({
 			resolveHostPath: (sessionPath) => this.toSessionHostPath(sessionPath),
+			createArchiveWorker,
+			getBlobsDir: () => this.blobsDir(),
 			logger: this.appLogger,
 		});
+	}
+
+	/** omp blob store 目录：本地 home 或 WSL home（windowsHome 已是 host 可读的 UNC 路径）。 */
+	private blobsDir(): string {
+		return join(this.wslEnvironment?.windowsHome ?? homedir(), ".omp", "agent", "blobs");
 	}
 
 	/**
@@ -318,6 +394,19 @@ export class AgentManager {
 
 	configureWsl(environment: WslEnvironment | null): void {
 		this.wslEnvironment = environment;
+	}
+
+	/**
+	 * 模型/鉴权配置被保存后调用。omp 进程不监听配置文件，只有重启才会重新读取
+	 * models.yml / auth.json；这里只登记版本，避免在用户保存配置的瞬间打断运行中的会话。
+	 * 运行中的会话在本轮结束后、下一次发 prompt 前由 applyPendingConfig 重连。
+	 */
+	markConfigChanged(): void {
+		this.configEpoch += 1;
+		void this.appLogger?.info("agent", "Model/auth config changed; live agents will reattach before next prompt", {
+			epoch: this.configEpoch,
+			agents: this.agents.size,
+		});
 	}
 
 	/** Windows 主进程文件操作必须使用可由 host 访问的路径。 */
@@ -341,6 +430,17 @@ export class AgentManager {
 	}
 
 	/**
+	 * 查找当前占用指定会话文件的 Agent。
+	 * 重命名必须区分：活跃会话走 RPC（由 omp 写原生标题并维护内存状态），
+	 * 已关闭的历史会话才直接改文件，避免桌面端与运行中的 omp 各写一份标题。
+	 */
+	getAgentBySessionPath(sessionPath: string) {
+		const sessionKey = this.normalizeSessionPathForCompare(sessionPath);
+		if (!sessionKey) return undefined;
+		return this.findRuntimeBySessionKey(sessionKey)?.tab;
+	}
+
+	/**
 	 * 判断指定项目是否仍有运行中的 Agent（pi 子进程未退出）。
 	 * 用于删除项目前拦截，避免删除后 pi 进程悬挂后台继续占用资源。
 	 */
@@ -358,7 +458,8 @@ export class AgentManager {
 	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
 	 */
 	getMessages(agentId: string): ChatMessage[] {
-		const messages = this.agents.get(agentId)?.transcript.messages ?? [];
+		const runtime = this.agents.get(agentId);
+		const messages = runtime?.transcript.messages ?? [];
 		// 预算与写入端 transcript 裁剪共用同一个常量（见 agentTranscript.MAX_TRANSCRIPT_BYTES）：
 		// 正常路径下写入端已把数组压回预算内，此处只在历史整段注入超过预算时兜底。
 		// 未超预算时返回原数组（保持既有引用语义）；超限时只保留尾部能装下的最近消息，
@@ -372,14 +473,79 @@ export class AgentManager {
 			start = i;
 		}
 		if (start === 0) return messages;
-		void this.appLogger?.warn("agent", "Transcript truncated for IPC baseline", {
-			agentId,
-			totalMessages: messages.length,
-			keptMessages: messages.length - start,
-			estimatedBytes: total,
-			limitBytes: MAX_TRANSCRIPT_BYTES,
-		});
+		// 超预算的会话每次 getMessages 都会走到这里；告警按 agent 限频，避免轮询把它放大成日志风暴。
+		const now = Date.now();
+		if (
+			runtime
+			&& now - (runtime.lastTranscriptTruncationWarnAt ?? 0) >= TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS
+		) {
+			runtime.lastTranscriptTruncationWarnAt = now;
+			void this.appLogger?.warn("agent", "Transcript truncated for IPC baseline", {
+				agentId,
+				totalMessages: messages.length,
+				keptMessages: messages.length - start,
+				estimatedBytes: total,
+				limitBytes: MAX_TRANSCRIPT_BYTES,
+			});
+		}
 		return messages.slice(start);
+	}
+
+	/**
+	 * 向前读取一页更早的会话历史，供活动会话突破 30 轮尾窗限制。
+	 * 只读会话文件并按 cursor 反向翻页；消息带 `meta.historyPage`，渲染层据此
+	 * 把这些只读旧页与可编辑的尾窗消息区分开（编辑/删除仍按 entryId 定位）。
+	 */
+	async readHistoryPage(
+		agentId: string,
+		beforeOffset?: number,
+	): Promise<{ messages: ChatMessage[]; cursor: number; hasMore: boolean }> {
+		const runtime = this.requireRuntime(agentId);
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) return { messages: [], cursor: 0, hasMore: false };
+		let cursor = typeof beforeOffset === "number" && Number.isFinite(beforeOffset)
+			? Math.max(0, Math.trunc(beforeOffset))
+			: undefined;
+		// 首次加载没有 cursor：优先用文件基线自己记录的窗口起点（精确到字节），
+		// 否则以当前时间线最旧一条消息的 entryId 作为上界。两条路都只返回基线之前
+		// 的内容，否则会先返回一页与基线重叠的最近 30 轮，用户点一次却看不到新消息。
+		if (cursor === undefined) {
+			if (typeof runtime.historyCursor === "number" && runtime.historyCursor >= 0) {
+				cursor = runtime.historyCursor;
+			} else {
+				const oldestEntryId = runtime.transcript.messages
+					.map((message) => message.meta?.entryId)
+					.find((entryId): entryId is string => typeof entryId === "string" && entryId.length > 0);
+				if (oldestEntryId) {
+					const offset = await this.sessionJsonl.findEntryOffset(sessionPath, oldestEntryId);
+					if (offset === undefined) {
+						return { messages: [], cursor: 0, hasMore: false };
+					}
+					cursor = offset;
+				}
+			}
+		}
+		const page = await this.sessionJsonl.readOlderMessages(
+			sessionPath,
+			cursor,
+			AgentManager.MAX_HISTORY_LOAD_TURNS,
+		);
+		if (page.messages.length === 0) {
+			return { messages: [], cursor: page.cursor, hasMore: page.hasMore };
+		}
+		const messages = convertAgentMessages(agentId, page.messages, page.entryIds, false);
+		for (const message of messages) {
+			message.meta = { ...message.meta, historyPage: true };
+		}
+		void this.appLogger?.info("agent", "Older history page loaded", {
+			agentId,
+			sessionPath,
+			beforeOffset: cursor,
+			cursor: page.cursor,
+			hasMore: page.hasMore,
+			messages: messages.length,
+		});
+		return { messages, cursor: page.cursor, hasMore: page.hasMore };
 	}
 
 	/**
@@ -422,15 +588,30 @@ export class AgentManager {
 	) {
 		const t0 = Date.now();
 		const runtime = this.requireRuntime(agentId);
+		/**
+		 * 大会话预检：get_messages/get_entries 都会把整份 JSONL 序列化进一个响应，超过
+		 * MAX_AUTO_HISTORY_LOAD_BYTES 后必然撞 pi 的 RPC 传输上限（线上 27MB 会话每次
+		 * 打开都白跑 0.3~2s，并在日志里各留一条失败记录）。这类会话直接走文件尾部读取，
+		 * 与失败后的兜底路径完全等价，但不再让 pi 做无谓的整文件序列化。
+		 */
+		const oversizedSession = runtime.tab.sessionPath
+			? !this.getHistoryAutoLoadDecision(runtime.tab.sessionPath).shouldLoad
+			: false;
 
 		// 并行请求：get_messages 和 get_entries 互不依赖，可以同时发起
 		// 如果已有提前发出的请求（earlyMessagesPromise），直接复用，避免重复发送
-		const messagesPromise = earlyMessagesPromise ?? runtime.slot.process.client.request({
-			type: "get_messages",
-		});
+		const messagesPromise = earlyMessagesPromise ?? (oversizedSession
+			? this.sessionJsonl.readRecentMessages(
+				runtime.tab.sessionPath as string,
+				AgentManager.MAX_HISTORY_LOAD_TURNS,
+			).catch(() => runtime.slot.process.client.request({ type: "get_messages" }))
+			: runtime.slot.process.client.request({
+				type: "get_messages",
+			}));
 
 		let entriesPromise: Promise<RpcResponse | undefined> | undefined;
-		if (!skipEntries) {
+		// 大会话的 entryId 映射同样因传输上限不可用；文件基线自带 entryIds，够编辑/删除定位。
+		if (!skipEntries && !oversizedSession) {
 			entriesPromise = runtime.slot.process.client.request({
 				type: "get_entries",
 			}, 15_000)
@@ -461,7 +642,25 @@ export class AgentManager {
 		]);
 		const t1 = Date.now();
 
-		let rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+		// 文件基线（readRecentMessages）会额外带 entryIds / cursor / hasOlder；
+		// 普通 get_messages 只有 messages。两者都从 response.data 读，create 路径把
+		// readRecentMessages 的 Promise 直接作为 earlyMessagesPromise 传进来，不能只认兜底分支。
+		type HistoryResponseData = {
+			messages?: unknown[];
+			entryIds?: unknown[];
+			cursor?: unknown;
+			hasOlder?: unknown;
+		};
+		const responseData = response.data as HistoryResponseData | undefined;
+		let rawMessages = responseData?.messages ?? [];
+		let baselineEntryIds = Array.isArray(responseData?.entryIds)
+			&& responseData.entryIds.length === rawMessages.length
+			? responseData.entryIds.map((id) => String(id))
+			: undefined;
+		let baselineCursor = typeof responseData?.cursor === "number" && Number.isFinite(responseData.cursor)
+			? Math.max(0, Math.trunc(responseData.cursor))
+			: undefined;
+		let baselineHasOlder = responseData?.hasOlder === true;
 		const failureKind = response.success ? undefined : classifyPiFailure(response);
 
 		// 兜底：get_messages 失败（大会话撞 RPC 传输上限最常见）时任何加载都回退文件直读；
@@ -485,10 +684,20 @@ export class AgentManager {
 						runtime.tab.sessionPath,
 						AgentManager.MAX_HISTORY_LOAD_TURNS,
 					).catch(() => undefined);
-					const fallbackMessages =
-						(fileFallback?.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+					const fallbackData = fileFallback?.data as HistoryResponseData | undefined;
+					const fallbackMessages = fallbackData?.messages ?? [];
 					if (fallbackMessages.length > 0) {
 						rawMessages = fallbackMessages;
+						// entryIds 必须与文件兜底消息一一对应；get_entries 对大会话同样会撞
+						// 传输上限，拿不到它时文件内 id 是唯一稳定的历史定位键。
+						const ids = fallbackData?.entryIds;
+						if (Array.isArray(ids) && ids.length === fallbackMessages.length) {
+							baselineEntryIds = ids.map((id) => String(id));
+						}
+						if (typeof fallbackData?.cursor === "number" && Number.isFinite(fallbackData.cursor)) {
+							baselineCursor = Math.max(0, Math.trunc(fallbackData.cursor));
+						}
+						baselineHasOlder = fallbackData?.hasOlder === true;
 						void this.appLogger?.warn("agent", "get_messages unusable; fell back to session file read", {
 							agentId,
 							sessionPath: runtime.tab.sessionPath,
@@ -514,8 +723,10 @@ export class AgentManager {
 		}
 
 		// 解析 entryId 列表（需要先于 convertAgentMessages，用于把消息关联到 pi 的会话分支）。
-		let activeEntryIds: string[] | undefined;
-		if (entriesResult) {
+		// 文件基线已经返回与消息严格对齐的 id 时优先使用：此时 get_entries 往往也失败了，
+		// 即使返回了空分支，也不能覆盖文件内稳定的 entry id。
+		let activeEntryIds = baselineEntryIds;
+		if (!activeEntryIds && entriesResult) {
 			const entriesData = entriesResult.data as
 				| { entries?: Array<{ id: string; parentId: string | null; type?: string; message?: { role?: string } }>; leafId?: string }
 				| undefined;
@@ -527,6 +738,15 @@ export class AgentManager {
 		// 按对话轮次截断（保留最近若干轮 user 消息）。压缩摘要不是 user 消息，会被此逻辑保留在尾部，
 		// 因此下方会单独把它插到最前面，确保不被按 user 轮次切掉。
 		const trimmed = trimHistoryMessages(rawMessages);
+		// 文件基线把窗口起点留给「加载更早」用；RPC 基线没有该值，回退 entryId 查找。
+		runtime.historyCursor = baselineCursor;
+		// 文件窗口本身已裁剪过，trimmed 与 raw 等长，因此还要看 readRecentMessages 的 hasOlder。
+		// 只有真的有更早历史才让渲染层显示入口，避免每个小会话都出现一个空按钮。
+		const historyHasOlder = baselineHasOlder || trimmed.length < rawMessages.length;
+		if (rawMessages.length > 0 && runtime.tab.historyHasOlder !== historyHasOlder) {
+			runtime.tab.historyHasOlder = historyHasOlder;
+			this.emitState();
+		}
 
 		// 解析会话文件里的压缩记录：拿到所有压缩段摘要 + 归档消息。
 		// pi 的 get_messages 对压缩会话只返回压缩后的消息，通常不带压缩摘要；
@@ -771,6 +991,9 @@ export class AgentManager {
 		});
 
 		let client: PiRpcClient;
+		// 必须在 child.start 之前取版本：start 返回后配置若已被保存，进程可能仍读的是旧文件，
+		// 用启动后的版本号会误判为「已应用」。
+		const startEpoch = this.configEpoch;
 		try {
 			client = await child.start(input.sessionPath, trustOverride, input.noSession);
 		} catch (error) {
@@ -870,6 +1093,7 @@ export class AgentManager {
 					? `${project.name} 历史会话`
 					: `${project.name} agent`);
 			tab.status = "idle";
+			runtime.appliedConfigEpoch = startEpoch;
 			// 若因桌面兼容性自动跳过了 codeisland 等扩展，给用户一条系统说明，避免「扩展在却不生效」困惑。
 			const blockedOnStart = child.getDiagnostics()?.blockedExtensions;
 			if (blockedOnStart && blockedOnStart.length > 0) {
@@ -1090,6 +1314,9 @@ export class AgentManager {
 
 		// 判断 agent 是否已在忙碌中；运行中继续发送时必须带 streamingBehavior，
 		// 否则 pi RPC 会拒绝请求。该值也用于给用户消息打上投递语义标记。
+		// 配置保存后运行中的旧进程仍用旧 models.yml/auth.json：空闲时先重连再发送，
+		// 否则用户会看到「配置已改，却仍然是同一个错误」。
+		await this.applyPendingConfig(input.agentId, runtime);
 		const alreadyBusy = runtime.tab.status === "running";
 		const statusBeforePrompt = runtime.tab.status;
 		const promptDeliveryBehavior = input.streamingBehavior ?? (alreadyBusy ? "steer" : undefined);
@@ -1109,21 +1336,33 @@ export class AgentManager {
 		delete runtime.tab.lastError;
 		this.emitState();
 
+		// 结束后排队：显式 followUp 的消息可能先躺在 omp 的服务端队列里，本轮上下文并不包含它。
+		// 这时不能往时间线插乐观气泡——否则当前一轮回答被切成「回答 → 用户消息 → 继续回答」，
+		// 看起来就像排队消息已经发送并打断了这一轮。只在「结束后排队」dock 里展示；
+		// 真正投递（或确认 omp 立即开跑）后再补气泡，见 admitQueuedFollowUp。
+		const queueAsFollowUp = promptDeliveryBehavior === "followUp";
+		const userText = trimmed || "[图片]";
+		const userMeta = promptDeliveryBehavior
+			? { streamingBehavior: promptDeliveryBehavior }
+			: undefined;
+
 		// 乐观更新：在等待 RPC 返回前先把用户消息写入会话，让用户立即看到自己的消息。
 		// 只展示用户原文；agentMessage 里的宿主指令不进 UI 气泡。
 		// 如果后续 RPC 失败，再追加错误消息；用户消息本身仍保留在聊天中（用户确已发送）。
-		this.addMessage(
-			runtime,
-			"user",
-			trimmed || "[图片]",
-			promptDeliveryBehavior ? { streamingBehavior: promptDeliveryBehavior } : undefined,
-			input.images,
-		);
+		// follow-up 例外：它还没进入本轮上下文，见上方注释，等投递后由
+		// reconcileFollowUpAdmission / flushDeliveredFollowUps 补写同样的气泡。
+		if (!queueAsFollowUp) {
+			this.addMessage(runtime, "user", userText, userMeta, input.images);
+		}
 
 		// streamingBehavior 只在 agent 忙碌时需要；UI 可以显式传 steer/followUp 以复用 pi 队列语义。
 		// 当前端排队 flush 连续发送多条消息时，第一条会触发 agent_start 使 agent 变忙碌，
 		// 后续消息必须带 streamingBehavior 否则 pi 直接返回 error。这里自动兜底。
 		// images 用于传递粘贴/拖拽的图片，pi 会将 base64 图片直接传给支持视觉的模型。
+		// 记下斜线命令名：command_output 帧不带命令名，命中时用它标注输出来源。
+		runtime.lastLocalCommand = trimmed.startsWith("/")
+			? trimmed.slice(1).split(/\s+/, 1)[0] || undefined
+			: undefined;
 		try {
 			const promptIsExtensionCommand = await this.promptMatchesRegisteredExtensionCommand(runtime, agentMessage);
 			const requestPayload: Record<string, unknown> = {
@@ -1137,6 +1376,8 @@ export class AgentManager {
 			if (promptDeliveryBehavior) {
 				requestPayload.streamingBehavior = promptDeliveryBehavior;
 			}
+			// 记下发出时刻：排队对账要判断这之后到达的 queue_update 是否已包含本次消息。
+			const promptSentAt = Date.now();
 			// 使用用户配置的 RPC 超时时间，因为用户提示词可能触发长时间运行的命令或复杂操作
 			const response = await runtime.slot.process.client.request(
 				requestPayload,
@@ -1145,12 +1386,46 @@ export class AgentManager {
 			if (!response.success) {
 				// pi RPC 会把不支持图片、忙碌队列参数缺失等前置错误作为 success:false 返回；
 				// 必须显式显示出来，否则 UI 会停在"已发送但无响应"的状态。
+				runtime.lastLocalCommand = undefined;
 				const errorMessage = response.error ?? "图片消息发送失败";
 				runtime.tab.status = statusBeforePrompt === "running" ? "running" : "idle";
 				this.addMessage(runtime, "error", errorMessage);
 				this.emitState();
 				return { accepted: false, error: errorMessage };
 			}
+
+			// 排队 follow-up 的落气泡时机：omp 收下后仍可能因为本地 busy 快照过期而立即开跑，
+			// 用一次 get_state 对账队列——队列里没有它说明已投递，这里补气泡；
+			// 队列里还有就记到 deferredFollowUps，等 queue_update 报告离队时再补。
+			if (queueAsFollowUp && userMeta) {
+				await this.reconcileFollowUpAdmission(
+					runtime,
+					{
+						text: userText,
+						queueText: agentMessage,
+						...(input.images ? { images: input.images } : {}),
+						meta: userMeta,
+					},
+					promptSentAt,
+				);
+			}
+
+			// agentInvoked:false 表示 omp 把这个 prompt 当本地命令就地执行完了：
+			// 不会有 agent_start / agent_end，也不会触发 provider 请求。必须立即收口，
+			// 否则空响应兜底会把它误报成"Provider 未返回流式响应"（问错方向）。
+			// 旧版 pi 不返回该字段，undefined 时保持原有兜底路径。
+			const agentInvoked = (response.data as { agentInvoked?: unknown } | undefined)?.agentInvoked;
+			if (agentInvoked === false) {
+				runtime.lastLocalCommand = undefined;
+				// 只回退本函数乐观设置的 running。发送前已在跑的 run 不归这条本地命令管：
+				// 期间若已 abort/收口，用旧快照写回 running 会造出没有 run 的假运行态。
+				if (statusBeforePrompt !== "running") runtime.tab.status = "idle";
+				// 不碰空响应兜底：这里若存在定时器，它属于另一条仍在等 provider 流的 prompt。
+				this.emitState();
+				return { accepted: true };
+			}
+			// 普通 agent prompt 不会来 command_output；清掉标签，防止后续无关输出被旧命令名标注。
+			runtime.lastLocalCommand = undefined;
 
 			if (promptIsExtensionCommand) {
 				// 机制：Pi 扩展命令可在 prompt 阶段直接执行并返回，不进入 agent run。
@@ -1166,11 +1441,17 @@ export class AgentManager {
 			}
 			return { accepted: true };
 		} catch (error) {
+			runtime.lastLocalCommand = undefined;
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			// prompt RPC 调用前已通过同步 write() 写入 pi stdin；此处所有异常都只说明
 			// preflight 响应未到达，无法证明 pi 没有接收。返回 unknown，renderer 会永久禁用
 			// 该快照的重试/编辑/取消，防止用户把同一条消息提交两次。
 			runtime.tab.status = statusBeforePrompt === "running" ? "running" : "error";
+			// follow-up 没有乐观气泡：结果未知时 omp 可能已收下并投递，
+			// 按「可能已提交」补一条，与 reconcileFollowUpAdmission 的降级方向一致。
+			if (queueAsFollowUp && userMeta) {
+				this.addMessage(runtime, "user", userText, userMeta, input.images);
+			}
 			this.addMessage(
 				runtime,
 				"error",
@@ -1294,7 +1575,343 @@ export class AgentManager {
 	}
 
 	async abort(agentId: string) {
+		// 普通停止不等待响应：前端状态切换已经同步完成，abort 响应只用于命令层确认。
+		await this.abortWithCommand(agentId, { type: "abort" }, false);
+	}
+
+	/**
+	 * Esc 语义：先撤回服务端待投递的用户队列，再中止当前 run。
+	 * 普通 abort 会把已排队/已 live-steer 的输入重新排进新一轮，用户点「停止」后
+	 * 这些消息仍会继续执行；这里拿回草稿后再停止，保证停止就是真的停止。
+	 */
+	async abortAndRestoreQueue(agentId: string): Promise<AbortAndRestoreQueueResult> {
 		const runtime = this.requireRuntime(agentId);
+		// 中止会清空服务端队列并推 queue_update：先给已知在队的文案立墓碑，这次离队
+		// （以及仍在途的准入对账）都不能当成「已投递」。恢复结果回来后再按名单反转。
+		const markedTexts = new Set<string>();
+		for (const text of queuedTexts(runtime.lastQueuedSnapshot ?? { steering: [], followUp: [] })) {
+			markedTexts.add(text);
+			this.markFollowUpWithdrawn(runtime, text);
+		}
+		for (const entry of runtime.deferredFollowUps ?? []) {
+			for (const text of [entry.text, entry.queueText]) {
+				markedTexts.add(text);
+				this.markFollowUpWithdrawn(runtime, text);
+			}
+		}
+		const data = await this.abortWithCommand(agentId, { type: "abort_and_restore_queue" }, true);
+		const readMessages = (value: unknown): RestoredQueuedMessage[] => {
+			if (!Array.isArray(value)) return [];
+			const restored: RestoredQueuedMessage[] = [];
+			for (const item of value) {
+				if (!item || typeof item !== "object") continue;
+				const record = item as Record<string, unknown>;
+				if (typeof record.text !== "string" || !record.text) continue;
+				const images = this.normalizeRestoredImages(record.images);
+				restored.push(images ? { text: record.text, images } : { text: record.text });
+			}
+			return restored;
+		};
+		const result: AbortAndRestoreQueueResult = {
+			steering: readMessages(data?.steering),
+			followUp: readMessages(data?.followUp),
+			...(data?.imagesDropped === true ? { imagesDropped: true } : {}),
+			...(data?.truncated === true ? { truncated: true } : {}),
+		};
+		if (!data) {
+			// 请求失败说明队列没被清空、墓碑的前提不成立：全部撤销，别压住后续正常投递。
+			for (const text of markedTexts) this.clearFollowUpWithdrawn(runtime, text);
+		} else {
+			// 撤回到输入框的排队 follow-up 从未落气泡（只存在 deferredFollowUps）：
+			// 在恢复到名单里的直接丢快照；不在名单里的说明中止前已经被投递，补上气泡。
+			// truncated 表示恢复的文本本身不完整，无法判断哪些已投递，只能全部丢弃，
+			// 宁可少一条气泡，也不要在时间线里塞进用户没看到执行的消息。
+			const restoredTexts = [...result.steering, ...result.followUp].map(
+				(item) => item.text,
+			);
+			const stillWithdrawn = new Set(restoredTexts);
+			for (const entry of runtime.deferredFollowUps ?? []) {
+				if (result.truncated) continue;
+				if (restoredTexts.some((text) => deferredMatchesText(entry, text))) continue;
+				this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+				stillWithdrawn.add(entry.text);
+				stillWithdrawn.add(entry.queueText);
+			}
+			runtime.deferredFollowUps = [];
+			if (!result.truncated) {
+				// 恢复名单外的文案 = 已投递/已不在队列，墓碑要撤掉，否则在途对账会把
+				// 已经投递的消息当成撤回而漏掉气泡。
+				for (const text of markedTexts) {
+					if (!stillWithdrawn.has(text)) this.clearFollowUpWithdrawn(runtime, text);
+				}
+			}
+			// abort 路径已取消节流中的消息推送，撤回气泡后必须立刻全量对齐 renderer，
+			// 否则本地仍会显示一条不会再执行的消息（getMessages 已无此条）。
+			if (this.dropWithdrawnUserBubbles(runtime, result)) {
+				this.scheduleMessageEmit(runtime, true);
+			}
+		}
+		// 撤回后服务端队列已空：立即刷新一次，避免 chip 停在旧快照等待下一次事件。
+		void this.emitRuntimeState(agentId);
+		if (!data) {
+			// 旧版 omp 不认 abort_and_restore_queue（请求失败时并未中止 run），
+			// 必须补发普通 abort；此时队列仍由服务端持有，下次 run 会继续投递。
+			await this.abort(agentId);
+		}
+		return result;
+	}
+
+	/**
+	 * 撤回的服务端队列消息从未写入会话记录，但发送时已在 UI 乐观插入用户气泡。
+	 * 这里按 chip 文本（从后往前、同文取最后一条）删掉这些气泡，避免「草稿已拿回、
+	 * 聊天里还躺着一条没执行的消息」。模板展开后的文本与 chip 原文不一致时匹配不到，
+	 * 这种气泡会在重新载入会话时自然消失。
+	 */
+	private dropWithdrawnUserBubbles(
+		runtime: AgentRuntime,
+		result: AbortAndRestoreQueueResult,
+	): boolean {
+		const remaining = [...result.steering, ...result.followUp].map((item) => item.text);
+		if (remaining.length === 0) return false;
+		const messages = runtime.transcript.messages;
+		let firstRemoved = -1;
+		for (let index = messages.length - 1; index >= 0 && remaining.length > 0; index -= 1) {
+			const message = messages[index];
+			if (!message || message.role !== "user") continue;
+			if (message.meta?.streamingBehavior === undefined) continue;
+			const match = remaining.lastIndexOf(message.text);
+			if (match === -1) continue;
+			messages.splice(index, 1);
+			remaining.splice(match, 1);
+			firstRemoved = index;
+		}
+		if (firstRemoved === -1) return false;
+		this.markMessagesDirty(runtime, firstRemoved);
+		return true;
+	}
+
+	/**
+	 * 排队 follow-up 的落气泡时机：omp 收下消息后仍可能因为本地 busy 快照过期而立即开跑，
+	 * 用一次 get_state 队列快照对账——快照里没有它说明已投递，立刻补气泡；
+	 * 还在队列里就记到 deferredFollowUps，等 queue_update 报告它离队时再补。
+	 * 快照读不到（RPC 失败/超时）时退回旧的乐观行为：宁可早显示一条，也不能让
+	 * 已投递的消息永远不出现在时间线。
+	 */
+	private async reconcileFollowUpAdmission(
+		runtime: AgentRuntime,
+		entry: DeferredFollowUp,
+		promptSentAt: number,
+	): Promise<void> {
+		const snapshot = await this.readQueuedMessagesSnapshot(runtime);
+		const stillQueued =
+			snapshot !== undefined &&
+			queuedTexts(snapshot).some((chipText) => deferredMatchesText(entry, chipText));
+		if (!stillQueued) {
+			// 离队不等于投递：对账窗口内用户可能已经撤回/中止并把它拿回输入框。
+			if (this.isFollowUpWithdrawn(runtime, entry)) return;
+			this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+			return;
+		}
+		(runtime.deferredFollowUps ??= []).push(entry);
+		// 竞态兜底：对账期间 omp 可能已经把它投递出去（那次 queue_update 早于本条目入表，
+		// 什么都没 flush 到）。用「发送之后到达的最新队列快照」再对账一次，避免气泡永久丢失。
+		if (runtime.lastQueuedSnapshot && (runtime.lastQueueUpdateAt ?? 0) >= promptSentAt) {
+			this.flushDeliveredFollowUps(runtime, runtime.lastQueuedSnapshot);
+		}
+	}
+
+	/** 只为队列对账读一次 get_state；失败返回 undefined，由调用方决定降级方向。 */
+	private async readQueuedMessagesSnapshot(
+		runtime: AgentRuntime,
+	): Promise<AgentQueuedMessages | undefined> {
+		try {
+			const response = await runtime.slot.process.client.request({ type: "get_state" }, 10_000);
+			if (!response.success) return undefined;
+			const data = response.data;
+			const queuedMessages =
+				data && typeof data === "object" && "queuedMessages" in data
+					? data.queuedMessages
+					: undefined;
+			return this.normalizeQueuedMessages(queuedMessages);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * omp 投递或撤回排队消息时会推 queue_update。按「剩余排队条数」对账：
+	 * 队列里该文案的剩余条数少于本地 deferred 条数的部分就是已投递，补上对应气泡。
+	 * omp 是 FIFO 投递，所以从尾部倒着保留仍在队列里的条目——同文案连发多条时
+	 * 先投递的是靠前那条，倒序保留才能让图片/meta 与真实投递内容对齐。
+	 */
+	private flushDeliveredFollowUps(runtime: AgentRuntime, snapshot: AgentQueuedMessages): void {
+		const deferred = runtime.deferredFollowUps;
+		if (!deferred || deferred.length === 0) return;
+		const remaining = new Map<string, number>();
+		for (const text of queuedTexts(snapshot)) {
+			remaining.set(text, (remaining.get(text) ?? 0) + 1);
+		}
+		const keep = new Array<boolean>(deferred.length).fill(false);
+		for (let index = deferred.length - 1; index >= 0; index -= 1) {
+			const entry = deferred[index];
+			if (!entry) continue;
+			// 本进程正在/已经撤回这条消息：它离队是撤回造成的，不是投递。
+			if (this.isFollowUpWithdrawn(runtime, entry)) {
+				keep[index] = true;
+				continue;
+			}
+			// plan 模式下 chip 文案带隐藏标记，两个候选里命中一个就算还在队列。
+			const queuedKey = [entry.queueText, entry.text].find(
+				(text) => (remaining.get(text) ?? 0) > 0,
+			);
+			if (queuedKey === undefined) continue;
+			remaining.set(queuedKey, (remaining.get(queuedKey) ?? 0) - 1);
+			keep[index] = true;
+		}
+		deferred.forEach((entry, index) => {
+			if (keep[index]) return;
+			this.addMessage(runtime, "user", entry.text, entry.meta, entry.images);
+		});
+		runtime.deferredFollowUps = deferred.filter((_, index) => keep[index]);
+	}
+
+	/**
+	 * 用户主动撤回排队 follow-up：气泡从未写入时间线，只需丢掉本地快照，
+	 * 否则下一次 queue_update 会把它当成「已投递」补一条不该出现的用户消息。
+	 * 按首条匹配丢弃（同文案连发时撤回的正是服务端队列里的第一条）。
+	 */
+	private withdrawDeferredFollowUp(
+		runtime: AgentRuntime,
+		text: string,
+	): DeferredFollowUp | undefined {
+		const deferred = runtime.deferredFollowUps;
+		if (!deferred || deferred.length === 0) return undefined;
+		const index = deferred.findIndex((entry) => deferredMatchesText(entry, text));
+		if (index === -1) return undefined;
+		const [entry] = deferred.splice(index, 1);
+		return entry;
+	}
+
+	/**
+	 * 记下「这条 follow-up 是我们撤走的」：离队事件/准入对账只看得到「不在队列里」，
+	 * 分不清投递还是撤回。墓碑只覆盖在途对账窗口，TTL 过期自动清理。
+	 */
+	private markFollowUpWithdrawn(runtime: AgentRuntime, text: string): void {
+		const tombstones = (runtime.withdrawnFollowUps ??= new Map());
+		const now = Date.now();
+		for (const [key, expiry] of tombstones) {
+			if (expiry <= now) tombstones.delete(key);
+		}
+		tombstones.set(text, now + WITHDRAWN_FOLLOW_UP_TTL_MS);
+	}
+
+	/** 这条 follow-up 是否刚被本进程撤回（撤回留下的墓碑命中即视为未投递）。 */
+	private isFollowUpWithdrawn(runtime: AgentRuntime, entry: DeferredFollowUp): boolean {
+		const tombstones = runtime.withdrawnFollowUps;
+		if (!tombstones || tombstones.size === 0) return false;
+		const now = Date.now();
+		let hit = false;
+		for (const [text, expiry] of tombstones) {
+			if (expiry <= now) {
+				tombstones.delete(text);
+				continue;
+			}
+			if (deferredMatchesText(entry, text)) hit = true;
+		}
+		return hit;
+	}
+
+	/** 撤回请求回执证明这条其实是「已投递」时，清掉墓碑让投递路径继续补气泡。 */
+	private clearFollowUpWithdrawn(runtime: AgentRuntime, text: string): void {
+		runtime.withdrawnFollowUps?.delete(text);
+	}
+
+	/** 服务端返回的图片条目按 ImageContent 逐项校验，坏条目直接丢弃而不是让整次撤回失败。 */
+	private normalizeRestoredImages(value: unknown): ImageContent[] | undefined {
+		if (!Array.isArray(value)) return undefined;
+		const images = value.filter(
+			(item): item is ImageContent =>
+				!!item &&
+				typeof item === "object" &&
+				(item as Record<string, unknown>).type === "image" &&
+				typeof (item as Record<string, unknown>).data === "string" &&
+				typeof (item as Record<string, unknown>).mimeType === "string",
+		);
+		return images.length > 0 ? images : undefined;
+	}
+
+	/**
+	 * 从 omp 待投递队列撤回一条 chip（首条匹配）。
+	 * 返回 removed:false 表示发送时已不在队列（可能刚被投递），调用方不得重试或改发。
+	 */
+	async removeQueuedMessage(
+		agentId: string,
+		message: string,
+		queue: "steering" | "followUp",
+	): Promise<RemoveQueuedMessageResult> {
+		const runtime = this.requireRuntime(agentId);
+		// 撤回命令自己会让消息离队并推 queue_update；先立墓碑，让那次事件/在途对账
+		// 都不把它误判为「已投递」。steering 撤回不涉及 follow-up 快照，无需墓碑。
+		if (queue === "followUp") this.markFollowUpWithdrawn(runtime, message);
+		const response = await runtime.slot.process.client.request(
+			{ type: "remove_queued_message", message, queue },
+			15_000,
+		);
+		if (!response.success) {
+			this.clearFollowUpWithdrawn(runtime, message);
+			throw new Error(response.error ?? "撤回排队消息失败");
+		}
+		const data = (response.data ?? {}) as Record<string, unknown>;
+		const images = this.normalizeRestoredImages(data.images);
+		const result: RemoveQueuedMessageResult = {
+			removed: data.removed === true,
+			...(images ? { images } : {}),
+			...(data.imagesDropped === true ? { imagesDropped: true } : {}),
+		};
+		// 撤回成功的 follow-up 从未写入时间线（只存在 deferredFollowUps）：丢快照即可，
+		// 否则下一次 queue_update 会把它误判成「已投递」补出气泡。
+		// removed:false 说明 omp 说它已不在队列——那就是刚被投递，必须清墓碑并补气泡，
+		// 否则这条已经进入本轮上下文的消息在时间线里彻底消失。
+		// 只摘 follow-up 的快照：steering 撤回不能动同文案的 follow-up。
+		const withdrawn =
+			queue === "followUp" ? this.withdrawDeferredFollowUp(runtime, message) : undefined;
+		if (result.removed) {
+			// 撤回成功后墓碑继续保留到 TTL 结束：准入对账可能还在途，不能让它补出气泡。
+			void this.emitRuntimeState(agentId);
+			return result;
+		}
+		this.clearFollowUpWithdrawn(runtime, message);
+		if (withdrawn) {
+			this.addMessage(runtime, "user", withdrawn.text, withdrawn.meta, withdrawn.images);
+		}
+		void this.emitRuntimeState(agentId);
+		return result;
+	}
+
+	/** 把首条匹配的 followUp 移到 steering 队尾（服务端移动，不重跑模板、不重复入队）。 */
+	async promoteQueuedMessage(
+		agentId: string,
+		message: string,
+	): Promise<PromoteQueuedMessageResult> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "promote_queued_message", message },
+			15_000,
+		);
+		if (!response.success) throw new Error(response.error ?? "提升排队消息失败");
+		const data = (response.data ?? {}) as Record<string, unknown>;
+		void this.emitRuntimeState(agentId);
+		return { promoted: data.promoted === true };
+	}
+
+	private async abortWithCommand(
+		agentId: string,
+		command: Record<string, unknown>,
+		awaitResponse: boolean,
+	): Promise<Record<string, unknown> | undefined> {
+		const runtime = this.requireRuntime(agentId);
+		// 用户主动停止的会话不应再弹"已完成"。
+		this.cancelSessionEndNotification(agentId);
 
 		// pi 在等待 extension_ui_response 时（如 ask_question），不发 abort 也能处理，
 		// 但必须解除 pending 请求的阻塞，否则 pi 不会继续读取 stdin 中的后续命令。
@@ -1304,11 +1921,13 @@ export class AgentManager {
 		const pending = runtime.pendingUIRequests;
 		if (pending.size > 0) {
 			runtime.run.abortedDuringAsk = true;
-			for (const [requestId] of pending) {
+			for (const [requestId, info] of pending) {
+				// 原生 ask 的解析器只认 cancelled；发 value:null 会落进
+				// "must carry N answers" 分支触发 ToolAbortError。旧 select 仍用 value:null。
 				runtime.slot.process.client.sendRaw({
 					type: "extension_ui_response",
 					id: requestId,
-					value: null,
+					...(info.method === "ask" ? { cancelled: true } : { value: null }),
 				});
 			}
 		}
@@ -1320,11 +1939,9 @@ export class AgentManager {
 		sealRun(runtime.run, Date.now());
 		this.scheduleAbortSettledFallback(runtime);
 
-		runtime.slot.process.client
-			.request({ type: "abort" }, 10_000)
-			.catch(() => {
-				// abort 超时或失败不影响前端状态切换
-			});
+		const abortRequest = runtime.slot.process.client
+			.request(command, 10_000)
+			.catch(() => undefined);
 
 		// 立即清理 pending UI 记录并移除 ask_question 卡片，不等待 abort 返回
 		if (pending.size > 0) {
@@ -1341,6 +1958,13 @@ export class AgentManager {
 					messages.splice(idx, 1);
 					this.markMessagesDirty(runtime, idx);
 				}
+				// 让渲染层立刻收起内联问答条；不能等 pi 回 cancelled（abort 路径不一定回）。
+				this.emit(ipcChannels.agentsUiRequest, {
+					agentId,
+					requestId,
+					completed: true,
+					cancelled: true,
+				});
 			}
 			pending.clear();
 		}
@@ -1367,6 +1991,13 @@ export class AgentManager {
 			duration: 2500,
 		});
 		this.emitState();
+		// 撤回队列的结果是 abort_and_restore_queue 的唯一数据来源，必须等响应；
+		// 普通 abort 不等待，避免 omp 卡住时把「停止」也拖成 10s。
+		if (!awaitResponse) return undefined;
+		const response = await abortRequest;
+		return response?.success
+			? (response.data as Record<string, unknown> | undefined)
+			: undefined;
 	}
 
 	/**
@@ -1506,6 +2137,8 @@ export class AgentManager {
 		// 非 AFK 路径（崩溃恢复/压缩重启）：不携带 CreateAgentInput.cwd，固定使用项目根目录；
 		// 若未来需要按 worktree 重连，需与 createUnlocked 的 cwd 解析保持一致。
 		const child = this.createAgentProcess(project.path);
+		// 与 createUnlocked 同理：start 之前的版本号才代表新 child 可能读到的配置。
+		const startEpoch = this.configEpoch;
 		// 先装配新租约再挂监听：旧 child 的租约此刻失权，它的迟到 exit 不会再被当成当前进程退出。
 		const lease = runtime.slot.install(child);
 		// 与 createUnlocked 一致：先挂生命周期监听，再 start，避免 error 事件无 listener。
@@ -1533,6 +2166,7 @@ export class AgentManager {
 			runtime.tab.sessionPath = data?.sessionFile ?? sessionPath;
 			runtime.tab.title = data?.sessionName ?? runtime.tab.title;
 			runtime.tab.status = "idle";
+			runtime.appliedConfigEpoch = startEpoch;
 			// 进程退出型压缩可能来不及发 compaction_end；重连成功即表示 Pi 已可继续接收消息。
 			runtime.rpcCompacting = false;
 
@@ -1553,6 +2187,233 @@ export class AgentManager {
 				error: error instanceof Error ? error.message : String(error),
 			});
 			throw error;
+		}
+	}
+
+	/**
+	 * 配置版本落后时重连会话（保留 session 文件、当前模型与思考档）。
+	 *
+	 * 只允许在会话空闲时执行：omp 进程不会热加载 models.yml / auth.json，
+	 * 而旧 child 与潜在的新 child 不能同时持有同一个 session 文件。
+	 * 失败会把状态落到 error 并给出可操作提示，绝不静默继续用旧配置发请求。
+	 */
+	private async applyPendingConfig(agentId: string, runtime: AgentRuntime): Promise<void> {
+		if (runtime.configApplyPromise) {
+			await runtime.configApplyPromise;
+			return;
+		}
+		if (runtime.appliedConfigEpoch === this.configEpoch) return;
+		if (runtime.tab.status !== "idle" && runtime.tab.status !== "error") return;
+		if (!runtime.tab.sessionPath) return;
+
+		runtime.configApplyPromise = (async () => {
+			const selection = await this.readRuntimeSelection(runtime);
+			runtime.tab.status = "starting";
+			this.emitState();
+			try {
+				await this.replaceRuntimeProcess(agentId, runtime);
+				await this.restoreRuntimeSelection(runtime, selection);
+				runtime.tab.status = "idle";
+				delete runtime.tab.lastError;
+				this.addMessage(runtime, "system", "模型配置已更新，会话已自动重连");
+				void this.appLogger?.info("agent", "Config applied via process reattach", {
+					agentId,
+					epoch: runtime.appliedConfigEpoch,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				runtime.tab.status = "error";
+				runtime.tab.lastError = message;
+				this.addMessage(
+					runtime,
+					"error",
+					`应用最新模型配置失败（${message}）。请手动重启 Agent。`,
+				);
+				void this.appLogger?.error("agent", "Config reattach failed", {
+					agentId,
+					error: message,
+				});
+			} finally {
+				runtime.configApplyPromise = undefined;
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
+		})();
+		await runtime.configApplyPromise;
+	}
+
+	/**
+	 * 上游返回 422「unknown variant `developer`」：provider 明确不支持 OpenAI 的
+	 * developer 角色，但 omp 已按旧配置（或内置 catalog 默认 true）把 system prompt
+	 * 发成了 developer。仅重启不一定够——配置若仍为 true 会再次失败，所以先尝试把
+	 * 该 provider 的 compat 显式关闭，再重连进程让其重新读取。
+	 *
+	 * 不自动重发上一轮 prompt：失败可能发生在工具执行后的后续请求，重发会重复副作用。
+	 */
+	private maybeRecoverDeveloperRole(agentId: string, runtime: AgentRuntime, errorText: string): void {
+		if (!errorText.includes("unknown variant `developer`")) return;
+		if (runtime.healingDeveloperRole) return;
+		runtime.healingDeveloperRole = true;
+		const task = (async () => {
+			// willRetry=true 时自动重试卡片还停在「正在自动重试」；进程即将被替换，
+			// 不会再有 auto_retry_end，先把它收口成失败态，避免 UI 永久显示重试中。
+			if (runtime.transcript.retryStatusMessageId !== undefined) {
+				this.upsertRetryStatusMessage(runtime, { errorMessage: errorText }, "error");
+			}
+			const liveSelection = await this.readRuntimeSelection(runtime);
+			// 进程可能已在 422 后退出：get_state 拿不到时退回本会话最近一次已知模型，
+			// 否则无法关闭该 provider 的 developer 角色。
+			const selection = liveSelection.provider
+				? liveSelection
+				: (runtime.lastModelSelection ?? liveSelection);
+			let configChanged = false;
+			if (selection.provider && this.config.disableDeveloperRole) {
+				try {
+					configChanged = await this.config.disableDeveloperRole(selection.provider);
+				} catch (error) {
+					void this.appLogger?.error("agent", "Disable developer role failed", {
+						agentId,
+						provider: selection.provider,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				if (configChanged) this.markConfigChanged();
+			}
+
+			const sessionPath = runtime.tab.sessionPath;
+			if (!sessionPath) {
+				runtime.healingDeveloperRole = false;
+				runtime.configApplyPromise = undefined;
+				return;
+			}
+			runtime.tab.status = "starting";
+			this.emitState();
+			try {
+				await this.replaceRuntimeProcess(agentId, runtime);
+				await this.restoreRuntimeSelection(runtime, selection);
+				runtime.tab.status = "idle";
+				delete runtime.tab.lastError;
+				this.addMessage(
+					runtime,
+					"system",
+					configChanged
+						? `上游不支持 developer 角色，已自动关闭 ${selection.provider} 的该兼容项并重连会话。请重新发送上一条消息。`
+						: "上游不支持 developer 角色，已重连会话以应用最新模型配置。请重新发送上一条消息。",
+				);
+				void this.appLogger?.info("agent", "Recovered from developer-role rejection", {
+					agentId,
+					provider: selection.provider,
+					configChanged,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				runtime.tab.status = "error";
+				runtime.tab.lastError = message;
+				this.addMessage(
+					runtime,
+					"error",
+					`检测到上游拒绝 developer 角色，但自动重连失败（${message}）。请手动重启 Agent。`,
+				);
+			} finally {
+				runtime.healingDeveloperRole = false;
+				runtime.configApplyPromise = undefined;
+				this.emitState();
+				void this.emitRuntimeState(agentId);
+			}
+		})();
+		// 自愈期间若有新 prompt 到达，sendPrompt 会先 await 这次重连，
+		// 避免把消息发给即将被替换的旧进程。
+		runtime.configApplyPromise = task;
+	}
+
+	/** 停掉旧 child 再按同一 session 重连，避免两个 omp 同时持有会话文件。 */
+	private async replaceRuntimeProcess(agentId: string, runtime: AgentRuntime): Promise<void> {
+		const sessionPath = runtime.tab.sessionPath;
+		if (!sessionPath) throw new Error("会话尚未落盘，无法重连");
+		const oldProcess = runtime.slot.retire();
+		try {
+			await oldProcess.stop();
+		} catch (error) {
+			void this.appLogger?.warn("agent", "Old process stop failed before reattach", {
+				agentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		await this.reattachProcess(agentId, sessionPath);
+	}
+
+	/** 读取当前会话实际使用的模型与思考档；进程已退出时返回空对象。 */
+	private async readRuntimeSelection(runtime: AgentRuntime): Promise<{
+		provider?: string;
+		modelId?: string;
+		thinkingLevel?: string;
+	}> {
+		const response = await runtime.slot.process.client
+			.request({ type: "get_state" }, 10_000)
+			.catch(() => undefined);
+		const data = response?.data as
+			| {
+					model?: { provider?: unknown; id?: unknown } | string;
+					thinkingLevel?: unknown;
+					thinking_level?: unknown;
+			  }
+			| undefined;
+		const model = typeof data?.model === "string" ? undefined : data?.model;
+		const thinkingLevel = data?.thinkingLevel ?? data?.thinking_level;
+		const selection = {
+			provider: typeof model?.provider === "string" ? model.provider : undefined,
+			modelId: typeof model?.id === "string" ? model.id : undefined,
+			thinkingLevel: typeof thinkingLevel === "string" ? thinkingLevel : undefined,
+		};
+		if (selection.provider && selection.modelId) {
+			runtime.lastModelSelection = {
+				provider: selection.provider,
+				modelId: selection.modelId,
+				thinkingLevel: selection.thinkingLevel,
+			};
+		}
+		return selection;
+	}
+
+	/**
+	 * 重连后的进程按默认角色选模型；恢复用户在本会话里显式选过的模型和思考档，
+	 * 避免「只是保存了配置，会话却悄悄换模型」。
+	 */
+	private async restoreRuntimeSelection(
+		runtime: AgentRuntime,
+		selection: { provider?: string; modelId?: string; thinkingLevel?: string },
+	): Promise<void> {
+		const client = runtime.slot.process.client;
+		if (selection.provider && selection.modelId) {
+			const response = await client
+				.request(
+					{ type: "set_model", provider: selection.provider, modelId: selection.modelId },
+					20_000,
+				)
+				.catch((error: unknown) => ({ success: false, error: String(error) }));
+			if (!response.success) {
+				void this.appLogger?.warn("agent", "Restore model after reattach failed", {
+					agentId: runtime.tab.id,
+					provider: selection.provider,
+					modelId: selection.modelId,
+					error: response.error,
+				});
+			}
+		}
+		if (selection.thinkingLevel) {
+			const response = await client
+				.request(
+					{ type: "set_thinking_level", level: selection.thinkingLevel },
+					20_000,
+				)
+				.catch((error: unknown) => ({ success: false, error: String(error) }));
+			if (!response.success) {
+				void this.appLogger?.warn("agent", "Restore thinking level after reattach failed", {
+					agentId: runtime.tab.id,
+					level: selection.thinkingLevel,
+					error: response.error,
+				});
+			}
 		}
 	}
 
@@ -1659,7 +2520,222 @@ export class AgentManager {
 					: undefined,
 			cacheHitPercent,
 			cost: stats?.cost,
+			// omp 服务档位：enabled 是持久化设置，active 是当前请求实际生效的档。
+			// 两者分开，避免用户在全局开启后误以为每个模型都支持。
+			fastModeEnabled: normalizePiBoolean(state?.fastModeEnabled),
+			fastModeActive: normalizePiBoolean(state?.fastModeActive),
+			slowModeSupported: normalizePiBoolean(state?.slowModeSupported),
+			slowModeEnabled: normalizePiBoolean(state?.slowModeEnabled),
+			slowModeScope:
+				typeof state?.slowModeScope === "string" ? state.slowModeScope : undefined,
+			// omp 的待投递队列是 chip 的唯一事实来源：renderer 直接渲染它，
+			// 撤回/提升都回服务端执行，本地不再维护第二份 pending 队列。
+			queuedMessages: this.normalizeQueuedMessages(state?.queuedMessages),
+			// todo 的权威快照来自 get_state；工具时间线只保留历史卡片，不再充当面板数据源。
+			todoPhases: this.normalizeTodoPhases(state?.todoPhases),
+			tokensPerSecond: this.pickNumber(state?.tokensPerSecond),
+			autoCompactionEnabled: normalizePiBoolean(state?.autoCompactionEnabled),
+			usageLimit: this.normalizeUsageLimit(state?.usageLimit),
+			// get_state 不暴露 cache warming；用事件投影，避免为只为展示而多读 config.yml。
+			...(runtime.cacheWarming ? { cacheWarming: runtime.cacheWarming } : {}),
 		};
+	}
+
+	/** get_state.queuedMessages 容错：缺失/非数组都收敛为空队列，避免 renderer 判空分支散落。 */
+	private normalizeQueuedMessages(value: unknown): AgentQueuedMessages {
+		const readList = (list: unknown): string[] =>
+			Array.isArray(list)
+				? list.filter((item): item is string => typeof item === "string" && item.length > 0)
+				: [];
+		const record =
+			value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+		return {
+			steering: readList(record.steering),
+			followUp: readList(record.followUp),
+		};
+	}
+
+	/**
+	 * get_state.todoPhases / set_todos 入参共用的五态归一化。
+	 * omp 的 TodoItem 还带 blocker/details/notes；这里完整保留，避免用户点击
+	 * 切换状态后再次下发时把 blocked 任务的等待原因丢掉。
+	 */
+	private normalizeTodoPhases(value: unknown): AgentTodoPhase[] {
+		if (!Array.isArray(value)) return [];
+		const phases: AgentTodoPhase[] = [];
+		for (const rawPhase of value) {
+			if (!rawPhase || typeof rawPhase !== "object") continue;
+			const phase = rawPhase as Record<string, unknown>;
+			if (typeof phase.name !== "string") continue;
+			const tasks: AgentTodoItem[] = [];
+			if (Array.isArray(phase.tasks)) {
+				for (const rawTask of phase.tasks) {
+					if (!rawTask || typeof rawTask !== "object") continue;
+					const task = rawTask as Record<string, unknown>;
+					if (typeof task.content !== "string" || !task.content) continue;
+					if (typeof task.status !== "string") continue;
+					if (AGENT_TODO_STATUSES[task.status as AgentTodoStatus] !== true) continue;
+					const notes = Array.isArray(task.notes)
+						? task.notes.filter((note): note is string => typeof note === "string")
+						: undefined;
+					tasks.push({
+						content: task.content,
+						status: task.status as AgentTodoStatus,
+						...(typeof task.blocker === "string" ? { blocker: task.blocker } : {}),
+						...(typeof task.details === "string" ? { details: task.details } : {}),
+						...(notes && notes.length > 0 ? { notes } : {}),
+					});
+				}
+			}
+			phases.push({ name: phase.name, tasks });
+		}
+		return phases;
+	}
+
+	/** get_state.usageLimit 容错：字段缺失/类型非法时视为无限制状态，不猜 stage。 */
+	private normalizeUsageLimit(value: unknown): AgentUsageLimitState | undefined {
+		if (!value || typeof value !== "object") return undefined;
+		const source = value as Record<string, unknown>;
+		const resetsAtSec = this.pickNumber(source.resetsAtSec);
+		if (source.stage === "low_priority") {
+			const allowanceLeftPercent = this.pickNumber(source.allowanceLeftPercent);
+			return {
+				stage: "low_priority",
+				...(resetsAtSec != null ? { resetsAtSec } : {}),
+				...(allowanceLeftPercent != null ? { allowanceLeftPercent } : {}),
+			};
+		}
+		if (source.stage === "wrap_up") {
+			return {
+				stage: "wrap_up",
+				extraUsage: source.extraUsage === true,
+				...(resetsAtSec != null ? { resetsAtSec } : {}),
+			};
+		}
+		return undefined;
+	}
+
+	/** 子代理快照按 omp registry 的 index 排序（无 index 的按 id 稳定排序）。 */
+	private getSubagentSnapshot(runtime: AgentRuntime): AgentSubagent[] {
+		return [...runtime.subagents.values()].sort(
+			(a, b) => (a.index ?? 0) - (b.index ?? 0) || a.id.localeCompare(b.id),
+		);
+	}
+
+	/** 子代理状态变化只走独立通道：progress 帧频率高，不能顺带触发 get_state RPC。 */
+	private emitSubagents(runtime: AgentRuntime) {
+		this.emit(ipcChannels.agentsSubagents, {
+			agentId: runtime.tab.id,
+			subagents: this.getSubagentSnapshot(runtime),
+		});
+	}
+
+	/** registry 快照（无 RPC）：渲染层重载后恢复已有子代理卡片。 */
+	async getSubagents(agentId: string): Promise<AgentSubagent[]> {
+		return this.getSubagentSnapshot(this.requireRuntime(agentId));
+	}
+
+	/**
+	 * 合并 subagent_lifecycle / subagent_progress 帧。
+	 *
+	 * 帧结构（omp rpc-types）：
+	 * - lifecycle: { payload: { id, agent, status, parentToolCallId, sessionFile, index, description? } }
+	 * - progress:  { payload: { index, agent, ...身份字段, progress: { id, status, task, assignment,
+	 *                lastIntent, recentTools, recentOutput, toolCount, requests, tokens, cost,
+	 *                durationMs, resolvedModel, ... }, sessionFile } }
+	 *
+	 * lifecycle 只保证身份和终态，progress 才有运行摘要；两者按字段向后合并，
+	 * 避免后到的 lifecycle(completed) 把 progress 的统计清空。
+	 */
+	private applySubagentFrame(runtime: AgentRuntime, frame: Record<string, any>) {
+		const payload =
+			frame.payload && typeof frame.payload === "object"
+				? (frame.payload as Record<string, any>)
+				: undefined;
+		if (!payload) return;
+		const progress =
+			payload.progress && typeof payload.progress === "object"
+				? (payload.progress as Record<string, any>)
+				: undefined;
+		const source = progress ?? payload;
+		const id =
+			typeof source.id === "string" && source.id
+				? source.id
+				: typeof payload.id === "string" && payload.id
+					? payload.id
+					: "";
+		if (!id) return;
+
+		// omp 的 subagentId 在 session 内可能复用（同 agent 名再次派生）：新的
+		// lifecycle(started) 视为全新一次运行，丢弃上一次的统计/终态，否则终态粘滞
+		// 会把新运行永久钉在 completed。
+		if (frame.type === "subagent_lifecycle" && source.status === "started") {
+			runtime.subagents.delete(id);
+		}
+
+		const previous = runtime.subagents.get(id);
+		const pickText = (value: unknown) =>
+			typeof value === "string" && value.trim() ? value : undefined;
+		const pickNumber = (value: unknown) =>
+			typeof value === "number" && Number.isFinite(value) ? value : undefined;
+		// omp 的 lifecycle 用 "started" 表示开跑，progress/lifecycle 终态用
+		// completed/aborted/failed；对外统一 running，UI 只需判一个运行态值。
+		// 终态粘滞：progress 帧按固定间隔产出，理论上可能晚于 lifecycle 终态帧排队到达；
+		// 若让 "running" 覆盖 "completed"，面板会永远转圈，所以终态一旦到达就不再回退。
+		const rawStatus =
+			typeof source.status === "string" && source.status
+				? source.status
+				: previous?.status ?? "running";
+		const normalizedStatus = rawStatus === "started" ? "running" : rawStatus;
+		// 终态之间允许互相覆盖（lifecycle 的 failed/aborted 比 progress 的 completed 权威），
+		// 只禁止终态回退到 running 等非终态。
+		const status =
+			previous &&
+			SUBAGENT_TERMINAL_STATUSES.has(previous.status) &&
+			!SUBAGENT_TERMINAL_STATUSES.has(normalizedStatus)
+				? previous.status
+				: normalizedStatus;
+
+		const recentTools = Array.isArray(source.recentTools)
+			? source.recentTools
+					.filter((item): item is Record<string, unknown> =>
+						Boolean(item) && typeof item === "object",
+					)
+					.map((item) => ({
+						tool: typeof item.tool === "string" ? item.tool : "tool",
+						args: pickText(item.args),
+						isError: item.isError === true,
+					}))
+			: previous?.recentTools;
+
+		const next: AgentSubagent = {
+			...(previous ?? {}),
+			id,
+			status,
+			agent: pickText(source.agent) ?? pickText(payload.agent) ?? previous?.agent,
+			description:
+				pickText(payload.description) ?? pickText(source.description) ?? previous?.description,
+			index: pickNumber(source.index) ?? previous?.index,
+			sessionFile:
+				pickText(source.sessionFile) ?? pickText(payload.sessionFile) ?? previous?.sessionFile,
+			task: pickText(source.task) ?? previous?.task,
+			assignment: pickText(source.assignment) ?? previous?.assignment,
+			lastIntent: pickText(source.lastIntent) ?? previous?.lastIntent,
+			recentTools,
+			toolCount: pickNumber(source.toolCount) ?? previous?.toolCount,
+			tokens: pickNumber(source.tokens) ?? previous?.tokens,
+			durationMs: pickNumber(source.durationMs) ?? previous?.durationMs,
+			resolvedModel: pickText(source.resolvedModel) ?? previous?.resolvedModel,
+		};
+		runtime.subagents.set(id, next);
+		this.emitSubagents(runtime);
+	}
+
+	/** 新会话不继承旧会话的子代理 registry（旧进程仍可能继续跑 detached 子代理）。 */
+	private clearSubagents(runtime: AgentRuntime) {
+		if (runtime.subagents.size === 0) return;
+		runtime.subagents.clear();
+		this.emitSubagents(runtime);
 	}
 
 	private applyActiveToolCallState(runtime: AgentRuntime, state: ActiveToolCallState) {
@@ -1782,8 +2858,148 @@ export class AgentManager {
 			60_000,
 		);
 		const models = ((response.data as any)?.models ?? []) as AvailableModel[];
-		// pi 会把有 Key（含环境变量）的供应商内置目录也返回，这里只保留 models.json 显式配置的模型
-		return this.config.filterConfiguredModels(models);
+		// 目录包含 embedding/vision 等非对话条目；omp 的 kind 只在 chat 时可被
+		// set_model/模型角色选择使用。旧版没有 kind 字段，按可对话处理。
+		return models.filter((model) => !model.kind || model.kind === "chat");
+	}
+
+	/** omp 原生 OAuth provider 列表（登录动作必须绑定一个运行中的 agent）。 */
+	async getLoginProviders(agentId: string): Promise<OmpLoginProvider[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_login_providers" },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "get_login_providers failed");
+		}
+		const raw = (response.data as { providers?: unknown } | undefined)?.providers;
+		if (!Array.isArray(raw)) return [];
+		return raw.flatMap((entry): OmpLoginProvider[] => {
+			if (!entry || typeof entry !== "object") return [];
+			const item = entry as Record<string, unknown>;
+			if (typeof item.id !== "string" || !item.id) return [];
+			return [{
+				id: item.id,
+				name: typeof item.name === "string" && item.name ? item.name : item.id,
+				available: item.available === true,
+				authenticated: item.authenticated === true,
+			}];
+		});
+	}
+
+	/**
+	 * 触发 omp OAuth 登录。omp 在流程中通过 `extension_ui_request` 发出
+	 * `open_url` / 非敏感 `input`；超时按 omp 的 10 分钟输入窗口放宽到 11 分钟。
+	 */
+	async login(agentId: string, providerId: string): Promise<{ providerId: string }> {
+		const runtime = this.requireRuntime(agentId);
+		const trimmed = providerId.trim();
+		if (!trimmed) throw new Error("providerId is required");
+		runtime.loginFlowProviderId = trimmed;
+		this.emit(ipcChannels.agentsUiRequest, {
+			agentId,
+			requestId: `login-${trimmed}`,
+			method: "login_flow",
+			title: "",
+			loginStatus: "started",
+			loginProviderId: trimmed,
+			loginFlow: true,
+		});
+		try {
+			const response = await runtime.slot.process.client.request(
+				{ type: "login", providerId: trimmed },
+				660_000,
+			);
+			if (!response.success) {
+				throw new Error(response.error || "login failed");
+			}
+			const data = response.data as { providerId?: unknown } | undefined;
+			const completedProvider =
+				typeof data?.providerId === "string" && data.providerId
+					? data.providerId
+					: trimmed;
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: `login-${trimmed}`,
+				method: "login_flow",
+				title: "",
+				loginStatus: "succeeded",
+				loginProviderId: completedProvider,
+				loginFlow: true,
+			});
+			return { providerId: completedProvider };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: `login-${trimmed}`,
+				method: "login_flow",
+				title: "",
+				loginStatus: "failed",
+				loginProviderId: trimmed,
+				loginFlow: true,
+				error: message,
+			});
+			throw error;
+		} finally {
+			if (runtime.loginFlowProviderId === trimmed) {
+				runtime.loginFlowProviderId = undefined;
+			}
+		}
+	}
+
+	/** 列出 provider 已存储的可登出凭据（active 在前）。 */
+	async getLogoutAccounts(agentId: string, providerId: string): Promise<OmpLogoutAccount[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_logout_accounts", providerId },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "get_logout_accounts failed");
+		}
+		const raw = (response.data as { accounts?: unknown } | undefined)?.accounts;
+		if (!Array.isArray(raw)) return [];
+		return raw.flatMap((entry): OmpLogoutAccount[] => {
+			if (!entry || typeof entry !== "object") return [];
+			const item = entry as Record<string, unknown>;
+			if (
+				typeof item.credentialId !== "number" ||
+				typeof item.provider !== "string" ||
+				typeof item.label !== "string"
+			) {
+				return [];
+			}
+			return [{
+				credentialId: item.credentialId,
+				provider: item.provider,
+				label: item.label,
+				detail: typeof item.detail === "string" ? item.detail : "",
+				type: item.type === "oauth" ? "oauth" : "api_key",
+				active: item.active === true,
+			}];
+		});
+	}
+
+	/** 移除一条凭据；remainingSource 表示仍能认证该 provider 的来源。 */
+	async logout(
+		agentId: string,
+		providerId: string,
+		credentialId: number,
+	): Promise<{ remainingSource?: string }> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "logout", providerId, credentialId },
+			60_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error || "logout failed");
+		}
+		const data = response.data as { remainingSource?: unknown } | undefined;
+		return typeof data?.remainingSource === "string" && data.remainingSource
+			? { remainingSource: data.remainingSource }
+			: {};
 	}
 
 	async setModel(agentId: string, provider: string, modelId: string) {
@@ -1792,6 +3008,9 @@ export class AgentManager {
 			{ type: "set_model", provider, modelId },
 			60_000,
 		);
+		// 记录用户显式选择：若之后进程在 developer-role 失败中退出，
+		// 自愈仍能定位到该 provider 并关闭不兼容项。
+		runtime.lastModelSelection = { provider, modelId };
 		return this.getRuntimeState(agentId);
 	}
 
@@ -1884,6 +3103,86 @@ export class AgentManager {
 	}
 
 	/**
+	 * 当前模型的可用思考档位（omp `get_available_thinking_levels`）。
+	 * 老版本没有该命令时返回空数组，渲染层回退到内置档位表。
+	 */
+	async getAvailableThinkingLevels(agentId: string): Promise<string[]> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "get_available_thinking_levels" },
+			15_000,
+		);
+		const levels = (response.data as { levels?: unknown } | undefined)?.levels;
+		if (!Array.isArray(levels)) return [];
+		return levels.filter((level): level is string => typeof level === "string" && !!level);
+	}
+
+	/** 切换 fast/priority 服务档；模型不支持时 omp 返回 success:false，需交给渲染层提示。 */
+	async setFastMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		// PiRpcClient 只在超时/断连时 reject，omp 的业务错误以 success:false 返回；
+		// 不检查会把“模型无优先通道”静默当成成功。
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_fast_mode", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_fast_mode failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/** 切换 slow/thinking 服务档；scope 由 omp 持久化设置决定。 */
+	async setSlowMode(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_slow_mode", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_slow_mode failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 切换会话自动压缩（omp `set_auto_compaction`）。
+	 * 该开关只影响后续上下文溢出时的自动压缩，不立即触发压缩；omp 响应无 data，
+	 * 生效值统一回读 get_state.autoCompactionEnabled。
+	 */
+	async setAutoCompaction(agentId: string, enabled: boolean): Promise<AgentRuntimeState> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_auto_compaction", enabled },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_auto_compaction failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 下发会话 todo（omp `set_todos`）。宿主 UI 的勾选/推进走这里，
+	 * 而不是只把 todo 当 tool 结果只读展示；omp 会同步给模型并广播 todo 更新。
+	 * 入参经过五态归一化，防止渲染层脏数据把非法状态写进会话。
+	 */
+	async setTodos(agentId: string, phases: AgentTodoPhase[]): Promise<AgentRuntimeState> {
+		if (!Array.isArray(phases)) {
+			throw new Error("set_todos: phases must be an array");
+		}
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "set_todos", phases: this.normalizeTodoPhases(phases) },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error?.trim() || "set_todos failed");
+		}
+		return this.getRuntimeState(agentId);
+	}
+
+	/**
 	 * 使用 pi �� switch_session RPC ���ص�ǰ�Ự���������½��̡�
 	 * ���̣��༭ JSONL → �ĵ�һ�� JSON ������ _reloadMarker �ֶ� → switch_session
 	 * → pi ���ֵ�һ�����ݱ仯→������Ч→���¶�ȡ → �Ƴ� _reloadMarker �ֶΡ�
@@ -1925,6 +3224,10 @@ export class AgentManager {
 				type: "switch_session",
 				sessionPath: sessionProtocolPath,
 			}, 30_000);
+
+			// reload 也是会话替换：进程内的子代理 registry 随旧会话丢弃，且不会补发
+			// 终态帧。不主动清空的话，编辑/删除消息后卡片会永远停在 Running。
+			if (response.success) this.clearSubagents(runtime);
 
 			void this.appLogger?.info("agent", "Session reload: switch_session done", {
 				agentId,
@@ -2631,6 +3934,9 @@ export class AgentManager {
 
 	private async refreshRuntimeAfterSessionReplacement(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
+		// 新会话不继承旧会话的子代理卡片；旧 detached 子代理最多失去实时入口，
+		// 其会话文件仍可通过会话列表打开（避免新会话时间线挂着上一会话的子代理）。
+		this.clearSubagents(runtime);
 		const stateResponse = await runtime.slot.process.client
 			.request({ type: "get_state" }, this.settingsStore.get().rpcTimeout)
 			.catch(() => ({ data: undefined }));
@@ -2672,6 +3978,47 @@ export class AgentManager {
 	async getCommands(agentId: string) {
 		const runtime = this.requireRuntime(agentId);
 		return this.readPiSlashCommands(runtime, agentId);
+	}
+
+	/**
+	 * 取消一个运行中的子代理。omp 返回 `{ cancelled: boolean }`：
+	 * false 表示子代理已自行结束/不存在，调用方按「已无运行子代理」处理即可。
+	 */
+	async cancelSubagent(agentId: string, subagentId: string): Promise<boolean> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "cancel_subagent", subagentId },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error ?? "cancel_subagent failed");
+		}
+		return (response.data as { cancelled?: unknown } | undefined)?.cancelled === true;
+	}
+
+	/** 给运行中的子代理追加 steering 消息（不打断其当前 run）。 */
+	async steerSubagent(agentId: string, subagentId: string, message: string): Promise<void> {
+		const runtime = this.requireRuntime(agentId);
+		const response = await runtime.slot.process.client.request(
+			{ type: "steer_subagent", subagentId, message },
+			30_000,
+		);
+		if (!response.success) {
+			throw new Error(response.error ?? "steer_subagent failed");
+		}
+	}
+
+	/**
+	 * 读取子代理会话 transcript。只接受本 agent registry 里登记过、且带 sessionFile 的子代理：
+	 * 渲染层传入的 subagentId 是外部输入，不能当任意文件路径使用。
+	 */
+	async getSubagentMessages(agentId: string, subagentId: string): Promise<ChatMessage[]> {
+		const runtime = this.requireRuntime(agentId);
+		const subagent = runtime.subagents.get(subagentId);
+		if (!subagent?.sessionFile) {
+			throw new Error(`Unknown subagent: ${subagentId}`);
+		}
+		return this.readSessionDisplayMessages(subagent.sessionFile, "_viewer");
 	}
 
 	private async promptMatchesRegisteredExtensionCommand(runtime: AgentRuntime, message: string): Promise<boolean> {
@@ -2774,8 +4121,9 @@ export class AgentManager {
 		this.agents.delete(agentId);
 		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
-		// agent 退役时清空响应兜底定时器，避免退役后兜底误打到空 runtime。
+		// agent 退役时清空响应兜底/结束通知定时器，避免退役后回调误打到空 runtime。
 		this.clearEmptyResponseTimer(runtime);
+		this.cancelSessionEndNotification(agentId);
 		this.retiringProcesses.add(child);
 		this.emitState();
 		return child;
@@ -2902,6 +4250,15 @@ export class AgentManager {
 				// 退役/换代 child 的迟到 exit 必须整体 no-op：此刻 runtime 可能已被 stop 摘除，
 				// 继续走退出分支会把 status 拉回 starting、往已退役的 transcript 写错误卡。
 				if (!owns()) return;
+				// 进程退出即服务端队列整体消失：本地 follow-up 快照/墓碑随之作废，
+				// 否则重连后的第一个 queue_update（空队列）会把从未投递的消息误放成气泡。
+				const rt = this.agents.get(agentId);
+				if (rt) {
+					rt.deferredFollowUps = undefined;
+					rt.withdrawnFollowUps = undefined;
+					rt.lastQueuedSnapshot = undefined;
+					rt.lastQueueUpdateAt = undefined;
+				}
 				options.onExit(payload);
 			} catch (error) {
 				void this.appLogger?.error("agent", "Pi process exit handler failed", {
@@ -3115,6 +4472,15 @@ export class AgentManager {
 		// 事件流活性戳：静默兜底（forceIdleOnDeadSilence）据此判断 pi 是否真的什么都不做了。
 		// 必须在任何提前 return 之前刷新——流式增量、被封印丢弃的 delta 同样是活性证据。
 		runtime.lastPiEventAt = Date.now();
+		// 会话结束通知的静默窗口只看用户可感知的工作事件；session_info 是标题等
+		// 元数据，不能因为它刷新时间戳而让「已完成」通知一直不弹。
+		if (
+			typed.type !== "session_info_changed" &&
+			typed.type !== "session_info_update" &&
+			typed.type !== "available_commands_update"
+		) {
+			runtime.lastWorkEventAt = runtime.lastPiEventAt;
+		}
 
 		// 扩展/RPC 调用 setSessionName 后 Pi 发 session_info_changed（旧 pi）/ session_info_update（omp）事件；
 		// 同步到 tab.title，使侧边栏与手动 rename 路径看到同一标题。
@@ -3130,7 +4496,96 @@ export class AgentManager {
 			}
 		}
 
+		// omp 子代理 registry 帧：lifecycle 带身份/终态，progress 带运行摘要。
+		// 帧只在 set_subagent_subscription:progress 后到达；旧版 pi 没有该帧，走不到这里。
+		// 子代理状态独立于父 agent 的 run 生命周期（detached 子代理在父 agent_end 后仍运行），
+		// 所以只更新 subagents 表并推送专门的 agents:subagents 通道，不触发 get_state RPC。
+		if (typed.type === "subagent_lifecycle" || typed.type === "subagent_progress") {
+			this.applySubagentFrame(runtime, typed);
+			return;
+		}
+
+		// 命令目录推送：omp 在启动和目录变化（/reload-plugins、扩展/技能热加载）时发出，
+		// 是斜线命令建议的唯一事实源。渲染层原先只在切换 Agent 时拉取一次，
+		// 运行中新增/移除的命令要等重启才可见。
+		if (typed.type === "available_commands_update") {
+			this.emit(ipcChannels.agentsCommandCatalog, {
+				agentId,
+				commands: normalizePiCommands(typed.commands),
+			});
+			return;
+		}
+
+		// omp 的本地斜线命令（/context、/tools、/session、/share 等）不进入 agent run：
+		// 只发 command_output 帧 + 带 agentInvoked:false 的 prompt 响应，既没有 agent_end
+		// 也没有工具消息。这里把输出落成时间线条目，否则命令执行完界面毫无反馈。
+		if (typed.type === "command_output") {
+			const text = typeof typed.text === "string" ? stripAnsi(typed.text).trim() : "";
+			if (text) {
+				this.addMessage(runtime, "system", truncateForDetail(text), {
+					type: "commandOutput",
+					// 帧里没有命令名，用发送时记下的名字标注来源；缺失时卡片退回通用标题。
+					// 同一条命令可能分多帧到达，标签保留到 prompt 响应再清（见 sendPrompt）。
+					...(runtime.lastLocalCommand ? { command: runtime.lastLocalCommand } : {}),
+				});
+			}
+			return;
+		}
+
+		// 模型被切换（/model、set_model、模型角色预设等都可能触发）。运行态条里的
+		// provider/model 是渲染层唯一来源，必须立即重拉 get_state，不能等下一次工具边沿。
+		if (typed.type === "model_changed") {
+			void this.emitRuntimeState(agentId);
+			return;
+		}
+
+		// config.yml 的警告集合变化（设置页保存、/config 重载等）。
+		// omp 不在 get_state 里暴露警告文本，桌面端只提示用户去 /config 查看并刷新状态。
+		if (typed.type === "config_warnings_changed") {
+			this.emit(ipcChannels.agentsNotice, {
+				agentId,
+				message: "Config warnings changed",
+				i18nKey: "app.configWarningsChanged",
+				kind: "warning",
+				duration: 4500,
+			});
+			void this.emitRuntimeState(agentId);
+			return;
+		}
+
+		// 缓存预热是 omp 在请求前后主动刷 prompt cache 的后台动作：
+		// 没有 get_state 字段可读，只能把事件投影到 runtime state。
+		// hit/miss 是正常结果，不弹提示；warming 与失败在状态条展示。
+		if (typed.type === "cache_warming_start" || typed.type === "cache_warming_end") {
+			const isEnd = typed.type === "cache_warming_end";
+			const rawOutcome = typed.outcome;
+			const outcome: AgentCacheWarmingState["outcome"] =
+				isEnd && (rawOutcome === "hit" || rawOutcome === "miss" || rawOutcome === "error" || rawOutcome === "aborted")
+					? rawOutcome
+					: undefined;
+			runtime.cacheWarming = {
+				phase: isEnd ? "done" : "warming",
+				...(outcome ? { outcome } : {}),
+				...(typeof typed.provider === "string" && typed.provider ? { provider: typed.provider } : {}),
+				...(typeof typed.model === "string" && typed.model ? { model: typed.model } : {}),
+				updatedAt: Date.now(),
+			};
+			void this.emitRuntimeState(agentId);
+			if (outcome === "error" || outcome === "aborted") {
+				void this.appLogger?.warn("agent", "Cache warming ended without a hit", {
+					agentId,
+					outcome,
+					provider: typed.provider,
+					model: typed.model,
+					stopReason: typed.warmingStopReason,
+				});
+			}
+			return;
+		}
+
 		if (typed.type === "agent_start") {
+			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知。
+			this.cancelSessionEndNotification(agentId);
 			// 流式生命信号：上游 provider 已开始跑 run，空响应兜底不再需要。
 			this.clearEmptyResponseTimer(runtime);
 			// agent_start 表示一轮新的 agent run 开始：
@@ -3198,6 +4653,7 @@ export class AgentManager {
 				const failureText = `请求失败：${String(reason)}`;
 				runtime.tab.lastError = failureText;
 				this.addMessage(runtime, "error", failureText);
+				this.maybeRecoverDeveloperRole(agentId, runtime, String(reason));
 				this.emitState();
 			}
 		}
@@ -3308,12 +4764,18 @@ export class AgentManager {
 					// 进入自动重试即恢复：清掉上次 error 的 lastError。
 					delete runtime.tab.lastError;
 				}
+				// developer 角色错误是确定性的：重试多少次都不会变。放在重试卡片创建之后
+				// 再自愈，才能把「正在自动重试」收口成失败态。
+				if (typeof errorMsg === "string") {
+					this.maybeRecoverDeveloperRole(agentId, runtime, errorMsg);
+				}
 			} else if (errorMsg) {
 				this.addDetailedErrorMessage(runtime, String(errorMsg));
 				// 有错误且不会重试 → Agent 进入 error 态，宠物聚合为 failed（行5），
 				// 否则会被误置为 idle 触发"所有任务完成"通知
 				runtime.tab.status = "error";
 				runtime.tab.lastError = String(errorMsg);
+				this.maybeRecoverDeveloperRole(agentId, runtime, String(errorMsg));
 			} else if (
 				typed.stopReason === "error" ||
 				errorMessages.length > 0
@@ -3331,6 +4793,23 @@ export class AgentManager {
 			// 定时查询 get_state 确认是否已无工作可做，避免 UI 动画永久卡住。
 			// 压缩完成后会重新调度；agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
 			this.scheduleSettleCheck(runtime, agentId);
+		}
+
+		if (typed.type === "queue_update") {
+			// 排队中的 follow-up 投递（或被撤回）后会离队：此刻补上用户气泡，
+			// 顺序天然落在新一轮 agent_start 之前，不会把上一轮回答切成两段。
+			runtime.lastQueuedSnapshot = this.normalizeQueuedMessages(typed);
+			runtime.lastQueueUpdateAt = Date.now();
+			this.flushDeliveredFollowUps(runtime, runtime.lastQueuedSnapshot);
+			// 待投递队列的 chip 文本以 get_state.queuedMessages 为准（事件快照同源）。
+			// 这里只触发一次完整状态刷新：节流合并天然吸收连续增删，renderer 不维护第二份队列。
+			void this.emitRuntimeState(agentId);
+		}
+
+		if (typed.type === "todo_auto_clear") {
+			// 会话空闲后 omp 会主动清空 todo；事件本身不带残留数据，
+			// 拉一次 get_state 让 composer 上方的原生 todo 面板同步消失。
+			void this.emitRuntimeState(agentId);
 		}
 
 		if (typed.type === "agent_settled" || typed.type === "session_settled") {
@@ -3374,7 +4853,7 @@ export class AgentManager {
 				const messages = runtime.transcript.messages;
 				const lastMessage = messages[messages.length - 1];
 				if (lastMessage?.role === "assistant" && !settledAfterAbort) {
-					this.notifySessionEnd(runtime.tab.title);
+					this.scheduleSessionEndNotification(runtime, agentId);
 				}
 			}
 		}
@@ -3482,6 +4961,33 @@ export class AgentManager {
 		const agentId = runtime.tab.id;
 		const method = String(typed.method ?? "");
 		const requestId = String(typed.id ?? "");
+		// pi 在 abort/超时后发 method:"cancel" + targetId 关闭已结算的对话框。
+		// 必须按 targetId 清理，否则桌面端会留下一个永远不会被回答的问答条。
+		if (method === "cancel") {
+			const targetId = String(typed.targetId ?? "");
+			if (!targetId) return;
+			runtime.pendingUIRequests.delete(targetId);
+			const messages = runtime.transcript.messages;
+			const idx = messages.findIndex(
+				(msg) =>
+					msg.role === "system" &&
+					msg.meta?.type === "askQuestion" &&
+					(msg.meta as Record<string, unknown>).uiRequest &&
+					((msg.meta as Record<string, unknown>).uiRequest as Record<string, unknown>).requestId === targetId,
+			);
+			if (idx !== -1) {
+				messages.splice(idx, 1);
+				this.markMessagesDirty(runtime, idx);
+				this.scheduleMessageEmit(runtime, false);
+			}
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId: targetId,
+				completed: true,
+				cancelled: true,
+			});
+			return;
+		}
 		// pi RPC 协议将 setWidget / dialog 字段放在顶层，不嵌套 params
 		if (method === "notify") {
 			this.emit(ipcChannels.agentsUiRequest, {
@@ -3519,13 +5025,82 @@ export class AgentManager {
 			});
 			return;
 		}
+
+		// omp 原生 OAuth：浏览器地址必须交给宿主打开；桌面端由登录浮层展示/打开。
+		if (method === "open_url") {
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method,
+				title: "",
+				url: typeof typed.url === "string" ? typed.url : undefined,
+				launchUrl: typeof typed.launchUrl === "string" ? typed.launchUrl : undefined,
+				instructions:
+					typeof typed.instructions === "string" ? typed.instructions : undefined,
+				loginFlow: runtime.loginFlowProviderId !== undefined,
+				loginProviderId: runtime.loginFlowProviderId,
+			});
+			return;
+		}
+
 		// 其他非对话 UI 方法暂不占用桌面 UI 空间。
 		if (["setStatus", "setTitle"].includes(method)) return;
+
+		// omp 原生 ask（ctx.ui.askDialog）：questions 是结构化数组，不是扩展 envelope。
+		// 它只能通过 ask 协议回答（answers 数组），不能降级成 select/input。
+		if (method === "ask") {
+			const questions = normalizeAskQuestions(typed.questions);
+			if (questions.length === 0) {
+				// 没有可回答的问题就立即取消，避免 pi 侧一直等待。
+				this.sendUIResponse(agentId, requestId, { cancelled: true });
+				return;
+			}
+			const title =
+				questions.length === 1
+					? questions[0].question
+					: `提问（${questions.length} 题）`;
+			runtime.pendingUIRequests.set(requestId, { method, title });
+			// 原生 ask 由渲染层的常驻内联问答条承载，不插入时间线 system 卡片，
+			// 避免与工具调用卡片重复展示同一个问题。
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method: "ask",
+				title,
+				askQuestions: questions,
+				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+			});
+			// 超时/abort 由 pi 主动发 method:"cancel" 关闭，桌面端不再自建超时，
+			// 避免两端计时竞争导致问答条提前消失。
+			return;
+		}
+
 		if (!["select", "confirm", "input", "editor"].includes(method)) return;
 
-		// select 无选项时自动取消，不等用户响应
+		// select 无选项时对任何流程都无法作答：先自动取消，避免登录浮层渲染空选择器。
 		if (method === "select" && (!Array.isArray(typed.options) || typed.options.length === 0)) {
 			this.sendUIResponse(agentId, requestId, { cancelled: true });
+			return;
+		}
+
+		// 登录流程的粘贴回调/确认不进入时间线，由登录浮层承接；否则会留下
+		// 一张永远无人回答的 askQuestion 卡片。
+		if (runtime.loginFlowProviderId) {
+			const loginTitle = String(typed.title ?? typed.question ?? "");
+			runtime.pendingUIRequests.set(requestId, { method, title: loginTitle });
+			this.emit(ipcChannels.agentsUiRequest, {
+				agentId,
+				requestId,
+				method,
+				title: loginTitle,
+				options: typed.options as string[] | undefined,
+				placeholder: typed.placeholder as string | undefined,
+				prefill: typed.prefill as string | undefined,
+				allowOther: typed.allowOther === true,
+				timeout: typeof typed.timeout === "number" ? typed.timeout : undefined,
+				loginFlow: true,
+				loginProviderId: runtime.loginFlowProviderId,
+			});
 			return;
 		}
 
@@ -3572,7 +5147,7 @@ export class AgentManager {
 	 * 发送 Extension UI 响应（extension_ui_response）到 pi 的 stdin。
 	 * 同时更新对应卡片消息的状态。
 	 */
-	sendUIResponse(agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) {
+	sendUIResponse(agentId: string, requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean; answers?: AgentUiAskAnswer[] }) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime) return;
 
@@ -3589,6 +5164,8 @@ export class AgentManager {
 		if ("value" in response) extPayload.value = response.value;
 		// pi 的 ctx.ui.confirm() 检查 confirmed 字段
 		if ("confirmed" in response) extPayload.confirmed = response.confirmed;
+		// omp 原生 ask：answers 必须按请求顺序携带全部问题，pi 会校验 id/数量。
+		if ("answers" in response) extPayload.answers = response.answers;
 		if (response.cancelled) extPayload.cancelled = true;
 		runtime.slot.process.client.sendRaw(extPayload);
 
@@ -4127,27 +5704,71 @@ export class AgentManager {
 	}
 
 	/**
-	 * 会话结束时发送系统通知。
-	 * 仅在设置中启用通知且 Electron Notification 可用时触发，
-	 * 通知用户 agent 已完成响应，可以查看结果或继续对话。
+	 * 会话结束通知延迟触发。
+	 *
+	 * 不在 session_settled 当场弹窗：pi 判定 settle 后，最终 assistant 消息的收尾事件
+	 * 或紧接着的短工作仍可能到达（用户反馈"通知比对话结束早几秒"）。窗口结束时
+	 * 复查状态与本地忙碌信号，只有真正空闲才弹；新 run 的 agent_start 会直接撤销
+	 * 定时器。点击通知会聚焦主窗口并切到该 Agent。
 	 */
-	private notifySessionEnd(sessionTitle: string) {
+	private scheduleSessionEndNotification(
+		runtime: AgentRuntime,
+		agentId: string,
+		delayMs: number = AgentManager.SESSION_END_NOTIFY_DELAY_MS,
+	) {
+		// settingsStore 在单测里可能只是空桩；通知失败不应影响 settle 收口。
+		let enabled = false;
 		try {
-			const settings = this.settingsStore.get();
-			if (!settings.enableNotifications) return;
-			if (!Notification.isSupported()) return;
-
-			// 使用应用名称作为通知标题，在 Windows/macOS 通知中心中显示为应用标识
-			const appName = app.getName();
-			const notification = new Notification({
-				title: appName,
-				body: `${sessionTitle} 已完成响应`,
-				silent: false,
-			});
-			notification.show();
+			enabled = this.settingsStore.get().enableNotifications;
 		} catch {
-			// 通知失败不影响主流程，静默处理
+			return;
 		}
+		if (!enabled) return;
+		const existing = this.sessionEndNotifyTimers.get(agentId);
+		if (existing) clearTimeout(existing);
+		const timer = setTimeout(() => {
+			this.sessionEndNotifyTimers.delete(agentId);
+			// 已被 stop/restart 摘除的 runtime 不再通知。
+			if (this.agents.get(agentId) !== runtime) return;
+			if (runtime.tab.status !== "idle" || runtime.run.recentlyAborted) return;
+			// 窗口结束时若仍在流式消息/工具/压缩/待回答 UI，说明这一轮并没有真的结束；
+			// 重新等一个窗口，而不是直接放弃——否则收尾事件晚到时会永远收不到通知。
+			if (
+				runtime.transcript.activeAssistantMessageId ||
+				runtime.activeToolCalls.size > 0 ||
+				runtime.toolExecuting ||
+				runtime.pendingUIRequests.size > 0 ||
+				runtime.compacting ||
+				runtime.rpcCompacting
+			) {
+				this.scheduleSessionEndNotification(runtime, agentId);
+				return;
+			}
+			// settled 到最终消息之间可能还有一段事件空档：以最后一次工作事件为准补足
+			// 静默窗口，避免通知比用户看到的最后一段输出早几秒。
+			const quietFor = Date.now() - (runtime.lastWorkEventAt ?? runtime.lastPiEventAt ?? 0);
+			const remaining = AgentManager.SESSION_END_NOTIFY_DELAY_MS - quietFor;
+			if (remaining > 0) {
+				this.scheduleSessionEndNotification(runtime, agentId, remaining);
+				return;
+			}
+			showAppNotification({
+				body: `${runtime.tab.title} 已完成响应`,
+				icon: this.notificationIcon,
+				agentId,
+				getWindow: this.getWindow,
+			});
+		}, delayMs);
+		timer.unref?.();
+		this.sessionEndNotifyTimers.set(agentId, timer);
+	}
+
+	/** 新一轮运行开始时撤销尚未触发的结束通知（排队消息会立刻接续，不应提示完成）。 */
+	private cancelSessionEndNotification(agentId: string) {
+		const timer = this.sessionEndNotifyTimers.get(agentId);
+		if (!timer) return;
+		clearTimeout(timer);
+		this.sessionEndNotifyTimers.delete(agentId);
 	}
 
 	/** agent_start 时尝试推进 generation；若仍在等 abort settled，则只记 pending。 */
@@ -4438,19 +6059,48 @@ type AgentRuntime = {
 	toolExecuting: string | null;
 	/** 完整运行态推送的单调序号：渲染层据此丢弃乱序到达的旧快照（长任务后 RPC 慢更容易乱序）。 */
 	runtimeStateSeq: number;
+	/**
+	 * omp 子代理 registry 的本地投影（subagentId -> 最新状态）。
+	 * 订阅 set_subagent_subscription:progress 后由 lifecycle/progress 帧维护；
+	 * 进程重启即清空（registry 属于单个 omp 进程）。
+	 */
+	subagents: Map<string, AgentSubagent>;
+	/**
+	 * 文件尾部窗口第一条消息的绝对字节偏移。大会话基线来自 readRecentMessages 时，
+	 * 「加载更早」直接从这里向前翻，避免再扫尾窗找 entryId；RPC 基线没有该值。
+	 */
+	historyCursor?: number;
+	/** 「IPC 基线截断」告警上次输出的时刻（毫秒）：getMessages 被高频调用，告警据此限频。 */
+	lastTranscriptTruncationWarnAt?: number;
 
 	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
 	settleCheckTimer?: NodeJS.Timeout;
 	/**
-	 * 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
+	 * 本次 prompt 里待消费的本地斜线命令名（不含前导 "/"）。
+	 * omp 的 command_output 帧不带命令名，只能由发送方在 prompt 前记下；
+	 * 标签保留到 prompt 响应再清（同一命令可能分多帧到达）。
+	 */
+	lastLocalCommand?: string;
+	/** 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
 	 * 只由 handlePiEvent 刷新——get_state 是我们主动发的请求，其响应不算事件流活性。
 	 */
 	lastPiEventAt?: number;
+	/**
+	 * 最近一次「用户可感知的工作事件」时刻：消息增量/工具/压缩/UI 请求等。
+	 * 会话结束通知用它做静默窗口判定；session_info 等元数据事件不刷新，
+	 * 避免标题更新把通知无限推迟。
+	 */
+	lastWorkEventAt?: number;
 	/** abort 后等 pi 确认的兜底定时器（见 scheduleAbortSettledFallback） */
 	abortSettledFallbackTimer?: NodeJS.Timeout;
 
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;
+	/**
+	 * 正在进行的原生 OAuth 登录 provider。omp 的 `open_url` / 登录输入请求
+	 * 不带流程标记，只能按宿主发起的 login 调用窗口识别，避免进入时间线。
+	 */
+	loginFlowProviderId?: string;
 
 	/**
 	 * 会话文件写入互斥锁链（readFile→modify→writeFile 原子化）
@@ -4467,7 +6117,132 @@ type AgentRuntime = {
 	modelRefreshing: boolean;
 	/** 已尝试过自动重连（防无限循环），重连成功后清除 */
 	autoRestartAttempted: boolean;
+	/**
+	 * 本进程启动时读取到的模型/鉴权配置版本（= AgentManager.configEpoch）。
+	 * 与全局版本不一致说明配置在进程启动后被保存过，下一次空闲发 prompt 前需要重连。
+	 */
+	appliedConfigEpoch: number;
+	/** 配置过期后的重连任务；并发 prompt 必须共用同一次重连，避免两个 child 抢同一会话。 */
+	configApplyPromise?: Promise<void>;
+	/** developer-role 自愈进行中：防止旧进程迟到的 agent_end 反复触发重连。 */
+	healingDeveloperRole?: boolean;
+	/**
+	 * 本会话最近一次确认过的模型/思考档（来自 set_model、get_state 或 prompt 发送前读取）。
+	 * 用于进程意外退出后仍能定位 provider，例如 developer-role 自愈需要改对配置。
+	 */
+	lastModelSelection?: { provider: string; modelId: string; thinkingLevel?: string };
+	/**
+	 * 最近一次 cache_warming_start/end 的本地投影。
+	 * omp get_state 不返回预热状态/模式，只能由事件维护；进程重启即丢弃。
+	 */
+	cacheWarming?: AgentCacheWarmingState;
+
+	/**
+	 * 已提交给 omp、但还在服务端队列里没投递的 follow-up 用户消息。
+	 *
+	 * 队列里的消息尚未进入本轮上下文，若此刻就往时间线插用户气泡，当前这一轮回答
+	 * 会被切成「上一轮 + 新冒出的用户消息 + 剩余回答」两段，用户看到的就是
+	 * 「结束后排队」的消息已经发出去了。这里只留快照，等 omp 真正投递
+	 * （queue_update 报告它离开队列）后再落气泡。
+	 */
+	deferredFollowUps?: DeferredFollowUp[];
+
+	/**
+	 * 本进程主动撤回（或中止恢复）的 follow-up 文案墓碑，值为过期时刻。
+	 *
+	 * 消息离队有两种原因：omp 投递，或被我们撤回。队列事件与准入对账只看得到
+	 * 「它不在队列里」，墓碑补上「是我们拿走的」这层信息，避免把撤回误判成投递
+	 * 而在时间线上补出幽灵气泡。带 TTL：只需覆盖在途对账窗口，过期自动清理。
+	 */
+	withdrawnFollowUps?: Map<string, number>;
+
+	/** 最近一次 queue_update 带下来的队列快照与到达时刻（与 deferredFollowUps 对账用）。 */
+	lastQueuedSnapshot?: AgentQueuedMessages;
+	lastQueueUpdateAt?: number;
 };
+
+/**
+ * 撤回墓碑的有效期。只需覆盖「撤回请求发出 → 在途准入对账返回」这段窗口
+ * （get_state 上限 10s），过期即失效，避免长期压制同文案的新消息。
+ */
+const WITHDRAWN_FOLLOW_UP_TTL_MS = 30_000;
+
+/** follow-up 排队消息的本地快照：与真实投递时的气泡内容一一对应。 */
+type DeferredFollowUp = {
+	/** 时间线气泡文案：用户可见原文，不含宿主注入的隐藏标记。 */
+	text: string;
+	/**
+	 * 对账用的队列文案：omp 的 queue chip 是按实际收到的消息生成的。
+	 * plan 模式等场景下它会带上隐藏标记，与 `text` 不同，所以两个都留着做匹配。
+	 */
+	queueText: string;
+	images?: ImageContent[];
+	meta: Record<string, unknown>;
+};
+
+/** 队列快照里的全部 chip 文案（steering 在前，followUp 在后）。 */
+function queuedTexts(snapshot: AgentQueuedMessages): string[] {
+	return [...snapshot.steering, ...snapshot.followUp];
+}
+
+/**
+ * 本地快照与 chip 文案是否指同一条消息。两个候选都算：`text` 是气泡原文，
+ * `queueText` 是实际发出去、chip 据此生成的原文（plan 模式带隐藏标记）。
+ */
+function deferredMatchesText(entry: DeferredFollowUp, text: string): boolean {
+	return entry.queueText === text || entry.text === text;
+}
+
+/**
+ * 清洗 omp ask 的 questions 载荷。pi 端已做类型校验，但 RPC 输入是 unknown：
+ * 这里只放宽展示/回答必需字段，丢弃无 question 或非法 option 的条目，
+ * 保证 answer 数组与 id 顺序不会因为脏字段错位。
+ */
+function normalizeAskQuestions(raw: unknown): AgentUiAskQuestion[] {
+	if (!Array.isArray(raw)) return [];
+	const questions: AgentUiAskQuestion[] = [];
+	for (const [index, item] of raw.entries()) {
+		if (!item || typeof item !== "object") continue;
+		const source = item as Record<string, unknown>;
+		const question = typeof source.question === "string" ? source.question : "";
+		if (!question) continue;
+		const options: AgentUiAskOption[] = [];
+		if (Array.isArray(source.options)) {
+			for (const option of source.options) {
+				if (typeof option === "string") {
+					options.push({ label: option });
+					continue;
+				}
+				if (!option || typeof option !== "object") continue;
+				const opt = option as Record<string, unknown>;
+				if (typeof opt.label !== "string") continue;
+				options.push({
+					label: opt.label,
+					description: typeof opt.description === "string" ? opt.description : undefined,
+					preview: typeof opt.preview === "string" ? opt.preview : undefined,
+				});
+			}
+		}
+		const recommended =
+			typeof source.recommended === "number" &&
+			Number.isInteger(source.recommended) &&
+			source.recommended >= 0 &&
+			source.recommended < options.length
+				? source.recommended
+				: undefined;
+		questions.push({
+			id: typeof source.id === "string" && source.id ? source.id : `q${index + 1}`,
+			question,
+			header: typeof source.header === "string" ? source.header : undefined,
+			options,
+			multi: source.multi === true,
+			recommended,
+		});
+	}
+	// 任何一道题被丢弃都会让 answers 数量与 pi 的 questions 错位（pi 会拒绝整包），
+	// 因此宁可整体取消，也不提交半份问卷。
+	return questions.length === raw.length ? questions : [];
+}
 
 /** 创建一个带有全部 per-agent 状态默认值的 AgentRuntime。 */
 function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRuntime {
@@ -4479,6 +6254,7 @@ function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRunt
 		toolStateSequence: 0,
 		activeToolCalls: new Map(),
 		toolExecuting: null,
+		subagents: new Map(),
 		pendingUIRequests: new Map(),
 		rpcLogging: false,
 		compacting: false,
@@ -4486,5 +6262,6 @@ function createAgentRuntime(tab: AgentTab, process: AgentProcessPort): AgentRunt
 		runtimeStateSeq: 0,
 		modelRefreshing: false,
 		autoRestartAttempted: false,
+		appliedConfigEpoch: 0,
 	};
 }

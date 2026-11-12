@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 
 import type { ChatMessage } from "../../shared/types";
@@ -21,8 +23,10 @@ import { LocalFileAdapter } from "../fs/adapters/localFileAdapter";
 import { SessionJsonl } from "../pi/sessionJsonl";
 import { SessionFileOps } from "./SessionFileOps";
 import { SessionScanner } from "./SessionScanner";
+import { extractSessionSummaryFacts } from "./sessionSummaryFacts";
 import {
   nodeEntriesIo,
+  parseSessionText,
   readEntries,
   readTailEntries,
   type SessionEntriesIo,
@@ -108,7 +112,9 @@ test("带 BOM 的会话文件在扫描/文件操作/sessionJsonl 三条路径上
   const fileOps = makeFileOps(home);
 
   // 1) SessionScanner（列表摘要走读取→解码→解析管线）
-  const summaries = await new SessionScanner().list();
+  const scanner = new SessionScanner();
+  const summaries = await scanner.list();
+  await scanner.close();
   assert.equal(summaries.length, 1);
   assert.equal(summaries[0].name, "BOM 会话");
   assert.equal(summaries[0].preview, "hello bom");
@@ -132,6 +138,57 @@ test("带 BOM 的会话文件在扫描/文件操作/sessionJsonl 三条路径上
   assert.equal(summaries[0].preview, (await fileOps.readMessages(sessionPath))[0].content);
 });
 
+test("重命名写入 omp 原生标题槽 + title_change，重启扫描仍生效", async () => {
+  const home = await createHome();
+  const entries = [
+    { type: "session", version: 3, id: "sess-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: "D:\\proj" },
+    // 旧桌面端写入的重命名记录：迁移时应清掉，避免 omp 读到不认识的格式。
+    { type: "session_info", id: "old-name-1", parentId: "sess-1", timestamp: "2026-01-01T00:00:00.500Z", name: "旧名字" },
+    { type: "message", id: "msg-1", parentId: "old-name-1", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "rename me" } },
+  ];
+  const raw = `\uFEFF${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+  const filePath = await writeSessionFile(home, "rename.jsonl", raw);
+  const fileOps = makeFileOps(home);
+
+  await fileOps.rename(filePath, "第一版标题");
+
+  const first = await readEntries(nodeEntriesIo, filePath);
+  const lines = first.entries.map((entry) => entry as Record<string, unknown>);
+  // 首行必须是 omp 定长 256 字节标题槽（含换行），且位于 session 头之前。
+  const firstLine = first.raw.split("\n")[0];
+  assert.equal(Buffer.byteLength(`${firstLine}\n`, "utf8"), 256);
+  assert.equal(lines[0].type, "title");
+  assert.equal(lines[0].title, "第一版标题");
+  assert.equal(lines[0].source, "user");
+  assert.equal(lines[1].type, "session");
+  assert.equal(lines[1].title, "第一版标题");
+  // 旧 session_info 被迁移清理，原有消息保留。
+  assert.equal(lines.some((entry) => entry.type === "session_info"), false);
+  assert.equal(lines.some((entry) => entry.type === "message"), true);
+  // 末尾追加 title_change，parentId 指向重命名前最后一条带 id 的记录。
+  const last = lines[lines.length - 1];
+  assert.equal(last.type, "title_change");
+  assert.equal(last.title, "第一版标题");
+  assert.equal(last.parentId, "msg-1");
+  assert.match(String(last.id), /^[0-9a-f]{8}$/);
+
+  // 重启等价于新 Scanner：原生标题必须直接成为会话列表名字。
+  const scanner = new SessionScanner();
+  assert.equal((await scanner.list())[0].name, "第一版标题");
+  await scanner.close();
+
+  // 第二次重命名覆盖标题槽而不是再插一行；超长标题按 UTF-8 字节截断后仍保持 256。
+  await fileOps.rename(filePath, `很长标题${"汉".repeat(200)}`);
+  const second = await readEntries(nodeEntriesIo, filePath);
+  const secondLines = second.entries.map((entry) => entry as Record<string, unknown>);
+  assert.equal(secondLines.filter((entry) => entry.type === "title").length, 1);
+  assert.equal(
+    Buffer.byteLength(`${second.raw.split("\n")[0]}\n`, "utf8"),
+    256,
+  );
+  assert.equal(secondLines[secondLines.length - 1].title, `很长标题${"汉".repeat(200)}`);
+});
+
 test("UTF-16 会话文件在三条路径上一致判定为不可读", async () => {
   const home = await createHome();
   // UTF-16LE 按 utf8 解码后满是 NUL：不是合法 JSONL，必须三处一致地隐藏/返回空，
@@ -139,7 +196,9 @@ test("UTF-16 会话文件在三条路径上一致判定为不可读", async () =
   const sessionPath = await writeSessionFile(home, "session.jsonl", Buffer.from(BOM_RAW, "utf16le"));
   const fileOps = makeFileOps(home);
 
-  expect(await new SessionScanner().list()).toEqual([]);
+  const scanner = new SessionScanner();
+  expect(await scanner.list()).toEqual([]);
+  await scanner.close();
   expect(await fileOps.readMessages(sessionPath)).toEqual([]);
   expect(await fileOps.readSessionMeta(sessionPath)).toEqual({
     provider: undefined,
@@ -227,6 +286,7 @@ test("扫描摘要缓存随指纹失效：外部改写后列表拿到新标题",
     `${JSON.stringify({ type: "session_info", id: "s1", name: "第二版标题更长" })}\n`,
   );
   assert.equal((await scanner.list())[0].name, "第二版标题更长");
+  await scanner.close();
 });
 
 // ── 尾窗读不整文件读 ───────────────────────────────────
@@ -266,3 +326,135 @@ test("尾窗读只读窗口字节，不整文件读", async () => {
   await readEntries(whole.io as SessionEntriesIo, filePath);
   assert.equal(whole.bytesRead(), size);
 });
+
+test("尾窗覆盖文件头且文件无结尾换行时保留第一行", async () => {
+  const home = await createHome();
+  const raw = [
+    JSON.stringify({ id: "m0", type: "message", message: { role: "user", content: [{ type: "text", text: "first" }] } }),
+    JSON.stringify({ id: "m1", type: "message", message: { role: "assistant", content: [{ type: "text", text: "last" }] } }),
+  ].join("\n");
+  const filePath = await writeSessionFile(home, "no-trailing-newline.jsonl", raw);
+
+  // start === 0 时窗口已经覆盖文件头，第一行不是跨窗口残行，不能被丢弃；
+  // 否则整文件读取路径会静默漏掉首条消息。
+  const tail = await readTailEntries(createCountingIo().io, filePath, { minLines: 100, maxBytes: 1024 * 1024 });
+  assert.deepEqual(tail.entries.map((entry) => (entry as { id?: string }).id), ["m0", "m1"]);
+  assert.equal(tail.startOffset, 0);
+});
+
+// ── 摘要事实提取与 worker 路径 ─────────────────────────
+
+test("摘要事实提取保留标题优先级、来源标记与损坏行计数", () => {
+  const entries = [
+    { type: "session", title: "header-title", cwd: "D:\\proj", parentSession: "parent.jsonl" },
+    { type: "title", title: "slot-title" },
+    { type: "title_change", title: "renamed-title" },
+    { type: "session_info", name: "old-name" },
+    { type: "custom", customType: "pi.child-session" },
+    {
+      type: "codex_import",
+      codexSessionId: "codex-1",
+      sourcePath: "C:\\codex\\thread.jsonl",
+      threadSource: "subagent",
+      parentThreadId: "parent-1",
+      agentRole: "reviewer",
+      agentNickname: "Rex",
+    },
+    { type: "message", message: { role: "user", content: [{ type: "text", text: "  hello  " }] } },
+    { type: "message", message: { role: "assistant", content: "world" } },
+  ];
+  const parsed = parseSessionText(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n{broken`);
+  const facts = extractSessionSummaryFacts({
+    entries: parsed.entries,
+    malformedLines: parsed.malformedLines,
+    unreadable: parsed.unreadable,
+    raw: parsed.text,
+  });
+
+  expect(facts.source).toBe("codex");
+  expect(facts.codexSessionId).toBe("codex-1");
+  expect(facts.codexThreadSource).toBe("subagent");
+  expect(facts.codexParentThreadId).toBe("parent-1");
+  expect(facts.codexAgentRole).toBe("reviewer");
+  expect(facts.codexAgentNickname).toBe("Rex");
+  expect(facts.codexSourcePath).toBe("C:\\codex\\thread.jsonl");
+  expect(facts.projectPath).toBe("D:\\proj");
+  expect(facts.forkParentSession).toBe("parent.jsonl");
+  expect(facts.hasSubagentChildMarker).toBe(true);
+  expect(facts.latestTitleChangeName).toBe("renamed-title");
+  expect(facts.titleSlotName).toBe("slot-title");
+  expect(facts.sessionHeaderTitle).toBe("header-title");
+  expect(facts.latestSessionInfoName).toBe("old-name");
+  expect(facts.preview).toBe("hello");
+  expect(facts.messageCount).toBe(2);
+  expect(facts.malformedLines).toBe(1);
+  expect(facts.rawEmpty).toBe(false);
+});
+
+test("worker 解析路径与主线程路径产出相同摘要", async () => {
+  const home = await createHome();
+  // 摘要解析只对 >=256KB 的文件启用 worker；夹具必须跨过阈值才会真正走 worker 池。
+  const largeEntries = [
+    ...BOM_ENTRIES,
+    { type: "custom", customType: "fixture.padding", payload: "x".repeat(300 * 1024) },
+  ];
+  await writeSessionFile(
+    home,
+    "session.jsonl",
+    `\uFEFF${largeEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+  );
+
+  const direct = new SessionScanner();
+  const directSummaries = await direct.list();
+  await direct.close();
+
+  const viaWorker = new SessionScanner({
+    createParseWorker: () => new FakeParseWorker() as unknown as Worker,
+    parseWorkerCount: 1,
+  });
+  const workerSummaries = await viaWorker.list();
+  await viaWorker.close();
+
+  expect(workerSummaries).toEqual(directSummaries);
+  expect(workerSummaries).toHaveLength(1);
+  expect(workerSummaries[0]).toMatchObject({
+    name: "BOM 会话",
+    preview: "hello bom",
+    messageCount: 1,
+    projectPath: "d:/proj",
+  });
+});
+
+/** 用同步实现替代真实 worker，验证 SessionParsePool 的消息契约与扫描集成。 */
+class FakeParseWorker extends EventEmitter {
+  unref(): void {}
+
+  terminate(): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  postMessage(request: { id: number; filePath: string }): void {
+    void (async () => {
+      try {
+        const raw = await nodeEntriesIo.read(request.filePath);
+        const parsed = parseSessionText(raw);
+        this.emit("message", {
+          id: request.id,
+          ok: true,
+          facts: extractSessionSummaryFacts({
+            entries: parsed.entries,
+            malformedLines: parsed.malformedLines,
+            unreadable: parsed.unreadable,
+            raw: parsed.text,
+          }),
+        });
+      } catch (error) {
+        this.emit("message", {
+          id: request.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+  }
+}

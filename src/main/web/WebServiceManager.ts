@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import type {
 	AgentTab,
+	AgentTodoPhase,
 	AppSettings,
 	ChatMessage,
 	CreateAgentInput,
@@ -36,6 +37,14 @@ type WebServiceAgentDeps = Pick<
 	| "refreshModels"
 	| "cycleThinking"
 	| "setThinking"
+	| "availableThinkingLevels"
+	| "setFastMode"
+	| "setSlowMode"
+	| "setAutoCompaction"
+	| "setTodos"
+	| "abortAndRestoreQueue"
+	| "removeQueuedMessage"
+	| "promoteQueuedMessage"
 >;
 
 type WebServiceDependencies = {
@@ -68,16 +77,31 @@ type _WebAgentDepsDriftGuard = {
 	refreshModels: AgentsNamespace["refreshModels"];
 	cycleThinking: AgentsNamespace["cycleThinking"];
 	setThinking: AgentsNamespace["setThinking"];
+	availableThinkingLevels: AgentsNamespace["availableThinkingLevels"];
+	setFastMode: AgentsNamespace["setFastMode"];
+	setSlowMode: AgentsNamespace["setSlowMode"];
+	setAutoCompaction: AgentsNamespace["setAutoCompaction"];
+	setTodos: AgentsNamespace["setTodos"];
+	abortAndRestoreQueue: AgentsNamespace["abortAndRestoreQueue"];
+	removeQueuedMessage: AgentsNamespace["removeQueuedMessage"];
+	promoteQueuedMessage: AgentsNamespace["promoteQueuedMessage"];
 } extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
 /**
- * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 600ms
+ * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 1000ms
  * fetch 轮询走 keep-alive，只要浏览器 tab 开着、或正好有请求在途，server.close()
  * 的回调就要等对应连接结束才触发；连接迟迟不结束则 await applySettings 的 IPC
  * 永不 settle（上层表现为「关闭 web 服务卡住」）。
  */
 const DEFAULT_CLOSE_GRACE_MS = 1000;
+
+/**
+ * /api/state 序列化缓存的硬上限（字符）。超过这个体积（例如压缩归档/巨型工具结果
+ * 尚未被 transcript 预算裁掉）就只本次返回、不再驻留：缓存是为了省重复 stringify
+ * 的 CPU，不是把一份超大 JSON 长期钉在主进程内存里；不缓存时按 uncached 路径重算。
+ */
+const STATE_PAYLOAD_CACHE_MAX_CHARS = 16 * 1024 * 1024;
 
 export class WebServiceManager {
 	private server: Server | null = null;
@@ -110,6 +134,8 @@ export class WebServiceManager {
 		if (!server) return;
 		this.server = null;
 		this.current = null;
+		// 服务停掉后缓存没有任何消费者，不必把最多 16MB 的字符串一直留在主进程。
+		this.invalidateStateCache();
 		await this.closeServer(server);
 	}
 
@@ -198,7 +224,7 @@ export class WebServiceManager {
 			}
 			if (url.pathname === "/api/state") {
 				// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
-				// 的双重序列化（web UI 每 600ms 轮询，命中缓存时零 stringify 开销）
+				// 的双重序列化（web UI 每 1000ms 轮询，命中缓存时零 stringify 开销）
 				const payload = this.getStatePayload();
 				response.writeHead(200, {
 					"content-type": "application/json; charset=utf-8",
@@ -221,6 +247,7 @@ export class WebServiceManager {
 					return;
 				}
 				const agent = await this.deps.createAgent({ projectId: body.projectId });
+				this.invalidateStateCache();
 				this.sendJson(response, { agent });
 				return;
 			}
@@ -237,6 +264,7 @@ export class WebServiceManager {
 					agentId: decodeURIComponent(promptMatch[1]),
 					message,
 				});
+				this.invalidateStateCache();
 				// prompt endpoint is a transport for SendPromptResult. Semantic rejection is still
 				// a successful HTTP exchange so browser clients can distinguish rejected from
 				// post-write unknown instead of collapsing both into a thrown fetch error.
@@ -246,7 +274,50 @@ export class WebServiceManager {
 			const stopMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/stop$/);
 			if (stopMatch && request.method === "POST") {
 				await this.deps.stopAgent(decodeURIComponent(stopMatch[1]));
+				this.invalidateStateCache();
 				this.sendJson(response, { ok: true });
+				return;
+			}
+			const abortRestoreMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/abort-and-restore-queue$/);
+			if (abortRestoreMatch && request.method === "POST") {
+				const result = await this.deps.abortAndRestoreQueue(decodeURIComponent(abortRestoreMatch[1]));
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
+				return;
+			}
+			const removeQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/remove-queued-message$/);
+			if (removeQueuedMatch && request.method === "POST") {
+				const body = await this.readJson<{ message?: string; queue?: "steering" | "followUp" }>(request);
+				if (typeof body.message !== "string" || !body.message) {
+					this.sendError(response, 400, "message 不能为空");
+					return;
+				}
+				if (body.queue !== "steering" && body.queue !== "followUp") {
+					this.sendError(response, 400, "queue 必须是 steering 或 followUp");
+					return;
+				}
+				const result = await this.deps.removeQueuedMessage(
+					decodeURIComponent(removeQueuedMatch[1]),
+					body.message,
+					body.queue,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
+				return;
+			}
+			const promoteQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/promote-queued-message$/);
+			if (promoteQueuedMatch && request.method === "POST") {
+				const body = await this.readJson<{ message?: string }>(request);
+				if (typeof body.message !== "string" || !body.message) {
+					this.sendError(response, 400, "message 不能为空");
+					return;
+				}
+				const result = await this.deps.promoteQueuedMessage(
+					decodeURIComponent(promoteQueuedMatch[1]),
+					body.message,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { result });
 				return;
 			}
 			const runtimeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/runtime$/);
@@ -258,6 +329,7 @@ export class WebServiceManager {
 			const cycleModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-model$/);
 			if (cycleModelMatch && request.method === "POST") {
 				const state = await this.deps.cycleModel(decodeURIComponent(cycleModelMatch[1]));
+				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;
 			}
@@ -275,18 +347,21 @@ export class WebServiceManager {
 					body.provider ?? "",
 					body.modelId ?? "",
 				);
+				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;
 			}
 			const refreshModelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/refresh-models$/);
 			if (refreshModelsMatch && request.method === "POST") {
 				const state = await this.deps.refreshModels(decodeURIComponent(refreshModelsMatch[1]));
+				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;
 			}
 			const cycleThinkingMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-thinking$/);
 			if (cycleThinkingMatch && request.method === "POST") {
 				const state = await this.deps.cycleThinking(decodeURIComponent(cycleThinkingMatch[1]));
+				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;
 			}
@@ -294,6 +369,75 @@ export class WebServiceManager {
 			if (setThinkingMatch && request.method === "POST") {
 				const body = await this.readJson<{ level?: string }>(request);
 				const state = await this.deps.setThinking(decodeURIComponent(setThinkingMatch[1]), body.level ?? "");
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const thinkingLevelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/thinking-levels$/);
+			if (thinkingLevelsMatch && request.method === "GET") {
+				const levels = await this.deps.availableThinkingLevels(
+					decodeURIComponent(thinkingLevelsMatch[1]),
+				);
+				this.sendJson(response, { levels });
+				return;
+			}
+			const fastModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/fast-mode$/);
+			if (fastModeMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setFastMode(
+					decodeURIComponent(fastModeMatch[1]),
+					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const slowModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/slow-mode$/);
+			if (slowModeMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setSlowMode(
+					decodeURIComponent(slowModeMatch[1]),
+					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const autoCompactionMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/auto-compaction$/);
+			if (autoCompactionMatch && request.method === "POST") {
+				const body = await this.readJson<{ enabled?: unknown }>(request);
+				if (typeof body.enabled !== "boolean") {
+					this.sendError(response, 400, "enabled 必须是布尔值");
+					return;
+				}
+				const state = await this.deps.setAutoCompaction(
+					decodeURIComponent(autoCompactionMatch[1]),
+					body.enabled,
+				);
+				this.invalidateStateCache();
+				this.sendJson(response, { state });
+				return;
+			}
+			const todosMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/todos$/);
+			if (todosMatch && request.method === "POST") {
+				const body = await this.readJson<{ phases?: unknown }>(request);
+				if (!Array.isArray(body.phases)) {
+					this.sendError(response, 400, "phases 必须是数组");
+					return;
+				}
+				const state = await this.deps.setTodos(
+					decodeURIComponent(todosMatch[1]),
+					body.phases as AgentTodoPhase[],
+				);
+				this.invalidateStateCache();
 				this.sendJson(response, { state });
 				return;
 			}
@@ -306,7 +450,7 @@ export class WebServiceManager {
 	}
 
 	/**
-	 * /api/state 序列化缓存：web UI 每 600ms 轮询一次，流式期间消息逐条增长，
+	 * /api/state 序列化缓存：web UI 每 1000ms 轮询一次，流式期间消息逐条增长，
 	 * 每次都全量 JSON.stringify 所有 agent 全部消息是主进程 CPU 大头。
 	 * 指纹覆盖 agents 状态与每个 agent 消息流的版本（见 shared/messageStreamVersion：
 	 * 长度 + 末条 id/timestamp/文本长度），覆盖流式追加、末条就地更新、消息增删；
@@ -315,26 +459,50 @@ export class WebServiceManager {
 	 */
 	private statePayloadCache: { fingerprint: string; payload: string } | null = null;
 
+	/**
+	 * 主动失效 /api/state 缓存：web 变更端点（创建/发送/停止/模型/思考）返回后，
+	 * 页面会立刻 refresh；这里清掉旧快照，避免「变更已生效但页面仍显示变更前状态」。
+	 * 指纹本身也能发现 agents 变化，主动失效只是把这次可见延迟压到零。
+	 */
+	invalidateStateCache(): void {
+		this.statePayloadCache = null;
+	}
+
 	private getStatePayload(): string {
+		// 项目与 agent 列表都在内存里（无 I/O），一次取出供指纹与 payload 共用，
+		// 避免同一轮询内重复读取、也避免两处数据不一致。
+		const projects = this.deps.listProjects();
 		const agents = this.deps.listAgents();
-		const fingerprint = agents
-			.map((agent) => {
-				const messages = this.deps.getMessages(agent.id);
-				return [agent.id, agent.status, agent.title, messageStreamVersion(messages)].join(":");
-			})
-			.join("|");
+		// 每个 agent 的消息数组只取一次：指纹与 payload 共用同一份快照。
+		// getMessages 在超预算路径会 slice 出新数组，旧实现每个轮询周期取两次，
+		// 等于把同样的复制与预算扫描做两遍。
+		//
+		// 指纹直接序列化 projects/agents：payload 里出现的一切元数据（cwd、压缩次数、
+		// lastError 等）都必须参与失效判定；旧实现只看 id/status/title，其余字段变化
+		// 会一直命中旧缓存。只序列化轻量元数据，消息仍走版本签名，不构成轮询热点。
+		const messagesByAgent = new Map<string, ChatMessage[]>();
+		const fingerprintParts: string[] = [JSON.stringify(projects), JSON.stringify(agents)];
+		for (const agent of agents) {
+			const messages = this.deps.getMessages(agent.id);
+			messagesByAgent.set(agent.id, messages);
+			fingerprintParts.push(messageStreamVersion(messages));
+		}
+		const fingerprint = fingerprintParts.join("|");
 		if (this.statePayloadCache && this.statePayloadCache.fingerprint === fingerprint) {
 			return this.statePayloadCache.payload;
 		}
 		const state = {
-			projects: this.deps.listProjects(),
+			projects,
 			agents,
 			messagesByAgent: Object.fromEntries(
-				agents.map((agent) => [agent.id, this.deps.getMessages(agent.id)]),
+				agents.map((agent) => [agent.id, messagesByAgent.get(agent.id) ?? []]),
 			),
 		};
 		const payload = JSON.stringify(state);
-		this.statePayloadCache = { fingerprint, payload };
+		// 超过硬上限只本次返回、不驻留；下一次轮询按 uncached 路径重新序列化。
+		this.statePayloadCache = payload.length <= STATE_PAYLOAD_CACHE_MAX_CHARS
+			? { fingerprint, payload }
+			: null;
 		return payload;
 	}
 
@@ -547,7 +715,7 @@ export class WebServiceManager {
 			return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 		}
 		refresh();
-		setInterval(refresh, 600);
+		setInterval(refresh, 1000);
 	</script>
 </body>
 </html>`;

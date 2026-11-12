@@ -4,7 +4,7 @@
  */
 import { ipcTable, type FetchModelsPayload, type IpcHandlerMap, type SetOmpRolePayload, type TestProviderPayload } from "../../shared/ipc";
 import type { PiDesktopApi } from "../../shared/api";
-import { formatRoleSelector, isOmpModelRole } from "../../shared/types/ompRoles";
+import { formatRoleSelector, isOmpModelRole, isValidOmpRoleSelector } from "../../shared/types/ompRoles";
 import type { ConfigManager, PiAuthFile, PiModelsFile } from "../config/ConfigManager";
 import type { OmpRolesStore } from "../config/OmpRolesStore";
 import type { AppLogger } from "../logging/AppLogger";
@@ -14,6 +14,11 @@ interface ConfigHandlerDeps {
 	/** config.yml 的模型角色读写（ConfigManager 不再逐方法转发）。 */
 	rolesStore: OmpRolesStore;
 	appLogger: AppLogger;
+	/**
+	 * 模型/鉴权配置落盘后的通知：omp 进程只在启动时读取这些文件，
+	 * AgentManager 据此安排空闲会话在下次 prompt 前重连。
+	 */
+	onModelConfigChanged?: () => void;
 }
 
 type ConfigHandlerMaps = {
@@ -21,13 +26,13 @@ type ConfigHandlerMaps = {
 };
 
 export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMaps {
-	const { configManager, rolesStore, appLogger } = deps;
+	const { configManager, rolesStore, appLogger, onModelConfigChanged } = deps;
 
 	return {
 		config: {
 			getModels: async () => configManager.getModelsConfig(),
 			getAuth: async () => configManager.getAuthConfig(),
-			getSettings: async () => configManager.getSettingsConfig(),
+			getOmpConfig: async () => configManager.ompConfig.read(),
 			getOmpDefault: async () => rolesStore.readDefaultModel(),
 			getTrust: async () => configManager.getTrustConfig(),
 			saveModels: async (_event, data) => {
@@ -40,6 +45,8 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 						? Object.keys(dataObj.providers).length
 						: 0;
 				void appLogger.info("config", "Models config saved", { providerCount });
+				// models.yml 不会热加载：运行中的 omp 进程必须重连后才能用上新配置
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
 			saveAuth: async (_event, data) => {
@@ -47,12 +54,27 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				const result = await configManager.saveAuthConfig(data as PiAuthFile);
 				const authCount = data && typeof data === "object" ? Object.keys(data).length : 0;
 				void appLogger.info("config", "Auth config saved", { authCount });
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
-			saveSettings: async (_event, settings) => {
-				const result = await configManager.saveSettingsConfig(settings);
-				const keyCount = settings && typeof settings === "object" ? Object.keys(settings).length : 0;
-				void appLogger.info("config", "Pi settings config saved", { keys: keyCount });
+			saveOmpConfigRaw: async (_event, raw) => {
+				const result = await configManager.ompConfig.writeRaw(raw);
+				if (result.valid) {
+					void appLogger.info("config", "config.yml saved from source editor", {
+						bytes: typeof raw === "string" ? raw.length : 0,
+					});
+				}
+				return result;
+			},
+			patchOmpConfig: async (_event, patch) => {
+				const result = await configManager.ompConfig.patch(patch);
+				if (result.valid) {
+					// 只记键路径、不记值：config.yml 可能含 auth.broker.token 等凭据
+					void appLogger.info("config", "config.yml patched", {
+						set: patch.set?.map((entry) => entry.path) ?? [],
+						unset: patch.unset ?? [],
+					});
+				}
 				return result;
 			},
 			// 原子设置 omp 默认模型：写 ~/.omp/agent/config.yml 的 modelRoles.default
@@ -105,6 +127,9 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				if (!selector) {
 					return { valid: false, error: "selector 不能为空" };
 				}
+				if (!isValidOmpRoleSelector(selector)) {
+					return { valid: false, error: "selector 格式无效（支持 provider/model、@role、逗号候选）" };
+				}
 				const result = await rolesStore.applyRole(
 					role,
 					selector,
@@ -131,6 +156,81 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 				}
 				return result;
 			},
+			getOmpModelPresets: async () => rolesStore.readModelPresets(),
+			saveOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.saveModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset saved", { name: presetName });
+				}
+				return result;
+			},
+			applyOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.applyModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset applied", { name: presetName });
+				}
+				return result;
+			},
+			deleteOmpModelPreset: async (_event, name: unknown) => {
+				const presetName = typeof name === "string" ? name.trim() : "";
+				const result = await rolesStore.deleteModelPreset(presetName);
+				if (result.valid) {
+					void appLogger.info("config", "Model preset deleted", { name: presetName });
+				}
+				return result;
+			},
+			getOmpCycleOrder: async () => rolesStore.readCycleOrder(),
+			setOmpCycleOrder: async (_event, order: unknown) => {
+				if (!Array.isArray(order)) {
+					return { valid: false, error: "cycleOrder 必须是字符串数组" };
+				}
+				const result = await rolesStore.setCycleOrder(
+					order.filter((item): item is string => typeof item === "string"),
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model cycle order set", { order });
+				}
+				return result;
+			},
+			getOmpProviderOrder: async () => rolesStore.readProviderOrder(),
+			setOmpProviderOrder: async (_event, order: unknown) => {
+				if (!Array.isArray(order)) {
+					return { valid: false, error: "modelProviderOrder 必须是字符串数组" };
+				}
+				const result = await rolesStore.setProviderOrder(
+					order.filter((item): item is string => typeof item === "string"),
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model provider order set", { order });
+				}
+				return result;
+			},
+			getOmpRoleStorage: async () => rolesStore.readRoleStorage(),
+			setOmpRoleStorage: async (_event, value: unknown) => {
+				if (value !== "global" && value !== "project") {
+					return { valid: false, error: "modelRoleStorage 必须是 global 或 project" };
+				}
+				const result = await rolesStore.setRoleStorage(value);
+				if (result.valid) {
+					void appLogger.info("config", "Model role storage set", { value });
+				}
+				return result;
+			},
+			getOmpFallbackChains: async () => rolesStore.readFallbackChains(),
+			setOmpFallbackChains: async (_event, chains: unknown) => {
+				if (!chains || typeof chains !== "object" || Array.isArray(chains)) {
+					return { valid: false, error: "fallbackChains 必须是对象" };
+				}
+				const result = await rolesStore.setFallbackChains(
+					chains as Record<string, string[]>,
+				);
+				if (result.valid) {
+					void appLogger.info("config", "Model fallback chains set", { chains });
+				}
+				return result;
+			},
 			saveRaw: async (_event, fileName, rawJson) => {
 				const result = await configManager.saveRawConfig(fileName, rawJson);
 				void appLogger.info("config", "Raw config saved", {
@@ -146,6 +246,8 @@ export function registerConfigHandlers(deps: ConfigHandlerDeps): ConfigHandlerMa
 					bytes: Buffer.byteLength(packageJson, "utf8"),
 					valid: result.valid,
 				});
+				// 导入会整体替换 models/auth：必须让运行中的旧进程在下次发送前重连
+				if (result.valid) onModelConfigChanged?.();
 				return result;
 			},
 			// 远程拉取 provider 模型列表（pack 成员：payload 类型由通道表 pack 派生）

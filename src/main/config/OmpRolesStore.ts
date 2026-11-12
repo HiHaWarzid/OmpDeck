@@ -3,13 +3,21 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseDocument, type Document } from "yaml";
 import {
+	isValidOmpModelPresetName,
+	isValidOmpRoleSelector,
 	OMP_MODEL_ROLES,
 	isOmpModelRole,
 	parseRoleSelector,
+	stripRoleThinkingSuffix,
+	type OmpFallbackChains,
+	type OmpModelPreset,
+	type OmpModelPresets,
 	type OmpModelRole,
+	type OmpModelRoleStorage,
 	type OmpRolesState,
 } from "../../shared/types/ompRoles";
 import { JsonFileStore } from "../storage/JsonFileStore";
+import { resolveOmpConfigFileName } from "./OmpConfigFile";
 import type { ConfigValidationResult } from "./ConfigManager";
 
 /**
@@ -52,6 +60,62 @@ function emptyRoles(): OmpRolesState {
 	return empty;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** 读取 `Record<string, string>`，丢弃空值/非字符串项（手编 config.yml 容错）。 */
+function readStringRecord(value: unknown): Record<string, string> {
+	const record = asRecord(value);
+	const result: Record<string, string> = {};
+	if (!record) return result;
+	for (const [key, entry] of Object.entries(record)) {
+		if (typeof entry === "string" && entry.trim()) result[key] = entry.trim();
+	}
+	return result;
+}
+
+/** 读取 `Record<string, string[]>`，丢弃空数组/非字符串项。 */
+function readStringArrayRecord(value: unknown): OmpFallbackChains {
+	const record = asRecord(value);
+	const result: OmpFallbackChains = {};
+	if (!record) return result;
+	for (const [key, entry] of Object.entries(record)) {
+		if (!Array.isArray(entry)) continue;
+		const chain = entry.filter(
+			(item): item is string => typeof item === "string" && item.trim().length > 0,
+		).map((item) => item.trim());
+		if (chain.length > 0) result[key] = chain;
+	}
+	return result;
+}
+
+/**
+ * 解析单个 `modelPresets.<name>`。与 omp `parseModelPreset` 同口径：
+ * `modelRoles` 必须是映射，每个值必须是非空字符串；`defaultThinkingLevel`
+ * 只接受字符串（档位合法性交给 omp 运行时校验）。
+ */
+function parseModelPreset(value: unknown): OmpModelPreset | undefined {
+	const record = asRecord(value);
+	const roles = asRecord(record?.modelRoles);
+	if (!record || !roles) return undefined;
+	const modelRoles: Record<string, string> = {};
+	for (const [role, selector] of Object.entries(roles)) {
+		if (typeof selector !== "string" || !selector.trim()) return undefined;
+		modelRoles[role] = selector.trim();
+	}
+	const level = record.defaultThinkingLevel;
+	if (level !== undefined && typeof level !== "string") return undefined;
+	return {
+		modelRoles,
+		...(typeof level === "string" && level.trim()
+			? { defaultThinkingLevel: level.trim() }
+			: {}),
+	};
+}
+
 export class OmpRolesStore {
 	private readonly deps: OmpRolesStoreDeps;
 
@@ -77,24 +141,21 @@ export class OmpRolesStore {
 		return created;
 	}
 
-	/** 读取 config.yml/config.yaml 原文；两者都不存在返回 null。 */
+	/** 读取当前生效的 config.yml(config.yaml) 原文；不存在返回 null。 */
 	private async readRawConfigYaml(): Promise<string | null> {
-		for (const name of ["config.yml", "config.yaml"]) {
-			try {
-				const raw = await this.yamlFile(join(this.configDir, name)).readRaw();
-				if (raw !== null) return raw;
-			} catch {
-				// 单个文件读失败继续尝试下一个
-			}
+		try {
+			return await this.yamlFile(
+				join(this.configDir, this.ompConfigYamlName()),
+			).readRaw();
+		} catch {
+			// 读取失败按缺失处理：不基于不可读内容做迁移/合并
+			return null;
 		}
-		return null;
 	}
 
-	/** 写入文件名：优先已存在的 config.yaml，否则 config.yml（与原行为一致）。 */
+	/** 写入文件名与读取文件保持一致（见 resolveOmpConfigFileName 的优先级说明）。 */
 	private ompConfigYamlName(): string {
-		return existsSync(join(this.configDir, "config.yaml"))
-			? "config.yaml"
-			: "config.yml";
+		return resolveOmpConfigFileName(this.configDir);
 	}
 
 	private async parseDoc(): Promise<Record<string, unknown> | null> {
@@ -157,6 +218,163 @@ export class OmpRolesStore {
 			: undefined;
 	}
 
+	/**
+	 * config.yml `modelPresets`：只返回结构合法的条目。名字非法或角色值损坏的
+	 * 条目仍保留在文件里（raw 编辑器可修），但不会出现在应用/删除 UI 中。
+	 */
+	async readModelPresets(): Promise<OmpModelPresets> {
+		const parsed = await this.parseDoc();
+		const presets = asRecord(parsed?.modelPresets);
+		const result: OmpModelPresets = {};
+		if (!presets) return result;
+		for (const [name, value] of Object.entries(presets)) {
+			if (!isValidOmpModelPresetName(name)) continue;
+			const preset = parseModelPreset(value);
+			if (preset) result[name] = preset;
+		}
+		return result;
+	}
+
+	/** `cycleOrder`：未配置返回空数组（UI 展示 omp 默认顺序）。 */
+	async readCycleOrder(): Promise<string[]> {
+		const parsed = await this.parseDoc();
+		const raw = parsed?.cycleOrder;
+		if (!Array.isArray(raw)) return [];
+		return raw
+			.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+			.map((item) => item.trim());
+	}
+
+	/**
+	 * `modelProviderOrder`：omp 解析裸模型 id/选择器时的供应商优先级。
+	 * 未配置返回空数组（omp 内置顺序）。
+	 */
+	async readProviderOrder(): Promise<string[]> {
+		const parsed = await this.parseDoc();
+		const raw = parsed?.modelProviderOrder;
+		if (!Array.isArray(raw)) return [];
+		return raw
+			.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+			.map((item) => item.trim());
+	}
+
+	/** 写入 `modelProviderOrder`；空数组删除该键回到 omp 内置顺序。 */
+	async setProviderOrder(order: readonly string[]): Promise<ConfigValidationResult> {
+		const normalized: string[] = [];
+		for (const provider of order) {
+			const trimmed = provider.trim();
+			if (trimmed && !normalized.includes(trimmed)) normalized.push(trimmed);
+		}
+		return this.writeDoc((doc) => {
+			if (normalized.length === 0) doc.delete("modelProviderOrder");
+			else doc.set("modelProviderOrder", normalized);
+		});
+	}
+
+	/** `modelRoleStorage`：决定 omp 把角色写入全局还是项目 config.yml。 */
+	async readRoleStorage(): Promise<OmpModelRoleStorage> {
+		const parsed = await this.parseDoc();
+		return parsed?.modelRoleStorage === "project" ? "project" : "global";
+	}
+
+	/** 写入 `modelRoleStorage`；global 是 omp 默认值，删除键即回归默认。 */
+	async setRoleStorage(value: OmpModelRoleStorage): Promise<ConfigValidationResult> {
+		return this.writeDoc((doc) => {
+			if (value === "global") doc.delete("modelRoleStorage");
+			else doc.set("modelRoleStorage", "project");
+		});
+	}
+
+	/** `retry.fallbackChains`（缺失/损坏按空处理）。 */
+	async readFallbackChains(): Promise<OmpFallbackChains> {
+		const parsed = await this.parseDoc();
+		return readStringArrayRecord(asRecord(parsed?.retry)?.fallbackChains);
+	}
+
+	/** 把当前 modelRoles + defaultThinkingLevel 快照保存为预设（覆盖同名）。 */
+	async saveModelPreset(name: string): Promise<ConfigValidationResult> {
+		const trimmed = name.trim();
+		if (!isValidOmpModelPresetName(trimmed)) {
+			return {
+				valid: false,
+				error: "预设名需以字母开头，只能包含字母、数字、下划线和连字符",
+			};
+		}
+		return this.writeDoc((doc) => {
+			const snapshot = asRecord(doc.toJS());
+			const modelRoles = readStringRecord(snapshot?.modelRoles);
+			const level = snapshot?.defaultThinkingLevel;
+			const preset: OmpModelPreset = {
+				modelRoles,
+				...(typeof level === "string" && level.trim()
+					? { defaultThinkingLevel: level.trim() }
+					: {}),
+			};
+			doc.setIn(["modelPresets", trimmed], preset);
+		});
+	}
+
+	/**
+	 * 应用预设：整块替换 modelRoles（预设里没有的角色会被清掉，与 omp
+	 * `writePresetRoles` 的全球作用域语义一致）；预设未记录 thinking 时保留
+	 * 当前顶层档位。
+	 */
+	async applyModelPreset(name: string): Promise<ConfigValidationResult> {
+		const trimmed = name.trim();
+		if (!trimmed) return { valid: false, error: "预设名不能为空" };
+		return this.writeDoc((doc) => {
+			const snapshot = asRecord(doc.toJS());
+			const preset = parseModelPreset(asRecord(snapshot?.modelPresets)?.[trimmed]);
+			if (!preset) throw new Error(`预设 "${trimmed}" 不存在或格式无效`);
+			doc.setIn(["modelRoles"], preset.modelRoles);
+			if (preset.defaultThinkingLevel !== undefined) {
+				doc.set("defaultThinkingLevel", preset.defaultThinkingLevel);
+			}
+		});
+	}
+
+	/** 删除全局预设；项目/overlay 层定义的预设需改对应文件。 */
+	async deleteModelPreset(name: string): Promise<ConfigValidationResult> {
+		const trimmed = name.trim();
+		if (!trimmed) return { valid: false, error: "预设名不能为空" };
+		return this.writeDoc((doc) => {
+			doc.deleteIn(["modelPresets", trimmed]);
+		});
+	}
+
+	/** 设置模型循环顺序；空数组回到 omp 默认（删除该键）。 */
+	async setCycleOrder(order: readonly string[]): Promise<ConfigValidationResult> {
+		const normalized: string[] = [];
+		for (const role of order) {
+			const trimmed = role.trim();
+			if (trimmed && !normalized.includes(trimmed)) normalized.push(trimmed);
+		}
+		return this.writeDoc((doc) => {
+			if (normalized.length === 0) doc.delete("cycleOrder");
+			else doc.set("cycleOrder", normalized);
+		});
+	}
+
+	/** 写入 `retry.fallbackChains`；空映射删除键并修剪空 retry 映射。 */
+	async setFallbackChains(chains: OmpFallbackChains): Promise<ConfigValidationResult> {
+		const normalized: OmpFallbackChains = {};
+		for (const [key, value] of Object.entries(chains)) {
+			const trimmedKey = key.trim();
+			if (!trimmedKey || !Array.isArray(value)) continue;
+			const chain = value
+				.map((selector) => (typeof selector === "string" ? selector.trim() : ""))
+				.filter(Boolean);
+			if (chain.length > 0) normalized[trimmedKey] = chain;
+		}
+		return this.writeDoc((doc) => {
+			if (Object.keys(normalized).length === 0) {
+				doc.deleteIn(["retry", "fallbackChains"]);
+			} else {
+				doc.setIn(["retry", "fallbackChains"], normalized);
+			}
+		});
+	}
+
 	/** 通用写盘：一次 parse-mutate-write（队列内），保留注释与无关键。 */
 	private async writeDoc(mutate: (doc: Document) => void): Promise<ConfigValidationResult> {
 		try {
@@ -175,6 +393,18 @@ export class OmpRolesStore {
 					Object.keys(rolesNode).length === 0
 				) {
 					doc.delete("modelRoles");
+				}
+				// 预设/回退链删除后同理，避免 `modelPresets: {}`、`retry: {}` 残壳
+				for (const key of ["modelPresets", "retry"] as const) {
+					const node: unknown = doc.get(key);
+					if (
+						node &&
+						typeof node === "object" &&
+						!Array.isArray(node) &&
+						Object.keys(node).length === 0
+					) {
+						doc.delete(key);
+					}
 				}
 				return doc.toString();
 			});
@@ -196,10 +426,16 @@ export class OmpRolesStore {
 		selector: string,
 		thinkingLevel?: string,
 	): Promise<ConfigValidationResult> {
-		if (role === "default") return this.applyDefault(selector, thinkingLevel);
+		const normalized = selector.trim();
+		if (!isValidOmpRoleSelector(normalized)) {
+			return { valid: false, error: "selector 格式无效" };
+		}
+		if (role === "default") return this.applyDefault(normalized, thinkingLevel);
 		return this.writeDoc((doc) => {
 			const trimmed = thinkingLevel?.trim();
-			doc.setIn(["modelRoles", role], trimmed ? `${selector}:${trimmed}` : selector);
+			// selector 可自带 `:level`；先剥掉再拼，避免 "a:b" + "b" → "a:b:b"。
+			const bare = trimmed ? stripRoleThinkingSuffix(normalized) : normalized;
+			doc.setIn(["modelRoles", role], trimmed ? `${bare}:${trimmed}` : bare);
 		});
 	}
 	/** 只写顶层 defaultThinkingLevel（导入恢复用：保留已有档位的兜底项）。 */
@@ -228,11 +464,16 @@ export class OmpRolesStore {
 		selector: string,
 		thinkingLevel?: string,
 	): Promise<ConfigValidationResult> {
+		const normalized = selector.trim();
+		if (!isValidOmpRoleSelector(normalized)) {
+			return { valid: false, error: "selector 格式无效" };
+		}
 		return this.writeDoc((doc) => {
 			const trimmed = thinkingLevel?.trim();
+			const bare = trimmed ? stripRoleThinkingSuffix(normalized) : normalized;
 			doc.setIn(
 				["modelRoles", "default"],
-				trimmed ? `${selector}:${trimmed}` : selector,
+				trimmed ? `${bare}:${trimmed}` : bare,
 			);
 			if (trimmed) doc.set("defaultThinkingLevel", trimmed);
 			else doc.delete("defaultThinkingLevel");
@@ -252,24 +493,58 @@ export class OmpRolesStore {
 		if (!ompConfig || typeof ompConfig !== "object" || Array.isArray(ompConfig)) {
 			return { valid: true };
 		}
-		const roles = (ompConfig as Record<string, unknown>).modelRoles;
-		const topLevel = (ompConfig as Record<string, unknown>).defaultThinkingLevel;
+		const incoming = ompConfig as Record<string, unknown>;
+		const roles = incoming.modelRoles;
+		const topLevel = incoming.defaultThinkingLevel;
+		const rawPresets = asRecord(incoming.modelPresets);
+		const rawCycle = incoming.cycleOrder;
+		const rawProviderOrder = incoming.modelProviderOrder;
+		const rawRoleStorage = incoming.modelRoleStorage;
+		const rawFallback = asRecord(asRecord(incoming.retry)?.fallbackChains);
 		return this.writeDoc((doc) => {
 			if (roles && typeof roles === "object" && !Array.isArray(roles)) {
 				for (const [role, selector] of Object.entries(roles)) {
-					if (!isOmpModelRole(role) || typeof selector !== "string" || !selector) continue;
-					const parsed = parseRoleSelector(selector);
-					if (!parsed.provider || !parsed.modelId) continue;
-					// 先剥离、再统一拼后缀，避免 "a:b" + "b" → "a:b:b"。
-					const bare = `${parsed.provider}/${parsed.modelId}`;
-					doc.setIn(
-						["modelRoles", role],
-						parsed.thinkingLevel ? `${bare}:${parsed.thinkingLevel}` : bare,
-					);
+					if (!isOmpModelRole(role) || typeof selector !== "string") continue;
+					// 导出包必须原样保留别名/候选列表（`@slow`、`a/b,c/d`）：
+					// 旧实现重建 provider/model 会把它们静默丢弃。
+					const normalized = selector.trim();
+					if (!isValidOmpRoleSelector(normalized)) continue;
+					doc.setIn(["modelRoles", role], normalized);
 				}
 			}
 			if (typeof topLevel === "string" && topLevel) {
 				doc.set("defaultThinkingLevel", topLevel);
+			}
+			if (rawPresets) {
+				for (const [name, value] of Object.entries(rawPresets)) {
+					if (!isValidOmpModelPresetName(name)) continue;
+					const preset = parseModelPreset(value);
+					if (preset) doc.setIn(["modelPresets", name], preset);
+				}
+			}
+			if (Array.isArray(rawCycle)) {
+				const order = rawCycle
+					.filter((item): item is string => typeof item === "string")
+					.map((item) => item.trim())
+					.filter((item, index, all) => item && all.indexOf(item) === index);
+				if (order.length > 0) doc.set("cycleOrder", order);
+			}
+			if (Array.isArray(rawProviderOrder)) {
+				const order = rawProviderOrder
+					.filter((item): item is string => typeof item === "string")
+					.map((item) => item.trim())
+					.filter((item, index, all) => item && all.indexOf(item) === index);
+				// 空数组在 omp 语义里等价于未配置（内置顺序），导入时删键而不是留空列表。
+				if (order.length > 0) doc.set("modelProviderOrder", order);
+				else doc.delete("modelProviderOrder");
+			}
+			if (rawRoleStorage === "project") doc.set("modelRoleStorage", "project");
+			else if (rawRoleStorage === "global") doc.delete("modelRoleStorage");
+			if (rawFallback) {
+				const chains = readStringArrayRecord(rawFallback);
+				if (Object.keys(chains).length > 0) {
+					doc.setIn(["retry", "fallbackChains"], chains);
+				}
 			}
 		});
 	}

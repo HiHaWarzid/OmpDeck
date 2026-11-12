@@ -1,9 +1,9 @@
 /**
  * useAgentLifecycle — Agent 生命周期状态 Hook
  *
- * 独占 App.tsx 中 7 个按 agent 隔离的状态切片（prompt / images / queuedPrompts /
- * terminalDock / drawerPinned / promptHistory / queueFlush），将 agent 替换
- * （pending→real、重启、关闭）这个 seam 变成两个原子事务方法：
+ * 独占 App.tsx 中按 agent 隔离的状态切片（prompt / images / terminalDock /
+ * drawerPinned / promptHistory），将 agent 替换（pending→real、重启、关闭）
+ * 这个 seam 变成两个原子事务方法：
  *
  * - migratePerAgentState: onState 推送时一次性迁移所有 per-agent 状态
  * - commitPendingToReal: createAgent 成功时将 pending 草稿迁移到真实 tab
@@ -16,8 +16,6 @@
  */
 import { useCallback, useRef, useState } from "react";
 import type { ImageContent } from "../../../shared/types";
-import type { QueuedPromptSnapshot } from "../utils/queuedPromptQueue";
-import { createQueuedPromptStore, type QueuedPromptStore } from "../utils/queuedPromptStore";
 import { usePersistedState } from "./usePersistedState";
 import {
 	migrateTerminalDockAgentState,
@@ -27,8 +25,6 @@ import {
 	type TerminalDockStateByOwner,
 } from "../terminalDockState";
 import type { DrawerPanel } from "../components/app/types";
-
-export type QueuedPrompt = QueuedPromptSnapshot;
 
 /**
  * 将 per-agent record 按 replacementById 迁移键并按 liveIds 裁剪。
@@ -87,18 +83,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 	);
 	attachedImagesByAgentRef.current = attachedImagesByAgent;
 
-	// ── 排队中的 prompt（按 agent 隔离） ──
-	// 队列的唯一事实来源是 queuedPromptStore：每个 op（claim/enqueue/resolve/
-	// retract/discard/migrate）原子推进 FSM 并恰好回调一次 onUpdate 回填 React state，
-	// 不再需要 ref/state 双写；drain 循环从 store.state 同步读取当前队列。
-	const [queuedPrompts, setQueuedPrompts] = useState<Record<string, QueuedPrompt[]>>({});
-	const queuedPromptStoreRef = useRef<QueuedPromptStore | null>(null);
-	if (queuedPromptStoreRef.current === null) {
-		// setQueuedPrompts 跨渲染稳定，初始化时捕获即可；store 对象本身引用稳定。
-		queuedPromptStoreRef.current = createQueuedPromptStore({}, setQueuedPrompts);
-	}
-	const queuedPromptStore = queuedPromptStoreRef.current;
-
 	// ── 终端 Dock 状态（按 owner 隔离：agent 或 project） ──
 	const [terminalDockStateByOwner, setTerminalDockStateByOwner] =
 		useState<TerminalDockStateByOwner>({});
@@ -123,10 +107,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 		});
 	/** 跟踪哪些 agent 已经用会话消息重建过 prompt history；重启/替换时清除标记 */
 	const promptHistoryInitedRef = useRef<Set<string>>(new Set());
-
-	// ── 客户端队列 flush 锁（按 agent 隔离） ──
-	/** 避免 tool-end 与 idle 并发投递导致同一条 queued prompt 被提交两次 */
-	const queueFlushByAgentRef = useRef<Set<string>>(new Set());
 
 	// ===== Per-agent 草稿/状态 ops（ref 与 state 的同步是内部实现细节） =====
 
@@ -287,11 +267,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 			setAttachedImagesByAgent((current) =>
 				migrateAgentRecord(current, replacementById, draftIds),
 			);
-			// 发送中的条目必须保持 sending，直到对应 IPC promise 明确完成。
-			// 普通 state 推送（包括 sendPrompt 先发出的 running）不能把它重新开放为可撤回。
-			// 迁移走 store 原子 op：只复制确定未投递的 pending/failed 项，
-			// 并按 draftIds 裁剪已关闭 agent 的队列。
-			queuedPromptStore.migrate(replacementById, draftIds);
 			// 重启/替换 agent 时清除 prompt history 重建标记，等待 onMessages 重新从会话重建
 			for (const [oldAgentId] of replacementById) {
 				promptHistoryInitedRef.current.delete(oldAgentId);
@@ -306,13 +281,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 				}
 				return next;
 			});
-			// 清理已关闭/替换 agent 的 flush 锁
-			for (const [oldAgentId] of replacementById) {
-				queueFlushByAgentRef.current.delete(oldAgentId);
-			}
-			for (const agentId of queueFlushByAgentRef.current) {
-				if (!draftIds.has(agentId)) queueFlushByAgentRef.current.delete(agentId);
-			}
 		},
 		[],
 	);
@@ -320,8 +288,8 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 	/**
 	 * createAgent 成功时将 pending 草稿迁移到真实 tab。
 	 *
-	 * 仅迁移 prompt 和 images——queuedPrompts 在 pending 阶段不入队，
-	 * terminalDock/drawerPinned 按 project 隔离不受 agentId 替换影响。
+	 * 仅迁移 prompt 和 images——terminalDock/drawerPinned 按 project 隔离不受
+	 * agentId 替换影响，待投递队列由 omp 持有。
 	 */
 	const commitPendingToReal = useCallback(
 		(pendingTabId: string, tabId: string) => {
@@ -355,9 +323,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 		// 附加图片（ref 镜像为内部实现细节）
 		attachedImagesByAgent,
 		setAttachedImagesForAgent,
-		// 排队 prompt
-		queuedPrompts,
-		queuedPromptStore,
 		// 终端 Dock（状态写入收敛为 op）
 		terminalDockStateByOwner,
 		setTerminalDockOpen,
@@ -371,8 +336,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 		setPromptHistory,
 		promptHistoryRef,
 		promptHistoryInitedRef,
-		// flush 锁
-		queueFlushByAgentRef,
 		// 原子迁移方法
 		migratePerAgentState,
 		commitPendingToReal,

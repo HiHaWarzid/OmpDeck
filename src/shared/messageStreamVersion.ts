@@ -9,7 +9,7 @@ import type { ChatMessage } from "./types";
  *   - 末条消息就地更新（id/timestamp/text 任一变化，如工具结果落写）
  *   - 消息增删（长度变化）
  * 不检出：中部消息的就地更新（末条未变）。这与 WebServiceManager /api/state 指纹的
- * 历史语义完全一致（web UI 600ms 轮询，只有尾部变化才需要重新序列化缓存）。
+ * 历史语义完全一致（web UI 1000ms 轮询，只有尾部变化才需要重新序列化缓存）。
  *
  * 与主进程消息推送的 messageDirtyFrom/replaceFrom（下标级变更追踪，增量传输）互补：
  * 那边是「从哪条下标开始变」，这边是「整条流的内容签名」，用于缓存失效判断。

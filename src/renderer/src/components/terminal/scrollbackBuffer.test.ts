@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 import {
 	TERMINAL_SCROLLBACK_MAX_CHARS,
+	ScrollbackBuffer,
 	appendScrollback,
 	trimScrollback,
 } from "./scrollbackBuffer";
@@ -103,4 +104,50 @@ test("append trims when the accumulated buffer passes the cap", () => {
 	const kept = appendScrollback(base, chunk);
 	assert.ok(kept.length <= MAX);
 	assert.ok(kept.endsWith("z".repeat(60)));
+});
+
+test("chunked buffer joins on demand without altering content under the cap", () => {
+	const buffer = new ScrollbackBuffer();
+	buffer.append("\u001b[32mok\u001b[0m\n");
+	buffer.append("done\n", NOTICE);
+	// 未达到上限时不该出现截断提示
+	assert.equal(buffer.getText(), "\u001b[32mok\u001b[0m\ndone\n");
+});
+
+test("chunked buffer keeps a bounded tail and emits the notice once", () => {
+	const buffer = new ScrollbackBuffer();
+	for (let index = 0; index < 30000; index += 1) {
+		buffer.append(`line-${String(index).padStart(6, "0")}\n`, NOTICE);
+	}
+	const text = buffer.getText();
+	assert.ok(text.startsWith(`${NOTICE}\r\n`));
+	assert.equal(text.split(NOTICE).length - 1, 1);
+	const body = text.slice(NOTICE.length + 2);
+	assert.ok(body.length <= MAX);
+	// 整块淘汰后保留区仍从完整行开始
+	assert.match(body.slice(0, 12), /^line-\d{6}\n$/);
+	assert.ok(body.endsWith("line-029999\n"));
+});
+
+test("chunked buffer starts the tail at a safe escape-sequence boundary", () => {
+	// 单行 spinner：每帧一次 append，块内没有任何 \n；帧长与上限不成整除，块边界会落在帧中间
+	const frame = "\u001b[2K\rworking 42%!";
+	const buffer = new ScrollbackBuffer();
+	let total = 0;
+	while (total <= MAX + 1000) {
+		buffer.append(frame);
+		total += frame.length;
+	}
+	const text = buffer.getText();
+	assert.ok(text.length <= MAX);
+	assert.equal(text[0], "\u001b", "保留区必须从转义序列开头起");
+	// 单行超长输入里插了 emoji 且切点可能落在代理对中间时，也要整字符对齐
+	const wide = `head ${"😀".repeat(MAX / 2 + 8)}`;
+	const emojiBuffer = new ScrollbackBuffer();
+	// 追加两轮，让整块淘汰的边界确实落在代理对中间（单轮只会走块内裁剪）
+	emojiBuffer.append(wide);
+	emojiBuffer.append(wide);
+	const kept = emojiBuffer.getText();
+	assert.doesNotThrow(() => encodeURIComponent(kept));
+	assert.ok(kept.length <= MAX);
 });

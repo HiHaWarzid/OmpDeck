@@ -17,7 +17,9 @@ import type {
 	FeishuChatBinding,
 	FeishuConnectInput,
 } from "../../shared/types";
-import { FeishuBridge } from "../feishu/FeishuBridge";
+// 仅类型引用：运行时通过 `await import("../feishu/FeishuBridge")` 在真正建连时加载，
+// 避免 @larksuiteoapi/node-sdk 随主进程启动一起解析（静态 import 会被打包进启动 bundle）。
+import type { FeishuBridge } from "../feishu/FeishuBridge";
 import {
 	listBots,
 	getBot,
@@ -95,7 +97,10 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 						appSecret,
 						defaultUserOpenId: input.defaultUserOpenId,
 					};
-					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list(), appSecret);
+					// 动态加载 FeishuBridge：@larksuiteoapi/node-sdk 仅建连需要，
+					// 静态 import 会把它带进主进程启动 bundle。
+					const feishuBridgeModule = await import("../feishu/FeishuBridge");
+					bridge = new feishuBridgeModule.FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list(), appSecret);
 					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
 					setFeishuBridge(bridge);
@@ -134,7 +139,8 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 						defaultUserOpenId: input.defaultUserOpenId,
 					});
 
-					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
+					const feishuBridgeModule = await import("../feishu/FeishuBridge");
+					bridge = new feishuBridgeModule.FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
 					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
 					setFeishuBridge(bridge);
@@ -241,8 +247,9 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 
 			// 测试连接
 			testConnection: async (_event, appId: string, appSecret: string) => {
-				// 创建临时 bridge 实例来测试连接
-				const testBridge = new FeishuBridge(
+				// 创建临时 bridge 实例来测试连接（动态加载原因同 connect）。
+				const feishuBridgeModule = await import("../feishu/FeishuBridge");
+				const testBridge = new feishuBridgeModule.FeishuBridge(
 					{
 						id: "test",
 						name: "测试",
@@ -305,7 +312,8 @@ export function registerFeishuHandlers(deps: FeishuHandlerDeps): FeishuHandlerMa
 						await existing.disconnect();
 						setFeishuBridge(null);
 					}
-					bridge = new FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
+					const feishuBridgeModule = await import("../feishu/FeishuBridge");
+					bridge = new feishuBridgeModule.FeishuBridge(botConfig, agentManager, getMainWindow, () => projectStore.list());
 					// 先启动成功再发布：getFeishuBridge() 绝不能拿到半成品 bridge。
 					await bridge.start();
 					setFeishuBridge(bridge);

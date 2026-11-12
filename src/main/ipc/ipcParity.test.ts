@@ -111,7 +111,7 @@ const moduleRegistrations = [
 	{ module: "clipboardHandlers", map: registerClipboardHandlers() },
 	{
 		module: "piHandlers",
-		map: registerPiHandlers({ piLocator: stubs, settingsStore: stubs, extensionManager: stubs, appLogger: stubs, configManager: stubs }),
+		map: registerPiHandlers({ piLocator: stubs, settingsStore: stubs, extensionManager: stubs, appLogger: stubs }),
 	},
 	{ module: "afkHandlers", map: registerAfkHandlers({ orchestrator: stubs }) },
 	{
@@ -131,12 +131,12 @@ const moduleRegistrations = [
 			settingsStore: stubs,
 			agentManager: stubs,
 			terminalManager: stubs,
-			piLocator: stubs,
 			updateManager: stubs,
 			getMainWindow: () => null,
 			setIsQuitting: stubs,
 			releaseSingleInstanceLock: stubs,
 			restartApp: stubs,
+			takeCrashedSessions: () => null,
 			getPetSystem: () => null,
 			getWebServiceManager: () => undefined,
 			getAfkOrchestrator: () => undefined,

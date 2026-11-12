@@ -37,7 +37,7 @@ PiDeck 不仅可以管理 **pi**，还可以通过会话导入功能将 **Codex*
 
 ### 4. 可视化配置管理
 
-直接图形化编辑 pi 的 `models.json`、`auth.json`、`settings.json`，无需手动编辑 JSON 文件，降低配置门槛。
+直接图形化编辑 omp 的 `models.yml`（Provider 与凭据）、`models.json`（兼容镜像）和 `config.yml`（设置权威源），并提供模型角色、命名预设、OAuth 登录等可视化入口，无需手动编辑配置文件。
 
 ### 5. 内置终端与浏览器
 

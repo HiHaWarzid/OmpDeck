@@ -2,12 +2,20 @@ import { readFile, writeFile, readdir, copyFile, unlink } from "node:fs/promises
 import { readdirSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 
+import type { Worker } from "node:worker_threads";
 import type { ChatMessage } from "../../shared/types";
 import type { RpcResponse } from "./PiRpcClient";
 import { extractMessageText } from "./messageContent";
 import { convertAgentMessages, trimHistoryMessages } from "./messageTimeline";
 import { BoundedLruCache } from "./boundedLruCache";
 import { findLastUserMessageLine } from "./sessionEntryIds";
+import { resolveBlobImagesInMessages } from "./sessionBlobs";
+import {
+	emptySessionArchives,
+	extractSessionArchives,
+	extractSessionArchivesFromEntries,
+	type SessionArchives,
+} from "./sessionArchives";
 import {
 	isJsonRecord,
 	nodeEntriesIo,
@@ -59,25 +67,24 @@ export interface SessionJsonlDeps {
 	 * 尾窗读取的字节成本必须有可观测的接缝，否则「不整文件读」只能靠读代码相信。
 	 */
 	entriesIo?: SessionTailEntriesIo;
+	/**
+	 * 可选归档解析 worker 工厂。压缩会话的整文件 JSON.parse 与归档转换是主线程最大的
+	 * 同步 CPU 块（打开/重载会话时卡 UI）；注入后解析移到 worker，主线程只收 Map。
+	 * 未注入（测试/纯 Node）时退回主线程解析。
+	 */
+	createArchiveWorker?: () => Worker;
+	/**
+	 * omp blob store 目录（`<agent dir>/blobs`）。JSONL 里的图片被外置成
+	 * `blob:sha256:<hash>`，`readRecentMessages` / `readDisplayMessages` 这两个真正
+	 * 进入时间线的读取路径需要它还原成 base64；归档卡片只渲染纯文本，不还原。
+	 * 返回 null（未配置/纯 Node 测试）时保留引用串，渲染层按「无图」处理。
+	 */
+	getBlobsDir?: () => string | null;
 	/** 可选日志；未提供时静默。 */
 	logger?: SessionJsonlLogger;
 }
 
-/** parseArchives 返回的压缩记录结构。 */
-export interface SessionCompaction {
-	id: string;
-	summary: string;
-	timestamp: string;
-	firstKeptEntryId?: string;
-	tokensBefore?: number;
-}
-
-/** parseArchives 返回值：压缩段列表 + 每段对应的归档消息（ChatMessage 格式）。 */
-export interface SessionArchives {
-	compactions: SessionCompaction[];
-	/** key 为压缩条目 id */
-	archivedMessagesByCompactionId: Map<string, ChatMessage[]>;
-}
+export type { SessionArchives, SessionCompaction } from "./sessionArchives";
 
 /**
  * 归档缓存条目的堆占用估算：文本按 UTF-16（2 字节/字符）计，图片按 base64 串长计，
@@ -123,6 +130,11 @@ export class SessionJsonl {
 		return this.deps.resolveHostPath(sessionPath);
 	}
 
+	/** 当前 omp blob store 目录；未注入时为 null（保留引用串，不读盘）。 */
+	private blobsDir(): string | null {
+		return this.deps.getBlobsDir?.() ?? null;
+	}
+
 	/**
 	 * 从 JSONL 文件尾部读取最近若干完整行（含文件末尾未换行的残行，与旧整文件 split 行为一致）。
 	 * 窗口扩展策略与编码守卫在 sessionEntries.readTailEntries（唯一实现）；
@@ -153,10 +165,13 @@ export class SessionJsonl {
 	): Promise<RpcResponse> {
 		const t0 = Date.now();
 		const hostPath = this.resolve(sessionPath);
-		let lines: string[];
+		let tail: Awaited<ReturnType<typeof readTailEntries>>;
 		try {
 			// 每轮对话至少需要 user + assistant 两行；按 8 行/轮预留工具消息余量
-			lines = await this.readTailLines(hostPath, maxTurns * 8 + 8, TAIL_READ_MAX_BYTES);
+			tail = await readTailEntries(this.io, hostPath, {
+				minLines: maxTurns * 8 + 8,
+				maxBytes: TAIL_READ_MAX_BYTES,
+			});
 		} catch (error) {
 			void this.deps.logger?.warn("agent", "Failed to read session file for recent messages", {
 				sessionPath,
@@ -165,30 +180,41 @@ export class SessionJsonl {
 			throw error;
 		}
 
-		const messageEntries: unknown[] = [];
-
-		for (const line of lines) {
+		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
+		let offset = tail.startOffset;
+		for (const line of tail.raw.split("\n")) {
+			const lineOffset = offset;
+			offset += Buffer.byteLength(line, "utf8") + 1;
 			if (!line.trim()) continue;
 			try {
-				const entry = JSON.parse(line);
-				if (entry.type === "message" && entry.message) {
-					messageEntries.push(entry.message);
+				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
+				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
+					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
 				}
 			} catch {
 				// 跳过单行解析失败，不影响后续行
 			}
 		}
 
-		// 只保留最近 maxTurns 轮对话
-		const trimmed = trimHistoryMessages(messageEntries, maxTurns);
+		// 只保留最近 maxTurns 轮对话；先裁剪再还原 blob，避免为已丢弃的历史图片读盘
+		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), maxTurns);
+		const trimStart = trimmed.length > 0
+			? Math.max(0, messageEntries.findIndex((item) => item.message === trimmed[0]))
+			: messageEntries.length;
+		const kept = messageEntries.slice(trimStart);
+		resolveBlobImagesInMessages(trimmed, this.blobsDir());
 		const t1 = Date.now();
+		// 尾部窗口已经读不到文件头（truncated）时，窗口之前仍可能有更早消息；
+		// 不能只用 trimStart 判断，否则工具调用密集、248 行尚未覆盖 30 轮时会误报「没有更早历史」。
+		const hasOlder = trimStart > 0 || (tail.truncated && kept.length > 0);
 
 		void this.deps.logger?.info("agent", "Recent messages read from session file", {
 			sessionPath,
-			windowLines: lines.length,
+			windowLines: tail.raw ? tail.raw.split("\n").length : 0,
 			messageEntries: messageEntries.length,
 			trimmedTurns: maxTurns,
 			trimmedMessages: trimmed.length,
+			hasOlder,
 			readMs: t1 - t0,
 		});
 
@@ -196,7 +222,110 @@ export class SessionJsonl {
 			type: "response" as const,
 			command: "get_messages",
 			success: true,
-			data: { messages: trimmed },
+			// entryIds / cursor 与 messages 一一对应：大会话 get_entries 和分页 RPC 都不可用，
+			// 文件内 id 与首行字节偏移就是编辑定位和「加载更早」的唯一稳定锚点。
+			data: {
+				messages: trimmed,
+				entryIds: kept.map((item) => item.entryId),
+				cursor: kept[0]?.startOffset ?? 0,
+				hasOlder,
+			},
+		};
+	}
+
+	/**
+	 * 从文件尾部向头部扫描，返回指定 entryId 所在行的绝对字节偏移。
+	 * 仅用于历史分页的 `beforeOffset` 起点：当前时间线最旧一条消息的 entryId
+	 * 通常就在尾部几十轮内，找到它即可只加载它之前的消息，避免第一页与基线重叠。
+	 * 文件极大且 entry 不在尾部扫描预算内时返回 undefined（调用方降级）。
+	 */
+	async findEntryOffset(sessionPath: string, entryId: string): Promise<number | undefined> {
+		const hostPath = this.resolve(sessionPath);
+		let endOffset: number | undefined;
+		// 最多向前扫 4 个尾窗（默认最多 64MB）；当前基线最旧消息应在第一页内命中。
+		for (let page = 0; page < 4; page++) {
+			const tail = await readTailEntries(this.io, hostPath, {
+				minLines: 200,
+				maxBytes: TAIL_READ_MAX_BYTES,
+				endOffset,
+			});
+			if (!tail.raw) return undefined;
+			let offset = tail.startOffset;
+			for (const line of tail.raw.split("\n")) {
+				const lineOffset = offset;
+				offset += Buffer.byteLength(line, "utf8") + 1;
+				if (!line.trim()) continue;
+				try {
+					const entry = JSON.parse(line) as { id?: unknown };
+					if (entry.id === entryId) return lineOffset;
+				} catch {
+					// 损坏行跳过，继续扫描
+				}
+			}
+			if (tail.startOffset <= 0) return undefined;
+			endOffset = tail.startOffset;
+		}
+		return undefined;
+	}
+
+	/**
+	 * 从 `beforeOffset` 向前读取一页历史消息（返回更早的 maxTurns 轮）。
+	 *
+	 * 为什么按字节偏移翻页而不是复用 readTailEntries 每次都读尾部：40MB 会话要看到
+	 * 最早消息，只能一页页向文件头部推进；cursor 取「本页保留的第一行起始偏移」，
+	 * 下一页以它为 endOffset，保证连续、无重叠、无 gap。
+	 *
+	 * 页内消息先裁剪到最近 maxTurns 轮，避免一次返回过多；`hasMore` 只表示文件头方向
+	 * 是否还有内容，渲染层据此停止显示「加载更早」。
+	 */
+	async readOlderMessages(
+		sessionPath: string,
+		beforeOffset: number | undefined,
+		maxTurns: number,
+	): Promise<{ messages: unknown[]; entryIds: string[]; cursor: number; hasMore: boolean }> {
+		const hostPath = this.resolve(sessionPath);
+		const turns = Math.min(Math.max(1, Math.trunc(maxTurns) || 1), 200);
+		const tail = await readTailEntries(this.io, hostPath, {
+			// 每轮至少 user + assistant 两行；按 8 行/轮预留工具消息余量
+			minLines: turns * 8 + 8,
+			maxBytes: TAIL_READ_MAX_BYTES,
+			endOffset: beforeOffset,
+		});
+		if (!tail.raw) return { messages: [], entryIds: [], cursor: 0, hasMore: false };
+
+		const messageEntries: Array<{ message: unknown; entryId: string; startOffset: number }> = [];
+		let offset = tail.startOffset;
+		for (const line of tail.raw.split("\n")) {
+			const lineOffset = offset;
+			// +1 为换行符；最后一行即使没有换行，也不会被当作下一页 cursor 的起点。
+			offset += Buffer.byteLength(line, "utf8") + 1;
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as { type?: unknown; id?: unknown; message?: unknown };
+				if (entry.type === "message" && entry.message && typeof entry.id === "string") {
+					messageEntries.push({ message: entry.message, entryId: entry.id, startOffset: lineOffset });
+				}
+			} catch {
+				// 损坏行跳过；cursor 仍按字节推进，避免分页卡死
+			}
+		}
+
+		const trimmed = trimHistoryMessages(messageEntries.map((item) => item.message), turns);
+		const trimStart = trimmed.length > 0
+			? Math.max(0, messageEntries.findIndex((item) => item.message === trimmed[0]))
+			: messageEntries.length;
+		const kept = messageEntries.slice(trimStart);
+		const messagesOut = kept.map((item) => item.message);
+		resolveBlobImagesInMessages(messagesOut, this.blobsDir());
+
+		// 没有消息条目时继续以上的窗口起点为 cursor；有消息则从本页第一条开始，
+		// 这样下一次读取严格只包含更早的行。
+		const cursor = kept.length > 0 ? kept[0].startOffset : tail.startOffset;
+		return {
+			messages: messagesOut,
+			entryIds: kept.map((item) => item.entryId),
+			cursor,
+			hasMore: cursor > 0,
 		};
 	}
 
@@ -215,17 +344,12 @@ export class SessionJsonl {
 		sessionContent?: string,
 	): Promise<ChatMessage[]> {
 		// 调用方已读入原文时直接复用；否则整读走 sessionEntries（编码守卫与逐行解析的唯一实现）。
-		// content 保留解码后的原文，后续 parseArchives 复用同一份文本，避免第二次整读。
-		let content: string;
+		// 只保留解析后的条目：归档解析直接复用这些条目，不再对同一份原文二次 JSON.parse。
 		let parsedEntries: unknown[];
 		if (sessionContent === undefined) {
-			const file = await readEntries(this.io, this.resolve(sessionPath));
-			content = file.raw;
-			parsedEntries = file.entries;
+			parsedEntries = (await readEntries(this.io, this.resolve(sessionPath))).entries;
 		} else {
-			const file = parseSessionText(sessionContent);
-			content = file.text;
-			parsedEntries = file.entries;
+			parsedEntries = parseSessionText(sessionContent).entries;
 		}
 		const entries: Array<{
 			id: string;
@@ -283,13 +407,25 @@ export class SessionJsonl {
 			.filter((entry) => entry.type === "message" && entry.message);
 		const rawMessages = currentEntries.map((entry) => entry.message);
 		const trimmed = trimHistoryMessages(rawMessages);
+		// blob 图片是引用串，只还原真正会进入时间线的那部分（与 readRecentMessages 同一策略）：
+		// 非活动分支、被 trim 掉的历史轮次、归档卡片都不渲染图片。
+		resolveBlobImagesInMessages(trimmed, this.blobsDir());
 		const trimStart = trimmed.length > 0 ? rawMessages.indexOf(trimmed[0]) : 0;
 		const activeEntryIds = currentEntries.slice(Math.max(0, trimStart)).map((entry) => entry.id);
 
 		let finalRaw: unknown[] = trimmed;
 		if (lastCompaction) {
 			const compactionEntry = lastCompaction;
-			const archiveData = await this.parseArchives(sessionPath, agentId, content);
+			// 复用上面已解析的 parsedEntries：此前 parseArchives 会把同一份全文
+			// 再 JSON.parse 一遍，35MB 会话在 Viewer 路径上等于双倍主线程 CPU。
+			const archiveData = extractSessionArchivesFromEntries(parsedEntries, agentId, (detail) => {
+				void this.deps.logger?.warn("agent", "Failed to convert archived messages", {
+					agentId,
+					compactionId: detail.compactionId,
+					rawCount: detail.rawCount,
+					error: detail.error instanceof Error ? detail.error.message : String(detail.error),
+				});
+			});
 			const archivedMessages = archiveData.archivedMessagesByCompactionId.get(compactionEntry.id) ?? [];
 			finalRaw = [{
 				role: "compactionSummary",
@@ -475,15 +611,37 @@ export class SessionJsonl {
 			}
 		}
 
-		let parsedEntries: unknown[];
-		if (sessionContent === undefined) {
+		let archives: SessionArchives;
+		// 归档卡片只渲染纯文本（DiagnosticCards 的 ArchivedMessage），不还原 blob 图片：
+		// 在这里解码 base64 只会增加同步读盘与 IPC 体积，渲染端没有消费点。
+		if (sessionContent !== undefined) {
+			archives = extractSessionArchives(sessionContent, agentId, (detail) => {
+				void this.deps.logger?.warn("agent", "Failed to convert archived messages", {
+					agentId,
+					compactionId: detail.compactionId,
+					rawCount: detail.rawCount,
+					error: detail.error instanceof Error ? detail.error.message : String(detail.error),
+				});
+			});
+		} else {
 			const hostPath = this.resolve(sessionPath);
-			// 读取 → 解码 → 逐行解析走 sessionEntries（编码守卫唯一实现）；
-			// 已有指纹直接复用，读取失败仍按原语义降级为空归档（ENOENT 静默，其余 warn）。
+			// 读取/解析失败仍按原语义降级为空归档（ENOENT 静默，其余 warn）。
 			try {
-				const file = await readEntries(this.io, hostPath, { fingerprint: fileFingerprint });
-				parsedEntries = file.entries;
-				fileFingerprint = { size: file.fingerprint.size, mtimeMs: file.fingerprint.mtimeMs };
+				if (this.deps.createArchiveWorker) {
+					// 整文件读取 + JSON.parse 全部移出主线程；读取失败的错误经 worker 回传。
+					archives = await this.parseArchivesInWorker(hostPath, agentId);
+				} else {
+					const file = await readEntries(this.io, hostPath, { fingerprint: fileFingerprint });
+					fileFingerprint = { size: file.fingerprint.size, mtimeMs: file.fingerprint.mtimeMs };
+					archives = extractSessionArchives(file.raw, agentId, (detail) => {
+						void this.deps.logger?.warn("agent", "Failed to convert archived messages", {
+							agentId,
+							compactionId: detail.compactionId,
+							rawCount: detail.rawCount,
+							error: detail.error instanceof Error ? detail.error.message : String(detail.error),
+						});
+					});
+				}
 			} catch (error) {
 				const code =
 					error instanceof Error && "code" in error ? String(error.code) : undefined;
@@ -502,125 +660,91 @@ export class SessionJsonl {
 						message: error instanceof Error ? error.message : String(error),
 					});
 				}
-				return { compactions: [], archivedMessagesByCompactionId: new Map() };
-			}
-		} else {
-			parsedEntries = parseSessionText(sessionContent).entries;
-		}
-
-		// 一次遍历收集所有 entry 和原始消息
-		const allEntries: Array<{
-			id: string;
-			parentId: string | null;
-			type: string;
-			message?: unknown;
-			summary?: string;
-			firstKeptEntryId?: string;
-			tokensBefore?: number;
-			timestamp: string;
-		}> = [];
-		const rawMessagesByEntryId = new Map<string, unknown>();
-
-		for (const entry of parsedEntries) {
-			// 单行解析失败已由 sessionEntries 隔离：跳过该行，其余记录照常参与归档回溯。
-			if (!isJsonRecord(entry)) continue;
-			const entryId = typeof entry.id === "string" ? entry.id : "";
-			allEntries.push({
-				id: entryId,
-				parentId: typeof entry.parentId === "string" ? entry.parentId : null,
-				type: typeof entry.type === "string" ? entry.type : "",
-				message: entry.message,
-				summary: typeof entry.summary === "string" ? entry.summary : undefined,
-				firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
-				tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
-				timestamp: typeof entry.timestamp === "string" ? entry.timestamp : "",
-			});
-			// 缓存消息型 entry 的原始 message 对象，供后续 convertAgentMessages 使用
-			if (entry.type === "message" && entry.message && typeof entry.message === "object" && entryId) {
-				rawMessagesByEntryId.set(entryId, entry.message);
-			}
-		}
-
-		// 建立 entryId → entry 索引（含 parentId 关系）
-		const entryById = new Map<string, (typeof allEntries)[number]>();
-		for (const entry of allEntries) {
-			if (entry.id) entryById.set(entry.id, entry);
-		}
-
-		// 提取压缩条目（按文件顺序，即时间顺序）
-		const compactionEntries = allEntries.filter((e) => e.type === "compaction");
-		const compactions: SessionCompaction[] = compactionEntries.map((c) => ({
-			id: c.id,
-			summary: c.summary ?? "",
-			timestamp: c.timestamp,
-			firstKeptEntryId: c.firstKeptEntryId,
-			tokensBefore: c.tokensBefore,
-		}));
-
-		// 为每个压缩条目收集其归档范围内的消息。
-		// 归档范围：从压缩条目的 parentId 沿 parentId 链向上，收集所有 type=message 的条目，
-		// 直到遇到该压缩条目的 firstKeptEntryId 或上一个压缩条目的 firstKeptEntryId（避免重复归组）。
-		const archivedMessagesByCompactionId = new Map<string, ChatMessage[]>();
-		const coveredEntryIds = new Set<string>();
-
-		// 按文件顺序处理（从旧到新），确保较早的压缩条目优先确定范围
-		for (const compEntry of compactionEntries) {
-			const rawMessages: unknown[] = [];
-			const seenIds = new Set<string>();
-
-			// 从压缩条目的 parentId 开始向上回溯
-			let currentId: string | null = compEntry.parentId;
-			while (currentId) {
-				if (seenIds.has(currentId)) break; // 防止循环
-				seenIds.add(currentId);
-
-				const entry = entryById.get(currentId);
-				if (!entry) break;
-
-				// 遇到 firstKept 或已被上一个压缩条目覆盖的条目时停止
-				if (currentId === compEntry.firstKeptEntryId) break;
-				if (coveredEntryIds.has(currentId)) break;
-
-				// 收集消息型 entry
-				if (entry.type === "message") {
-					const rawMsg = rawMessagesByEntryId.get(currentId);
-					if (rawMsg) {
-						rawMessages.push(rawMsg);
-						coveredEntryIds.add(currentId);
-					}
-				}
-
-				currentId = entry.parentId;
-			}
-
-			if (rawMessages.length > 0) {
-				// 反转消息顺序（回溯得到的是从新到旧，需反转为从旧到新）
-				rawMessages.reverse();
-				// 转换为 ChatMessage 格式
-				try {
-					const chatMessages = convertAgentMessages(agentId, rawMessages, undefined, false);
-					if (chatMessages.length > 0) {
-						archivedMessagesByCompactionId.set(compEntry.id, chatMessages);
-					}
-				} catch (err) {
-					void this.deps.logger?.warn("agent", "Failed to convert archived messages", {
-						agentId,
-						compactionId: compEntry.id,
-						rawCount: rawMessages.length,
-						error: err instanceof Error ? err.message : String(err),
-					});
-				}
+				return emptySessionArchives();
 			}
 		}
 
 		if (fileFingerprint) {
 			this.archivesCache.set(sessionPath, {
 				...fileFingerprint,
-				value: { compactions, archivedMessagesByCompactionId },
+				value: archives,
 			});
 		}
 
-		return { compactions, archivedMessagesByCompactionId };
+		return archives;
+	}
+
+	/** 归档解析 worker：懒创建、单实例；失败时重建，后续请求不受影响。 */
+	private archiveWorker: Worker | null = null;
+	private nextArchiveJobId = 1;
+	private readonly archiveJobs = new Map<
+		number,
+		{ resolve: (archives: SessionArchives) => void; reject: (error: Error) => void }
+	>();
+
+	private parseArchivesInWorker(
+		hostPath: string,
+		agentId: string,
+	): Promise<SessionArchives> {
+		return new Promise<SessionArchives>((resolve, reject) => {
+			let worker: Worker;
+			try {
+				worker = this.getArchiveWorker();
+			} catch (error) {
+				reject(error instanceof Error ? error : new Error(String(error)));
+				return;
+			}
+			const id = this.nextArchiveJobId++;
+			this.archiveJobs.set(id, { resolve, reject });
+			try {
+				worker.postMessage({ id, filePath: hostPath, agentId });
+			} catch (error) {
+				this.archiveJobs.delete(id);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	private getArchiveWorker(): Worker {
+		if (this.archiveWorker) return this.archiveWorker;
+		const createWorker = this.deps.createArchiveWorker;
+		if (!createWorker) throw new Error("archive worker factory not configured");
+		const worker = createWorker();
+		// 池不应阻止应用退出；进程结束时由运行时回收。
+		worker.unref();
+		worker.on("message", (response: {
+			id: number;
+			ok: boolean;
+			archives?: SessionArchives;
+			error?: string;
+			code?: string;
+		}) => {
+			const job = this.archiveJobs.get(response.id);
+			if (!job) return;
+			this.archiveJobs.delete(response.id);
+			if (response.ok && response.archives) {
+				job.resolve(response.archives);
+				return;
+			}
+			const error = new Error(response.error ?? "archive parse failed");
+			// 保留 code，让 parseArchives 的 ENOENT 静默分支继续生效。
+			if (response.code) (error as NodeJS.ErrnoException).code = response.code;
+			job.reject(error);
+		});
+		const fail = (error: Error) => {
+			if (this.archiveWorker === worker) this.archiveWorker = null;
+			for (const job of this.archiveJobs.values()) job.reject(error);
+			this.archiveJobs.clear();
+			void worker.terminate().catch(() => 0);
+		};
+		worker.on("error", fail);
+		worker.on("exit", (code) => {
+			if (this.archiveWorker === worker) {
+				fail(new Error(`archive worker exited with code ${code}`));
+			}
+		});
+		this.archiveWorker = worker;
+		return worker;
 	}
 
 	// ── 纯查找（不读文件，对已读取的 lines 操作）──────────

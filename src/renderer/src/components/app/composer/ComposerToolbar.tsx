@@ -14,6 +14,48 @@ export const SessionStatus = memo(function SessionStatus(props: {
 	if (!state) return null;
 	// 会话头部状态用轻量 Badge，与左右分栏/新会话按钮同一套素雅边框语言，
 	// 避免各 chip 自定义高度/圆角造成头部控件参差。
+	const usageLimit = state.usageLimit;
+	const usageText =
+		usageLimit?.stage === "low_priority"
+			? [
+					t("app.usageLimitLowPriority"),
+					usageLimit.allowanceLeftPercent != null
+						? t("app.usageLimitAllowance", {
+								percent: Math.round(usageLimit.allowanceLeftPercent),
+							})
+						: null,
+				]
+					.filter(Boolean)
+					.join(" · ")
+			: usageLimit?.stage === "wrap_up"
+				? [
+						t("app.usageLimitWrapUp"),
+						usageLimit.extraUsage ? t("app.usageLimitExtraUsage") : null,
+					]
+						.filter(Boolean)
+						.join(" · ")
+				: "";
+	const usageTitle = usageLimit
+		? [
+				usageText,
+				usageLimit.resetsAtSec != null
+					? t("app.usageLimitResetAt", {
+							time: new Date(usageLimit.resetsAtSec * 1000).toLocaleTimeString(
+								undefined,
+								{ hour: "2-digit", minute: "2-digit" },
+							),
+						})
+					: null,
+			]
+				.filter(Boolean)
+				.join("\n")
+		: undefined;
+	const cacheWarming = state.cacheWarming;
+	const cacheWarmingFailed =
+		cacheWarming?.outcome === "error" || cacheWarming?.outcome === "aborted";
+	const cacheWarmingTitle = cacheWarming
+		? [cacheWarming.provider, cacheWarming.model].filter(Boolean).join("/")
+		: undefined;
 	return (
 		<div className="session-status">
 			{state.contextPercent != null && (
@@ -30,6 +72,37 @@ export const SessionStatus = memo(function SessionStatus(props: {
 					)}
 				</Badge>
 			)}
+			{state.tokensPerSecond != null && (
+				<Badge variant="outline" badgeSize="sm" className="throughput-chip">
+					{t("app.tokensPerSecond", {
+						value:
+							state.tokensPerSecond < 10
+								? state.tokensPerSecond.toFixed(1)
+								: Math.round(state.tokensPerSecond),
+					})}
+				</Badge>
+			)}
+			{usageLimit && (
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className={`usage-chip${usageLimit.stage === "wrap_up" ? " critical" : ""}`}
+					title={usageTitle}
+				>
+					{usageText}
+				</Badge>
+			)}
+			{cacheWarming?.phase === "warming" ||
+			(cacheWarming?.phase === "done" && cacheWarmingFailed) ? (
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className={`warming-chip${cacheWarmingFailed ? " failed" : ""}`}
+					title={cacheWarmingTitle}
+				>
+					{cacheWarmingFailed ? t("app.cacheWarmingFailed") : t("app.cacheWarming")}
+				</Badge>
+			) : null}
 			{(state.cacheHitPercent != null || state.cacheTotal != null) && (
 				<Badge variant="outline" badgeSize="sm" className="cache-chip">
 					{state.cacheHitPercent != null && (
@@ -67,8 +140,10 @@ export const ComposerStatusChips = memo(
 		isAgentBusy: boolean;
 		isAgentStarting: boolean;
 		compacting: boolean;
+		serviceTierBusy: boolean;
 		onOpenModelPicker: () => void;
 		onOpenThinkingPicker: () => void;
+		onToggleServiceTier: (kind: "fast" | "slow", enabled: boolean) => void;
 		onCompact: () => void;
 	}) {
 		const {
@@ -77,8 +152,10 @@ export const ComposerStatusChips = memo(
 			isAgentBusy,
 			isAgentStarting,
 			compacting,
+			serviceTierBusy,
 			onOpenModelPicker,
 			onOpenThinkingPicker,
+			onToggleServiceTier,
 			onCompact,
 		} = props;
 		return (
@@ -106,6 +183,37 @@ export const ComposerStatusChips = memo(
 							const level = THINKING_LEVELS.find((l) => l.value === state.thinkingLevel);
 							return level ? t(level.labelKey) : state.thinkingLevel;
 						})()}
+					</button>
+				)}
+				{/* fast 只有已开启时才露出（部分 provider 不支持，常驻会误导）；
+				    slow 只要模型声明支持就露出，作为发现/开启入口。点击直接切档。 */}
+				{(state?.fastModeEnabled || state?.fastModeActive) && (
+					<button
+						type="button"
+						className={`composer-bar-btn service-tier fast${state.fastModeEnabled ? " on" : ""}`}
+						disabled={serviceTierBusy}
+						aria-pressed={!!state.fastModeEnabled}
+						onClick={() => onToggleServiceTier("fast", !state.fastModeEnabled)}
+						title={state.fastModeActive ? t("app.serviceFastActive") : t("app.serviceFastIdle")}
+					>
+						{t("app.serviceFastChip")}
+					</button>
+				)}
+				{(state?.slowModeSupported || state?.slowModeEnabled) && (
+					<button
+						type="button"
+						className={`composer-bar-btn service-tier slow${state.slowModeEnabled ? " on" : ""}`}
+						disabled={serviceTierBusy}
+						aria-pressed={!!state.slowModeEnabled}
+						onClick={() => onToggleServiceTier("slow", !state.slowModeEnabled)}
+						title={t("app.serviceSlowTitle", {
+							scope:
+								state.slowModeScope === "session"
+									? t("app.serviceSlowScopeSession")
+									: t("app.serviceSlowScopeGlobal"),
+						})}
+					>
+						{t("app.serviceSlowChip")}
 					</button>
 				)}
 				{/* 上下文压缩：与 /compact 同一路径。
@@ -168,7 +276,8 @@ export const ComposerStatusChips = memo(
 		previous.activeAgentId === next.activeAgentId &&
 		previous.isAgentBusy === next.isAgentBusy &&
 		previous.isAgentStarting === next.isAgentStarting &&
-		previous.compacting === next.compacting,
+		previous.compacting === next.compacting &&
+		previous.serviceTierBusy === next.serviceTierBusy,
 );
 export function ComposerToolbar(props: {
 	state?: AgentRuntimeState;

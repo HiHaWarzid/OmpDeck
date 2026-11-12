@@ -42,6 +42,8 @@ describe("parseModelsJson", () => {
 			},
 			{ provider: "opencode", id: "no-name", input: ["text"], reasoning: false },
 			{ provider: "minimax", id: "MiniMax-M2.5", name: "MiniMax M2.5", input: ["text"] },
+			// 非对话条目不能被 set_model 选中。
+			{ provider: "openai", kind: "embedding", id: "text-embedding-3-small" },
 			// 畸形条目：缺 provider / id 必须跳过，不能让 undefined 流进 set_model。
 			{ id: "orphan" },
 			{ provider: "broken" },
@@ -55,6 +57,8 @@ describe("parseModelsJson", () => {
 			{
 				provider: "commandcode",
 				id: "deepseek/deepseek-v4.1-flash",
+				kind: "chat",
+				selector: "commandcode/deepseek/deepseek-v4.1-flash",
 				name: "DeepSeek V4.1 Flash",
 				contextWindow: 1_000_000,
 				reasoning: true,

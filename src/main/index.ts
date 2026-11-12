@@ -4,6 +4,7 @@ import {
 	BrowserWindow,
 	dialog,
 	ipcMain,
+	nativeImage,
 	nativeTheme,
 	net,
 } from "electron";
@@ -11,7 +12,7 @@ import { join, resolve } from "node:path";
 import { connect } from "node:net";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { is } from "@electron-toolkit/utils";
-import { PetSystem, type PetSystemDeps } from "./pet";
+import type { PetSystem } from "./pet";
 import {
 	applyLinuxDisplayBackendWorkaround,
 	isUsingLinuxXWaylandWorkaround,
@@ -33,8 +34,30 @@ import {
 } from "./rendererRecovery";
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
-// 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
+// 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题。
+// Windows 额外用多尺寸 ICO：任务栏/窗口图标优先使用 ICO。
+// 但 AUMID 未注册开始菜单快捷方式时，Windows 会忽略窗口图标，仍需
+// windowsAppIdentity.ts 补建快捷方式。
 import iconPath from "../../build/icon.png?asset";
+import windowsIconPath from "../../build/icon.ico?asset";
+import {
+	ensureWindowsAppUserModelShortcut,
+	resolveWindowsAppUserModelId,
+} from "./windowsAppIdentity";
+
+const windowsShortcutIconPath =
+	!app.isPackaged && existsSync(join(app.getAppPath(), "build", "icon.ico"))
+		? join(app.getAppPath(), "build", "icon.ico")
+		: windowsIconPath;
+
+/**
+ * 系统通知正文图标与窗口/托盘同源。Windows 用多尺寸 ICO，避免通知正文图像发糊；
+ * 通知左上角的应用图标由 AUMID 对应的开始菜单快捷方式决定，见
+ * windowsAppIdentity.ts。
+ */
+const notificationIcon = nativeImage.createFromPath(
+	process.platform === "win32" ? windowsIconPath : iconPath,
+);
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 OmpDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -77,6 +100,14 @@ if (!app.isPackaged) {
 			console.error("[OmpDeck] 历史数据迁移失败，请手动从 pi-desktop-dev 恢复:", error);
 		}
 	}
+}
+
+// Windows 任务栏/通知按 AppUserModelID 归组并绑定应用图标。
+// 注册表里没有对应 AUMID 的开始菜单快捷方式时，Windows 会忽略 BrowserWindow.icon，
+// 任务栏和 Toast 左上角都回退成 electron.exe 的默认图标；快捷方式由
+// ensureWindowsAppUserModelShortcut() 在 ready 后补齐。
+if (process.platform === "win32") {
+	app.setAppUserModelId(resolveWindowsAppUserModelId(app.isPackaged));
 }
 
 // 三个 pre-ready 偏好（宠物、Chromium 沙箱、单实例）都取自同一份 settings.json：
@@ -162,6 +193,7 @@ import type {
 	CreatePiPromptTemplateInput,
 	CreatePiSkillInput,
 	CreateProjectSkillInput,
+	CrashedRun,
 	PiPromptTemplateSummary,
 	PromptStoreSearchResult,
 	PromptStoreSearchResponse,
@@ -177,12 +209,14 @@ import { AgentManager } from "./pi/AgentManager";
 import { PiLocator } from "./pi/PiLocator";
 import { PiProcess } from "./pi/PiProcess";
 import { QuickGenProcess } from "./pi/QuickGenProcess";
-import { ensureAllPiSettingsDefaults } from "./pi/PiSettingsDefaults";
 import { SessionScanner } from "./sessions/SessionScanner";
+import { createSessionParseWorker } from "./sessions/sessionWorkerFactory";
+import { createSessionArchiveWorker } from "./sessions/sessionArchiveWorkerFactory";
 import { ImportPipeline } from "./sessions/importPipeline";
 import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter";
 import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
 import { CodexImportAdapter } from "./sessions/adapters/codexImportAdapter";
+import { OpenSessionSnapshot } from "./sessions/OpenSessionSnapshot";
 import { SettingsStore } from "./settings/SettingsStore";
 import { applyDesktopProxy } from "./settings/DesktopProxy";
 import { GitService } from "./git/GitService";
@@ -233,9 +267,10 @@ import {
 	openProjectInEditor,
 	validateExternalEditorCommand,
 } from "./editors/EditorDetector";
-import { FeishuBridge } from "./feishu/FeishuBridge";
+import type { FeishuBridge } from "./feishu/FeishuBridge";
 import { listBots } from "./feishu/FeishuConfig";
 import { perfDump } from "./perf";
+import { startSoakRecorder } from "./perf/soak";
 
 let mainWindow: BrowserWindow | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
@@ -305,6 +340,7 @@ let worktreeService: WorktreeService;
 let gitService: GitService;
 let piLocator: PiLocator;
 let agentManager: AgentManager;
+let openSessionSnapshot: OpenSessionSnapshot | null = null;
 let afkOrchestrator: AfkOrchestrator;
 let configManager: ConfigManager;
 let promptManager: PromptManager;
@@ -548,7 +584,12 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
 	]);
 	const stop = () => {
+		// 正常退出必须先落盘「干净退出」标记：漏了这一步，下次启动会把上次的会话当成崩溃恢复。
+		// 同步写在这里是必要的——before-quit 之后进程随时可能被系统收走。
+		openSessionSnapshot?.markCleanExit();
 		void webServiceManager?.stop();
+		// 关闭会话目录 watcher，避免进程退出前仍持有目录句柄。
+		void sessionScanner?.close();
 		terminalManager?.closeAll();
 		void agentManager?.stopAll();
 		petSystem?.stop();
@@ -746,7 +787,7 @@ async function createWindow() {
 		minWidth: 880,
 		minHeight: 640,
 		title: "",
-		icon: iconPath,
+		icon: process.platform === "win32" ? windowsIconPath : iconPath,
 		frame: windowOptions.frame,
 		titleBarStyle: windowOptions.titleBarStyle,
 		...(windowOptions.trafficLightPosition ? { trafficLightPosition: windowOptions.trafficLightPosition } : {}),
@@ -1125,9 +1166,14 @@ function registerIpc() {
 		registerFileHandlers({ projectStore, fileSystemService, settingsStore, appLogger }),
 		registerSessionHandlers({ projectStore, sessionScanner, sessionFileOps: sessionScanner.fileOps, importPipeline, agentManager, appLogger }),
 		registerGitHandlers({ projectStore, gitService, settingsStore, worktreeService, appLogger, quickGen: quickGen! }),
-		registerConfigHandlers({ configManager, rolesStore: configManager.rolesStore, appLogger }),
+		registerConfigHandlers({
+			configManager,
+			rolesStore: configManager.rolesStore,
+			appLogger,
+			onModelConfigChanged: () => agentManager.markConfigChanged(),
+		}),
 		registerClipboardHandlers(),
-		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger, configManager }),
+		registerPiHandlers({ piLocator, settingsStore, extensionManager, appLogger }),
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
 		registerAgentHandlers({
 			agentManager,
@@ -1135,13 +1181,13 @@ function registerIpc() {
 			appLogger,
 			getFeishuBridge: () => feishuBridge,
 			getMainWindow: () => mainWindow,
+			notificationIcon,
 		}),
 		registerAppHandlers({
 			appLogger,
 			settingsStore,
 			agentManager,
 			terminalManager,
-			piLocator,
 			updateManager,
 			getMainWindow: () => mainWindow,
 			setIsQuitting: (value: boolean) => {
@@ -1154,6 +1200,8 @@ function registerIpc() {
 			getPetSystem: () => petSystem,
 			getWebServiceManager: () => webServiceManager,
 			getAfkOrchestrator: () => afkOrchestrator,
+			// 崩溃恢复快照在渲染层挂载后一次性取走（主进程内只剩这一个消费者）
+			takeCrashedSessions: () => openSessionSnapshot?.takeCrashedRun() ?? null,
 			openExternalUrl,
 			syncWslEnvironment,
 			applyNativeThemeSource,
@@ -1209,13 +1257,37 @@ app.whenReady().then(async () => {
 
 	projectStore = new ProjectStore();
 	fileSystemService = new FileSystemService();
-	sessionScanner = new SessionScanner();
+	sessionScanner = new SessionScanner({
+		onScanSettled: () => {
+			if (mainWindow && !mainWindow.isDestroyed()) {
+				mainWindow.webContents.send(ipcChannels.sessionsChanged);
+			}
+		},
+		// 扫描在 appLogger 就绪前注册，但超时只可能发生在用户调用 sessions:list 之后，
+		// 因此这里延迟取 appLogger，避免为日志调整主进程初始化顺序。
+		logScanDegraded: (detail) => {
+			void appLogger?.warn("session", "Session listing degraded", detail);
+		},
+		createParseWorker: createSessionParseWorker,
+	});
 	importPipeline = new ImportPipeline(join(app.getPath("home"), ".omp", "agent", "sessions"));
 	importPipeline.registerAdapter(new OpenCodeImportAdapter(join(app.getPath("home"), ".local", "share", "opencode", "opencode.db")));
 	importPipeline.registerAdapter(new ClaudeImportAdapter(join(app.getPath("home"), ".claude", "projects")));
 	importPipeline.registerAdapter(new CodexImportAdapter(join(app.getPath("home"), ".codex", "sessions")));
 	settingsStore = new SettingsStore();
 	appLogger = new AppLogger();
+	// 与设置加载/IPC 注册并行：只在首次或版本/路径变化时真正拉起 PowerShell，
+	// 后续启动命中 marker 直接返回，不拖慢首帧。
+	const windowsAppIdentityReady = ensureWindowsAppUserModelShortcut({
+		isPackaged: app.isPackaged,
+		execPath: process.execPath,
+		appPath: app.getAppPath(),
+		appVersion: app.getVersion(),
+		appDataDir: app.getPath("appData"),
+		userDataDir: app.getPath("userData"),
+		iconPath: windowsShortcutIconPath,
+		portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE,
+	});
 	rpcLogger = new RpcLogger();
 	updateManager = new UpdateManager({ appLogger, getMainWindow: () => mainWindow });
 	linkOpener = new LinkOpener({ getMainWindow: () => mainWindow, getSettings: () => settingsStore.get() });
@@ -1249,12 +1321,31 @@ app.whenReady().then(async () => {
 		settingsStore,
 		{
 			readOmpDefaultThinkingLevel: () => configManager.rolesStore.readDefaultThinkingLevel(),
-			filterConfiguredModels: (models) => configManager.filterConfiguredModels(models),
 			trustStore: configManager.trustStore,
+			disableDeveloperRole: (providerName) => configManager.disableDeveloperRole(providerName),
 		},
 		rpcLogger,
 		appLogger,
+		undefined,
+		undefined,
+		createSessionArchiveWorker,
+		notificationIcon,
 	);
+	// 崩溃恢复：先把上次运行的快照读出来（必须在 beginRun 覆盖文件之前），
+	// 再登记「每次 emitState 同步落盘已打开会话」，最后由渲染层在挂载后一次性取走恢复。
+	// 读取失败/首次运行都只是空快照，不影响启动。
+	openSessionSnapshot = new OpenSessionSnapshot(app.getPath("userData"));
+	const crashedRun = openSessionSnapshot.readCrashedRun();
+	openSessionSnapshot.beginRun();
+	agentManager.addStateListener((tabs) => openSessionSnapshot?.recordAgents(tabs));
+	if (crashedRun) {
+		void appLogger.info("app", "Previous run ended without clean shutdown", {
+			previousPid: crashedRun.pid,
+			previousStartedAt: crashedRun.startedAt,
+			openSessions: crashedRun.sessions.length,
+			projectIds: [...new Set(crashedRun.sessions.map((session) => session.projectId))],
+		});
+	}
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),
 		listAgents: () => agentManager.list(),
@@ -1273,6 +1364,16 @@ app.whenReady().then(async () => {
 		refreshModels: (agentId) => agentManager.refreshModels(agentId),
 		cycleThinking: (agentId) => agentManager.cycleThinking(agentId),
 		setThinking: (agentId, level) => agentManager.setThinking(agentId, level),
+		availableThinkingLevels: (agentId) => agentManager.getAvailableThinkingLevels(agentId),
+		setFastMode: (agentId, enabled) => agentManager.setFastMode(agentId, enabled),
+		setSlowMode: (agentId, enabled) => agentManager.setSlowMode(agentId, enabled),
+		setAutoCompaction: (agentId, enabled) => agentManager.setAutoCompaction(agentId, enabled),
+		setTodos: (agentId, phases) => agentManager.setTodos(agentId, phases),
+		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
+		removeQueuedMessage: (agentId, message, queue) =>
+			agentManager.removeQueuedMessage(agentId, message, queue),
+		promoteQueuedMessage: (agentId, message) =>
+			agentManager.promoteQueuedMessage(agentId, message),
 	});
 	// AFK 编排器：消费 AgentManager 语义事件（settled/statusChanged error）驱动
 	// ticket→worktree→agent→PR 链路；启动自动恢复在 runPostWindowStartupTasks。
@@ -1310,7 +1411,20 @@ app.whenReady().then(async () => {
 			feishuBridge = bridge;
 		},
 	}));
+	// 任务栏/Toast 的图标解析发生在窗口创建时，必须先把开始菜单快捷方式补好。
+	const windowsAppIdentity = await windowsAppIdentityReady;
+	if (windowsAppIdentity.status === "registered") {
+		void appLogger.info("app", "Registered Windows AppUserModelID shortcut", {
+			shortcutPath: windowsAppIdentity.shortcutPath,
+		});
+	} else if (windowsAppIdentity.status === "failed") {
+		void appLogger.warn("app", "Failed to register Windows AppUserModelID shortcut", {
+			error: windowsAppIdentity.error,
+		});
+	}
 	await createWindow();
+	// PIDECK_PERF_SOAK=1 时长时运行采样（默认关闭，空操作）。
+	startSoakRecorder();
 	setupTray();
 
 	void runPostWindowStartupTasks().catch((error) => {
@@ -1353,11 +1467,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 			installationType: settingsStore.get().installationType,
 		}),
 	]);
-
-	// 补齐 pi settings.json 缺失的默认配置项，新安装或精简配置的用户无需手动添加。
-	void ensureAllPiSettingsDefaults(settingsStore.get(), piLocator, activeWslEnvironment).catch((error) => {
-		console.error("Failed to ensure pi settings defaults:", error);
-	});
 
 	// AFK 启动自动恢复：设置持久化的 enabled 时恢复轮询与未完成任务判定。
 	if (settingsStore.get().afk?.enabled) {
@@ -1413,7 +1522,10 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		void appLogger.warn("editor", "External editor first launch detection failed", error);
 	});
 
-	// 桌面宠物系统：新增模块，默认关闭（petEnabled=false），不触碰现有 IPC 与主窗逻辑
+	// 桌面宠物系统：新增模块，默认关闭（petEnabled=false），不触碰现有 IPC 与主窗逻辑。
+	// 动态 import：pet 模块及其依赖只在真正构造时解析，避免随主进程启动一起加载。
+	// 构造点本来就在窗口出现之后，因此加载时机变化不影响启动时序。
+	const { PetSystem } = await import("./pet");
 	petSystem = new PetSystem({
 		agentManager,
 		settingsStore,

@@ -72,9 +72,21 @@ function loadSessionScanner(homePath) {
 	// 读取半部分（解码/逐行解析/字节预算）收敛到 sessionEntries，两个模块都依赖它：
 	// vm 沙箱不解析 .ts 扩展引入，需显式注入同一份加载结果。
 	const sessionEntries = loadTranspiledModule("src/main/sessions/sessionEntries.ts");
+	const sessionText = loadTranspiledModule("src/main/sessions/sessionText.ts");
+	const sessionSummaryFacts = loadTranspiledModule(
+		"src/main/sessions/sessionSummaryFacts.ts",
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
+	);
+	const sessionParsePool = loadTranspiledModule("src/main/sessions/sessionParsePool.ts");
 	const sessionFileOps = loadTranspiledModule(
 		"src/main/sessions/SessionFileOps.ts",
-		new Map([["./sessionEntries", sessionEntries]]),
+		new Map([
+			["./sessionEntries", sessionEntries],
+			["./sessionText", sessionText],
+		]),
 	);
 	const sandbox = {
 		AbortController,
@@ -82,6 +94,7 @@ function loadSessionScanner(homePath) {
 		Buffer,
 		clearTimeout,
 		exports: {},
+		process,
 		setTimeout,
 		require: (id) => {
 			if (id === "electron") {
@@ -101,6 +114,8 @@ function loadSessionScanner(homePath) {
 			if (id === "./subagentParentInference") return subagentParentInference;
 			if (id === "./SessionFileOps") return sessionFileOps;
 			if (id === "./sessionEntries") return sessionEntries;
+			if (id === "./sessionSummaryFacts") return sessionSummaryFacts;
+			if (id === "./sessionParsePool") return sessionParsePool;
 			return require(id);
 		},
 	};
@@ -117,29 +132,32 @@ function readLines(filePath) {
 	return readFileSync(filePath, "utf8").split(/\r?\n/).filter(Boolean);
 }
 
-/** 与 pi buildSessionInfo 相同的首行校验：首条可解析记录必须是 type:"session"。 */
-function firstParseableEntry(lines) {
-	for (const line of lines) {
-		try {
-			return JSON.parse(line);
-		} catch {
-			// 跳过不可解析行
-		}
+function parseEntry(line) {
+	try {
+		return JSON.parse(line);
+	} catch {
+		return null;
 	}
-	return null;
 }
 
-/** 与 pi getSessionName 一致：倒序取最后一条 session_info 的 name。 */
-function piSessionName(lines) {
-	for (let i = lines.length - 1; i >= 0; i--) {
-		try {
-			const entry = JSON.parse(lines[i]);
-			if (entry.type === "session_info") return entry.name?.trim() || undefined;
-		} catch {
-			// 跳过不可解析行
-		}
-	}
-	return undefined;
+function entriesOfType(lines, type) {
+	return lines.map(parseEntry).filter((entry) => entry?.type === type);
+}
+
+/** omp 的权威标题在首行定长 title 槽；重命名必须原地覆盖而不是追加旧格式。 */
+function readTitleSlot(lines) {
+	const slot = parseEntry(lines[0]);
+	assert.equal(slot?.type, "title");
+	return slot;
+}
+
+function readTitleChange(lines) {
+	const changes = entriesOfType(lines, "title_change");
+	return changes[changes.length - 1];
+}
+
+function titleName(lines) {
+	return readTitleChange(lines)?.title ?? readTitleSlot(lines).title;
 }
 
 const healthySession = [
@@ -148,7 +166,7 @@ const healthySession = [
 	{ type: "message", id: "aaaa0003", parentId: "aaaa0002", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: "hi" } },
 ];
 
-test("rename appends a pi-native session_info entry and keeps the header first (#114)", async () => {
+test("rename writes the native fixed-size title slot first and appends title_change", async () => {
 	const home = mkdtempSync(join(tmpdir(), "pideck-rename-native-"));
 	try {
 		const { SessionScanner } = loadSessionScanner(home);
@@ -159,50 +177,60 @@ test("rename appends a pi-native session_info entry and keeps the header first (
 		await scanner.fileOps.rename(file, "新会话名");
 
 		const lines = readLines(file);
-		// 首行仍是 type:"session" 头，pi 可以正常加载（#114 的核心回归点）
-		assert.equal(firstParseableEntry(lines)?.type, "session");
-		assert.equal(lines.length, healthySession.length + 1);
+		// omp 只读首行 title 槽；槽必须定长，避免后续写入破坏行偏移。
+		const slot = readTitleSlot(lines);
+		assert.equal(slot.title, "新会话名");
+		assert.equal(slot.source, "user");
+		assert.equal(Buffer.byteLength(`${lines[0]}\n`, "utf8"), 256);
+		assert.equal(lines.length, healthySession.length + 2);
 
-		const appended = JSON.parse(lines[lines.length - 1]);
-		assert.equal(appended.type, "session_info");
-		assert.equal(appended.name, "新会话名");
-		assert.match(appended.id, /^[0-9a-f]{8}$/);
+		// 会话头仍在，且同步了标题字段，兼容只读头部的旧查看器。
+		const [header] = entriesOfType(lines, "session");
+		assert.equal(header.id, "aaaa0001");
+		assert.equal(header.title, "新会话名");
+		assert.equal(header.titleSource, "user");
+
+		const change = readTitleChange(lines);
+		assert.equal(change.title, "新会话名");
+		assert.equal(change.source, "user");
+		assert.match(change.id, /^[0-9a-f]{8}$/);
 		// parentId 指向追加前最后一条带 id 的记录，保持会话树链条完整
-		assert.equal(appended.parentId, "aaaa0003");
-		assert.equal(typeof appended.timestamp, "string");
-		// pi 语义：倒序读取到的名字就是新名字
-		assert.equal(piSessionName(lines), "新会话名");
+		assert.equal(change.parentId, "aaaa0003");
+		assert.equal(typeof change.timestamp, "string");
+		assert.equal(titleName(lines), "新会话名");
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
 });
 
-test("rename heals legacy OmpDeck sessionName head lines that broke pi loading (#114)", async () => {
+test("rename heals legacy sessionName head lines and stale session_info records", async () => {
 	const home = mkdtempSync(join(tmpdir(), "pideck-rename-heal-"));
 	try {
 		const { SessionScanner } = loadSessionScanner(home);
 		const scanner = new SessionScanner();
 		const file = join(home, "session-b.jsonl");
-		// 旧版应用的破坏产物：头部前置无 type 的 sessionName 私有行
+		// 旧版应用的破坏产物：头部前置无 type 的 sessionName 私有行 + 旧 session_info。
 		writeSession(file, [
 			{ sessionName: "Old app name", ts: 1700000000000 },
 			...healthySession,
+			{ type: "session_info", id: "bbbb0001", parentId: "aaaa0003", name: "stale" },
 		]);
-		assert.notEqual(firstParseableEntry(readLines(file))?.type, "session");
+		assert.equal(parseEntry(readLines(file)[0])?.type, undefined);
 
 		await scanner.fileOps.rename(file, "Healed");
 
 		const lines = readLines(file);
-		// 私有行被剔除，首条记录恢复为 type:"session"，pi 重新可见
-		assert.equal(firstParseableEntry(lines)?.type, "session");
+		assert.equal(readTitleSlot(lines).title, "Healed");
 		assert.ok(!lines.some((line) => line.includes("sessionName")));
-		assert.equal(piSessionName(lines), "Healed");
+		assert.equal(entriesOfType(lines, "session_info").length, 0);
+		assert.equal(entriesOfType(lines, "session").length, 1);
+		assert.equal(titleName(lines), "Healed");
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
 });
 
-test("repeated rename keeps the file flat and the latest name authoritative", async () => {
+test("repeated rename keeps a single title slot and the latest name authoritative", async () => {
 	const home = mkdtempSync(join(tmpdir(), "pideck-rename-twice-"));
 	try {
 		const { SessionScanner } = loadSessionScanner(home);
@@ -214,10 +242,11 @@ test("repeated rename keeps the file flat and the latest name authoritative", as
 		await scanner.fileOps.rename(file, "second");
 
 		const lines = readLines(file);
-		const infoCount = lines.filter((line) => line.includes('"session_info"')).length;
-		assert.equal(infoCount, 2);
-		assert.equal(piSessionName(lines), "second");
-		// OmpDeck 摘要同样以最后一条 session_info 为准
+		assert.equal(entriesOfType(lines, "title").length, 1);
+		assert.equal(readTitleSlot(lines).title, "second");
+		assert.equal(entriesOfType(lines, "title_change").length, 2);
+		assert.equal(titleName(lines), "second");
+		// OmpDeck 摘要同样读取原生标题槽
 		const summary = await scanner["readSummary"](file);
 		assert.equal(summary?.name, "second");
 	} finally {
@@ -225,7 +254,7 @@ test("repeated rename keeps the file flat and the latest name authoritative", as
 	}
 });
 
-test("rename sanitizes newlines in the name like pi appendSessionInfo", async () => {
+test("rename sanitizes newlines without breaking the fixed-size title slot", async () => {
 	const home = mkdtempSync(join(tmpdir(), "pideck-rename-sanitize-"));
 	try {
 		const { SessionScanner } = loadSessionScanner(home);
@@ -236,8 +265,9 @@ test("rename sanitizes newlines in the name like pi appendSessionInfo", async ()
 		await scanner.fileOps.rename(file, "line1\nline2\r\nline3");
 
 		const lines = readLines(file);
-		assert.equal(lines.length, healthySession.length + 1);
-		assert.equal(piSessionName(lines), "line1 line2 line3");
+		assert.equal(lines.length, healthySession.length + 2);
+		assert.equal(readTitleSlot(lines).title, "line1 line2 line3");
+		assert.equal(titleName(lines), "line1 line2 line3");
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}
@@ -253,7 +283,7 @@ test("rename delegates to the SessionFileOps module (no scanner forwarding)", as
 
 		await scanner.fileOps.rename(file, "Via file ops");
 
-		assert.equal(piSessionName(readLines(file)), "Via file ops");
+		assert.equal(titleName(readLines(file)), "Via file ops");
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 	}

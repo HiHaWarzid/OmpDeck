@@ -134,6 +134,25 @@ const PANE_HEADER_HEIGHT = 26;
 const BRANCH_BAR_HEIGHT = 36;
 const PANE_RESIZE_STEP = 20;
 const PANE_RESIZE_LARGE_STEP = 60;
+/**
+ * 可见状态下的兜底轮询间隔：窗口聚焦、面板重新可见、git 操作后都会立即刷新，
+ * 30s 只兜底在外部编辑器/终端里发生的改动，避免面板可见时高频 spawn git。
+ */
+const GIT_POLL_INTERVAL_MS = 30_000;
+
+/**
+ * 面板在 DOM 中是否真的可见。
+ * 抽屉的 diff 视图用 `visibility: hidden` 覆盖源码面板：布局盒还在，IntersectionObserver
+ * 仍会报告相交，只有 checkVisibility 能看到这层 CSS 可见性。用于轮询触发前的最后一道判断，
+ * 避免用户看不到面板时仍然 spawn git。
+ */
+function panelActuallyVisible(element: HTMLElement | null): boolean {
+  if (!element) return false;
+  if (typeof element.checkVisibility === "function") {
+    return element.checkVisibility({ checkVisibilityCSS: true });
+  }
+  return getComputedStyle(element).visibility !== "hidden";
+}
 
 function visiblePaneIds(open: PaneOpenState): PaneId[] {
   return PANE_IDS.filter((id) => open[id]);
@@ -893,6 +912,12 @@ function GitPanelImpl(props: GitPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const projectIdRef = useRef(props.projectId);
   projectIdRef.current = props.projectId;
+  /**
+   * 面板是否出现在视口内。抽屉切到 Files/Browser tab、折叠或窄屏被遮挡时，
+   * GitPanel 仍挂在 DOM 里但用户看不到，此时轮询纯属浪费（每次都要 spawn git）。
+   * 默认 true：挂载初期 IntersectionObserver 还没回调，先让首次刷新照常发生。
+   */
+  const [panelVisible, setPanelVisible] = useState(true);
   const statusRequestRef = useRef(0);
   const statusRunningRequestRef = useRef<{
     projectId: string;
@@ -969,33 +994,52 @@ function GitPanelImpl(props: GitPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectId, refreshBranches]);
 
-  // 窗口可见时 10s 轮询分支（与 App 侧 composer 分支展示同频）：面板打开期间
-  // 外部终端/IDE 切换分支也能及时反映。
+  // 面板可见性信号：GitPanel 根节点进入/离开视口时更新，供下面的轮询共用。
+  // 抽屉切 tab 用 CSS 保留 DOM，因此不能只依赖 document.hidden。
+  useEffect(() => {
+    const element = panelRef.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (entry) setPanelVisible(entry.isIntersecting);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  // 分支轮询：只在「面板在视口内 + 窗口可见」时跑；30s 兜底，
+  // 面板重新可见、窗口重新聚焦时立即补一次，保证外部终端/IDE 切换分支能及时反映。
   useEffect(() => {
     if (!props.projectId) return;
     let timer: number | undefined;
-    const start = () => {
-      if (timer) return;
-      void refreshBranches();
-      timer = window.setInterval(() => void refreshBranches(), 10_000);
-    };
     const stop = () => {
-      if (timer) {
+      if (timer !== undefined) {
         window.clearInterval(timer);
         timer = undefined;
       }
     };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
+    const sync = () => {
+      const shouldPoll = panelVisible && document.visibilityState === "visible";
+      if (!shouldPoll) {
+        stop();
+        return;
+      }
+      void refreshBranches();
+      if (timer === undefined) {
+        timer = window.setInterval(() => {
+          if (panelActuallyVisible(panelRef.current)) void refreshBranches();
+        }, GIT_POLL_INTERVAL_MS);
+      }
     };
-    onVisibility();
-    document.addEventListener("visibilitychange", onVisibility);
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
     return () => {
       stop();
-      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
     };
-  }, [props.projectId, refreshBranches]);
+  }, [props.projectId, refreshBranches, panelVisible]);
 
   useEffect(() => {
     const element = panelRef.current;
@@ -1062,7 +1106,7 @@ function GitPanelImpl(props: GitPanelProps) {
    */
   const refresh = useCallback(
     async (silent = false) => {
-      // 静默轮询不打断 mutation，也不与前一个 status 请求重叠；否则慢于 5 秒的请求会彼此作废，列表永久不更新。
+      // 静默轮询不打断 mutation，也不与前一个 status 请求重叠；否则慢于轮询间隔的请求会彼此作废，列表永久不更新。
       if (
         silent &&
         (mutationRunningRef.current ||
@@ -1083,7 +1127,7 @@ function GitPanelImpl(props: GitPanelProps) {
           request === statusRequestRef.current &&
           projectId === projectIdRef.current
         ) {
-          // 静默轮询每 5 秒一次；工作区没变时必须保留旧引用，否则整棵资源树
+          // 静默轮询是兜底通道；工作区没变时必须保留旧引用，否则整棵资源树
           // （大仓库数千行）会跟着无意义地重渲染一次，白占主线程。
           setGroups((current) =>
             sameResourceGroups(current, next) ? current : next,
@@ -1138,37 +1182,39 @@ function GitPanelImpl(props: GitPanelProps) {
     void refresh();
   }, [refresh]);
 
-  // 静默轮询：每 5 秒拉取一次最新工作区状态，不显示 loading 动画、不覆盖错误。
-  // 窗口隐藏/最小化时暂停（React 定时器不随 document.hidden 暂停，抽屉不可见时
-  // 继续 spawn git 纯属浪费），恢复可见时立即补一次并重启定时器。
+  // 静默轮询：只在「面板在视口内 + 窗口可见」时跑，30s 兜底拉取一次最新工作区状态，
+  // 不显示 loading 动画、不覆盖错误。每次轮询都会 spawn git，抽屉切走/最小化时必须停；
+  // 面板重新可见、窗口重新聚焦时立即补一次再重启定时器。
   useEffect(() => {
     let timer: number | undefined;
-    const start = () => {
-      if (timer !== undefined) return;
-      timer = window.setInterval(() => {
-        void refresh(true);
-      }, 5000);
-    };
     const stop = () => {
       if (timer !== undefined) {
         window.clearInterval(timer);
         timer = undefined;
       }
     };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else {
-        void refresh(true);
-        start();
+    const sync = () => {
+      const shouldPoll = panelVisible && document.visibilityState === "visible";
+      if (!shouldPoll) {
+        stop();
+        return;
+      }
+      void refresh(true);
+      if (timer === undefined) {
+        timer = window.setInterval(() => {
+          if (panelActuallyVisible(panelRef.current)) void refresh(true);
+        }, GIT_POLL_INTERVAL_MS);
       }
     };
-    start();
-    document.addEventListener("visibilitychange", onVisibility);
+    sync();
+    document.addEventListener("visibilitychange", sync);
+    window.addEventListener("focus", sync);
     return () => {
       stop();
-      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("visibilitychange", sync);
+      window.removeEventListener("focus", sync);
     };
-  }, [refresh]);
+  }, [refresh, panelVisible]);
 
   const toggleResource = (key: keyof typeof resourceOpen) => {
     setResourceOpen((current) => ({ ...current, [key]: !current[key] }));

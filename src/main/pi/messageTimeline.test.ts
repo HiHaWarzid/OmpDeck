@@ -14,8 +14,11 @@ import {
 	tryParseBatchAskEnvelope,
 } from "./askQuestionCard";
 import {
+	MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS,
+	MAX_TOOL_RESULT_IMAGES,
 	extractImages,
 	extractThinking,
+	extractToolResultImages,
 	extractToolResultText,
 	safeJson,
 	stripAnsi,
@@ -328,6 +331,104 @@ test("extractImages extracts image content blocks", () => {
 test("extractImages returns empty for non-array", () => {
 	assert.equal(extractImages(null).length, 0);
 	assert.equal(extractImages("string").length, 0);
+});
+
+test("extractToolResultImages keeps base64 images and drops unresolved blob refs", () => {
+	const content = [
+		{ type: "text", text: "image" },
+		{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+		{ type: "image", data: `blob:sha256:${"a".repeat(64)}`, mimeType: "image/webp" },
+	];
+	const images = extractToolResultImages(content);
+	assert.equal(images.length, 1);
+	assert.equal(images[0].data, "aGVsbG8=");
+});
+
+test("extractToolResultImages caps image count", () => {
+	const content = Array.from({ length: MAX_TOOL_RESULT_IMAGES + 2 }, () => ({
+		type: "image",
+		data: "aGVsbG8=",
+		mimeType: "image/png",
+	}));
+	assert.equal(extractToolResultImages(content).length, MAX_TOOL_RESULT_IMAGES);
+});
+
+test("extractToolResultImages stops at the per-message total budget", () => {
+	const half = Math.ceil(MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS / 2);
+	const content = [
+		{ type: "image", data: "a".repeat(half), mimeType: "image/png" },
+		{ type: "image", data: "b".repeat(half), mimeType: "image/png" },
+		{ type: "image", data: "cGVsbG8=", mimeType: "image/png" },
+	];
+	const images = extractToolResultImages(content);
+	// 前两张刚好占满预算，第三张不得进入（否则单条消息会超过时间线总预算）。
+	assert.equal(images.length, 2);
+	const total = images.reduce((sum, image) => sum + image.data.length, 0);
+	assert.ok(total <= MAX_TOOL_IMAGES_TOTAL_BASE64_CHARS);
+});
+
+test("convertAgentMessages keeps [图片] placeholder but drops unresolved user blob refs", () => {
+	const messages = convertAgentMessages(
+		"agent-1",
+		[
+			{
+				role: "user",
+				content: [
+					{ type: "image", data: `blob:sha256:${"c".repeat(64)}`, mimeType: "image/png" },
+				],
+				timestamp: 1000,
+			},
+		],
+		undefined,
+		false,
+	);
+	// 渲染层只认 data: URL，未还原的引用串会拼成坏图；占位文本保留说明「有图但不可用」。
+	assert.equal(messages.length, 1);
+	assert.equal(messages[0].text, "[图片]");
+	assert.equal(messages[0].images, undefined);
+});
+
+test("convertAgentMessages keeps tool result images on the tool message", () => {
+	const messages = convertAgentMessages(
+		"agent-1",
+		[
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [
+					{ type: "text", text: "Screenshot captured" },
+					{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+				],
+				timestamp: 1000,
+			},
+		],
+		undefined,
+		false,
+	);
+	assert.equal(messages.length, 1);
+	assert.equal(messages[0].role, "tool");
+	assert.equal(messages[0].images?.length, 1);
+	assert.equal(messages[0].images?.[0].mimeType, "image/png");
+});
+
+test("convertAgentMessages drops tool images that are still blob refs", () => {
+	const messages = convertAgentMessages(
+		"agent-1",
+		[
+			{
+				role: "toolResult",
+				toolCallId: "call-2",
+				toolName: "read",
+				content: [{ type: "image", data: `blob:sha256:${"b".repeat(64)}`, mimeType: "image/png" }],
+				timestamp: 1000,
+			},
+		],
+		undefined,
+		false,
+	);
+	assert.equal(messages.length, 1);
+	assert.equal(messages[0].images, undefined);
 });
 
 // ── extractThinking ─────────────────────────────────────

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test, vi } from "vitest";
 
-import type { AgentTab, AvailableModel, ChatMessage } from "../../shared/types";
+import type { AgentTab, ChatMessage } from "../../shared/types";
 import { AgentManager, type AgentConfigDeps } from "./AgentManager";
 import { MAX_TRANSCRIPT_BYTES } from "./agentTranscript";
 import type { SettingsStore } from "../settings/SettingsStore";
@@ -27,7 +27,6 @@ function makeManager(warnings: string[]): AgentManager {
 		{ get: () => ({ rpcTimeout: 1_000 }) } as unknown as SettingsStore,
 		{
 			readOmpDefaultThinkingLevel: async () => undefined,
-			filterConfiguredModels: async (models: AvailableModel[]) => models,
 			trustStore: { decide: async () => undefined },
 		} as unknown as AgentConfigDeps,
 		undefined,

@@ -120,6 +120,7 @@ const previewOverrides: NamespaceOverrides = {
 	},
 	sessions: {
 		list: async () => getSessions(),
+		onChanged: () => () => {},
 		copy: async (_projectId, filePath) => ({
 			cancelled: false,
 			sessionPath: `${filePath}-copy`,
@@ -254,20 +255,6 @@ const previewOverrides: NamespaceOverrides = {
 		downloadUpdate: async (asset) => ({
 			filePath: asset.name,
 			assetName: asset.name,
-		}),
-		feedbackEnvironment: async () => ({
-			appVersion: "preview",
-			platform: "win32",
-			arch: "x64",
-			electronVersion: "preview",
-			chromeVersion: "preview",
-			nodeVersion: "preview",
-			pi: {
-				installed: true,
-				command: "omp",
-				version: "preview",
-				searchedDirs: [],
-			},
 		}),
 		rendererLog: async (level, scope, message, detail) => {
 			console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
@@ -436,11 +423,12 @@ const previewOverrides: NamespaceOverrides = {
 			parsed: { providers: {} },
 		}),
 		getAuth: async () => ({ raw: "{}", parsed: {} }),
-		getSettings: async () => ({ raw: "{}", parsed: {} }),
+		getOmpConfig: async () => ({ raw: "", parsed: {} }),
 		getTrust: async () => ({ raw: "{}", parsed: {} }),
 		saveModels: async () => ({ valid: true }),
 		saveAuth: async () => ({ valid: true }),
-		saveSettings: async () => ({ valid: true }),
+		saveOmpConfigRaw: async () => ({ valid: true }),
+		patchOmpConfig: async () => ({ valid: true }),
 		getOmpDefault: async () => ({}),
 		setDefaultModel: async () => ({ valid: true }),
 		clearOmpDefault: async () => ({ valid: true }),
@@ -449,7 +437,7 @@ const previewOverrides: NamespaceOverrides = {
 			JSON.stringify({
 				version: 1,
 				exportedAt: new Date().toISOString(),
-				files: { "models.json": {}, "auth.json": {}, "settings.json": {} },
+				files: { "models.json": {}, "config.yml": {} },
 			}),
 		import: async () => ({ valid: true }),
 		fetchModels: async () => ({
@@ -472,6 +460,7 @@ const previewOverrides: NamespaceOverrides = {
 	agents: {
 		list: async () => getAgents(),
 		getMessages: async () => getMessages(),
+		getHistoryPage: async () => ({ messages: [], cursor: 0, hasMore: false }),
 		create: async () => getAgents()[0],
 		rename: async (agentId, name) => {
 			const agent =
@@ -538,6 +527,17 @@ const previewOverrides: NamespaceOverrides = {
 		setThinking: async (_agentId, level) => ({
 			modelName: "Preview GPT",
 			thinkingLevel: level,
+		}),
+		availableThinkingLevels: async () => ["off", "low", "medium", "high"],
+		setFastMode: async () => ({
+			modelName: "Preview GPT",
+			fastModeEnabled: true,
+			fastModeActive: true,
+		}),
+		setSlowMode: async () => ({
+			modelName: "Preview GPT",
+			slowModeEnabled: true,
+			slowModeSupported: true,
 		}),
 		commands: async () => [
 			{ name: "reload", description: "Reload runtime", source: "builtin" },

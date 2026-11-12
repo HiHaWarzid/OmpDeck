@@ -22,11 +22,22 @@ const formats = args.length > 0
 console.log(`[1/2] 打包代码…`);
 execSync("npm run build", { cwd: root, stdio: "inherit", shell: true });
 
+// 本地默认走 npmmirror 二进制镜像：GitHub 直连在国内经常 10 分钟超时。
+// --publish never：CI 环境会触发 electron-builder 的隐式发布，本地没有 GH_TOKEN 必然失败。
+const env = {
+  ...process.env,
+  ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || "https://npmmirror.com/mirrors/electron/",
+  ELECTRON_BUILDER_BINARIES_MIRROR:
+    process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||
+    "https://npmmirror.com/mirrors/electron-builder-binaries/",
+};
+
 console.log(`\n[2/2] electron-builder --win ${formats} …`);
-execSync(`npx electron-builder --win ${formats}`, {
+execSync(`npx electron-builder --win ${formats} --publish never`, {
   cwd: root,
   stdio: "inherit",
   shell: true,
+  env,
 });
 
 console.log(`\n✅ 完成！产物在 release/ 目录下`);

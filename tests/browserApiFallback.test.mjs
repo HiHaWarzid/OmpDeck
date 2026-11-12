@@ -22,6 +22,10 @@ function loadBrowserApiModule() {
 					t: (key, params) => `${key}:${params?.status ?? ""}:${params?.statusText ?? ""}`,
 				};
 			}
+			// browserApi 只用版本号判断是否需要丢弃过期全量结果；这些用例不涉及流合并。
+			if (specifier === "../../shared/messageStreamVersion") {
+				return { messageStreamVersion: () => 0 };
+			}
 			if (specifier === "./previewApi") {
 				return {
 					createPreviewApi: () => ({

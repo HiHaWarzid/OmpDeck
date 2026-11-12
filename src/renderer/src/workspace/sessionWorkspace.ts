@@ -5,6 +5,7 @@ import {
 } from "./slices/extensionWidgetsSlice";
 import { rpcLogSlice, type RpcLogState } from "./slices/rpcLogSlice";
 import { runtimeSlice, type RuntimeState } from "./slices/runtimeSlice";
+import { subagentsSlice, type SubagentsState } from "./slices/subagentsSlice";
 import { thinkingSlice, type ThinkingState } from "./slices/thinkingSlice";
 import { transcriptSlice, type TranscriptState } from "./slices/transcriptSlice";
 
@@ -82,6 +83,7 @@ export const workspaceSlices = {
   rpcLog: rpcLogSlice,
   transcript: transcriptSlice,
   runtime: runtimeSlice,
+  subagents: subagentsSlice,
   extensionWidgets: extensionWidgetsSlice,
 } as const;
 
@@ -97,6 +99,7 @@ export type SliceStateMap = {
   rpcLog: RpcLogState;
   transcript: TranscriptState;
   runtime: RuntimeState;
+  subagents: SubagentsState;
   extensionWidgets: ExtensionWidgetState;
 };
 
@@ -198,6 +201,7 @@ function seedEntryData(kind: EntryKind): EntryData {
     rpcLog: rpcLogSlice.seed(kind),
     transcript: transcriptSlice.seed(kind),
     runtime: runtimeSlice.seed(kind),
+    subagents: subagentsSlice.seed(kind),
     extensionWidgets: extensionWidgetsSlice.seed(kind),
   } as EntryData;
 }

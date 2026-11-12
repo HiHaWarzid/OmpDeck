@@ -235,7 +235,6 @@ export type ComposerSubmitDecision =
 	| { action: "ignore"; reason: ComposerSendBlockReason }
 	| { action: "compact"; compactPrompt: string | undefined }
 	| { action: "block-empty-template"; templateName: string }
-	| { action: "enqueue" }
 	| { action: "submit" };
 
 /**
@@ -243,12 +242,13 @@ export type ComposerSubmitDecision =
  *
  * 行顺序即 App 现有顺序，改顺序会改行为：
  * 1. ignore：starting（仅非 override）/ 无 target / 空文本且无图；
- * 2. compact：/compact 绕过队列，即使忙也直接走压缩（App 先判 compact 后判 busy）；
- * 3. 空模板拦截：expand 报 emptyTemplateName 即拦，即使忙也不入队；
- * 4. busy → 入队；5. 否则直发。
+ * 2. compact：/compact 单纯走压缩（App 先判 compact 后判发送）；
+ * 3. 空模板拦截：expand 报 emptyTemplateName 即拦；
+ * 4. 其余一律直发——agent 忙碌时由调用方选 steer/followUp，交给 omp 服务端队列，
+ *    前端不再持有 pending 队列（队列 chip 以 get_state.queuedMessages 为准）。
  *
  * commandRoutes=false 时跳过 2、3 行，对应 sendPromptAsFollowUp
- * （跟随发送不做命令展开，原样走 busy/直发）。
+ * （跟随发送不做命令展开，原样走直发）。
  */
 export function decideComposerSubmit(params: {
 	isOverride: boolean;
@@ -257,7 +257,6 @@ export function decideComposerSubmit(params: {
 	message: string;
 	imageCount: number;
 	emptyTemplateName?: string;
-	isBusy: boolean;
 	commandRoutes?: boolean;
 }): ComposerSubmitDecision {
 	const {
@@ -267,7 +266,6 @@ export function decideComposerSubmit(params: {
 		message,
 		imageCount,
 		emptyTemplateName,
-		isBusy,
 		commandRoutes = true,
 	} = params;
 	if (!isOverride && agentStarting) return { action: "ignore", reason: "starting" };
@@ -278,7 +276,6 @@ export function decideComposerSubmit(params: {
 		if (compact) return { action: "compact", compactPrompt: compact.compactPrompt || undefined };
 		if (emptyTemplateName) return { action: "block-empty-template", templateName: emptyTemplateName };
 	}
-	if (isBusy) return { action: "enqueue" };
 	return { action: "submit" };
 }
 

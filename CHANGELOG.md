@@ -4,6 +4,77 @@
 
 All notable changes to PiDeck are documented here.
 
+## Unreleased
+
+### 🚀 New Features
+
+- **omp-native OAuth login** — The Auth tab can start omp's OAuth directly: the
+  authorization URL opens in the system browser while a copyable loopback URL
+  and code input stay in the dialog. Login callbacks never leak into the session
+  timeline and survive tab switches; authenticated providers can list and revoke
+  stored credentials. Requires at least one running agent.
+- **Kind-scoped model roles** — The Model Roles page gains `image` / `web` /
+  `speech` / `dictation` / `judge`, and the picker filters models by the kind the
+  role accepts. The catalog is fetched with `omp models --kind all`; `embedding`
+  entries are never offered.
+- **Model presets / cycle order / fallback chains** — Snapshot every role plus
+  the default thinking level into `modelPresets.<name>`, set `cycleOrder`, and
+  configure `retry.fallbackChains`; all three are written to global `config.yml`.
+- **Native session TODO panel** — The composer shows omp's live session
+  `todoPhases`; click a task to advance pending → in progress → completed, and
+  the whole list is written back with `set_todos`. Blocked/abandoned tasks return
+  to pending, and `todo_auto_clear` hides the panel.
+- **Auto compaction & service tiers** — The model picker footer can toggle the
+  session's auto-compaction and Fast/Slow service tiers; unsupported tiers report
+  the model limitation instead of failing silently.
+
+### ✨ Improvements
+
+- **Quota, throughput and cache-warming indicators** — The session status bar
+  now surfaces the usage-limit stage (low-priority lane / wrap-up allowance),
+  reset time, tokens per second, and cache warming/failure from omp's events.
+- **Auth tab edits the authoritative model file** — API keys are written to
+  `providers.<name>.apiKey` in `models.yml`, preserving comments and hand-written
+  fields; clearing a key deletes just that field. The obsolete `type` field and
+  the duplicate-credential action are gone.
+- **Config export/import no longer carries credentials** — Exports contain no
+  `apiKey`; imports keep the target machine's existing keys and only take an
+  explicitly non-empty key from the package.
+
+### 🐛 Bug Fixes
+
+- **Large sessions no longer freeze the window** — Sessions above 5 MB now load
+  their history straight from the JSONL tail instead of round-tripping the whole
+  file through pi's RPC, which always hit the transport limit and left a failed
+  `get_messages`/`get_entries` pair per open. Tool-card details are only built
+  when a card is expanded and cleaned assistant text is memoized, removing the
+  20 s input stalls that preceded renderer crashes on multi-megabyte sessions.
+- **Session list degrades instead of failing** — When the cold scan watchdog
+  fires, the sessions parsed so far are returned; when the project filter times
+  out, matching falls back to path/cwd rules. Both degradations are logged under
+  the `session` scope instead of surfacing a list error that made sessions look
+  lost.
+- **Open sessions survive a crash** — OmpDeck now keeps a synchronous snapshot of
+  the open session tabs (`open-sessions.json`). When the previous run was killed
+  (task manager, terminal Ctrl-C, GPU/utility process restart) the next launch
+  reopens those sessions itself instead of leaving an empty workspace; a normal
+  quit marks the snapshot clean so nothing is resurrected.
+- **Refuse to save a broken `models.yml`** — The Auth tab no longer rewrites an
+  unparsable `models.yml` into a half-empty file and points at the raw-file tab
+  instead; empty declarations like `providers: null` or `openai:` no longer fail.
+- **Validated import baseline** — Imports abort when `models.yml` has parse
+  diagnostics, so repairable content is not discarded before being overwritten.
+- **Mirror warning code** — With `auth.json` sync removed, model mirror failures
+  report `models-json-mirror-failed` instead of "auth.json sync failed".
+- **Stale lazy chunks reload instead of breaking the window** — When the renderer
+  bundle is replaced underneath a running window, opening Settings or another
+  lazy panel used to 404 its chunk and replace the whole app with an error page.
+  Chunk-load failures now trigger one automatic reload (rate-limited to once per
+  10s, logged); genuine module errors still surface normally.
+- **Log details keep the real error** — Nested `Error` objects inside log details
+  are serialized with name/message/stack, so failures such as "Failed to list
+  sessions" no longer land in the log as `{"error":{}}`.
+
 ## v0.6.7 - 2026-07-29
 
 ### 🚀 New Features

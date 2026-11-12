@@ -14,7 +14,7 @@ import { ChevronDown, ChevronUp, MoreHorizontal, Plus, X } from "lucide-react";
 import type { PiDesktopApi } from "../../../../shared/api";
 import type { TerminalTab } from "../../../../shared/types";
 import { t } from "../../i18n";
-import { appendScrollback } from "./scrollbackBuffer";
+import { ScrollbackBuffer } from "./scrollbackBuffer";
 
 const TERMINAL_THEMES = {
 	"pi-soft": {
@@ -96,7 +96,7 @@ export function TerminalDock(props: {
 	const xtermRef = useRef<Terminal | null>(null);
 	const fitRef = useRef<FitAddon | null>(null);
 	const activeTabIdRef = useRef("");
-	const buffersRef = useRef<Record<string, string>>({});
+	const buffersRef = useRef<Record<string, ScrollbackBuffer>>({});
 	// sessionKey 由 App 按 owner 解析；缺省时不应 ensure，避免误写入全局桶
 	const sessionKey = props.sessionKey;
 	/** 无 agent（cwd 桶）时显式传项目路径作为 CWD */
@@ -174,18 +174,19 @@ export function TerminalDock(props: {
 			try {
 				const nextTabs = await props.terminal.ensure(sessionKey!, effectiveCwd);
 				if (cancelled) return;
-				buffersRef.current = nextTabs.reduce<Record<string, string>>(
-					(current, tab) => ({
-						...current,
-						// 主进程回放缓冲也可能很大（切回会话时一次性送来），同样要过一遍有界截断
-						[tab.id]: appendScrollback(
-							"",
-							tab.buffer ?? current[tab.id] ?? "",
-							t("terminal.scrollbackTruncated"),
-						),
-					}),
-					{ ...buffersRef.current },
-				);
+				// 主进程回放缓冲也可能很大（切回会话时一次性送来），同样要过一遍有界截断；
+				// 没有新回放数据时沿用已有 buffer 对象，避免重建时丢历史输出。
+				const nextBuffers: Record<string, ScrollbackBuffer> = { ...buffersRef.current };
+				for (const tab of nextTabs) {
+					const replay = tab.buffer;
+					const buffer =
+						replay != null
+							? new ScrollbackBuffer()
+							: (nextBuffers[tab.id] ?? new ScrollbackBuffer());
+					if (replay != null) buffer.append(replay, t("terminal.scrollbackTruncated"));
+					nextBuffers[tab.id] = buffer;
+				}
+				buffersRef.current = nextBuffers;
 				setTabs(nextTabs.map(stripReplayBuffer));
 				setActiveTabId(nextTabs[0]?.id ?? "");
 			} catch (error) {
@@ -232,11 +233,12 @@ export function TerminalDock(props: {
 	 * 初始回放、onData、onExit 都经此处，避免任何一处退回无上限字符串拼接（那正是 OOM 的成因）。
 	 */
 	function pushScrollback(tabId: string, chunk: string) {
-		buffersRef.current[tabId] = appendScrollback(
-			buffersRef.current[tabId] ?? "",
-			chunk,
-			t("terminal.scrollbackTruncated"),
-		);
+		let buffer = buffersRef.current[tabId];
+		if (!buffer) {
+			buffer = new ScrollbackBuffer();
+			buffersRef.current[tabId] = buffer;
+		}
+		buffer.append(chunk, t("terminal.scrollbackTruncated"));
 	}
 
 	useEffect(() => {
@@ -299,7 +301,7 @@ export function TerminalDock(props: {
 		const observer = new ResizeObserver(scheduleResize);
 		observer.observe(containerRef.current);
 		resize();
-		terminal.write(buffersRef.current[activeTab.id] ?? "", () => {
+		terminal.write(buffersRef.current[activeTab.id]?.getText() ?? "", () => {
 			terminal.scrollToBottom();
 			scheduleResize();
 		});

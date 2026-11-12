@@ -665,10 +665,8 @@ export function ModelsTab(props: {
 													props.onChangeProvider(name, "apiKey", v)
 												}
 											/>
-											{/* 非空 apiKey 会同步到 auth.json；从表单删除 provider
-											    不会自动清除 auth.json 里已写入的 key。 */}
 											<span className="config-field-hint">
-												{t("config.authOrphanKeyNote")}
+												{t("config.apiKeyModelsHint")}
 											</span>
 										</div>
 										<div className="config-form-row">
