@@ -17,6 +17,7 @@ import {
 	DRAWER_ANIMATION_MS,
 	EMPTY_PANEL_STATE,
 	applyPanelIntent,
+	forgetStoredProject,
 	loadExpandedDirs,
 	loadStoredPanel,
 	saveExpandedDirs,
@@ -120,6 +121,11 @@ export function useSessionPanelHost(
 						break;
 					case "refresh-files":
 						optionsRef.current.onRefreshFiles(effect.projectId);
+						break;
+					case "forget-project":
+						// 展开目录没有「写空」语义，必须显式删键；不删的话被删项目的
+						// pid:project-expanded-dirs:<id> 会永久留在 localStorage。
+						if (storage) forgetStoredProject(storage, effect.projectId);
 						break;
 				}
 			}

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	EMPTY_PANEL_STATE,
 	applyPanelIntent,
+	forgetStoredProject,
 	loadExpandedDirs,
 	loadStoredPanel,
 	saveExpandedDirs,
@@ -187,9 +188,8 @@ describe("applyPanelIntent", () => {
 		const state: PanelState = { ...EMPTY_PANEL_STATE, pinnedByProject: { p1: "files", p2: "git" } };
 		const result = applyPanelIntent(state, { type: "project-removed", projectId: "p2" }, ENV);
 		expect(result.state.pinnedByProject).toEqual({ p1: "files" });
-		expect(result.effects).toEqual([
-			{ type: "persist", projectId: "p2", panel: null, pinned: false },
-		]);
+		// 删除即删键（面板 + 展开目录），不留空记录。
+		expect(result.effects).toEqual([{ type: "forget-project", projectId: "p2" }]);
 		// 未删除的项目不受影响，也不会重复清盘。
 		const untouched = applyPanelIntent(result.state, { type: "project-removed", projectId: "p1" }, ENV);
 		expect(untouched.state.pinnedByProject).toEqual({});
@@ -264,6 +264,19 @@ describe("localStorage codec", () => {
 		});
 		expect([...loadExpandedDirs(storage, "p9", ["a1", "a2"])]).toEqual(["lib"]);
 		expect(storage.dump()["pid:agent-expanded-dirs:a2"]).toBeUndefined();
+	});
+
+	it("forgets both persisted keys of a deleted project", () => {
+		const storage = memoryStorage({
+			"pid:project-drawer:p1": JSON.stringify({ panel: "git", pinned: true }),
+			"pid:project-expanded-dirs:p1": JSON.stringify(["src"]),
+			"pid:project-drawer:p2": JSON.stringify({ panel: "files", pinned: false }),
+		});
+		forgetStoredProject(storage, "p1");
+		// 删的是键本身：留一份空记录会让「从未展开过」和「展开过但清空」无法区分。
+		expect(storage.dump()).not.toHaveProperty("pid:project-drawer:p1");
+		expect(storage.dump()).not.toHaveProperty("pid:project-expanded-dirs:p1");
+		expect(storage.dump()["pid:project-drawer:p2"]).toBeDefined();
 	});
 
 	it("survives a storage that throws", () => {

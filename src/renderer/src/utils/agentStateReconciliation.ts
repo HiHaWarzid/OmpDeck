@@ -7,8 +7,7 @@ import { isReplacementForPendingAgent, type PendingAgentTab } from "../agentList
  * 从 App.tsx 的挂载一次 onState effect 提炼（W5：session-path → active-agent
  * 派生链收敛为可测纯函数）。调用方（effect）只负责落库：
  * - remainingPendingAgents.length 变化时才写 pending 列表
- * - pendingReplacementById / draftIds / activeProjectIds 直接喂给
- *   migratePerAgentState 与消息缓存迁移
+ * - pendingReplacementById / draftIds 直接喂给 migratePerAgentState 与消息缓存迁移
  */
 export interface AgentStateReconciliation {
 	/** 尚未被真实 Agent 替换的占位列表（减掉已被新进程顶替的 pending）。 */

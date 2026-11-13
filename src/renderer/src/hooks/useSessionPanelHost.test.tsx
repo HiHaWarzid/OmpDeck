@@ -227,12 +227,15 @@ describe("useSessionPanelHost", () => {
 		expect(latest.panel).toBe("files");
 
 		// 项目真正被删除时才清它的钉选与存储记录；切回来不会复活。
+		localStorage.setItem(
+			"pid:project-expanded-dirs:b",
+			JSON.stringify(["/src", "/docs"]),
+		);
 		await run(() => latest.forgetProject("b"));
 		expect(latest.pinned).toBe(true);
-		expect(JSON.parse(localStorage.getItem("pid:project-drawer:b")!)).toEqual({
-			panel: null,
-			pinned: false,
-		});
+		// 键本身被删掉：面板记录与展开目录都不能留下无主残留。
+		expect(localStorage.getItem("pid:project-drawer:b")).toBeNull();
+		expect(localStorage.getItem("pid:project-expanded-dirs:b")).toBeNull();
 		await rerender({ activeProjectId: "b" });
 		expect(latest.pinned).toBe(false);
 		expect(latest.panel).toBeNull();

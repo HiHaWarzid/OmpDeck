@@ -3003,11 +3003,13 @@ export function App() {
     });
     forgetProject(removedProjectId);
     // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
-    // 所以「调了 remove」不等于「记录真没了」。只有确认它从可见列表里消失才清面板记录，
-    // 否则聊天项目会在一次无效删除后丢掉自己的面板与钉选。
-    const existedBefore = projectsRef.current.some((project) => project.id === removedProjectId);
-    const stillExists = next.some((project) => project.id === removedProjectId);
-    if (existedBefore && !stillExists) panelHost.forgetProject(removedProjectId);
+    // 所以「调了 remove」不等于「记录真没了」。按删除前后的列表差集清理，而不是只清
+    // 被点的那一个：删除父项目会连带删掉它的 worktree 子项目（ProjectStore.remove 里
+    // 按 worktreeParentId 过滤），子项目的钉选与持久化记录同样不能留下。
+    const alive = new Set(next.map((project) => project.id));
+    for (const project of projectsRef.current) {
+      if (!alive.has(project.id)) panelHost.forgetProject(project.id);
+    }
     if (activeProjectId === removedProjectId) {
       setActiveProjectId(next[0]?.id);
       setActiveAgentId(undefined);

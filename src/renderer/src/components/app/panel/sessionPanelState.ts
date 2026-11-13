@@ -16,7 +16,7 @@ import type { DrawerPanel } from "../types";
 export type ToolPanel = "files" | "git" | "browser";
 
 /** 右侧工具栏可承载的面板；`editor` 不是独立工具 Tab，已并入文件面板 */
-export const TOOL_PANELS: readonly ToolPanel[] = ["files", "git", "browser"];
+const TOOL_PANELS: readonly ToolPanel[] = ["files", "git", "browser"];
 
 /** 能被读回的面板值（含历史遗留的 `editor`，读入后统一折叠到 files） */
 const KNOWN_PANELS: readonly string[] = ["files", "sessions", "browser", "editor", "git"];
@@ -24,7 +24,7 @@ const KNOWN_PANELS: readonly string[] = ["files", "sessions", "browser", "editor
 export function isToolPanel(
 	panel: DrawerPanel | null | undefined,
 ): panel is ToolPanel {
-	return panel === "files" || panel === "git" || panel === "browser";
+	return panel != null && TOOL_PANELS.includes(panel as ToolPanel);
 }
 
 /**
@@ -94,7 +94,13 @@ export type PanelIntent =
  */
 export type PanelEffect =
 	| { type: "persist"; projectId: string; panel: DrawerPanel | null; pinned: boolean }
-	| { type: "refresh-files"; projectId: string };
+	| { type: "refresh-files"; projectId: string }
+	/**
+	 * 项目已被真正删除：清掉本项目名下**全部**持久化记录（面板 + 展开目录）。
+	 * 面板记录用 persist(null) 清，展开目录没有对应的「空值写入」语义，单独成一个副作用，
+	 * 否则被删项目的目录键会永远留在 localStorage。
+	 */
+	| { type: "forget-project"; projectId: string };
 
 export interface PanelResult {
 	state: PanelState;
@@ -337,7 +343,9 @@ export function applyPanelIntent(
 					panel: ownedSessions && state.panel === "sessions" ? null : state.panel,
 				},
 				// 项目已删：清掉它的持久化记录，避免同 id 项目回来时带着旧面板与钉选。
-				effects: [{ type: "persist", projectId, panel: null, pinned: false }],
+				// 用 forget-project 而不是 persist(null)：面板键与展开目录键都要删，
+				// 而「写空值」既表达不了展开目录，也会留下一份无主的空记录。
+				effects: [{ type: "forget-project", projectId }],
 			};
 		}
 	}
@@ -483,5 +491,20 @@ export function saveExpandedDirs(
 		storage.setItem(PROJECT_EXPANDED_DIRS_KEY_PREFIX + projectId, JSON.stringify([...dirs]));
 	} catch {
 		/* ignore */
+	}
+}
+
+/**
+ * 项目被真正删除：删掉它名下全部持久化键。
+ * 展开目录没有「写空即清」的语义（空数组与「从未展开过」无法区分），因此必须删除键本身；
+ * 面板记录由 persist(null) 覆盖，这里一并删掉以免留下无主记录。
+ */
+export function forgetStoredProject(storage: StorageLike, projectId: string): void {
+	for (const prefix of [PROJECT_DRAWER_KEY_PREFIX, PROJECT_EXPANDED_DIRS_KEY_PREFIX]) {
+		try {
+			storage.removeItem(prefix + projectId);
+		} catch {
+			/* localStorage 不可用时静默忽略，不能打断项目删除 */
+		}
 	}
 }

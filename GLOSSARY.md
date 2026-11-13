@@ -201,12 +201,16 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 一次性持有 `panel`（当前面板）、`collapsed`（用户收起）、`pinnedByProject`（按项目钉选）、`lastToolPanel`（标题栏一键展开要恢复的 Tab）、`sessionsProjectId`（历史面板正在看哪个项目）。以前散在 App 的 5 个 useState + 3 个 ref。
 
 ### PanelEffect（面板副作用）
-归约**不执行**的副作用，由 host 落地：`persist`（写项目级 localStorage）、`refresh-files`（拉文件树）。归约只声明「该持久化成什么」，因此纯归约可单测，持久化语义只有一处。
+归约**不执行**的副作用，由 host 落地：`persist`（写项目级 localStorage）、`refresh-files`（拉文件树）、`forget-project`（删项目时清掉该项目名下全部持久化键，面板与展开目录各一份）。归约只声明「该持久化成什么」，因此纯归约可单测，持久化语义只有一处。
+
+`forget-project` 必须单独存在而不是复用 `persist(null)`：展开目录键没有「空即清」语义（空数组与「从未展开」不可区分），写空值只会留下一份无主记录。
 
 ### 面板钉选（Pinned）
 钉选后：关闭按钮失效（只能用「取消钉选」）、切换其他工具 Tab 无效（`openPanel` 被拒）、面板在项目切换时随记录恢复。钉选按项目存储。
 
 **清盘只在项目真正被删除时发生**（`project-removed` 意图）：删项目、删 worktree 的子项目。**不在可见项目列表缩小时清盘**——`projects` 是按 WSL/Windows 环境过滤后的列表，另一个环境的项目会临时「消失」，据此裁剪会误删它们的钉选记录。
+
+判定「真正被删除」用**前后列表差集**，而不是比对被点的那一个 id：删除父项目时 `ProjectStore.remove` 会按 `worktreeParentId` 连带删掉它的 worktree 子项目，子项目的记录同样不能留下。
 
 ### 已知历史值（`editor`）
 旧版把 `editor` 当成独立面板值。现在编辑器是 files 的子视图：`DrawerPanel` 类型不再含 `editor`，只有 localStorage 读入时接受该值并折叠为 `files`（`normalizePanel`）。
