@@ -67,7 +67,12 @@ export interface PanelEnv {
 }
 
 export type PanelIntent =
-	| { type: "open-panel"; panel: DrawerPanel }
+	/**
+	 * 只接受工具面板。历史会话面板有自己的入口 `open-sessions`：它不落盘、
+	 * 也不走「切 Tab 刷新文件树」的副作用，两者混在一个意图里会让调用方
+	 * 误以为 `openPanel("sessions")` 与 `openSessions(id)` 等价。
+	 */
+	| { type: "open-panel"; panel: ToolPanel }
 	| { type: "open-sessions"; projectId: string }
 	| { type: "toggle-header" }
 	| { type: "close" }
@@ -84,7 +89,12 @@ export type PanelIntent =
 	 * 归约是纯函数，不知道自己没被恢复的 git 记录还躺在存储里，无法据此清盘。
 	 */
 	| { type: "git-disabled"; saved: StoredPanelState | null }
-	| { type: "project-removed"; projectId: string };
+	/**
+	 * 项目记录真的消失（删除项目 / 删 worktree / 关掉 worktree 模式都会连带删记录）。
+	 * 按**集合**而不是单个 id 表达：调用方只需对比删除前后的项目列表，
+	 * 不用各自重算「哪些 id 消失了」——那正是漏掉一条删除路径的成因。
+	 */
+	| { type: "projects-removed"; projectIds: readonly string[] };
 
 /**
  * 数据获取与持久化需求，由归约结果返回。
@@ -124,16 +134,17 @@ function withoutPin(
 }
 
 /**
- * 展开某面板。始终打开目标面板（“再点一次关闭”只属于已删除的 `openDrawer` 死代码）。
+ * 展开某个工具面板。始终打开目标面板（“再点一次关闭”只属于已删除的 `openDrawer` 死代码）。
  * 钉选时只允许回到钉选面板；Git 功能关闭时 Git 面板不可打开。
+ *
+ * 入参是 `ToolPanel`，因此这里既不产生也不处理历史会话面板：那条入口是 `open-sessions`，
+ * 它的持久化语义不同（不落盘），混进来只能靠 `target === "sessions"` 分支区分。
  */
 function openPanel(
 	state: PanelState,
-	asked: DrawerPanel,
+	target: ToolPanel,
 	env: PanelEnv,
 ): PanelResult {
-	const target = normalizePanel(asked);
-	if (!target) return { state, effects: [] };
 	if (target === "git" && !env.gitEnabled) return { state, effects: [] };
 	const pinned = pinnedPanelOf(state, env.activeProjectId);
 	if (pinned && target !== pinned) return { state, effects: [] };
@@ -151,8 +162,7 @@ function openPanel(
 			...state,
 			panel: target,
 			collapsed: false,
-			lastToolPanel: isToolPanel(target) ? target : state.lastToolPanel,
-			sessionsProjectId: target === "sessions" ? projectId : state.sessionsProjectId,
+			lastToolPanel: target,
 		},
 		effects,
 	};
@@ -331,21 +341,30 @@ export function applyPanelIntent(
 			};
 		}
 
-		case "project-removed": {
-			const { projectId } = intent;
+		case "projects-removed": {
+			const removed = new Set(intent.projectIds);
+			if (removed.size === 0) return { state, effects: [] };
 			// 被删项目的历史面板不能继续展示：列表刷新已不可能，操作也会落到不存在的项目。
-			const ownedSessions = state.sessionsProjectId === projectId;
+			const ownedSessions =
+				state.sessionsProjectId !== undefined && removed.has(state.sessionsProjectId);
+			let pinnedByProject = state.pinnedByProject;
+			for (const projectId of removed) {
+				pinnedByProject = withoutPin(pinnedByProject, projectId);
+			}
 			return {
 				state: {
 					...state,
-					pinnedByProject: withoutPin(state.pinnedByProject, projectId),
+					pinnedByProject,
 					sessionsProjectId: ownedSessions ? undefined : state.sessionsProjectId,
 					panel: ownedSessions && state.panel === "sessions" ? null : state.panel,
 				},
 				// 项目已删：清掉它的持久化记录，避免同 id 项目回来时带着旧面板与钉选。
 				// 用 forget-project 而不是 persist(null)：面板键与展开目录键都要删，
 				// 而「写空值」既表达不了展开目录，也会留下一份无主的空记录。
-				effects: [{ type: "forget-project", projectId }],
+				effects: intent.projectIds.map((projectId) => ({
+					type: "forget-project" as const,
+					projectId,
+				})),
 			};
 		}
 	}

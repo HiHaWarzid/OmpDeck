@@ -186,13 +186,38 @@ describe("applyPanelIntent", () => {
 
 	it("forgets the pin and the stored record of a removed project", () => {
 		const state: PanelState = { ...EMPTY_PANEL_STATE, pinnedByProject: { p1: "files", p2: "git" } };
-		const result = applyPanelIntent(state, { type: "project-removed", projectId: "p2" }, ENV);
+		const result = applyPanelIntent(state, { type: "projects-removed", projectIds: ["p2"] }, ENV);
 		expect(result.state.pinnedByProject).toEqual({ p1: "files" });
 		// 删除即删键（面板 + 展开目录），不留空记录。
 		expect(result.effects).toEqual([{ type: "forget-project", projectId: "p2" }]);
 		// 未删除的项目不受影响，也不会重复清盘。
-		const untouched = applyPanelIntent(result.state, { type: "project-removed", projectId: "p1" }, ENV);
+		const untouched = applyPanelIntent(result.state, { type: "projects-removed", projectIds: ["p1"] }, ENV);
 		expect(untouched.state.pinnedByProject).toEqual({});
+	});
+
+	it("cleans up every project that vanished in one pass", () => {
+		// 关闭工作区模式会一次性删掉某父项目下所有 worktree 子项目，差集可能不止一个 id。
+		const state: PanelState = {
+			...EMPTY_PANEL_STATE,
+			pinnedByProject: { p1: "files", p2: "git", p3: "browser" },
+		};
+		const result = applyPanelIntent(
+			state,
+			{ type: "projects-removed", projectIds: ["p2", "p3"] },
+			ENV,
+		);
+		expect(result.state.pinnedByProject).toEqual({ p1: "files" });
+		expect(result.effects).toEqual([
+			{ type: "forget-project", projectId: "p2" },
+			{ type: "forget-project", projectId: "p3" },
+		]);
+	});
+
+	it("treats an empty removal set as a no-op", () => {
+		const state: PanelState = { ...EMPTY_PANEL_STATE, pinnedByProject: { p1: "files" } };
+		const result = applyPanelIntent(state, { type: "projects-removed", projectIds: [] }, ENV);
+		expect(result.state).toBe(state);
+		expect(result.effects).toEqual([]);
 	});
 
 	it("closes the history panel of a removed project and forgets its pin", () => {
@@ -201,7 +226,7 @@ describe("applyPanelIntent", () => {
 			{ type: "project-restored", saved: { panel: "sessions", pinned: true } },
 			ENV,
 		).state;
-		const result = applyPanelIntent(state, { type: "project-removed", projectId: "p1" }, ENV);
+		const result = applyPanelIntent(state, { type: "projects-removed", projectIds: ["p1"] }, ENV);
 		expect(result.state.panel).toBeNull();
 		expect(result.state.sessionsProjectId).toBeUndefined();
 		expect(result.state.pinnedByProject).toEqual({});

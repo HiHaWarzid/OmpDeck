@@ -155,7 +155,7 @@ describe("useSessionPanelHost", () => {
 		await run(() => latest.openSessions("p3"));
 		expect(latest.sessionsProjectId).toBe("p3");
 
-		await run(() => latest.forgetProject("p3"));
+		await run(() => latest.forgetProjects(["p3"]));
 
 		expect(latest.sessionsProjectId).toBeUndefined();
 		expect(latest.panel).toBeNull();
@@ -231,7 +231,7 @@ describe("useSessionPanelHost", () => {
 			"pid:project-expanded-dirs:b",
 			JSON.stringify(["/src", "/docs"]),
 		);
-		await run(() => latest.forgetProject("b"));
+		await run(() => latest.forgetProjects(["b"]));
 		expect(latest.pinned).toBe(true);
 		// 键本身被删掉：面板记录与展开目录都不能留下无主残留。
 		expect(localStorage.getItem("pid:project-drawer:b")).toBeNull();

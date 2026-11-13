@@ -27,6 +27,7 @@ import {
 	type PanelIntent,
 	type PanelState,
 	type StorageLike,
+	type ToolPanel,
 } from "../components/app/panel/sessionPanelState";
 
 export interface SessionPanelHostOptions {
@@ -53,7 +54,8 @@ export interface SessionPanelHost {
 	sessionsProjectId: string | undefined;
 	expandedDirs: Set<string>;
 
-	openPanel: (panel: DrawerPanel) => boolean;
+	/** 打开工具面板（文件 / Git / 浏览器）；历史会话面板用 openSessions */
+	openPanel: (panel: ToolPanel) => boolean;
 	openSessions: (projectId: string) => void;
 	toggleHeader: () => void;
 	close: () => void;
@@ -64,8 +66,11 @@ export interface SessionPanelHost {
 	/** 拖拽分隔条导致的收起/展开 */
 	resizeCollapse: (collapsed: boolean) => void;
 	togglePin: () => void;
-	/** 项目被真正删除时调用：清钉选、清会话面板归属、清持久化记录 */
-	forgetProject: (projectId: string) => void;
+	/**
+	 * 项目记录真的消失时调用（删项目 / 删 worktree / 关掉 worktree 模式）。
+	 * 传**全部**消失的 id：清钉选、清会话面板归属、清持久化记录。
+	 */
+	forgetProjects: (projectIds: readonly string[]) => void;
 
 	toggleDirectory: (path: string) => void;
 	collapseAllDirectories: () => void;
@@ -215,7 +220,7 @@ export function useSessionPanelHost(
 	);
 
 	const openPanel = useCallback(
-		(panel: DrawerPanel) => dispatchAccepted({ type: "open-panel", panel }),
+		(panel: ToolPanel) => dispatchAccepted({ type: "open-panel", panel }),
 		[dispatchAccepted],
 	);
 	const openSessions = useCallback(
@@ -235,8 +240,9 @@ export function useSessionPanelHost(
 		[dispatch],
 	);
 	const togglePin = useCallback(() => dispatch({ type: "toggle-pin" }), [dispatch]);
-	const forgetProject = useCallback(
-		(projectId: string) => dispatch({ type: "project-removed", projectId }),
+	const forgetProjects = useCallback(
+		(projectIds: readonly string[]) =>
+			dispatch({ type: "projects-removed", projectIds }),
 		[dispatch],
 	);
 
@@ -296,7 +302,7 @@ export function useSessionPanelHost(
 		restore,
 		resizeCollapse,
 		togglePin,
-		forgetProject,
+		forgetProjects,
 
 		toggleDirectory,
 		collapseAllDirectories,

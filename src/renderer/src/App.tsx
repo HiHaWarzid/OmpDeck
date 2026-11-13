@@ -2992,6 +2992,31 @@ export function App() {
     }
   }
 
+  /**
+   * 项目记录消失后的统一收尾：**必须**在 `setProjects(next)` 之后、下一次渲染之前同步调用，
+   * 因为这里要读 `projectsRef.current`（仍是删除前的列表）做差集。
+   *
+   * 三条路径都会让主进程连带删掉一批项目记录——删项目（父项目连带 worktree 子项目）、
+   * 删 worktree、关闭工作区模式（清空该父项目下全部子项目）。只有「删除前列表 −
+   * 删除后列表」这个差集知道到底少了谁，所以差集计算只放这里：新增删除路径时不会再漏掉
+   * 面板钉选清理，被删项目的 `pid:project-drawer:*` / `pid:project-expanded-dirs:*`
+   * 也不会永久留在 localStorage 里。
+   */
+  function syncVanishedProjects(next: Project[]): string[] {
+    const alive = new Set(next.map((project) => project.id));
+    const vanished = projectsRef.current
+      .filter((project) => !alive.has(project.id))
+      .map((project) => project.id);
+    if (vanished.length > 0) panelHost.forgetProjects(vanished);
+    // 活动项目可能正是被连带删除的子项目：不回落就会一直停在已不存在的 id 上，
+    // 面板恢复 effect 也再不会为新项目运行。
+    if (activeProjectId !== undefined && !alive.has(activeProjectId)) {
+      setActiveProjectId(next[0]?.id);
+      setActiveAgentId(undefined);
+    }
+    return vanished;
+  }
+
   function updateAfterProjectRemoved(
     removedProjectId: string,
     next: Project[],
@@ -3003,17 +3028,8 @@ export function App() {
     });
     forgetProject(removedProjectId);
     // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
-    // 所以「调了 remove」不等于「记录真没了」。按删除前后的列表差集清理，而不是只清
-    // 被点的那一个：删除父项目会连带删掉它的 worktree 子项目（ProjectStore.remove 里
-    // 按 worktreeParentId 过滤），子项目的钉选与持久化记录同样不能留下。
-    const alive = new Set(next.map((project) => project.id));
-    for (const project of projectsRef.current) {
-      if (!alive.has(project.id)) panelHost.forgetProject(project.id);
-    }
-    if (activeProjectId === removedProjectId) {
-      setActiveProjectId(next[0]?.id);
-      setActiveAgentId(undefined);
-    }
+    // 所以「调了 remove」不等于「记录真没了」——按前后列表差集清理，而不是只清被点的那一个。
+    syncVanishedProjects(next);
   }
 
   async function createAgent(
@@ -4368,15 +4384,11 @@ export function App() {
       if (!removed) {
         throw new Error(t("app.worktreeRemoveNotFound"));
       }
-      const before = new Set(projectsRef.current.map((project) => project.id));
       const next = await api.projects.list();
       setProjects(next);
-      // 主进程连带删掉了该 worktree 的子项目记录；这里同步清它的面板钉选与持久化记录，
-      // 否则同一路径再次注册成项目时会带着旧面板回来。
-      const alive = new Set(next.map((project) => project.id));
-      for (const projectId of before) {
-        if (!alive.has(projectId)) panelHost.forgetProject(projectId);
-      }
+      // 主进程连带删掉了该 worktree 的子项目记录；统一差集收尾会清它的面板钉选与
+      // 持久化记录，否则同一路径再次注册成项目时会带着旧面板回来。
+      syncVanishedProjects(next);
       await refreshWorktrees(parentProjectId);
       showToast(t("app.worktreeRemoved"));
     } catch (e) {
@@ -6457,6 +6469,10 @@ export function App() {
               if (updated) {
                 const next = await api.projects.list();
                 setProjects(next);
+                // 关闭工作区模式时主进程会清空该父项目下全部 worktree 子项目记录
+                // （ProjectStore.clearWorktreeChildren），那些子项目的面板钉选、
+                // 持久化记录和「活动项目」指向都要一起收尾，否则会留下无主状态。
+                syncVanishedProjects(next);
                 // 开启后立即扫描并注册已有 worktree
                 if (updated.worktreeEnabled) {
                   void refreshWorktrees(updated.id);
