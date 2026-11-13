@@ -183,6 +183,11 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：任何新的客户端门只允许调这 8 个方法，不得直接对 `AgentManager` 的变更方法再拼一遍「校验 → 关终端 → 停进程」。读路径、运行控制（归 `AgentControl`）与 AFK 编排不经过本 module——AFK 创建的 agent 没有桌面终端，且它在域内把 AgentManager 当 spawn 工具用。
 
+### RouteDescriptor / webRoutes（Web 路由唯一事实源）
+`src/shared/ipc.ts` 里的 `WebRestRoute`（`method` + `path` 模板 + `result` 拆包方式）与 `webRoutes` 表，是 **LAN-web 三端唯一的路径真值**：`WebServiceManager` 用 `matchWebRoute` 分发，`browserApi` 用 `webRouteUrl` 反向拼 URL，`mobile.js` 对齐同一批路径。
+
+规则：新增/修改任何 `/api` 端点只改 `webRoutes` 与 `ipcTable` 的 `route` 列，不在客户端手抄路径字符串。`route`（该成员确实有独立 REST 端点）与 `web`（该成员在 LAN-web 下也必须可用，是给守卫用的能力声明）**互不蕴含**：有 `route` 未必有 `web`（手机端专用端点），有 `web` 未必有 `route`（走 `/api/state` 轮询的能力）。两者的一致性由 `overrideParity.test.ts`（守卫探针）与 `webRouteParity.test.ts`（静态核对三端调用）各自把守。
+
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。
 

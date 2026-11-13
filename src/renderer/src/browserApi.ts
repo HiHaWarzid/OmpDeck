@@ -2,11 +2,16 @@ import type { PiDesktopApi } from "../../shared/api";
 import type {
 	WebAgentHistoryPage,
 	WebAgentHistoryPageInput,
+	AbortAndRestoreQueueResult,
 	AgentMessagesDelta,
+	AgentRuntimeState,
 	AgentTab,
 	AgentUiRequest,
+	AvailableModel,
 	ChatMessage,
 	Project,
+	PromoteQueuedMessageResult,
+	RemoveQueuedMessageResult,
 	SendPromptInput,
 	SendPromptResult,
 	SessionSummary,
@@ -14,6 +19,7 @@ import type {
 } from "../../shared/types";
 import { t } from "./i18n";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
+import { webRouteUrl, webRoutes, type WebRestRoute } from "../../shared/ipc";
 import { createPreviewApi } from "./previewApi";
 
 type WebState = {
@@ -157,7 +163,35 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return data as T;
 }
 
+/**
+ * 按 webRoutes 描述符发起 REST 调用：路径、method、响应解包字段全部来自共享表，
+ * 成员实现只补路径参数/查询/请求体。路径参数与模板占位符不匹配时 webRouteUrl
+ * 直接抛错，避免成员签名与路由漂移后静默打到错误端点。
+ */
+async function callRoute<T>(
+	route: WebRestRoute,
+	call: {
+		params?: Readonly<Record<string, string>>;
+		query?: URLSearchParams;
+		body?: unknown;
+	} = {},
+): Promise<T> {
+	const search = call.query && call.query.size > 0 ? `?${call.query.toString()}` : "";
+	const payload = await request<Record<string, unknown>>(
+		`${webRouteUrl(route, call.params)}${search}`,
+		{
+			method: route.method,
+			...(call.body === undefined ? {} : { body: JSON.stringify(call.body) }),
+		},
+	);
+	const result = route.result;
+	if (result === "body") return payload as T;
+	if (result) return payload[result.field] as T;
+	return undefined as T;
+}
+
 async function refreshState() {
+	// /api/state 是跨命名空间聚合端点（多份 deps 拼装），没有对应 api 成员，故不进 webRoutes。
 	const nextState = await request<unknown>("/api/state");
 	if (!isWebState(nextState)) {
 		throw new Error("Invalid web service state payload");
@@ -254,10 +288,9 @@ export function createBrowserApi(): PiDesktopApi {
 			...base.sessions,
 			list: async (projectId) => {
 				if (!projectId) return [];
-				const result = await request<{ sessions: SessionSummary[] }>(
-					`/api/projects/${encodeURIComponent(projectId)}/sessions`,
-				);
-				return result.sessions;
+				return callRoute<SessionSummary[]>(webRoutes.sessions.list, {
+					params: { projectId },
+				});
 			},
 		},
 		agents: {
@@ -269,152 +302,103 @@ export function createBrowserApi(): PiDesktopApi {
 					return connected ? state.agents : base.agents.list();
 				}
 			},
-			getMessages: async (agentId) => {
-				const result = await request<{ messages: ChatMessage[] }>(
-					`/api/agents/${encodeURIComponent(agentId)}/messages`,
-				);
-				return result.messages;
-			},
-			create: async (input) => {
-				const result = await request<{ agent: AgentTab }>("/api/agents", {
-					method: "POST",
-					body: JSON.stringify(input),
-				});
-				return result.agent;
-			},
+			getMessages: async (agentId) =>
+				callRoute<ChatMessage[]>(webRoutes.agents.getMessages, { params: { agentId } }),
+			create: async (input) => callRoute<AgentTab>(webRoutes.agents.create, { body: input }),
 			historyPage: async (input: WebAgentHistoryPageInput): Promise<WebAgentHistoryPage> => {
-				const params = new URLSearchParams();
-				if (input.before) params.set("before", input.before);
-				if (input.limit) params.set("limit", String(input.limit));
-				const query = params.size > 0 ? `?${params.toString()}` : "";
-				return request<WebAgentHistoryPage>(
-					`/api/agents/${encodeURIComponent(input.agentId)}/history-page${query}`,
-				);
+				const query = new URLSearchParams();
+				if (input.before) query.set("before", input.before);
+				if (input.limit) query.set("limit", String(input.limit));
+				return callRoute<WebAgentHistoryPage>(webRoutes.agents.historyPage, {
+					params: { agentId: input.agentId },
+					query,
+				});
 			},
 			stop: async (agentId) => {
-				await request(`/api/agents/${encodeURIComponent(agentId)}/stop`, {
-					method: "POST",
-					body: "{}",
-				});
+				await callRoute(webRoutes.agents.stop, { params: { agentId } });
 				await refreshState();
 			},
 			abort: async (agentId) => {
-				await request(`/api/agents/${encodeURIComponent(agentId)}/stop`, {
-					method: "POST",
-					body: "{}",
-				});
+				// abort 只中止当前回合；会话仍存活，不能复用 /stop（会退役 pi 进程）。
+				await callRoute(webRoutes.agents.abort, { params: { agentId } });
 				await refreshState();
 			},
 			abortAndRestoreQueue: async (agentId) => {
-				const response = await request<{
-					result: Awaited<ReturnType<PiDesktopApi["agents"]["abortAndRestoreQueue"]>>;
-				}>(`/api/agents/${encodeURIComponent(agentId)}/abort-and-restore-queue`, {
-					method: "POST",
-					body: "{}",
-				});
+				const response = await callRoute<AbortAndRestoreQueueResult>(
+					webRoutes.agents.abortAndRestoreQueue,
+					{ params: { agentId } },
+				);
 				await refreshState();
-				return response.result;
+				return response;
 			},
 			removeQueuedMessage: async (agentId, message, queue) => {
-				const response = await request<{
-					result: Awaited<ReturnType<PiDesktopApi["agents"]["removeQueuedMessage"]>>;
-				}>(`/api/agents/${encodeURIComponent(agentId)}/remove-queued-message`, {
-					method: "POST",
-					body: JSON.stringify({ message, queue }),
-				});
+				const response = await callRoute<RemoveQueuedMessageResult>(
+					webRoutes.agents.removeQueuedMessage,
+					{ params: { agentId }, body: { message, queue } },
+				);
 				await refreshState();
-				return response.result;
+				return response;
 			},
 			promoteQueuedMessage: async (agentId, message) => {
-				const response = await request<{
-					result: Awaited<ReturnType<PiDesktopApi["agents"]["promoteQueuedMessage"]>>;
-				}>(`/api/agents/${encodeURIComponent(agentId)}/promote-queued-message`, {
-					method: "POST",
-					body: JSON.stringify({ message }),
-				});
+				const response = await callRoute<PromoteQueuedMessageResult>(
+					webRoutes.agents.promoteQueuedMessage,
+					{ params: { agentId }, body: { message } },
+				);
 				await refreshState();
-				return response.result;
+				return response;
 			},
 			prompt: async (input: SendPromptInput) => {
-				const response = await request<{ result: SendPromptResult }>(
-					`/api/agents/${encodeURIComponent(input.agentId)}/prompt`,
-					{
-						method: "POST",
-						body: JSON.stringify(input),
-					},
-				);
+				const response = await callRoute<SendPromptResult>(webRoutes.agents.prompt, {
+					params: { agentId: input.agentId },
+					body: input,
+				});
 				// The SendPromptResult is already authoritative. State refresh is best-effort and
 				// must not turn an explicit semantic rejection into an indeterminate delivery.
 				void refreshState().catch(() => undefined);
-				return response.result;
+				return response;
 			},
-			runtimeState: async (agentId) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["runtimeState"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/runtime`,
-				);
-				return result.state;
-			},
-			cycleModel: async (agentId) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["cycleModel"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/cycle-model`,
-					{ method: "POST", body: "{}" },
-				);
-				return result.state;
-			},
-			availableModels: async (agentId) => {
-				const result = await request<{ models: Awaited<ReturnType<PiDesktopApi["agents"]["availableModels"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/models`,
-				);
-				return result.models;
-			},
-			setModel: async (agentId, provider, modelId) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setModel"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/model`,
-					{ method: "POST", body: JSON.stringify({ provider, modelId }) },
-				);
-				return result.state;
-			},
-			refreshModels: async (agentId) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["refreshModels"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/refresh-models`,
-					{ method: "POST", body: "{}" },
-				);
-				return result.state;
-			},
-			cycleThinking: async (agentId) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["cycleThinking"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/cycle-thinking`,
-					{ method: "POST", body: "{}" },
-				);
-				return result.state;
-			},
-			setThinking: async (agentId, level) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setThinking"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/thinking`,
-					{ method: "POST", body: JSON.stringify({ level }) },
-				);
-				return result.state;
-			},
-			availableThinkingLevels: async (agentId) => {
-				const result = await request<{ levels: Awaited<ReturnType<PiDesktopApi["agents"]["availableThinkingLevels"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/thinking-levels`,
-				);
-				return result.levels;
-			},
-			setFastMode: async (agentId, enabled) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setFastMode"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/fast-mode`,
-					{ method: "POST", body: JSON.stringify({ enabled }) },
-				);
-				return result.state;
-			},
-			setSlowMode: async (agentId, enabled) => {
-				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setSlowMode"]>> }>(
-					`/api/agents/${encodeURIComponent(agentId)}/slow-mode`,
-					{ method: "POST", body: JSON.stringify({ enabled }) },
-				);
-				return result.state;
-			},
+			runtimeState: async (agentId) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.runtimeState, { params: { agentId } }),
+			cycleModel: async (agentId) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.cycleModel, { params: { agentId } }),
+			availableModels: async (agentId) =>
+				callRoute<AvailableModel[]>(webRoutes.agents.availableModels, { params: { agentId } }),
+			setModel: async (agentId, provider, modelId) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setModel, {
+					params: { agentId },
+					body: { provider, modelId },
+				}),
+			refreshModels: async (agentId) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.refreshModels, { params: { agentId } }),
+			cycleThinking: async (agentId) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.cycleThinking, { params: { agentId } }),
+			setThinking: async (agentId, level) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setThinking, {
+					params: { agentId },
+					body: { level },
+				}),
+			availableThinkingLevels: async (agentId) =>
+				callRoute<string[]>(webRoutes.agents.availableThinkingLevels, { params: { agentId } }),
+			setFastMode: async (agentId, enabled) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setFastMode, {
+					params: { agentId },
+					body: { enabled },
+				}),
+			setSlowMode: async (agentId, enabled) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setSlowMode, {
+					params: { agentId },
+					body: { enabled },
+				}),
+			setAutoCompaction: async (agentId, enabled) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setAutoCompaction, {
+					params: { agentId },
+					body: { enabled },
+				}),
+			setTodos: async (agentId, phases) =>
+				callRoute<AgentRuntimeState>(webRoutes.agents.setTodos, {
+					params: { agentId },
+					body: { phases },
+				}),
 			onState: (callback) => subscribe(stateListeners, callback),
 			onMessages: (callback) => subscribe(messageListeners, callback),
 			onThinking: () => () => undefined,
@@ -435,16 +419,16 @@ export function createBrowserApi(): PiDesktopApi {
 				return () => trustListeners.delete(callback);
 			},
 			sendUiResponse: async (agentId, requestId, response) => {
-				await request(`/api/agents/${encodeURIComponent(agentId)}/ui-response`, {
-					method: "POST",
-					body: JSON.stringify({ requestId, ...response }),
+				await callRoute(webRoutes.agents.sendUiResponse, {
+					params: { agentId },
+					body: { requestId, ...response },
 				});
 				void refreshState().catch(() => undefined);
 			},
 			respondTrustRequest: async (requestId, choice) => {
-				await request(`/api/trust/${encodeURIComponent(requestId)}`, {
-					method: "POST",
-					body: JSON.stringify({ choice }),
+				await callRoute(webRoutes.agents.respondTrustRequest, {
+					params: { requestId },
+					body: { choice },
 				});
 				void refreshState().catch(() => undefined);
 			},
@@ -452,6 +436,7 @@ export function createBrowserApi(): PiDesktopApi {
 		web: {
 			...base.web,
 			// 手机端读真实服务状态；非回环请求拿不到令牌，设置页不会显示假的预览令牌。
+			// /api/web/status 是状态聚合端点（叠加 loopback 字段），不对应单个 api 成员，不进 webRoutes。
 			status: async () => request<WebServiceStatus>("/api/web/status"),
 			// 轮换必须在桌面端设置页完成，避免手机端误操作后所有设备一起掉线。
 			rotateToken: async () => {

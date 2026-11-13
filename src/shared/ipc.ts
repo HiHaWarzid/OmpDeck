@@ -42,6 +42,35 @@ export type IpcPushSource =
 	| "afk-orchestrator"
 	| "main-index";
 
+/**
+ * LAN-web HTTP 契约 —— /api 接缝的唯一事实源。
+ *
+ * 一条 WebRestRoute 描述「api 成员 ↔ 一个 REST 端点」：HTTP method + 路径模板 + 返回值拆包方式。
+ * 路径模板相对于 /api 前缀，`:name` 段是命名占位符：服务端用 matchWebRoute 匹配并解码，
+ * 客户端用 webRouteUrl 按名注入。模板与占位符只在这里写一次，两侧都不再手抄路径字符串。
+ *
+ * 消费方：
+ *   - WebServiceManager.handleRequest 的 /api 分发条件；
+ *   - renderer 的 browserApi（LAN-web 客户端）构造 URL/method 并拆响应信封；
+ *   - overrideParity.test.ts 的 web 奇偶守卫（表↔实现、表↔路由 双向核对）。
+ *
+ * 未进表的路由：/api/health、/api/state、/api/web/status 是非 IPC 聚合端点，
+ * 单个消息详情 /api/agents/:id/messages/:mid 没有对应 api 成员（移动端直连），
+ * 它们留在 WebServiceManager 原地并在分发处注明理由。
+ */
+export type WebRouteResult = "body" | { readonly field: string };
+
+export interface WebRestRoute {
+	readonly method: "GET" | "POST";
+	/** 相对 /api 的路径模板（含 `:name` 占位符）。 */
+	readonly path: string;
+	/**
+	 * 返回值契约：{ field } 取响应 JSON 的该字段；"body" 表示整个响应体即成员返回值；
+	 * 缺省表示成员返回 void（响应里的 { ok } 只是传输层确认，不是业务数据）。
+	 */
+	readonly result?: WebRouteResult;
+}
+
 export interface IpcOpEntry<Args extends unknown[] = unknown[], Packed = unknown> {
 	readonly channel?: string;
 	readonly kind: IpcOpKind;
@@ -75,6 +104,20 @@ export interface IpcOpEntry<Args extends unknown[] = unknown[], Packed = unknown
 	 * 下必须显式抛"桌面端独占"错误，禁止静默回退到 preview 罐头/undefined。
 	 */
 	readonly web?: true;
+	/**
+	 * HTTP 契约列：该成员在 /api 上的端点（见 webRoutes）。与 web 列正交。
+	 *
+	 * **route = 该成员确实有独立 REST 端点**（browserApi 与手机端按此路径调用）。
+	 * **web = 该成员在 LAN-web 运行时也必须可用**——它是给守卫用的**能力声明**，
+	 * 生产代码不读它（browserApi 直接按 webRoutes 手写适配；没有独立端点的能力显式抛
+	 * 「桌面端独占」）。overrideParity.test.ts 依据它要求每个成员都有守卫探针，
+	 * 并在「挂端点」与「走 /api/state 轮询」（POLL_WEB_KEYS）之间二选一。
+	 *
+	 * 两列不互相蕴含，也不表示某个具体客户端会调用：mobile.js 有一批只在手机端使用的
+	 * 端点（agents.getMessages、sessions.readMessageFullText、agents.sendUiResponse…）
+	 * 标了 route 却没标 web。判断「谁调用了哪条路径」请查 webRouteParity.test.ts 的静态核对。
+	 */
+	readonly route?: WebRestRoute;
 }
 
 /** skillHub.search 打包 payload：由 (query, page, pageSize, sortBy, order) 折叠为单对象。 */
@@ -116,6 +159,158 @@ export type IpcTable = {
 		readonly [M in keyof PiDesktopApi[Ns]]: IpcOpEntry;
 	};
 };
+
+/** webRoutes 的键必须真实存在于 PiDesktopApi：成员改名/删除时这里编译失败。 */
+type WebRouteTable = {
+	readonly [Ns in keyof PiDesktopApi]?: {
+		readonly [M in keyof PiDesktopApi[Ns]]?: WebRestRoute;
+	};
+};
+
+/**
+ * /api 路由表：WebServiceManager 分发、browserApi REST 客户端、奇偶守卫三方共用。
+ * 键与 ipcTable 的命名空间/成员一一对应，条目本身通过 ipcTable 的 route 列挂回成员。
+ */
+export const webRoutes = {
+	sessions: {
+		/** 手机首页只取顶层会话：topLevel=1 是查询参数，不进路径。 */
+		list: { method: "GET", path: "/projects/:projectId/sessions", result: { field: "sessions" } },
+		readMessageFullText: {
+			method: "GET",
+			path: "/agents/:agentId/messages/:messageId/full-text",
+			result: "body",
+		},
+	},
+	agents: {
+		getMessages: { method: "GET", path: "/agents/:agentId/messages", result: { field: "messages" } },
+		create: { method: "POST", path: "/agents", result: { field: "agent" } },
+		historyPage: { method: "GET", path: "/agents/:agentId/history-page", result: "body" },
+		stop: { method: "POST", path: "/agents/:agentId/stop" },
+		prompt: { method: "POST", path: "/agents/:agentId/prompt", result: { field: "result" } },
+		abort: { method: "POST", path: "/agents/:agentId/abort" },
+		abortAndRestoreQueue: {
+			method: "POST",
+			path: "/agents/:agentId/abort-and-restore-queue",
+			result: { field: "result" },
+		},
+		removeQueuedMessage: {
+			method: "POST",
+			path: "/agents/:agentId/remove-queued-message",
+			result: { field: "result" },
+		},
+		promoteQueuedMessage: {
+			method: "POST",
+			path: "/agents/:agentId/promote-queued-message",
+			result: { field: "result" },
+		},
+		sendUiResponse: { method: "POST", path: "/agents/:agentId/ui-response" },
+		respondTrustRequest: { method: "POST", path: "/trust/:requestId" },
+		runtimeState: { method: "GET", path: "/agents/:agentId/runtime", result: { field: "state" } },
+		cycleModel: { method: "POST", path: "/agents/:agentId/cycle-model", result: { field: "state" } },
+		availableModels: { method: "GET", path: "/agents/:agentId/models", result: { field: "models" } },
+		setModel: { method: "POST", path: "/agents/:agentId/model", result: { field: "state" } },
+		refreshModels: {
+			method: "POST",
+			path: "/agents/:agentId/refresh-models",
+			result: { field: "state" },
+		},
+		cycleThinking: {
+			method: "POST",
+			path: "/agents/:agentId/cycle-thinking",
+			result: { field: "state" },
+		},
+		setThinking: { method: "POST", path: "/agents/:agentId/thinking", result: { field: "state" } },
+		availableThinkingLevels: {
+			method: "GET",
+			path: "/agents/:agentId/thinking-levels",
+			result: { field: "levels" },
+		},
+		setFastMode: { method: "POST", path: "/agents/:agentId/fast-mode", result: { field: "state" } },
+		setSlowMode: { method: "POST", path: "/agents/:agentId/slow-mode", result: { field: "state" } },
+		setAutoCompaction: {
+			method: "POST",
+			path: "/agents/:agentId/auto-compaction",
+			result: { field: "state" },
+		},
+		setTodos: { method: "POST", path: "/agents/:agentId/todos", result: { field: "state" } },
+	},
+} as const satisfies WebRouteTable;
+
+/** 路径模板里的命名占位符（`:agentId` → "agentId"），按出现顺序。 */
+export function webRoutePathParams(template: string): string[] {
+	return (template.match(/:([A-Za-z0-9_]+)/g) ?? []).map((token) => token.slice(1));
+}
+
+/**
+ * 模板 → 匹配完整 /api 路径的正则。按模板缓存：路由集合在模块加载后固定，
+ * 缓存有界；服务端每次请求都走缓存，避免逐请求编译正则。
+ */
+const webRouteRegexCache = new Map<string, RegExp>();
+
+function webRouteRegex(template: string): RegExp {
+	const cached = webRouteRegexCache.get(template);
+	if (cached) return cached;
+	const pattern = template
+		.split("/")
+		.map((segment) =>
+			segment.startsWith(":") ? "([^/]+)" : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+		)
+		.join("/");
+	// 唯一一处 /api 前缀字面量：模板都以它为根，客户端/服务端不重复声明。
+	const regex = new RegExp(`^/api${pattern}$`);
+	webRouteRegexCache.set(template, regex);
+	return regex;
+}
+
+/** HEAD 在 HTTP 语义上等同 GET（只是不返回响应体），匹配到 GET 路由才不会回归成 404。 */
+function normalizeRouteMethod(method: string): string {
+	const upper = method.toUpperCase();
+	return upper === "HEAD" ? "GET" : upper;
+}
+
+/**
+ * 服务端分发：method + 路径模板命中时返回解码后的命名参数，否则 null。
+ * 非法百分号转义按未命中处理，让请求落到统一的 404 而不是抛 URIError。
+ */
+export function matchWebRoute(
+	route: WebRestRoute,
+	pathname: string,
+	method: string,
+): Record<string, string> | null {
+	if (route.method !== normalizeRouteMethod(method)) return null;
+	const matched = webRouteRegex(route.path).exec(pathname);
+	if (!matched) return null;
+	const names = webRoutePathParams(route.path);
+	const params: Record<string, string> = {};
+	for (let index = 0; index < names.length; index += 1) {
+		try {
+			params[names[index]] = decodeURIComponent(matched[index + 1]);
+		} catch {
+			return null;
+		}
+	}
+	return params;
+}
+
+/**
+ * 客户端：路径模板 + 命名参数 → 完整 /api URL。
+ * 参数集合必须与模板占位符一一对应；多传/少传直接抛错，让成员参数名与
+ * 路由占位符的漂移在第一次调用就暴露，而不是静默打到错误端点。
+ */
+export function webRouteUrl(route: WebRestRoute, params: Readonly<Record<string, string>> = {}): string {
+	const names = webRoutePathParams(route.path);
+	const missing = names.filter((name) => params[name] === undefined);
+	const extra = Object.keys(params).filter((name) => !names.includes(name));
+	if (missing.length > 0 || extra.length > 0) {
+		throw new Error(
+			`web 路由参数不匹配: ${route.method} ${route.path}（缺 [${missing.join(", ")}]，多 [${extra.join(", ")}]）`,
+		);
+	}
+	const path = route.path.replace(/:([A-Za-z0-9_]+)/g, (_token, name: string) =>
+		encodeURIComponent(params[name]),
+	);
+	return `/api${path}`;
+}
 
 /** 按 api 成员嵌套的通道表。local 条目无 channel 或 channel 仅为通道注册（实现走 preload 覆盖层）。 */
 export const ipcTable = {
@@ -170,7 +365,7 @@ export const ipcTable = {
 		getClipboardPaths: { channel: "clipboard:read-file-paths", kind: "sendSync", override: true },
 	},
 	sessions: {
-		list: { channel: "sessions:list", kind: "invoke", web: true },
+		list: { channel: "sessions:list", kind: "invoke", web: true, route: webRoutes.sessions.list },
 		rename: { channel: "sessions:rename", kind: "invoke" },
 		copy: { channel: "sessions:copy", kind: "invoke" },
 		exportHtml: { channel: "sessions:export-html", kind: "invoke" },
@@ -179,7 +374,11 @@ export const ipcTable = {
 		readUserPrompts: { channel: "sessions:read-user-prompts", kind: "invoke" },
 		readSessionMeta: { channel: "sessions:read-meta", kind: "invoke" },
 		readChatMessages: { channel: "sessions:read-chat-messages", kind: "invoke" },
-		readMessageFullText: { channel: "sessions:read-message-full-text", kind: "invoke" },
+		readMessageFullText: {
+			channel: "sessions:read-message-full-text",
+			kind: "invoke",
+			route: webRoutes.sessions.readMessageFullText,
+		},
 		readArchivedMessages: { channel: "sessions:read-archived-messages", kind: "invoke" },
 		// 冷扫描先返回部分结果，完整扫描结束后由主进程推送一次，渲染层据此重取热缓存列表。
 		onChanged: { channel: "sessions:changed", kind: "subscribe", pushFrom: "main-index" },
@@ -436,19 +635,31 @@ export const ipcTable = {
 	},
 	agents: {
 		list: { channel: "agents:list", kind: "invoke", web: true },
-		getMessages: { channel: "agents:get-messages", kind: "invoke" },
+		getMessages: { channel: "agents:get-messages", kind: "invoke", route: webRoutes.agents.getMessages },
 		getHistoryPage: { channel: "agents:get-history-page", kind: "invoke" },
-		create: { channel: "agents:create", kind: "invoke", web: true },
-		historyPage: { channel: "agents:history-page", kind: "invoke", web: true },
+		create: { channel: "agents:create", kind: "invoke", web: true, route: webRoutes.agents.create },
+		historyPage: { channel: "agents:history-page", kind: "invoke", web: true, route: webRoutes.agents.historyPage },
 		rename: { channel: "agents:rename", kind: "invoke" },
-		stop: { channel: "agents:stop", kind: "invoke", web: true },
-		prompt: { channel: "agents:prompt", kind: "invoke", web: true },
-		abort: { channel: "agents:abort", kind: "invoke", web: true },
+		stop: { channel: "agents:stop", kind: "invoke", web: true, route: webRoutes.agents.stop },
+		prompt: { channel: "agents:prompt", kind: "invoke", web: true, route: webRoutes.agents.prompt },
+		abort: { channel: "agents:abort", kind: "invoke", web: true, route: webRoutes.agents.abort },
 		/** Esc 语义：撤回服务端待投递队列并停止当前 run，返回可取回的草稿。 */
-		abortAndRestoreQueue: { channel: "agents:abort-and-restore-queue", kind: "invoke" },
+		abortAndRestoreQueue: {
+			channel: "agents:abort-and-restore-queue",
+			kind: "invoke",
+			route: webRoutes.agents.abortAndRestoreQueue,
+		},
 		/** 从 omp steering/followUp 队列撤回一条 chip；结果以服务端确认 removed 为准。 */
-		removeQueuedMessage: { channel: "agents:remove-queued-message", kind: "invoke" },
-		promoteQueuedMessage: { channel: "agents:promote-queued-message", kind: "invoke" },
+		removeQueuedMessage: {
+			channel: "agents:remove-queued-message",
+			kind: "invoke",
+			route: webRoutes.agents.removeQueuedMessage,
+		},
+		promoteQueuedMessage: {
+			channel: "agents:promote-queued-message",
+			kind: "invoke",
+			route: webRoutes.agents.promoteQueuedMessage,
+		},
 		exportHtml: { channel: "agents:export-html", kind: "invoke" },
 		getForkMessages: { channel: "agents:fork-messages", kind: "invoke" },
 		forkSession: { channel: "agents:fork-session", kind: "invoke" },
@@ -462,7 +673,13 @@ export const ipcTable = {
 		restart: { channel: "agents:restart", kind: "invoke" },
 		compact: { channel: "agents:compact", kind: "invoke" },
 		// 双用途通道：invoke（主动拉取）+ subscribe（主进程推送运行态），配对见 onRuntimeState
-		runtimeState: { channel: "agents:runtime-state", kind: "invoke", pairKey: "agents:runtime-state", web: true },
+		runtimeState: {
+			channel: "agents:runtime-state",
+			kind: "invoke",
+			pairKey: "agents:runtime-state",
+			web: true,
+			route: webRoutes.agents.runtimeState,
+		},
 		/**
 		 * omp 子代理 registry 推送（订阅 subagent_lifecycle/subagent_progress 后）。
 		 * 与 runtime-state 分开：progress 帧频率高，单独推送避免每次 progress 都触发
@@ -480,8 +697,13 @@ export const ipcTable = {
 		steerSubagent: { channel: "agents:steer-subagent", kind: "invoke" },
 		/** 按需读取子代理会话 transcript（仅允许 runtime 已登记的 subagentId）。 */
 		subagentMessages: { channel: "agents:subagent-messages", kind: "invoke" },
-		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true },
-		availableModels: { channel: "agents:available-models", kind: "invoke", web: true },
+		cycleModel: { channel: "agents:cycle-model", kind: "invoke", web: true, route: webRoutes.agents.cycleModel },
+		availableModels: {
+			channel: "agents:available-models",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.availableModels,
+		},
 		// OAuth 登录依赖本机浏览器回跳与系统浏览器进程，LAN-web 无对应 REST 实现，
 		// 因此不标 web（浏览器端沿用 desktop-only 空实现，AuthTab 据此隐藏入口）。
 		/** omp 原生 OAuth 登录 */
@@ -490,15 +712,40 @@ export const ipcTable = {
 		/** omp 原生凭据登出 */
 		getLogoutAccounts: { channel: "agents:get-logout-accounts", kind: "invoke" },
 		logout: { channel: "agents:logout", kind: "invoke" },
-		setModel: { channel: "agents:set-model", kind: "invoke", web: true },
-		refreshModels: { channel: "agents:refresh-models", kind: "invoke", web: true },
-		cycleThinking: { channel: "agents:cycle-thinking", kind: "invoke", web: true },
-		setThinking: { channel: "agents:set-thinking", kind: "invoke", web: true },
-		availableThinkingLevels: { channel: "agents:available-thinking-levels", kind: "invoke", web: true },
-		setFastMode: { channel: "agents:set-fast-mode", kind: "invoke", web: true },
-		setSlowMode: { channel: "agents:set-slow-mode", kind: "invoke", web: true },
-		setAutoCompaction: { channel: "agents:set-auto-compaction", kind: "invoke", web: true },
-		setTodos: { channel: "agents:set-todos", kind: "invoke", web: true },
+		setModel: { channel: "agents:set-model", kind: "invoke", web: true, route: webRoutes.agents.setModel },
+		refreshModels: {
+			channel: "agents:refresh-models",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.refreshModels,
+		},
+		cycleThinking: {
+			channel: "agents:cycle-thinking",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.cycleThinking,
+		},
+		setThinking: {
+			channel: "agents:set-thinking",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.setThinking,
+		},
+		availableThinkingLevels: {
+			channel: "agents:available-thinking-levels",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.availableThinkingLevels,
+		},
+		setFastMode: { channel: "agents:set-fast-mode", kind: "invoke", web: true, route: webRoutes.agents.setFastMode },
+		setSlowMode: { channel: "agents:set-slow-mode", kind: "invoke", web: true, route: webRoutes.agents.setSlowMode },
+		setAutoCompaction: {
+			channel: "agents:set-auto-compaction",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.setAutoCompaction,
+		},
+		setTodos: { channel: "agents:set-todos", kind: "invoke", web: true, route: webRoutes.agents.setTodos },
 		commands: { channel: "agents:commands", kind: "invoke" },
 		/** omp `available_commands_update`：命令目录变化时推送（目录以 runtime 为唯一事实源） */
 		onCommandCatalog: { channel: "agents:command-catalog", kind: "subscribe", pushFrom: "agent-event-bridge" },
@@ -516,12 +763,12 @@ export const ipcTable = {
 		/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
 		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 渲染进程 → 主进程，传递用户在 UI 请求中的响应（选中的选项、输入的文本等） */
-		sendUiResponse: { channel: "agents:ui-response", kind: "invoke" },
+		sendUiResponse: { channel: "agents:ui-response", kind: "invoke", route: webRoutes.agents.sendUiResponse },
 		notifyAsk: { channel: "agents:notify-ask", kind: "invoke" },
 		/** 项目信任确认：主进程 → 渲染进程，启动 Agent 前请求用户对含 .pi 资源的项目做信任决策 */
 		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 项目信任确认：渲染进程 → 主进程，回传用户的信任选择（trust-remember/trust-session/deny） */
-		respondTrustRequest: { channel: "agents:trust-response", kind: "invoke" },
+		respondTrustRequest: { channel: "agents:trust-response", kind: "invoke", route: webRoutes.agents.respondTrustRequest },
 	},
 	pet: {
 		/** 宠物窗监听主进程推送的聚合状态 */

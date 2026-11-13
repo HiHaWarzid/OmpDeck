@@ -4,7 +4,27 @@ import test from "node:test";
 import ts from "typescript";
 import vm from "node:vm";
 
+/**
+ * 共享 ipc.ts 现在携带 webRoutes（浏览器适配层的唯一路由事实源），只有 type-only import，
+ * 转译后无运行时依赖；沙箱必须提供同一份模块，否则 require 直接抛错。
+ */
+function loadSharedIpcModule() {
+  const source = readFileSync("src/shared/ipc.ts", "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  });
+  const sandbox = {
+    exports: {},
+    require: (specifier) => {
+      throw new Error(`Unexpected require in shared/ipc: ${specifier}`);
+    },
+  };
+  vm.runInNewContext(outputText, sandbox, { filename: "ipc.ts" });
+  return sandbox.exports;
+}
+
 function loadBrowserApiModule() {
+  const sharedIpc = loadSharedIpcModule();
   const source = readFileSync("src/renderer/src/browserApi.ts", "utf8");
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -12,6 +32,7 @@ function loadBrowserApiModule() {
   const sandbox = {
     exports: {},
     require: (specifier) => {
+      if (specifier === "../../shared/ipc") return sharedIpc;
       if (specifier === "./i18n") return { t: (key) => key };
       // browserApi 只用版本号判断是否需要丢弃过期全量结果；这些用例不涉及流合并。
       if (specifier === "../../shared/messageStreamVersion") {

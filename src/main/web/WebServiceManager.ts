@@ -19,6 +19,7 @@ import type {
 	WebServiceStatus,
 } from "../../shared/types";
 import type { PiDesktopApi } from "../../shared/api";
+import { matchWebRoute, webRoutes } from "../../shared/ipc";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import {
 	attachDisplayMeta,
@@ -375,6 +376,8 @@ export class WebServiceManager {
 				return;
 			}
 
+			// 非 IPC 聚合端点（健康检查 / 服务状态 / 跨命名空间 state）没有对应的
+			// window.piDesktop 成员，故不进 shared/ipc.ts 的 webRoutes，只能在此手写路径。
 			if (url.pathname === "/api/health") {
 				this.sendJson(request, response, {
 					ok: true,
@@ -418,9 +421,16 @@ export class WebServiceManager {
 				this.sendJsonText(request, response, payload);
 				return;
 			}
-			const sessionsMatch = url.pathname.match(/^\/api\/projects\/([^/]+)\/sessions$/);
-			if (sessionsMatch && request.method === "GET") {
-				const projectId = decodeURIComponent(sessionsMatch[1]);
+			// 以下分发条件全部取自 shared/ipc.ts 的 webRoutes（method + 路径模板 + 命名参数）。
+			// 例外：单个消息详情 /api/agents/:id/messages/:mid 没有对应 api 成员
+			// （移动端直连的展开端点），留在原地手写匹配。
+			const sessionsParams = matchWebRoute(
+				webRoutes.sessions.list,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (sessionsParams) {
+				const projectId = sessionsParams.projectId;
 				this.assertProjectExists(projectId);
 				const sessions = await this.deps.listSessions(projectId);
 				// 手机首页只展示顶层会话；子会话占列表的 60%+，在服务端剔除可显著减少
@@ -431,7 +441,8 @@ export class WebServiceManager {
 				});
 				return;
 			}
-			if (url.pathname === "/api/agents" && request.method === "POST") {
+			const createParams = matchWebRoute(webRoutes.agents.create, url.pathname, request.method ?? "");
+			if (createParams) {
 				// 透传完整 CreateAgentInput：带 sessionPath 即「打开历史会话」，
 				// 不带则新建会话；title/noSession/cwd 与桌面端共用同一语义。
 				const body = await this.readJson<Partial<CreateAgentInput>>(request);
@@ -450,9 +461,13 @@ export class WebServiceManager {
 				this.sendJson(request, response, { agent: toWebAgentView(agent) });
 				return;
 			}
-			const messagesMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages$/);
-			if (messagesMatch && request.method === "GET") {
-				const messages = this.deps.getMessages(decodeURIComponent(messagesMatch[1]));
+			const messagesParams = matchWebRoute(
+				webRoutes.agents.getMessages,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (messagesParams) {
+				const messages = this.deps.getMessages(messagesParams.agentId);
 				// 手机端只轮询最近窗口，避免大会话每 2s 重传整段消息。
 				const tailParam = url.searchParams.get("tail");
 				const tail = tailParam === null ? null : Math.min(200, Math.max(1, Number(tailParam) || 40));
@@ -529,20 +544,20 @@ export class WebServiceManager {
 				});
 				return;
 			}
-			const fullTextMatch = url.pathname.match(
-				/^\/api\/agents\/([^/]+)\/messages\/([^/]+)\/full-text$/,
+			const fullTextParams = matchWebRoute(
+				webRoutes.sessions.readMessageFullText,
+				url.pathname,
+				request.method ?? "",
 			);
-			if (fullTextMatch && request.method === "GET") {
-				const agentId = decodeURIComponent(fullTextMatch[1]);
-				const messageId = decodeURIComponent(fullTextMatch[2]);
+			if (fullTextParams) {
 				if (!this.deps.readMessageFullText) {
 					this.sendError(response, 404, "完整输出不可用", "message_full_text_unavailable");
 					return;
 				}
 				try {
 					const result = await this.deps.readMessageFullText(
-						agentId,
-						messageId,
+						fullTextParams.agentId,
+						fullTextParams.messageId,
 						url.searchParams.get("entryId") ?? undefined,
 					);
 					this.sendJson(request, response, result);
@@ -552,6 +567,7 @@ export class WebServiceManager {
 				}
 				return;
 			}
+			// 单个消息详情没有对应 api 成员（移动端展开时直连本端点），故不进 webRoutes。
 			const messageDetailMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages\/([^/]+)$/);
 			if (messageDetailMatch && request.method === "GET") {
 				const agentId = decodeURIComponent(messageDetailMatch[1]);
@@ -566,11 +582,15 @@ export class WebServiceManager {
 				this.sendJson(request, response, { message: attachDisplayMeta(message) });
 				return;
 			}
-			const historyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/history-page$/);
-			if (historyMatch && request.method === "GET") {
+			const historyParams = matchWebRoute(
+				webRoutes.agents.historyPage,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (historyParams) {
 				const limit = Number(url.searchParams.get("limit") ?? 40);
 				const page = await this.deps.getHistoryPage(
-					decodeURIComponent(historyMatch[1]),
+					historyParams.agentId,
 					url.searchParams.get("before") ?? undefined,
 					Number.isFinite(limit) ? limit : 40,
 				);
@@ -585,8 +605,12 @@ export class WebServiceManager {
 				);
 				return;
 			}
-			const uiResponseMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/ui-response$/);
-			if (uiResponseMatch && request.method === "POST") {
+			const uiResponseParams = matchWebRoute(
+				webRoutes.agents.sendUiResponse,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (uiResponseParams) {
 				const body = await this.readJson<{
 					requestId?: string;
 					value?: string | boolean | null;
@@ -597,7 +621,7 @@ export class WebServiceManager {
 					this.sendError(response, 400, "requestId 不能为空");
 					return;
 				}
-				await this.deps.sendUiResponse(decodeURIComponent(uiResponseMatch[1]), body.requestId, {
+				await this.deps.sendUiResponse(uiResponseParams.agentId, body.requestId, {
 					value: body.value,
 					cancelled: body.cancelled,
 					confirmed: body.confirmed,
@@ -605,19 +629,23 @@ export class WebServiceManager {
 				this.sendJson(request, response, { ok: true });
 				return;
 			}
-			const trustMatch = url.pathname.match(/^\/api\/trust\/([^/]+)$/);
-			if (trustMatch && request.method === "POST") {
+			const trustParams = matchWebRoute(
+				webRoutes.agents.respondTrustRequest,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (trustParams) {
 				const body = await this.readJson<{ choice?: "trust-remember" | "trust-session" | "deny" }>(request);
 				if (!body.choice || !["trust-remember", "trust-session", "deny"].includes(body.choice)) {
 					this.sendError(response, 400, "choice 无效");
 					return;
 				}
-				await this.deps.respondTrustRequest(decodeURIComponent(trustMatch[1]), body.choice);
+				await this.deps.respondTrustRequest(trustParams.requestId, body.choice);
 				this.sendJson(request, response, { ok: true });
 				return;
 			}
-			const promptMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/prompt$/);
-			if (promptMatch && request.method === "POST") {
+			const promptParams = matchWebRoute(webRoutes.agents.prompt, url.pathname, request.method ?? "");
+			if (promptParams) {
 				const body = await this.readJson<Omit<SendPromptInput, "agentId">>(request);
 				const message = body.message?.trim() ?? "";
 				if (!message && !body.images?.length) {
@@ -626,7 +654,7 @@ export class WebServiceManager {
 				}
 				const result = await this.deps.sendPrompt({
 					...body,
-					agentId: decodeURIComponent(promptMatch[1]),
+					agentId: promptParams.agentId,
 					message,
 				});
 				this.invalidateStateCache();
@@ -643,28 +671,36 @@ export class WebServiceManager {
 			}
 			// abort 只停止当前回合，保留 pi 进程和会话；/stop 才会关闭会话。
 			// 手机聊天页的停止按钮走这里，不能复用 /stop。
-			const abortMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/abort$/);
-			if (abortMatch && request.method === "POST") {
-				await this.deps.abortAgent(decodeURIComponent(abortMatch[1]));
+			const abortParams = matchWebRoute(webRoutes.agents.abort, url.pathname, request.method ?? "");
+			if (abortParams) {
+				await this.deps.abortAgent(abortParams.agentId);
 				this.sendJson(request, response, { ok: true });
 				return;
 			}
-			const stopMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/stop$/);
-			if (stopMatch && request.method === "POST") {
-				await this.deps.stopAgent(decodeURIComponent(stopMatch[1]));
+			const stopParams = matchWebRoute(webRoutes.agents.stop, url.pathname, request.method ?? "");
+			if (stopParams) {
+				await this.deps.stopAgent(stopParams.agentId);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { ok: true });
 				return;
 			}
-			const abortRestoreMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/abort-and-restore-queue$/);
-			if (abortRestoreMatch && request.method === "POST") {
-				const result = await this.deps.abortAndRestoreQueue(decodeURIComponent(abortRestoreMatch[1]));
+			const abortRestoreParams = matchWebRoute(
+				webRoutes.agents.abortAndRestoreQueue,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (abortRestoreParams) {
+				const result = await this.deps.abortAndRestoreQueue(abortRestoreParams.agentId);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { result });
 				return;
 			}
-			const removeQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/remove-queued-message$/);
-			if (removeQueuedMatch && request.method === "POST") {
+			const removeQueuedParams = matchWebRoute(
+				webRoutes.agents.removeQueuedMessage,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (removeQueuedParams) {
 				const body = await this.readJson<{ message?: string; queue?: "steering" | "followUp" }>(request);
 				if (typeof body.message !== "string" || !body.message) {
 					this.sendError(response, 400, "message 不能为空");
@@ -675,7 +711,7 @@ export class WebServiceManager {
 					return;
 				}
 				const result = await this.deps.removeQueuedMessage(
-					decodeURIComponent(removeQueuedMatch[1]),
+					removeQueuedParams.agentId,
 					body.message,
 					body.queue,
 				);
@@ -683,24 +719,32 @@ export class WebServiceManager {
 				this.sendJson(request, response, { result });
 				return;
 			}
-			const promoteQueuedMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/promote-queued-message$/);
-			if (promoteQueuedMatch && request.method === "POST") {
+			const promoteQueuedParams = matchWebRoute(
+				webRoutes.agents.promoteQueuedMessage,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (promoteQueuedParams) {
 				const body = await this.readJson<{ message?: string }>(request);
 				if (typeof body.message !== "string" || !body.message) {
 					this.sendError(response, 400, "message 不能为空");
 					return;
 				}
 				const result = await this.deps.promoteQueuedMessage(
-					decodeURIComponent(promoteQueuedMatch[1]),
+					promoteQueuedParams.agentId,
 					body.message,
 				);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { result });
 				return;
 			}
-			const runtimeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/runtime$/);
-			if (runtimeMatch && request.method === "GET") {
-				const agentId = decodeURIComponent(runtimeMatch[1]);
+			const runtimeParams = matchWebRoute(
+				webRoutes.agents.runtimeState,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (runtimeParams) {
+				const agentId = runtimeParams.agentId;
 				const state = await this.deps.runtimeState(agentId);
 				// 手机端头部副标题的状态文案由此派生：isStreaming 优先，其次 runtime 自带
 				// 的 status（老版本主进程），最后回退 /api/state 的 agent 状态。
@@ -718,24 +762,36 @@ export class WebServiceManager {
 				});
 				return;
 			}
-			const cycleModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-model$/);
-			if (cycleModelMatch && request.method === "POST") {
-				const state = await this.deps.cycleModel(decodeURIComponent(cycleModelMatch[1]));
+			const cycleModelParams = matchWebRoute(
+				webRoutes.agents.cycleModel,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (cycleModelParams) {
+				const state = await this.deps.cycleModel(cycleModelParams.agentId);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const modelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/models$/);
-			if (modelsMatch && request.method === "GET") {
-				const models = await this.deps.availableModels(decodeURIComponent(modelsMatch[1]));
+			const modelsParams = matchWebRoute(
+				webRoutes.agents.availableModels,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (modelsParams) {
+				const models = await this.deps.availableModels(modelsParams.agentId);
 				this.sendJson(request, response, { models });
 				return;
 			}
-			const setModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/model$/);
-			if (setModelMatch && request.method === "POST") {
+			const setModelParams = matchWebRoute(
+				webRoutes.agents.setModel,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (setModelParams) {
 				const body = await this.readJson<{ provider?: string; modelId?: string }>(request);
 				const state = await this.deps.setModel(
-					decodeURIComponent(setModelMatch[1]),
+					setModelParams.agentId,
 					body.provider ?? "",
 					body.modelId ?? "",
 				);
@@ -743,90 +799,107 @@ export class WebServiceManager {
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const refreshModelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/refresh-models$/);
-			if (refreshModelsMatch && request.method === "POST") {
-				const state = await this.deps.refreshModels(decodeURIComponent(refreshModelsMatch[1]));
+			const refreshModelsParams = matchWebRoute(
+				webRoutes.agents.refreshModels,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (refreshModelsParams) {
+				const state = await this.deps.refreshModels(refreshModelsParams.agentId);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const cycleThinkingMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-thinking$/);
-			if (cycleThinkingMatch && request.method === "POST") {
-				const state = await this.deps.cycleThinking(decodeURIComponent(cycleThinkingMatch[1]));
+			const cycleThinkingParams = matchWebRoute(
+				webRoutes.agents.cycleThinking,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (cycleThinkingParams) {
+				const state = await this.deps.cycleThinking(cycleThinkingParams.agentId);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const setThinkingMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/thinking$/);
-			if (setThinkingMatch && request.method === "POST") {
+			const setThinkingParams = matchWebRoute(
+				webRoutes.agents.setThinking,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (setThinkingParams) {
 				const body = await this.readJson<{ level?: string }>(request);
-				const state = await this.deps.setThinking(decodeURIComponent(setThinkingMatch[1]), body.level ?? "");
+				const state = await this.deps.setThinking(setThinkingParams.agentId, body.level ?? "");
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const thinkingLevelsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/thinking-levels$/);
-			if (thinkingLevelsMatch && request.method === "GET") {
-				const levels = await this.deps.availableThinkingLevels(
-					decodeURIComponent(thinkingLevelsMatch[1]),
-				);
+			const thinkingLevelsParams = matchWebRoute(
+				webRoutes.agents.availableThinkingLevels,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (thinkingLevelsParams) {
+				const levels = await this.deps.availableThinkingLevels(thinkingLevelsParams.agentId);
 				this.sendJson(request, response, { levels });
 				return;
 			}
-			const fastModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/fast-mode$/);
-			if (fastModeMatch && request.method === "POST") {
+			const fastModeParams = matchWebRoute(
+				webRoutes.agents.setFastMode,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (fastModeParams) {
 				const body = await this.readJson<{ enabled?: unknown }>(request);
 				if (typeof body.enabled !== "boolean") {
 					this.sendError(response, 400, "enabled 必须是布尔值");
 					return;
 				}
-				const state = await this.deps.setFastMode(
-					decodeURIComponent(fastModeMatch[1]),
-					body.enabled,
-				);
+				const state = await this.deps.setFastMode(fastModeParams.agentId, body.enabled);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const slowModeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/slow-mode$/);
-			if (slowModeMatch && request.method === "POST") {
+			const slowModeParams = matchWebRoute(
+				webRoutes.agents.setSlowMode,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (slowModeParams) {
 				const body = await this.readJson<{ enabled?: unknown }>(request);
 				if (typeof body.enabled !== "boolean") {
 					this.sendError(response, 400, "enabled 必须是布尔值");
 					return;
 				}
-				const state = await this.deps.setSlowMode(
-					decodeURIComponent(slowModeMatch[1]),
-					body.enabled,
-				);
+				const state = await this.deps.setSlowMode(slowModeParams.agentId, body.enabled);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const autoCompactionMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/auto-compaction$/);
-			if (autoCompactionMatch && request.method === "POST") {
+			const autoCompactionParams = matchWebRoute(
+				webRoutes.agents.setAutoCompaction,
+				url.pathname,
+				request.method ?? "",
+			);
+			if (autoCompactionParams) {
 				const body = await this.readJson<{ enabled?: unknown }>(request);
 				if (typeof body.enabled !== "boolean") {
 					this.sendError(response, 400, "enabled 必须是布尔值");
 					return;
 				}
-				const state = await this.deps.setAutoCompaction(
-					decodeURIComponent(autoCompactionMatch[1]),
-					body.enabled,
-				);
+				const state = await this.deps.setAutoCompaction(autoCompactionParams.agentId, body.enabled);
 				this.invalidateStateCache();
 				this.sendJson(request, response, { state });
 				return;
 			}
-			const todosMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/todos$/);
-			if (todosMatch && request.method === "POST") {
+			const todosParams = matchWebRoute(webRoutes.agents.setTodos, url.pathname, request.method ?? "");
+			if (todosParams) {
 				const body = await this.readJson<{ phases?: unknown }>(request);
 				if (!Array.isArray(body.phases)) {
 					this.sendError(response, 400, "phases 必须是数组");
 					return;
 				}
 				const state = await this.deps.setTodos(
-					decodeURIComponent(todosMatch[1]),
+					todosParams.agentId,
 					body.phases as AgentTodoPhase[],
 				);
 				this.invalidateStateCache();
