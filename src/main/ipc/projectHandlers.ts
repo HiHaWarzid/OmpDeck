@@ -15,6 +15,7 @@ import type { WorktreeService } from "../git/WorktreeService";
 import type { AppLogger } from "../logging/AppLogger";
 import type { WslEnvironment } from "../wsl/WslPaths";
 import { createProjectGuard, projectNotFoundError } from "./withProjectGuard";
+import { filterProjectsForEnvironment, projectEnvironmentOf } from "../../shared/projectVisibility";
 
 interface ProjectHandlerDeps {
 	projectStore: ProjectStore;
@@ -50,15 +51,14 @@ export function registerProjectHandlers(deps: ProjectHandlerDeps): ProjectHandle
 	} = deps;
 	const { resolveProject } = createProjectGuard(projectStore);
 
-	// 获取当前环境过滤后的项目列表（WSL 模式只显示 WSL 项目，Chat 始终显示）
-	const getVisibleProjects = (): Project[] => {
-		const settings = settingsStore.get();
-		const all = projectStore.list();
-		if (settings.wslEnabled) {
-			return all.filter((p) => p.kind === "chat" || p.environment === "wsl");
-		}
-		return all.filter((p) => p.kind === "chat" || !p.environment || p.environment === "windows");
-	};
+	// 获取当前环境过滤后的项目列表（WSL 模式只显示 WSL 项目，Chat 始终显示）。
+	// 谓词来自 shared/projectVisibility：渲染层判断「项目是否真的被删除」用同一个，
+	// 两处各写一份时，环境过滤掉的项目会被渲染层当成已删除并清掉它的面板记录。
+	const getVisibleProjects = (): Project[] =>
+		filterProjectsForEnvironment(
+			projectStore.list(),
+			projectEnvironmentOf(settingsStore.get().wslEnabled),
+		);
 
 	return {
 		projects: {

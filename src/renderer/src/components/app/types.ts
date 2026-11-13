@@ -2,7 +2,7 @@
 import type { WidgetLineItem } from "../../../../shared/types";
 
 /** 右侧面板；历史值 "editor" 已并入 files，仅存在于旧版 localStorage 记录里 */
-export type DrawerPanel = "files" | "sessions" | "browser" | "git";
+export type DrawerPanel = "files" | "browser" | "git";
 export type SessionModifiedFile = {
 	path: string;
 	toolName: string;

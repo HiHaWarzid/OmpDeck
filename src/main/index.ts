@@ -183,6 +183,10 @@ process.on("unhandledRejection", (reason) => {
 	console.error("Unhandled rejection:", reason);
 });
 import { ipcChannels } from "../shared/ipc";
+import {
+	filterProjectsForEnvironment,
+	projectEnvironmentOf,
+} from "../shared/projectVisibility";
 import type {
 	AppSettings,
 	AppLogLevel,
@@ -1571,10 +1575,10 @@ async function runPostWindowStartupTasks(): Promise<void> {
 	void projectStore
 		.load()
 		.then(() => {
-			const s = settingsStore.get();
-			const visible = s.wslEnabled
-				? projectStore.list().filter((p) => p.kind === "chat" || p.environment === "wsl")
-				: projectStore.list().filter((p) => p.kind === "chat" || !p.environment || p.environment === "windows");
+			const visible = filterProjectsForEnvironment(
+				projectStore.list(),
+				projectEnvironmentOf(settingsStore.get().wslEnabled),
+			);
 			mainWindow?.webContents.send(ipcChannels.projectsChanged, visible);
 		})
 		.catch(() => undefined);

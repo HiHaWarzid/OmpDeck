@@ -1,8 +1,8 @@
 /**
- * useSessionPanelHost — 右侧面板（文件 / Git / 浏览器 / 历史会话）的唯一所有者。
+ * useSessionPanelHost — 右侧面板（文件 / Git / 浏览器）的唯一所有者。
  *
- * App 以前自己持有 `drawer` / `drawerCollapsed` / `renderedDrawer` / `expandedDirs` /
- * `sessionsProjectId` 五个 state 加 `lastToolDrawerRef` / `prevDrawerPanelRef` /
+ * App 以前自己持有 `drawer` / `drawerCollapsed` / `renderedDrawer` / `expandedDirs`
+ * 四个 state 加 `lastToolDrawerRef` / `prevDrawerPanelRef` /
  * `drawerUnmountTimerRef` 三个 ref，并用六个 handler + 两个受控 effect 维护规则。
  * 现在规则全在 `sessionPanelState` 的纯归约里，本 hook 只负责：
  *
@@ -51,12 +51,10 @@ export interface SessionPanelHost {
 	pinned: boolean;
 	/** 折叠动画期间仍需渲染的上次内容 */
 	contentPanel: DrawerPanel | null;
-	sessionsProjectId: string | undefined;
 	expandedDirs: Set<string>;
 
-	/** 打开工具面板（文件 / Git / 浏览器）；历史会话面板用 openSessions */
+	/** 打开工具面板（文件 / Git / 浏览器） */
 	openPanel: (panel: ToolPanel) => boolean;
-	openSessions: (projectId: string) => void;
 	toggleHeader: () => void;
 	close: () => void;
 	/** 隐藏面板但不落盘：用于面板被弹层替代的临时关闭 */
@@ -68,7 +66,7 @@ export interface SessionPanelHost {
 	togglePin: () => void;
 	/**
 	 * 项目记录真的消失时调用（删项目 / 删 worktree / 关掉 worktree 模式）。
-	 * 传**全部**消失的 id：清钉选、清会话面板归属、清持久化记录。
+	 * 传**全部**消失的 id：清钉选、清持久化记录。
 	 */
 	forgetProjects: (projectIds: readonly string[]) => void;
 
@@ -111,6 +109,9 @@ export function useSessionPanelHost(
 	const [renderedPanel, setRenderedPanel] = useState<DrawerPanel | null>(null);
 	const unmountTimerRef = useRef<number | null>(null);
 	const [expandedDirs, setExpandedDirsState] = useState<Set<string>>(new Set());
+	/** 展开集合的权威快照：写入口在调用瞬间读它算 next，不必等 React 提交。 */
+	const expandedDirsRef = useRef<Set<string>>(expandedDirs);
+	expandedDirsRef.current = expandedDirs;
 
 	const runEffects = useCallback(
 		(effects: readonly PanelEffect[]) => {
@@ -132,11 +133,49 @@ export function useSessionPanelHost(
 						// pid:project-expanded-dirs:<id> 会永久留在 localStorage。
 						if (storage) forgetStoredProject(storage, effect.projectId);
 						break;
+					default: {
+						// 新增 PanelEffect 变体却没在这里处理时编译失败——这些副作用
+						// 都是「漏执行就静默丢数据」的类型（持久化/刷新/清盘），不能默认忽略。
+						const unhandled: never = effect;
+						throw new Error(`Unhandled panel effect: ${String(unhandled)}`);
+					}
 				}
 			}
 		},
 		[storage],
 	);
+
+	const persistDirs = useCallback(
+		(dirs: Set<string>, projectId: string | undefined) => {
+			// 项目在调用瞬间确定：写盘键必须和用户看到的那份展开状态同属一个项目。
+			if (storage && projectId) saveExpandedDirs(storage, projectId, dirs);
+		},
+		[storage],
+	);
+
+	/**
+	 * 展开目录的写入口：**同步算出 next**，再 setState 并落盘。
+	 *
+	 * 以前 setState 的 updater 里直接调 persistDirs：updater 必须是纯函数（StrictMode 会
+	 * 调两次），且它读到的是「执行时」的 activeProjectId——若用户在两次渲染之间切换项目，
+	 * 上一个项目的展开目录可能被写进新项目的键，切回来时文件树展开状态就是错乱的。
+	 * 现在 next 在调用瞬间算出，持久化按同一个 ref 快照走。
+	 */
+	const writeDirs = useCallback(
+		(resolve: (current: Set<string>) => Set<string>) => {
+			const next = resolve(expandedDirsRef.current);
+			expandedDirsRef.current = next;
+			setExpandedDirsState(next);
+			persistDirs(next, envRef.current.activeProjectId);
+		},
+		[persistDirs],
+	);
+
+	/** 从存储恢复：只落 state 不回写——恢复不是用户编辑，回写会把刚删掉的旧键种回去。 */
+	const restoreDirs = useCallback((dirs: Set<string>) => {
+		expandedDirsRef.current = dirs;
+		setExpandedDirsState(dirs);
+	}, []);
 
 	const dispatch = useCallback(
 		(intent: PanelIntent) => {
@@ -156,7 +195,7 @@ export function useSessionPanelHost(
 		const projectId = options.activeProjectId;
 		if (!projectId) {
 			dispatch({ type: "project-restored", saved: null });
-			setExpandedDirsState(new Set());
+			restoreDirs(new Set());
 			return;
 		}
 		const legacyAgentIds = optionsRef.current.legacyAgentIdsFor?.(projectId) ?? [];
@@ -164,10 +203,10 @@ export function useSessionPanelHost(
 			type: "project-restored",
 			saved: storage ? loadStoredPanel(storage, projectId, legacyAgentIds) : null,
 		});
-		setExpandedDirsState(
+		restoreDirs(
 			storage ? loadExpandedDirs(storage, projectId, legacyAgentIds) : new Set(),
 		);
-	}, [options.activeProjectId, storage, dispatch]);
+	}, [options.activeProjectId, storage, dispatch, restoreDirs]);
 
 	useEffect(() => {
 		if (options.gitEnabled) return;
@@ -223,10 +262,6 @@ export function useSessionPanelHost(
 		(panel: ToolPanel) => dispatchAccepted({ type: "open-panel", panel }),
 		[dispatchAccepted],
 	);
-	const openSessions = useCallback(
-		(projectId: string) => dispatch({ type: "open-sessions", projectId }),
-		[dispatch],
-	);
 	const toggleHeader = useCallback(
 		() => dispatch({ type: "toggle-header" }),
 		[dispatch],
@@ -246,41 +281,28 @@ export function useSessionPanelHost(
 		[dispatch],
 	);
 
-	const persistDirs = useCallback(
-		(dirs: Set<string>) => {
-			const projectId = envRef.current.activeProjectId;
-			if (storage && projectId) saveExpandedDirs(storage, projectId, dirs);
-		},
-		[storage],
-	);
-
 	const toggleDirectory = useCallback(
 		(path: string) => {
 			// 文件树默认折叠，只有用户显式展开目录才显示子项，避免大仓库一打开就产生视觉噪音。
-			setExpandedDirsState((current) => {
+			writeDirs((current) => {
 				const next = new Set(current);
 				if (next.has(path)) next.delete(path);
 				else next.add(path);
-				persistDirs(next);
 				return next;
 			});
 		},
-		[persistDirs],
+		[writeDirs],
 	);
 
 	const collapseAllDirectories = useCallback(() => {
-		const next = new Set<string>();
-		setExpandedDirsState(next);
-		persistDirs(next);
-	}, [persistDirs]);
+		writeDirs(() => new Set<string>());
+	}, [writeDirs]);
 
 	const replaceExpandedDirs = useCallback(
 		(dirs: Iterable<string>) => {
-			const next = new Set(dirs);
-			setExpandedDirsState(next);
-			persistDirs(next);
+			writeDirs(() => new Set(dirs));
 		},
-		[persistDirs],
+		[writeDirs],
 	);
 
 	const view = selectPanelView(state, options.activeProjectId, renderedPanel);
@@ -290,11 +312,9 @@ export function useSessionPanelHost(
 		collapsed: view.collapsed,
 		pinned: view.pinned,
 		contentPanel: view.contentPanel,
-		sessionsProjectId: state.sessionsProjectId,
 		expandedDirs,
 
 		openPanel,
-		openSessions,
 		toggleHeader,
 		close,
 		hide,

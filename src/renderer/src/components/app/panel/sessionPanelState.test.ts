@@ -111,12 +111,11 @@ describe("applyPanelIntent", () => {
 	it("restores the saved panel per project and clears state for a project without a record", () => {
 		const restored = applyPanelIntent(
 			EMPTY_PANEL_STATE,
-			{ type: "project-restored", saved: { panel: "sessions", pinned: true } },
+			{ type: "project-restored", saved: { panel: "browser", pinned: true } },
 			ENV,
 		);
-		expect(restored.state.panel).toBe("sessions");
-		expect(restored.state.pinnedByProject).toEqual({ p1: "sessions" });
-		expect(restored.state.sessionsProjectId).toBe("p1");
+		expect(restored.state.panel).toBe("browser");
+		expect(restored.state.pinnedByProject).toEqual({ p1: "browser" });
 
 		const cleared = applyPanelIntent(
 			restored.state,
@@ -220,16 +219,15 @@ describe("applyPanelIntent", () => {
 		expect(result.effects).toEqual([]);
 	});
 
-	it("closes the history panel of a removed project and forgets its pin", () => {
+	it("forgets the pin of a removed project", () => {
 		const state = applyPanelIntent(
 			EMPTY_PANEL_STATE,
-			{ type: "project-restored", saved: { panel: "sessions", pinned: true } },
+			{ type: "project-restored", saved: { panel: "browser", pinned: true } },
 			ENV,
 		).state;
 		const result = applyPanelIntent(state, { type: "projects-removed", projectIds: ["p1"] }, ENV);
-		expect(result.state.panel).toBeNull();
-		expect(result.state.sessionsProjectId).toBeUndefined();
 		expect(result.state.pinnedByProject).toEqual({});
+		expect(result.state.panel).toBe("browser");
 	});
 
 	it("opens the header toggle onto the last tool panel and skips git when it is off", () => {
@@ -302,6 +300,15 @@ describe("localStorage codec", () => {
 		expect(storage.dump()).not.toHaveProperty("pid:project-drawer:p1");
 		expect(storage.dump()).not.toHaveProperty("pid:project-expanded-dirs:p1");
 		expect(storage.dump()["pid:project-drawer:p2"]).toBeDefined();
+	});
+
+	it("drops the retired sessions panel value stored by older versions", () => {
+		// 历史会话面板已删除：旧 localStorage 里的 "sessions" 必须归一成 null，
+		// 否则恢复出来的抽屉指向一个没有渲染分支的面板（空 aside，且关不掉）。
+		const storage = memoryStorage({
+			"pid:project-drawer:p1": JSON.stringify({ panel: "sessions", pinned: true }),
+		});
+		expect(loadStoredPanel(storage, "p1", [])).toBeNull();
 	});
 
 	it("survives a storage that throws", () => {

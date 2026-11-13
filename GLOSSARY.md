@@ -231,7 +231,7 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 # 右侧面板（Renderer 领域术语）
 
-> 第四领域：右侧面板（文件 / Git / 浏览器 / 历史会话）的状态机，源自架构评审候选 1「Collapse the right-panel FSM into one module」。维护规则同上。
+> 第四领域：右侧面板（文件 / Git / 浏览器）的状态机，源自架构评审候选 1「Collapse the right-panel FSM into one module」。维护规则同上。
 
 ## 术语
 
@@ -241,7 +241,7 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 规则：新增面板行为先改归约里的一条 intent，不在 App 里加 setter 或受控 effect。归约必须是纯函数（无 localStorage、无 React），否则「接口即测试面」失效。
 
 ### PanelState（面板状态）
-一次性持有 `panel`（当前面板）、`collapsed`（用户收起）、`pinnedByProject`（按项目钉选）、`lastToolPanel`（标题栏一键展开要恢复的 Tab）、`sessionsProjectId`（历史面板正在看哪个项目）。以前散在 App 的 5 个 useState + 3 个 ref。
+一次性持有 `panel`（当前面板）、`collapsed`（用户收起）、`pinnedByProject`（按项目钉选）、`lastToolPanel`（标题栏一键展开要恢复的 Tab）。以前散在 App 的 useState + ref。
 
 ### PanelEffect（面板副作用）
 归约**不执行**的副作用，由 host 落地：`persist`（写项目级 localStorage）、`refresh-files`（拉文件树）、`forget-project`（删项目时清掉该项目名下全部持久化键，面板与展开目录各一份）。归约只声明「该持久化成什么」，因此纯归约可单测，持久化语义只有一处。
@@ -255,8 +255,8 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 判定「真正消失」用**前后列表差集**，且差集计算只有一份实现（`App.syncVanishedProjects`）：`remove` 与 `toggleWorktreeEnabled` 都会连带删掉一批项目记录，曾被点的那一个 id 不足以描述结果。清盘接口按**集合**而非单个 id 表达，正是为了让新增删除路径不会漏掉其中一部分。
 
-### ToolPanel 与 sessions 入口分离
-`openPanel` 只接受 `ToolPanel`（`files` / `git` / `browser`），历史会话面板必须走 `openSessions(projectId)`。两条入口的持久化语义不同：工具面板落盘并按项目恢复，历史会话面板不落盘、靠 `sessionsProjectId` 触发按项目刷新。合并成一个接受 `DrawerPanel` 的入口会让调用方误以为 `openPanel("sessions")` 等价于 `openSessions(id)`。
+### ToolPanel 与退役的 sessions 面板
+`openPanel` 只接受 `ToolPanel`（`files` / `git` / `browser`），`DrawerPanel` 与之一致。历史会话面板（`sessions`）已整体退役：它的入口 `openProjectSessions` 无调用方，最终只剩一条「选择器 → 面板 → 抽屉组件」的不可达链路，与侧栏 `SessionManagerModal` 重复。会话历史的唯一入口是项目菜单的会话管理弹框。
 
-### 已知历史值（`editor`）
-旧版把 `editor` 当成独立面板值。现在编辑器是 files 的子视图：`DrawerPanel` 类型不再含 `editor`，只有 localStorage 读入时接受该值并折叠为 `files`（`normalizePanel`）。
+### 已知历史值（`editor` / `sessions`）
+旧版把 `editor`、`sessions` 当成独立面板值。现在编辑器是 files 的子视图，历史会话面板已删除：`DrawerPanel` 类型不含这两者，只有 localStorage 读入时接受并折叠——`editor` → `files`，`sessions` → `null`（`normalizePanel`，不带这个折叠会让恢复出的抽屉指向一个没有渲染分支的面板）。

@@ -1,5 +1,5 @@
 /**
- * 右侧面板（文件 / Git / 浏览器 / 历史会话）的单一状态机。
+ * 右侧面板（文件 / Git / 浏览器）的单一状态机。
  *
  * 以前这条规则分散在 App 的 `openDrawer` / `switchToolDrawer` / `toggleRightDrawer` /
  * `closeDrawer` / `collapseDrawer` / `toggleDrawerPinned` 六个函数、两个受控 effect
@@ -18,8 +18,13 @@ export type ToolPanel = "files" | "git" | "browser";
 /** 右侧工具栏可承载的面板；`editor` 不是独立工具 Tab，已并入文件面板 */
 const TOOL_PANELS: readonly ToolPanel[] = ["files", "git", "browser"];
 
-/** 能被读回的面板值（含历史遗留的 `editor`，读入后统一折叠到 files） */
-const KNOWN_PANELS: readonly string[] = ["files", "sessions", "browser", "editor", "git"];
+/**
+ * 能被读回的面板值（含历史遗留的 `editor`）。
+ * 旧记录里的 `sessions` 也在这里识别：历史会话面板已删除，读回时归一成 null，
+ * 否则 localStorage 恢复的 drawer 会指向一个没有渲染分支的面板。
+ */
+const KNOWN_PANELS: readonly string[] = ["files", "browser", "editor", "git"];
+const LEGACY_REMOVED_PANELS: readonly string[] = ["sessions"];
 
 export function isToolPanel(
 	panel: DrawerPanel | null | undefined,
@@ -34,6 +39,7 @@ export function isToolPanel(
 export function normalizePanel(panel: string | null | undefined): DrawerPanel | null {
 	if (!panel) return null;
 	if (panel === "editor") return "files";
+	if (LEGACY_REMOVED_PANELS.includes(panel)) return null;
 	return KNOWN_PANELS.includes(panel) ? (panel as DrawerPanel) : null;
 }
 
@@ -46,8 +52,6 @@ export interface PanelState {
 	pinnedByProject: Record<string, DrawerPanel>;
 	/** 标题栏一键展开时恢复的工具 Tab */
 	lastToolPanel: ToolPanel;
-	/** 历史会话面板归属的项目；与 activeProjectId 解耦，因为项目菜单可直接打开他项目历史 */
-	sessionsProjectId: string | undefined;
 }
 
 export const EMPTY_PANEL_STATE: PanelState = {
@@ -55,7 +59,6 @@ export const EMPTY_PANEL_STATE: PanelState = {
 	collapsed: false,
 	pinnedByProject: {},
 	lastToolPanel: "files",
-	sessionsProjectId: undefined,
 };
 
 /** 归约所需的环境事实：全部由调用方提供，纯函数不读全局 */
@@ -67,13 +70,7 @@ export interface PanelEnv {
 }
 
 export type PanelIntent =
-	/**
-	 * 只接受工具面板。历史会话面板有自己的入口 `open-sessions`：它不落盘、
-	 * 也不走「切 Tab 刷新文件树」的副作用，两者混在一个意图里会让调用方
-	 * 误以为 `openPanel("sessions")` 与 `openSessions(id)` 等价。
-	 */
 	| { type: "open-panel"; panel: ToolPanel }
-	| { type: "open-sessions"; projectId: string }
 	| { type: "toggle-header" }
 	| { type: "close" }
 	/** 隐藏但不在持久化里留痕：面板被弹层接管时的临时关闭 */
@@ -137,8 +134,6 @@ function withoutPin(
  * 展开某个工具面板。始终打开目标面板（“再点一次关闭”只属于已删除的 `openDrawer` 死代码）。
  * 钉选时只允许回到钉选面板；Git 功能关闭时 Git 面板不可打开。
  *
- * 入参是 `ToolPanel`，因此这里既不产生也不处理历史会话面板：那条入口是 `open-sessions`，
- * 它的持久化语义不同（不落盘），混进来只能靠 `target === "sessions"` 分支区分。
  */
 function openPanel(
 	state: PanelState,
@@ -214,9 +209,6 @@ function restoreForProject(
 			collapsed: false,
 			pinnedByProject,
 			lastToolPanel: isToolPanel(panel) ? panel : state.lastToolPanel,
-			// 恢复历史会话面板时同步归属项目：freshness effect 依赖它按当前项目刷新，
-			// 否则展示上一个项目的残留列表（删除/复制等操作还会落到错误的项目）。
-			sessionsProjectId: panel === "sessions" ? projectId : state.sessionsProjectId,
 		},
 		effects: [],
 	};
@@ -231,24 +223,6 @@ export function applyPanelIntent(
 	switch (intent.type) {
 		case "open-panel":
 			return openPanel(state, intent.panel, env);
-
-		case "open-sessions": {
-			// 项目菜单可直接为「非当前」项目打开历史会话，因此项目来自意图而非 env。
-			const { projectId } = intent;
-			const pinned = pinnedPanelOf(state, projectId);
-			if (pinned && pinned !== "sessions") return { state, effects: [] };
-			return {
-				state: {
-					...state,
-					panel: "sessions",
-					collapsed: false,
-					sessionsProjectId: projectId,
-				},
-				// 刷新不在这里发：历史会话面板的 freshness effect 以 sessionsProjectId
-				// 为触发点，打开/切项目都会走到，归约再发一次就是重复拉取。
-				effects: [],
-			};
-		}
 
 		case "toggle-header": {
 			// 关闭态：展开上次工具面板；展开态：折叠。钉选时折叠只收回内容，不关闭面板。
@@ -344,20 +318,12 @@ export function applyPanelIntent(
 		case "projects-removed": {
 			const removed = new Set(intent.projectIds);
 			if (removed.size === 0) return { state, effects: [] };
-			// 被删项目的历史面板不能继续展示：列表刷新已不可能，操作也会落到不存在的项目。
-			const ownedSessions =
-				state.sessionsProjectId !== undefined && removed.has(state.sessionsProjectId);
 			let pinnedByProject = state.pinnedByProject;
 			for (const projectId of removed) {
 				pinnedByProject = withoutPin(pinnedByProject, projectId);
 			}
 			return {
-				state: {
-					...state,
-					pinnedByProject,
-					sessionsProjectId: ownedSessions ? undefined : state.sessionsProjectId,
-					panel: ownedSessions && state.panel === "sessions" ? null : state.panel,
-				},
+				state: { ...state, pinnedByProject },
 				// 项目已删：清掉它的持久化记录，避免同 id 项目回来时带着旧面板与钉选。
 				// 用 forget-project 而不是 persist(null)：面板键与展开目录键都要删，
 				// 而「写空值」既表达不了展开目录，也会留下一份无主的空记录。

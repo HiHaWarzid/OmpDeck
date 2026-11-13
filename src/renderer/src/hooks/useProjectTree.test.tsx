@@ -150,16 +150,45 @@ describe("useProjectTree", () => {
     expect(deps.refreshProjectSessions).toHaveBeenCalledWith(CHAT_ID);
   });
 
-  it("显示更多按页大小累加，删除项目时清掉分页行", async () => {
+  it("显示更多按页大小累加，删除项目时清掉分页行、来源过滤与子会话组", async () => {
     await mount(makeDeps());
 
     act(() => latest.noteProjectSessionsChanged("p1"));
     expect(latest.visibleProjectChildCountByProject.p1).toBe(5);
     act(() => latest.showMoreProjectChildren("p1"));
     expect(latest.visibleProjectChildCountByProject.p1).toBe(10);
+    act(() => {
+      latest.setSessionSourceFilter({ p1: new Set(["codex"]) });
+      latest.toggleSubagentGroup("p1:session.jsonl");
+      latest.toggleSubagentGroup("p2:session.jsonl");
+    });
 
-    act(() => latest.forgetProject("p1"));
+    act(() => latest.forgetProjects(["p1"]));
     expect(latest.visibleProjectChildCountByProject).not.toHaveProperty("p1");
+    expect(latest.sessionSourceFilter).not.toHaveProperty("p1");
+    // 按项目前缀裁决：另一个项目的同路径会话组不能被连带清掉。
+    expect([...latest.expandedSubagentGroups]).toEqual(["p2:session.jsonl"]);
+  });
+
+  it("删除 worktree 子项目时清掉 wt: 形状的子会话组键（两种键形状都要认）", async () => {
+    await mount(makeDeps());
+
+    act(() => {
+      // 顶层键、worktree 子项目键、以及孙级键同时存在。
+      latest.toggleSubagentGroup("p1:session.jsonl");
+      latest.toggleSubagentGroup("wt:wt1:session.jsonl");
+      latest.toggleSubagentGroup("wt:wt1:session.jsonl:grand.jsonl");
+      latest.toggleSubagentGroup("wt:wt2:session.jsonl");
+    });
+
+    // 删掉 worktree 子项目 wt1：以 wt1 为归属的组必须一起清掉，
+    // 否则它们永久留在本地存储里，每轮增删再追加一批。
+    act(() => latest.forgetProjects(["wt1"]));
+
+    expect([...latest.expandedSubagentGroups].sort()).toEqual([
+      "p1:session.jsonl",
+      "wt:wt2:session.jsonl",
+    ]);
   });
 
   it("来源过滤与子会话组展开状态落盘并在重挂后还原", async () => {

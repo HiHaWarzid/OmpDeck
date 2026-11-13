@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePersistedState } from "./usePersistedState";
-import { SIDEBAR_PROJECT_CHILD_PAGE_SIZE } from "../components/app/sidebar/sidebarProjection";
+import {
+  SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
+  subagentGroupProjectId,
+} from "../components/app/sidebar/sidebarProjection";
 import type {
   AppSettings,
   GitBranchInfo,
@@ -28,6 +31,16 @@ const SIDEBAR_EXPANDED_PROJECTS_KEY = "pid:sidebar-expanded-projects";
 const SIDEBAR_COLLAPSED_PROJECTS_LEGACY_KEY = "pid:sidebar-collapsed-projects";
 const SUBAGENT_GROUPS_STORAGE_KEY = "pid:sidebar-expanded-subagent-groups";
 const SESSION_SOURCE_FILTER_KEY = "pideck-session-source-filter";
+
+/**
+ * 侧栏会话删除确认的目标。必须带 projectId：右键菜单可能指向非当前项目的会话，
+ * 确认框弹出到用户点确定之间 activeProjectId 还可能变，事后再推项目就会错。
+ */
+export interface SidebarSessionDeleteConfirm {
+  projectId: string;
+  session: SessionSummary;
+  childCount: number;
+}
 /** 与主进程 ProjectStore 内置 chat id 保持一致 */
 const BUILTIN_CHAT_PROJECT_ID = "builtin-chat";
 
@@ -147,16 +160,16 @@ export interface ProjectTree {
   noteProjectSessionsChanged: (projectId: string) => void;
   /** 「显示更多」：按固定页大小追加侧栏可见子项数。 */
   showMoreProjectChildren: (projectId: string) => void;
-  /** 项目被删除时立即清掉它的分页/可见子项行（不必等项目列表回推）。 */
-  forgetProject: (projectId: string) => void;
+  /** 项目记录真的消失时立即清掉它们的按项目状态（分页行 / 来源过滤 / 子会话组）。 */
+  forgetProjects: (projectIds: readonly string[]) => void;
   sessionSourceFilter: SessionSourceFilter;
   setSessionSourceFilter: React.Dispatch<React.SetStateAction<SessionSourceFilter>>;
   expandedSubagentGroups: Set<string>;
   toggleSubagentGroup: (key: string) => void;
   // 确认弹框
-  sidebarDeleteConfirm: { session: SessionSummary; childCount: number } | null;
+  sidebarDeleteConfirm: SidebarSessionDeleteConfirm | null;
   setSidebarDeleteConfirm: React.Dispatch<
-    React.SetStateAction<{ session: SessionSummary; childCount: number } | null>
+    React.SetStateAction<SidebarSessionDeleteConfirm | null>
   >;
   worktreeCreateDialog: { projectId: string } | null;
   setWorktreeCreateDialog: React.Dispatch<
@@ -201,10 +214,8 @@ export function useProjectTree(deps: ProjectTreeDeps): ProjectTree {
   /** settings.json 是否已成为展开集合的权威写入（防止迟到的启动读覆盖用户点击） */
   const expandedSidebarFromSettingsRef = useRef(false);
 
-  const [sidebarDeleteConfirm, setSidebarDeleteConfirm] = useState<{
-    session: SessionSummary;
-    childCount: number;
-  } | null>(null);
+  const [sidebarDeleteConfirm, setSidebarDeleteConfirm] =
+    useState<SidebarSessionDeleteConfirm | null>(null);
   const [worktreeCreateDialog, setWorktreeCreateDialog] = useState<{
     projectId: string;
   } | null>(null);
@@ -340,14 +351,39 @@ export function useProjectTree(deps: ProjectTreeDeps): ProjectTree {
     }));
   }, []);
 
-  const forgetProject = useCallback((projectId: string) => {
+  /**
+   * 项目记录真的消失时清掉按项目键存的侧栏状态：分页行数、来源过滤、子会话组展开。
+   *
+   * 这三个 map 都以项目 id 为键并以 localStorage 持久化，不随项目列表裁剪——
+   * 项目删了却留着键，同路径重新注册时会继承上一个项目的过滤与展开状态。
+   * 收成一个集合入口：调用方只需给出「真正消失了哪些 id」（差集由
+   * shared/projectVisibility 裁决），不必逐条删除，也不会漏掉新增的按项目 map。
+   */
+  const forgetProjects = useCallback((projectIds: readonly string[]) => {
+    if (projectIds.length === 0) return;
+    const removed = new Set(projectIds);
     setVisibleProjectChildCountByProject((current) => {
-      if (!(projectId in current)) return current;
+      if (!projectIds.some((id) => id in current)) return current;
       const next = { ...current };
-      delete next[projectId];
+      for (const id of removed) delete next[id];
       return next;
     });
-  }, []);
+    setSessionSourceFilter((current) => {
+      if (!projectIds.some((id) => id in current)) return current;
+      const next = { ...current };
+      for (const id of removed) delete next[id];
+      return next;
+    });
+    setExpandedSubagentGroups((current) => {
+      // 归属必须用 subagentGroupProjectId 判定：键有「顶层」与「worktree 子项目」
+      // 两种形状（`p:…` / `wt:p:…`），只取第一段会把 worktree 的组全部漏掉。
+      const kept = [...current].filter((key) => {
+        const owner = subagentGroupProjectId(key);
+        return owner === undefined || !removed.has(owner);
+      });
+      return kept.length === current.size ? current : new Set(kept);
+    });
+  }, [setExpandedSubagentGroups, setSessionSourceFilter]);
 
   const toggleSubagentGroup = useCallback(
     (key: string) => {
@@ -493,7 +529,7 @@ export function useProjectTree(deps: ProjectTreeDeps): ProjectTree {
     visibleProjectChildCountByProject,
     noteProjectSessionsChanged,
     showMoreProjectChildren,
-    forgetProject,
+    forgetProjects,
     sessionSourceFilter,
     setSessionSourceFilter,
     expandedSubagentGroups,

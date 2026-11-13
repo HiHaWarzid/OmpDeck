@@ -236,12 +236,15 @@ const UpToDateModalLazy = lazyWithReload(() => import("./components/app/UpdateMo
 const GitPanel = lazyWithReload(() => import("./components/app/GitPanel").then((m) => ({ default: m.GitPanel })));
 const BrowserPanel = lazyWithReload(() => import("./components/app/BrowserPanel").then((m) => ({ default: m.BrowserPanel })));
 const FilesDrawer = lazyWithReload(() => import("./components/app/drawers/FilesDrawer").then((m) => ({ default: m.FilesDrawer })));
-const SessionsDrawer = lazyWithReload(() => import("./components/app/drawers/SessionsDrawer").then((m) => ({ default: m.SessionsDrawer })));
 const EnvironmentDialog = lazyWithReload(() => import("./components/app/modals/EnvironmentDialog").then((m) => ({ default: m.EnvironmentDialog })));
 const SessionManagerModal = lazyWithReload(() => import("./components/app/modals/SessionManagerModal").then((m) => ({ default: m.SessionManagerModal })));
 const WorktreeCreateDialog = lazyWithReload(() => import("./components/app/modals/WorktreeCreateDialog").then((m) => ({ default: m.WorktreeCreateDialog })));
 const LazyPanelFallback = <div className="drawer-panel-loading">{t("common.loading")}</div>;
 import { createDefaultExternalEditorSettings } from "../../shared/types";
+import {
+  diffVanishedProjects,
+  projectEnvironmentOf,
+} from "../../shared/projectVisibility";
 import type {
   AgentRuntimeState,
   AgentTab,
@@ -428,15 +431,15 @@ export function App() {
   // RPC effect / createAgent 等通过 setters/refs 更新，行为与原内联声明一致。
   const {
     agents, pendingAgents, activeAgentId, activeAgentByProject,
-    sessions, sessionsByProject,
+    sessionsByProject,
     sessionLoadingByProject, sessionErrorByProject,
     setAgents, setActiveAgentId, setActiveAgentByProject,
-    setSessions, setSessionsByProject, setSessionLoadingByProject,
+    setSessionsByProject, setSessionLoadingByProject,
     agentsRef, activeAgentIdRef, pendingAgentsRef,
     displayAgentsRef,
     displayAgents, activeAgent,
     refreshRuntimeState, cycleModel, cycleThinking,
-    editMessage, refreshSessions, refreshProjectSessions,
+    editMessage, refreshProjectSessions, forgetProjectSessions,
     updatePendingAgents,
   } = useAgentSessions({
     api,
@@ -479,7 +482,7 @@ export function App() {
     setDragOverProjectId,
     visibleProjectChildCountByProject,
     showMoreProjectChildren,
-    forgetProject,
+    forgetProjects,
     sessionSourceFilter,
     setSessionSourceFilter,
     expandedSubagentGroups,
@@ -1000,7 +1003,6 @@ export function App() {
       ),
     onImported: async (id, report, project) => {
       await refreshProjectSessions(project.id);
-      if (sessionsProjectId === project.id) await refreshSessions(project.id, true);
       showToast(
         t(importSources[id].labels.importDone, {
           imported: report.imported,
@@ -1068,11 +1070,9 @@ export function App() {
   const transcriptRuntime = transcriptRuntimeRef.current;
 
   // compact 在途标志按条目存放（composer 切片），不再是根级 boolean。
-  // 右侧面板（文件/Git/浏览器/历史会话）的状态与规则全部归 useSessionPanelHost 所有：
+  // 右侧面板（文件/Git/浏览器）的状态与规则全部归 useSessionPanelHost 所有：
   // 根组件只读派生视图、调意图方法（声明在 settings 之后，因为 Git 开关来自 settings）。
 
-
-  const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [afkOpen, setAfkOpen] = useState(false);
   // 从 AFK 中心「去配置」跳转：SettingsModal 挂载时定位到 afk tab，关闭后复位
@@ -1151,7 +1151,7 @@ export function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
-  // 右侧面板（文件/Git/浏览器/历史会话）的唯一所有者：状态、持久化、收起动画、
+  // 右侧面板（文件/Git/浏览器）的唯一所有者：状态、持久化、收起动画、
   // 钉选与 Git 开关规则都在 useSessionPanelHost 里，App 只消费派生视图 + 意图方法。
   const panelHost = useSessionPanelHost({
     activeProjectId,
@@ -1167,7 +1167,6 @@ export function App() {
   const drawerPinned = panelHost.pinned;
   const drawerContentPanel = panelHost.contentPanel;
   const expandedDirs = panelHost.expandedDirs;
-  const sessionsProjectId = panelHost.sessionsProjectId;
 
   useEffect(() => {
     // 详情仍在抽屉模式时，用户切换到其他面板应关闭快照，并且即使内容尚未返回也要废弃在途读取；
@@ -1386,21 +1385,8 @@ export function App() {
 
   const scratchPad = useScratchPad();
 
-  // 历史会话面板激活时总是拉取最新列表：抽屉面板会随项目从 localStorage 恢复，
-  // 若只在显式打开时刷新，恢复路径会展示上一个项目的残留列表或空列表（表现为“点了没反应”）。
-  useEffect(() => {
-    if (drawer === "sessions" && !drawerCollapsed && sessionsProjectId) {
-      void refreshSessions(sessionsProjectId);
-    }
-    // refreshSessions 每次渲染都是新函数；只需在面板/项目切换时触发。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawer, drawerCollapsed, sessionsProjectId]);
-
   const activeProject = projects.find(
     (project) => project.id === activeProjectId,
-  );
-  const sessionsProject = projects.find(
-    (project) => project.id === sessionsProjectId,
   );
   // Agent 关闭后清除对应历史命令。
   // 挂载初期 agents 尚未从主进程同步（displayAgents 为空），此时不能裁剪：
@@ -2437,7 +2423,6 @@ export function App() {
   useEffect(() => {
     if (!activeProjectId) {
       setFiles([]);
-      setSessions([]);
       resetBranchInfo();
       return;
     }
@@ -2662,31 +2647,7 @@ export function App() {
     }
   }
 
-  async function refreshSessionHistory(projectId = sessionsProjectId) {
-    if (!projectId) return;
-    setSessionHistoryLoading(true);
-    try {
-      // 项目历史弹框内的刷新需要显式进入 loading 状态;否则刷新很快完成时用户会误以为按钮没有响应。
-      await refreshSessions(projectId);
-    } catch {
-      // refreshSessions 内部已捕获并提示错误；这里仅兜底，避免调用方产生未捕获 rejection。
-    } finally {
-      setSessionHistoryLoading(false);
-    }
-  }
-
-  async function openProjectSessions(project: Project) {
-    setProjectMenu(null);
-    setActiveProjectId(project.id);
-    setSessions([]);
-    panelHost.openSessions(project.id);
-    await refreshSessionHistory(project.id);
-  }
-
-  async function copySession(
-    filePath: string,
-    projectId = sessionsProjectId ?? activeProjectId,
-  ) {
+  async function copySession(filePath: string, projectId = activeProjectId) {
     if (!projectId) return;
     try {
       const result = await api.sessions.copy(projectId, filePath);
@@ -2695,7 +2656,6 @@ export function App() {
         return;
       }
       showToast(t("app.sessionCopied"));
-      await refreshSessions(projectId, true);
       await refreshProjectSessions(projectId);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -2703,21 +2663,19 @@ export function App() {
     }
   }
 
-  async function exportHistorySession(session: SessionSummary) {
-    const projectId = sessionsProjectId ?? activeProjectId;
-    if (!projectId) return;
+  /**
+   * 导出/删除会话都必须指明会话所属项目：侧栏与会话管理弹框都能对**非当前**项目操作，
+   * 用 activeProjectId 兜底会刷新错项目的列表（被删行留在界面上），导出也可能落到别的项目。
+   */
+  async function exportHistorySession(projectId: string, session: SessionSummary) {
     const result = await api.sessions.exportHtml(projectId, session.filePath);
     showToast(t("app.exportedPath", { path: result.path }), 3500);
   }
 
-  async function deleteHistorySession(session: SessionSummary) {
+  async function deleteHistorySession(projectId: string, session: SessionSummary) {
     await api.sessions.delete(session.filePath);
     showToast(t("app.sessionDeleted"), 2200);
-    const projectId = sessionsProjectId ?? activeProjectId;
-    // 乐观移除已删除的会话，避免刷新失败时残留无法打开的条目。
-    setSessions((current) => current.filter((s) => s.filePath !== session.filePath));
-    await refreshSessions(projectId, true);
-    if (projectId) await refreshProjectSessions(projectId);
+    await refreshProjectSessions(projectId);
   }
 
   async function cloneAgentSession(agentId: string) {
@@ -2730,7 +2688,6 @@ export function App() {
       }
       showToast(t("app.currentSessionCopied"));
       await refreshRuntimeState(agentId);
-      await refreshSessions(activeProjectId, true);
       if (activeProjectId) await refreshProjectSessions(activeProjectId);
     } catch (error) {
       // 主进程现在会把 pi 的失败（命令不兼容/会话忙）抛过来：必须提示，否则用户只看到
@@ -2775,8 +2732,6 @@ export function App() {
       setAgentRenameValue("");
       showToast(t("app.sessionRenamed"), 2200);
       await refreshProjectSessions(tab.projectId);
-      if (sessionsProjectId === tab.projectId)
-        await refreshSessions(tab.projectId, true);
     } catch (error) {
       showToast(
         t("app.sessionRenameFailed", {
@@ -2800,9 +2755,6 @@ export function App() {
     try {
       await api.sessions.rename(sessionRenameTarget.session.filePath, name);
       await refreshProjectSessions(sessionRenameTarget.projectId);
-      if (sessionsProjectId === sessionRenameTarget.projectId) {
-        await refreshSessions(sessionRenameTarget.projectId, true);
-      }
       setSessionRenameTarget(null);
       setAgentRenameValue("");
       showToast(t("app.sessionRenamed"), 2200);
@@ -2994,51 +2946,61 @@ export function App() {
   }
 
   /**
-   * 项目记录消失后的统一收尾。
+   * 项目记录变更后的统一收尾：删除前的列表快照 → 执行变更 → 重载可见列表 → 差集清理。
    *
-   * 三条路径都会让主进程连带删掉一批项目记录——删项目（父项目连带 worktree 子项目）、
-   * 删 worktree、关闭工作区模式（清空该父项目下全部子项目）。只有「删除前列表 −
-   * 删除后列表」这个差集知道到底少了谁，所以差集计算只放这里：新增删除路径时不会再漏掉
-   * 面板钉选清理，被删项目的 `pid:project-drawer:*` / `pid:project-expanded-dirs:*`
-   * 也不会永久留在 localStorage 里。
+   * 三条路径（删项目 / 删 worktree / 关闭工作区模式）此前各抄了一遍
+   * 「取 prev → await 变更 → 取 next → setProjects → syncVanishedProjects」，
+   * 于是每加一条删除路径就有一次漏收尾的机会（面板钉选、展开目录、会话缓存各自为政）。
+   * 变更函数只管变更本身，收尾顺序只在这里定义。
    *
-   * `prev` 由调用方在删除前显式取好（唯一合法前值来源是 `projectsRef.current`），
-   * 不在函数里读 ref：这样调用方即使将来在 `setProjects` 与调用之间插入 `await`，
-   * 差集也不会静默退化成空集。
+   * `mutate` 的返回值原样返回（`worktreeRemove` 的布尔、`toggleWorktreeEnabled` 的项目），
+   * 调用方需要的错误提示仍由它自己决定。
    *
    * **不可用于** `refreshProjects` / `projects:changed` 这类「整体重载列表」的路径：
-   * 那里 `next` 可能是启动瞬间还没 load 完的空列表，也可能按 WSL/Windows 环境过滤过，
-   * 据此清盘会删掉存活项目（含另一环境全部项目）的持久化键。
+   * 那里没有「变更」，`next` 可能是启动瞬间还没 load 完的空列表，据此清盘会删掉存活项目。
+   */
+  async function applyProjectMutation<T>(
+    mutate: () => Promise<T>,
+  ): Promise<{ result: T; next: Project[] }> {
+    // 快照必须在 await 之前取：await 期间可能重渲染，ref 会指向新列表。
+    const prev = projectsRef.current;
+    const result = await mutate();
+    const next = await api.projects.list();
+    setProjects(next);
+    syncVanishedProjects(prev, next);
+    return { result, next };
+  }
+
+  /**
+   * 真正消失的项目：清掉面板钉选与持久化记录、展开目录、会话缓存，必要时回落活动项目。
+   *
+   * 差集计算收在 shared/projectVisibility（主进程的可见性过滤用同一谓词）：
+   * WSL/Windows 切换会让另一半项目**看起来**消失，那不是删除，不能清盘。
+   * 新增删除路径必须走 applyProjectMutation，否则差集根本不会被计算。
    */
   function syncVanishedProjects(prev: readonly Project[], next: Project[]): string[] {
-    const alive = new Set(next.map((project) => project.id));
-    const vanished = prev
-      .filter((project) => !alive.has(project.id))
-      .map((project) => project.id);
+    const vanished = diffVanishedProjects(
+      prev,
+      next,
+      projectEnvironmentOf(settingsRef.current.wslEnabled),
+    );
     if (vanished.length > 0) panelHost.forgetProjects(vanished);
+    // 会话缓存（按项目的列表 / loading / 错误 / 来源过滤）与项目记录同生命周期：
+    // 项目删了却留着缓存，同路径重新注册时会先闪一段上一个项目的会话。
+    if (vanished.length > 0) forgetProjectSessions(vanished);
+    if (vanished.length > 0) forgetProjects(vanished);
     // 活动项目可能正是被连带删除的子项目：不回落就会一直停在已不存在的 id 上，
     // 面板恢复 effect 也再不会为新项目运行。
-    if (activeProjectId !== undefined && !alive.has(activeProjectId)) {
+    //
+    // 读 ref 而不是闭包里的 activeProjectId：三条删除路径都跨 await（删 worktree 前面
+    // 还有 280ms 淡出动画），用户完全可能在这期间切到别的项目。用闭包值会两头出错——
+    // 闭包值是被删的那个就把用户刚切到的项目劫走，闭包值过期就漏掉回落、停在死 id 上。
+    const current = activeProjectIdRef.current;
+    if (current !== undefined && !next.some((project) => project.id === current)) {
       setActiveProjectId(next[0]?.id);
       setActiveAgentId(undefined);
     }
     return vanished;
-  }
-
-  function updateAfterProjectRemoved(
-    removedProjectId: string,
-    prev: readonly Project[],
-    next: Project[],
-  ) {
-    setSessionsByProject((current) => {
-      const updated = { ...current };
-      delete updated[removedProjectId];
-      return updated;
-    });
-    forgetProject(removedProjectId);
-    // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
-    // 所以「调了 remove」不等于「记录真没了」——按前后列表差集清理，而不是只清被点的那一个。
-    syncVanishedProjects(prev, next);
   }
 
   async function createAgent(
@@ -4264,11 +4226,7 @@ export function App() {
         void piEnv.refreshStatus();
         void api.agents.list().then(setAgents).catch(() => undefined);
         void api.projects.list().then(setProjects).catch(() => undefined);
-        if (activeProjectId) {
-          void api.sessions.list(activeProjectId).then((sessions) => {
-            setSessions([...sessions].sort((a, b) => b.updatedAt - a.updatedAt));
-          }).catch(() => undefined);
-        }
+        if (activeProjectId) void refreshProjectSessions(activeProjectId, true);
       }
       showToast(notice);
       return true;
@@ -4389,17 +4347,13 @@ export function App() {
   /** 删除 worktree 工作区 */
   async function removeWorktree(parentProjectId: string, worktreePath: string) {
     try {
-      // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
-      const prev = projectsRef.current;
-      const removed = await api.git.worktreeRemove(parentProjectId, worktreePath);
-      if (!removed) {
-        throw new Error(t("app.worktreeRemoveNotFound"));
-      }
-      const next = await api.projects.list();
-      setProjects(next);
-      // 主进程连带删掉了该 worktree 的子项目记录；统一差集收尾会清它的面板钉选与
-      // 持久化记录，否则同一路径再次注册成项目时会带着旧面板回来。
-      syncVanishedProjects(prev, next);
+      // 主进程连带删掉了该 worktree 的子项目记录；统一收尾会清它的面板钉选、
+      // 持久化记录与会话缓存，否则同一路径再次注册成项目时会带着旧状态回来。
+      await applyProjectMutation(async () => {
+        const removed = await api.git.worktreeRemove(parentProjectId, worktreePath);
+        // 变更函数内部抛错：列表更新与差集清理都不会执行（记录没删掉，也就不该清盘）。
+        if (!removed) throw new Error(t("app.worktreeRemoveNotFound"));
+      });
       await refreshWorktrees(parentProjectId);
       showToast(t("app.worktreeRemoved"));
     } catch (e) {
@@ -6239,61 +6193,6 @@ export function App() {
               </div>
             )}
           </>
-        ) : drawerContentPanel === "sessions" && !drawerCollapsed ? (
-          <LazyWrapper
-            className="drawer-content-frame"
-            enabled={true}
-            threshold={0}
-            rootMargin="50px"
-            placeholder={
-              <div style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "100%",
-                color: "var(--text-secondary)",
-                fontSize: "14px"
-              }}>
-                加载中...
-              </div>
-            }
-          >
-            <Suspense fallback={LazyPanelFallback}>
-            <SessionsDrawer
-              project={sessionsProject}
-              sessions={(sessionsProjectId && sessionSourceFilter[sessionsProjectId]) ? sessions.filter(
-                (s) => !s.parentSessionPath && (sessionSourceFilter[sessionsProjectId]!)!.has(s.source ?? "pi"),
-              ).concat(sessions.filter(s => s.parentSessionPath && (sessionSourceFilter[sessionsProjectId]!)!.has(s.source ?? "pi"))) : sessions}
-              sessionsLoading={sessionHistoryLoading}
-              pinned={drawerPinned}
-              onTogglePin={toggleDrawerPinned}
-              onCollapse={collapseDrawer}
-              onClose={closeDrawer}
-              onRefreshSessions={() =>
-                refreshSessions(sessionsProjectId ?? activeProjectId)
-              }
-              onOpenSession={(session) =>
-                createAgent(
-                  sessionsProjectId ?? activeProjectId ?? "",
-                  session.filePath,
-                  session.name,
-                )
-              }
-              onRenameSession={async (filePath, newName) => {
-                await api.sessions.rename(filePath, newName);
-                await refreshSessions(sessionsProjectId ?? activeProjectId, true);
-              }}
-              onCopySession={(session) =>
-                copySession(
-                  session.filePath,
-                  sessionsProjectId ?? activeProjectId,
-                )
-              }
-              onExportSession={exportHistorySession}
-              onDeleteSession={deleteHistorySession}
-            />
-            </Suspense>
-          </LazyWrapper>
         ) : null}
       </aside>
       {drawer && drawerCollapsed && (
@@ -6476,20 +6375,19 @@ export function App() {
             const project = projectMenu.project;
             setProjectMenu(null);
             try {
-              // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
-              const prev = projectsRef.current;
-              const updated = await api.projects.toggleWorktreeEnabled(project.id);
-              if (updated) {
-                const next = await api.projects.list();
-                setProjects(next);
+              const projectId = project.id;
+              const { result: updated } = await applyProjectMutation(async () => {
+                const toggled = await api.projects.toggleWorktreeEnabled(projectId);
                 // 关闭工作区模式时主进程会清空该父项目下全部 worktree 子项目记录
-                // （ProjectStore.clearWorktreeChildren），那些子项目的面板钉选、
-                // 持久化记录和「活动项目」指向都要一起收尾，否则会留下无主状态。
-                syncVanishedProjects(prev, next);
-                // 开启后立即扫描并注册已有 worktree
-                if (updated.worktreeEnabled) {
-                  void refreshWorktrees(updated.id);
-                }
+                // （ProjectStore.clearWorktreeChildren），统一收尾会一并处理它们的
+                // 面板钉选、持久化记录、会话缓存与「活动项目」回落，否则留下无主状态。
+                // 记录不存在时后端抛 projectNotFound，变更函数随之抛错，列表与差集都不动。
+                if (!toggled) throw new Error("PROJECT_NOT_FOUND");
+                return toggled;
+              });
+              // 开启后立即扫描并注册已有 worktree
+              if (updated.worktreeEnabled) {
+                void refreshWorktrees(updated.id);
               }
             } catch (e) {
               // 后端在非 git 项目启用时抛出 NOT_A_GIT_REPO，给用户明确提示而非静默失败。
@@ -6509,11 +6407,10 @@ export function App() {
             const project = projectMenu.project;
             setProjectMenu(null);
             try {
-              // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
-              const prev = projectsRef.current;
-              const next = await api.projects.remove(project.id);
-              setProjects(next);
-              updateAfterProjectRemoved(project.id, prev, next);
+              // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
+              // 所以「调了 remove」不等于「记录真没了」——统一收尾按前后列表差集清理，
+              // 而不是只清被点的那一个。
+              await applyProjectMutation(() => api.projects.remove(project.id));
             } catch (e) {
               if (String((e as Error)?.message ?? e).includes("PROJECT_HAS_RUNNING_AGENT")) {
                 setConfirmDialog({
@@ -6633,7 +6530,7 @@ export function App() {
             const childCount = projectSessions.filter(
               (s) => isSameSessionPath(s.parentSessionPath, session.filePath),
             ).length;
-            setSidebarDeleteConfirm({ session, childCount });
+            setSidebarDeleteConfirm({ projectId: sessionMenu.projectId, session, childCount });
           }}
         />
       )}
@@ -6655,9 +6552,9 @@ export function App() {
           danger
           onCancel={() => setSidebarDeleteConfirm(null)}
           onConfirm={() => {
-            const target = sidebarDeleteConfirm.session;
+            const { projectId, session } = sidebarDeleteConfirm;
             setSidebarDeleteConfirm(null);
-            void deleteHistorySession(target);
+            void deleteHistorySession(projectId, session);
           }}
         />
       )}
@@ -6671,8 +6568,10 @@ export function App() {
               openSessionRename(sessionManagerProject.id, session);
             }}
             onExport={(session) => {
+              // 弹框关闭会把 sessionManagerProject 置空，项目 id 必须先取。
+              const projectId = sessionManagerProject.id;
               setSessionManagerProject(null);
-              void exportHistorySession(session);
+              void exportHistorySession(projectId, session);
             }}
             onDelete={async (sessions) => {
               for (const session of sessions) {
@@ -6682,7 +6581,6 @@ export function App() {
               const projectId = sessionManagerProject.id;
               // 先关闭弹框，避免列表数据在刷新期间显示不一致
               setSessionManagerProject(null);
-              await refreshSessions(projectId);
               await refreshProjectSessions(projectId);
             }}
           />

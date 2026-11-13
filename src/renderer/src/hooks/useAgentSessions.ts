@@ -9,7 +9,7 @@
  * 迁移策略（见 .trae/documents/useAgentSessions-extraction.md）：
  * - Step 0: 状态 + refs + 计算值（零行为变化） ✅
  * - Step 1: 纯动作（applyAgentRuntimeState / cycleModel 等） ✅
- * - Step 2: 会话加载（refreshSessions / refreshProjectSessions） ✅
+ * - Step 2: 会话加载（refreshProjectSessions） ✅
  */
 
 import { useMemo, useRef, useState } from "react";
@@ -37,7 +37,7 @@ export function isPendingAgentId(agentId?: string) {
 interface UseAgentSessionsDeps {
 	/** 桌面 API（Electron preload / browser / preview），由 App.tsx 注入。 */
 	api: PiDesktopApi;
-	/** 当前活跃项目 ID，refreshSessions 默认刷新该项目。 */
+	/** 当前活跃项目 ID。 */
 	activeProjectId: string | undefined;
 	/**
 	 * 项目会话列表变更后的回调（如更新侧栏可见子项数）。
@@ -56,7 +56,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const [activeAgentByProject, setActiveAgentByProject] = useState<
 		Record<string, string>
 	>({});
-	const [sessions, setSessions] = useState<SessionSummary[]>([]);
 	const [sessionsByProject, setSessionsByProject] = useState<
 		Record<string, SessionSummary[]>
 	>({});
@@ -80,8 +79,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	const sessionRequestByProjectRef = useRef<Record<string, number>>({});
 	const sessionRefreshRunningRef = useRef<Set<string>>(new Set());
 	const sessionRefreshPendingRef = useRef<Set<string>>(new Set());
-	/** sessions 抽屉列表的请求序号（按项目）：快速切换项目时丢弃旧项目的慢响应，避免抽屉展示上一个项目的残留列表。 */
-	const sessionListSeqRef = useRef<Record<string, number>>({});
 
 	// ===== Computed =====
 	const displayAgents = useMemo(() => {
@@ -198,28 +195,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 	}
 
 	/**
-	 * 刷新活跃项目的会话列表（用于 sessions state，非按项目分组的 sessionsByProject）。
-	 * silent=true 用于删除/重命名/复制等操作后的静默刷新：失败时保留旧列表且不弹错误提示，
-	 * 避免与操作自身的成功提示叠加成矛盾通知；错误统一在此捕获，杜绝调用点产生未捕获 rejection。
-	 */
-	async function refreshSessions(projectId = activeProjectId, silent = false) {
-		// 按项目编号请求：快速切换项目时，旧项目的慢响应不能覆盖当前抽屉列表。
-		const key = projectId ?? "";
-		const request = (sessionListSeqRef.current[key] ?? 0) + 1;
-		sessionListSeqRef.current[key] = request;
-		try {
-			const next = await listSessionsWithRetry(projectId, silent);
-			if (sessionListSeqRef.current[key] !== request) return;
-			setSessions([...next].sort((a, b) => b.updatedAt - a.updatedAt));
-		} catch (error) {
-			if (!silent) {
-				const msg = error instanceof Error ? error.message : String(error);
-				showNotice(`${t("app.sessionLoadFailed")}: ${msg}`, 4000, "error");
-			}
-		}
-	}
-
-	/**
 	 * 刷新指定项目的会话列表（sessionsByProject），带去重和 loading 状态。
 	 *
 	 * 并发控制：同一项目的请求通过 sessionRefreshRunningRef 串行化，
@@ -306,13 +281,40 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		}
 	}
 
+	/**
+	 * 项目记录真的消失：清掉该项目的会话列表缓存与扫描在途标记。
+	 *
+	 * 会话缓存与项目记录同生命周期——项目被删/被连带删除后若留着 sessionsByProject、
+	 * loading、error 与在途序号，同一路径重新注册成新项目时会先闪一段旧项目的会话，
+	 * 且旧请求的序号还压在表里，新请求可能被当成"未变化"丢弃。
+	 * 只在这里清理，App 侧不直接摸这些 map。
+	 */
+	function forgetProjectSessions(projectIds: readonly string[]) {
+		if (projectIds.length === 0) return;
+		const removed = new Set(projectIds);
+		const prune = <T,>(current: Record<string, T>): Record<string, T> => {
+			if (!projectIds.some((id) => id in current)) return current;
+			const next: Record<string, T> = { ...current };
+			for (const id of removed) delete next[id];
+			return next;
+		};
+		setSessionsByProject(prune);
+		setSessionLoadingByProject(prune);
+		setSessionErrorByProject((current) => prune(current));
+		// 在途扫描的序号与 pending 标记必须一起清：留着会让下一次扫描拿到旧序号。
+		for (const id of removed) {
+			delete sessionRequestByProjectRef.current[id];
+			sessionRefreshRunningRef.current.delete(id);
+			sessionRefreshPendingRef.current.delete(id);
+		}
+	}
+
 	return {
 		// state（messages/runtimeState 已迁入会话工作区切片：App 用 useWorkspaceSlice 订阅）
 		agents,
 		pendingAgents,
 		activeAgentId,
 		activeAgentByProject,
-		sessions,
 		sessionsByProject,
 		sessionLoadingByProject,
 		sessionErrorByProject,
@@ -320,7 +322,6 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		setAgents,
 		setActiveAgentId,
 		setActiveAgentByProject,
-		setSessions,
 		setSessionsByProject,
 		setSessionLoadingByProject,
 		// refs（挂载一次的监听器/异步路径需要最新值；会话扫描内部序号仅 hook 内部使用）
@@ -336,8 +337,8 @@ export function useAgentSessions(deps: UseAgentSessionsDeps) {
 		cycleModel,
 		cycleThinking,
 		editMessage,
-		refreshSessions,
 		refreshProjectSessions,
+		forgetProjectSessions,
 		updatePendingAgents,
 	};
 }

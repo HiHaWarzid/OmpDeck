@@ -150,17 +150,6 @@ describe("useSessionPanelHost", () => {
 		expect(localStorage.getItem("pid:project-drawer:p1")).toBe(stored);
 	});
 
-	it("closes the sessions panel when its project is forgotten", async () => {
-		await mount({ activeProjectId: "p1" });
-		await run(() => latest.openSessions("p3"));
-		expect(latest.sessionsProjectId).toBe("p3");
-
-		await run(() => latest.forgetProjects(["p3"]));
-
-		expect(latest.sessionsProjectId).toBeUndefined();
-		expect(latest.panel).toBeNull();
-	});
-
 	it("toggles directories through the host and persists them for the project", async () => {
 		await mount({ activeProjectId: "p1" });
 

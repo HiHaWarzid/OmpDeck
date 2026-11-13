@@ -31,6 +31,38 @@ export const WORKTREE_COLLAPSED_SESSION_LIMIT = 3;
 /** 侧栏主列表每页子项数（「查看更多」每次追加一页）。 */
 export const SIDEBAR_PROJECT_CHILD_PAGE_SIZE = 5;
 
+/**
+ * 子会话组展开键的**唯一**构造/解析处（落盘于 sidebar-expanded-subagent-groups）。
+ *
+ * 键有两个维度：所属项目、以及是否为 worktree 子项目；孙级再向后串联一层。
+ * 此前构造散在侧栏组件里三处、归属解析写在「删除项目后清理」的逻辑里，两边各拼一遍
+ * 字符串——清理侧只认顶层形状，worktree 子项目（`wt:` 前缀）的键永远匹配不上，
+ * 于是删掉 worktree 后这些键永久留在本地存储里，每轮增删再追加一批。
+ *
+ * 项目 id 是 UUID（不含 `:`），所以按段落解析归属是安全的；会话键里的盘符冒号
+ * 只可能出现在归属段之后，不影响取前 1~2 段。
+ */
+export function subagentGroupKey(
+	projectId: string,
+	sessionKey: string,
+	options: { worktree?: boolean } = {},
+): string {
+	return options.worktree
+		? `wt:${projectId}:${sessionKey}`
+		: `${projectId}:${sessionKey}`;
+}
+
+/** 孙级键：在父键后接一层会话键，项目归属随父键不变。 */
+export function nestedSubagentGroupKey(parentKey: string, sessionKey: string): string {
+	return `${parentKey}:${sessionKey}`;
+}
+
+/** 从展开键反解所属项目 id；必须与 `subagentGroupKey` 的两种形状保持对称。 */
+export function subagentGroupProjectId(key: string): string | undefined {
+	const parts = key.split(":");
+	return key.startsWith("wt:") ? parts[1] : parts[0];
+}
+
 // 共享空值：投影表用不到的键 / 空会话列表兜底，避免每次 .get() miss 都新建引用。
 export const EMPTY_AGENTS: AgentTab[] = Object.freeze([]) as unknown as AgentTab[];
 // 无会话项目的共享空数组；冻结防止任何路径写坏这份共享默认值。

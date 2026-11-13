@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import type { SessionSummary } from "../../shared/types";
 import {
 	getProjectAgentSessionDisplay,
-	getSessionTreeProjection,
 	sameSessionSummary,
 	sameSessionSummaryList,
 } from "./agentListDisplay";
@@ -44,38 +43,6 @@ describe("sameSessionSummaryList", () => {
 		expect(
 			sameSessionSummaryList([makeSession()], [makeSession({ updatedAt: 2 })]),
 		).toBe(false);
-	});
-});
-
-describe("getSessionTreeProjection", () => {
-	it("groups pi children by normalized parent path and restores orphans", () => {
-		const parent = makeSession({ id: "p", filePath: "/project/p.jsonl" });
-		const child = makeSession({
-			id: "c",
-			filePath: "/PROJECT/c.jsonl",
-			parentSessionPath: "\\project\\p.jsonl",
-		});
-		const orphan = makeSession({
-			id: "o",
-			filePath: "/project/o.jsonl",
-			parentSessionPath: "/project/missing.jsonl",
-		});
-		const projection = getSessionTreeProjection([parent, child, orphan]);
-		expect(projection.topLevel.map((s) => s.id)).toEqual(["p", "o"]);
-		expect(projection.childrenOf.get("/project/p.jsonl")?.map((s) => s.id)).toEqual(["c"]);
-	});
-
-	it("groups codex subagents by codexSessionId and sorts top level desc", () => {
-		const parent = makeSession({ id: "p", codexSessionId: "cx-p", updatedAt: 100 });
-		const child = makeSession({
-			id: "c",
-			codexThreadSource: "subagent",
-			codexParentThreadId: "cx-p",
-			updatedAt: 200,
-		});
-		const projection = getSessionTreeProjection([child, parent]);
-		expect(projection.topLevel.map((s) => s.id)).toEqual(["p"]);
-		expect(projection.childrenOf.get("cx-p")?.map((s) => s.id)).toEqual(["c"]);
 	});
 });
 

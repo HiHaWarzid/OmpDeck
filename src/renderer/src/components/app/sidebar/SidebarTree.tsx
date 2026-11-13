@@ -50,6 +50,8 @@ import {
 	EMPTY_AGENTS,
 	EMPTY_PROJECT_DISPLAY,
 	SIDEBAR_PROJECT_CHILD_PAGE_SIZE,
+	nestedSubagentGroupKey,
+	subagentGroupKey as sidebarSubagentGroupKey,
 	type SessionSource,
 	type SidebarProjectRow,
 } from "./sidebarProjection";
@@ -592,7 +594,7 @@ function SidebarTreeView({
 									}
 								>
 									{projectDisplay.visibleChildren.map((child) => {
-									const subagentGroupKey = `${project.id}:${child.key}`;
+									const subagentGroupKey = sidebarSubagentGroupKey(project.id, child.key);
 									const subagentsExpanded = expandedSubagentGroups.has(subagentGroupKey);
 									const totalSubagentCount = (child.codexSubagents?.length ?? 0) + (child.piSubagents?.length ?? 0);
 									const renderSubagentRow = (
@@ -692,7 +694,7 @@ function SidebarTreeView({
 												{subagents.map((subagent) => {
 													const subagentKey = normalizeSessionPathForCompare(subagent.filePath) ?? subagent.filePath;
 													const grandchildren = projectDisplay.piSubagentsByParent.get(subagentKey) ?? [];
-													const grandGroupKey = `${groupKey}:${subagentKey}`;
+													const grandGroupKey = nestedSubagentGroupKey(groupKey, subagentKey);
 													const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
 													return (
 														<Fragment key={subagent.filePath}>
@@ -899,7 +901,7 @@ function SidebarTreeView({
 													{subagents.map((sa) => {
 														const saKey = normalizeSessionPathForCompare(sa.filePath) ?? sa.filePath;
 														const grandchildren = wtDisplay?.piSubagentsByParent.get(saKey) ?? [];
-														const grandGroupKey = `${groupKey}:${saKey}`;
+														const grandGroupKey = nestedSubagentGroupKey(groupKey, saKey);
 														const grandExpanded = expandedSubagentGroups.has(grandGroupKey);
 														return (
 															<Fragment key={sa.filePath}>
@@ -1035,7 +1037,7 @@ function SidebarTreeView({
 												{wtChildren.filter(c => c.type === "agent").map((item) => {
 													const agent = item.agent;
 													const totalSubagentCount = (item.codexSubagents?.length ?? 0) + (item.piSubagents?.length ?? 0);
-													const subagentGroupKey = `wt:${childProject.id}:${item.key}`;
+													const subagentGroupKey = sidebarSubagentGroupKey(childProject.id, item.key, { worktree: true });
 													const subagentExpanded = expandedSubagentGroups.has(subagentGroupKey);
 													return (
 														<Fragment key={item.key}>
@@ -1100,7 +1102,7 @@ function SidebarTreeView({
 												{wtChildren.filter(c => c.type === "session").map((item) => {
 													const session = item.session;
 													const totalSubagentCount = (item.codexSubagents?.length ?? 0) + (item.piSubagents?.length ?? 0);
-													const subagentGroupKey = `wt:${childProject.id}:${item.key}`;
+													const subagentGroupKey = sidebarSubagentGroupKey(childProject.id, item.key, { worktree: true });
 													const subagentExpanded = expandedSubagentGroups.has(subagentGroupKey);
 													return (
 														<Fragment key={item.key}>
