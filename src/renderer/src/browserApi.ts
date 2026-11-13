@@ -292,6 +292,15 @@ export function createBrowserApi(): PiDesktopApi {
 					params: { projectId },
 				});
 			},
+			readMessageFullText: async (agentId, messageId, entryId) => {
+				// 工具输出被截断时手机端按需取全文；entryId 是查询参数，不进路径。
+				const query = new URLSearchParams();
+				if (entryId) query.set("entryId", entryId);
+				return callRoute<{ text: string }>(webRoutes.sessions.readMessageFullText, {
+					params: { agentId, messageId },
+					query,
+				});
+			},
 		},
 		agents: {
 			...base.agents,

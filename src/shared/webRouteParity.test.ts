@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { webRoutes, type WebRestRoute } from "./ipc";
+import { matchWebRoute, webRoutePathParams, webRoutes, webRouteUrl, type WebRestRoute } from "./ipc";
 
 /**
  * 手机端路由奇偶守卫（静态契约）——手写客户端的死链防线。
@@ -225,8 +225,9 @@ describe.each(CLIENTS)("/api 路由 × webRoutes 奇偶守卫（$name）", ({ so
 	/**
 	 * 反向缺口：`web:true` 只表示「手机端 UI 需要该能力」，不等于客户端一定有调用点
 	 * （stop / settings 类由桌面 renderer 与 /api/state 聚合路径承担）。因此这里只核对
-	 * **abort 与 stop 不得混用**——那是唯一曾真实出错的路径漂移：abort 曾打到 /stop，
-	 * 导致手机上点「停止」直接退役 pi 进程。
+	 * **abort 与 stop 不得混用**——两者语义差一个数量级（abort 只中止当前回合，
+	 * stop 会退役 pi 进程），把 abort 打到 /stop 会让用户的「停止」变成杀掉会话，
+	 * 而这种漂移不会报错，只会表现得「点一下整段对话没了」。
 	 */
 	it("abort 与 stop 路径不同，且该客户端确实调用 abort", () => {
 		const abortPath = routeShape(`/api${webRoutes.agents.abort.path}`);
@@ -251,10 +252,26 @@ describe.each(CLIENTS)("/api 路由 × webRoutes 奇偶守卫（$name）", ({ so
 describe("服务端分发 × webRoutes 奇偶守卫", () => {
 	const serverSource = readFileSync(WEB_SERVICE_MANAGER, "utf8");
 
+	/**
+	 * 扫源码前剥掉注释。
+	 *
+	 * 守卫是文本匹配：把一条真分发删掉、在注释里留一句
+	 * `// matchWebRoute(webRoutes.agents.runtimeState` 就能骗过它。
+	 * 剥注释后注释不再能"满足"守卫，这条捷径消失。
+	 */
+	function stripComments(source: string): string {
+		return source
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			// 行注释只认「行首或空白之后的 //」：URL 里的 `http://` 前面是冒号，
+			// 放宽成 `[^:]` 外的任意字符会把 `"http://x"` 之后整行切掉，
+			// 连同行尾的真实分发调用一起吞掉（守卫于是假绿）。
+			.replace(/(^|\s)\/\/[^\n]*/g, "$1");
+	}
+
 	/** 抽出 `matchWebRoute(webRoutes.<ns>.<member>` 的成员键。 */
 	function dispatchedKeys(): string[] {
 		const keys = new Set<string>();
-		for (const match of serverSource.matchAll(
+		for (const match of stripComments(serverSource).matchAll(
 			/matchWebRoute\(\s*webRoutes\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/g,
 		)) {
 			keys.add(`${match[1]}.${match[2]}`);
@@ -290,5 +307,76 @@ describe("服务端分发 × webRoutes 奇偶守卫", () => {
 
 	it("能抽到分发调用（否则守卫空转）", () => {
 		expect(dispatchedKeys().length).toBe(tableKeys().length);
+	});
+});
+
+/**
+ * 表内 method + path 唯一性。
+ *
+ * 分发是顺序 if 链：两条同形状条目时，前一条分支永远遮蔽后一条，而后一条的客户端
+ * 仍能拼出「合法」URL——只会落到前一条的语义上。三处守卫都会自证一致（客户端从表取值、
+ * 服务端用同表匹配），所以这条重复必须单独守。
+ */
+describe("webRoutes 表自洽", () => {
+	it("method + path 组合不重复", () => {
+		const seen = new Map<string, string>();
+		const duplicates: string[] = [];
+		for (const [namespace, members] of Object.entries(
+			webRoutes as unknown as Record<string, Record<string, WebRestRoute>>,
+		)) {
+			for (const [member, route] of Object.entries(members)) {
+				const key = `${route.method} ${route.path}`;
+				const owner = seen.get(key);
+				if (owner) duplicates.push(`${key}（${owner} 与 ${namespace}.${member}）`);
+				else seen.set(key, `${namespace}.${member}`);
+			}
+		}
+		expect(
+			duplicates,
+			`webRoutes 存在重复端点（后一条分发永远不可达）: ${duplicates.join(" | ")}`,
+		).toEqual([]);
+	});
+
+	/**
+	 * 占位符语法：必须独占一整段。
+	 *
+	 * `webRouteUrl`（客户端拼 URL）与 `webRouteRegex`（服务端匹配）是两条独立实现，
+	 * 段内写法 `/x/full-text:entryId` 会让客户端替换成字面量路径、服务端却按字面量 `:`
+	 * 匹配——「客户端拼得出、服务端永远 404」，且不报错。两侧都拒绝这种模板。
+	 */
+	it("占位符独占路径段（客户端与服务端语法同源）", () => {
+		const bad: string[] = [];
+		for (const [namespace, members] of Object.entries(
+			webRoutes as unknown as Record<string, Record<string, WebRestRoute>>,
+		)) {
+			for (const [member, route] of Object.entries(members)) {
+				const embedded = route.path
+					.split("/")
+					.filter((segment) => segment.includes(":") && !/^:[A-Za-z0-9_]+$/.test(segment));
+				if (embedded.length > 0) {
+					bad.push(`${namespace}.${member} ${route.path}（${embedded.join(", ")}）`);
+				}
+			}
+		}
+		expect(bad, `webRoutes 存在段内占位符: ${bad.join(" | ")}`).toEqual([]);
+	});
+
+	it("段内占位符在建 URL 与匹配时都抛错，而不是各解析一套", () => {
+		const malformed = { method: "GET", path: "/agents/:agentId/full-text:entryId" } as WebRestRoute;
+		expect(() => webRoutePathParams(malformed.path)).toThrow(/独占一段/);
+		expect(() => webRouteUrl(malformed, { agentId: "a", entryId: "e" })).toThrow(/独占一段/);
+		// 服务端匹配同样拒绝，而不是把这个模板当成一条「字面量里带冒号」的普通路由。
+		expect(() => matchWebRoute(malformed, "/api/agents/a/full-text:x", "GET")).toThrow(/独占一段/);
+	});
+
+	it("参数值编码后不会逃出所属路径段", () => {
+		const route = { method: "GET", path: "/agents/:agentId/messages/:messageId" } as WebRestRoute;
+		expect(webRouteUrl(route, { agentId: "a/1", messageId: "m 1" })).toBe(
+			"/api/agents/a%2F1/messages/m%201",
+		);
+		expect(matchWebRoute(route, "/api/agents/a%2F1/messages/m%201", "GET")).toEqual({
+			agentId: "a/1",
+			messageId: "m 1",
+		});
 	});
 });

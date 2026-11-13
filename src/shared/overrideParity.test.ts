@@ -145,8 +145,6 @@ function checkOverridePresence(surface: unknown): string[] {
 describe("override 成员 × 实现层奇偶守卫（表驱动）", () => {
 	describe.each(LAYERS)("$name", ({ name, surface }) => {
 		it(`补齐表里全部 ${OVERRIDE_KEYS.length} 个 override 成员（${OVERRIDE_KEYS.join("、")}）`, () => {
-			// 【预期红灯】previewApi / browserApi 当前缺 clipboard.writeText
-			// （browserApi 经 ...base 继承 previewApi 的缺口），preload 必须全绿
 			const failures = checkOverridePresence(surface());
 			// 失败详情直接进断言消息：即便 diff 折叠数组，也能看到具体缺了哪个成员
 			expect(failures, `${name} 层覆盖缺口：${failures.join(" | ")}`).toEqual([]);
@@ -200,6 +198,44 @@ const WEB_PROBES: Record<string, WebProbe> = {
 		args: [GUARD_PROJECT],
 		params: { projectId: GUARD_PROJECT },
 		response: { sessions: [] },
+	},
+	"sessions.readMessageFullText": {
+		args: [GUARD_AGENT, "guard-message", "guard-entry"],
+		params: { agentId: GUARD_AGENT, messageId: "guard-message" },
+		query: { entryId: "guard-entry" },
+		response: { text: "guard full text" },
+	},
+	"agents.getMessages": {
+		args: [GUARD_AGENT],
+		params: { agentId: GUARD_AGENT },
+		response: { messages: [] },
+	},
+	"agents.abortAndRestoreQueue": {
+		args: [GUARD_AGENT],
+		params: { agentId: GUARD_AGENT },
+		response: { restoredText: "", hadQueue: false },
+	},
+	"agents.removeQueuedMessage": {
+		args: [GUARD_AGENT, "guard message", "steering"],
+		params: { agentId: GUARD_AGENT },
+		body: { message: "guard message", queue: "steering" },
+		response: { removed: true },
+	},
+	"agents.promoteQueuedMessage": {
+		args: [GUARD_AGENT, "guard message"],
+		params: { agentId: GUARD_AGENT },
+		body: { message: "guard message" },
+		response: { promoted: true },
+	},
+	"agents.sendUiResponse": {
+		args: [GUARD_AGENT, "guard-request", { value: "guard" }],
+		params: { agentId: GUARD_AGENT },
+		body: { requestId: "guard-request", value: "guard" },
+	},
+	"agents.respondTrustRequest": {
+		args: ["guard-request", "trust-session"],
+		params: { requestId: "guard-request" },
+		body: { choice: "trust-session" },
 	},
 	"agents.list": { args: [] },
 	"agents.create": {
@@ -355,8 +391,12 @@ describe("web 能力列 × browserApi 奇偶守卫（表驱动）", () => {
 			"fetch",
 			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 				calls.push({ url: String(input), init });
-				// 变更类端点的后续 refreshState 需要合法 /api/state 载荷，否则会走兜底分支。
-				const payload = route && probe.response ? probe.response : WEB_STATE_RESPONSE;
+				// 变更类端点在路由调用之后还会拉 /api/state：那个请求必须拿到合法聚合载荷，
+				// 否则 refreshState 会抛「Invalid web service state payload」，把探针的失败
+				// 伪装成被测成员的问题。按 URL 分流，而不是按 URL 顺序猜。
+				const isStatePoll = String(input).includes("/api/state");
+				const payload =
+					!isStatePoll && route && probe.response ? probe.response : WEB_STATE_RESPONSE;
 				return { ok: true, status: 200, statusText: "OK", json: async () => payload } as unknown as Response;
 			}),
 		);

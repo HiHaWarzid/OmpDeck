@@ -99,23 +99,26 @@ export interface IpcOpEntry<Args extends unknown[] = unknown[], Packed = unknown
 	 */
 	readonly override?: boolean;
 	/**
-	 * LAN-web 能力列（候选 6）：标记 WebServiceManager 的 /api/* REST 实接覆盖的
-	 * 成员。browserApi 以此列为唯一事实源生成 REST 适配；未标记成员在 LAN-web
-	 * 下必须显式抛"桌面端独占"错误，禁止静默回退到 preview 罐头/undefined。
+	 * LAN-web 能力列：该成员在 LAN-web 运行时**必须可用**。生产代码不读这一列
+	 * （browserApi 按 webRoutes 直接实接），它是**给守卫用的能力声明**：
+	 * overrideParity.test.ts 依据它要求每个成员都有行为探针，并在「挂独立端点」
+	 * 与「走 /api/state 轮询」（POLL_WEB_KEYS）之间显式二选一。
+	 *
+	 * 因此漏标不是无害的：没有 `web` 就没有探针，browserApi 里掉一个实现会被
+	 * previewApi 的 `async () => undefined` 静默接住，全部测试仍然绿。
+	 * 未标记成员在 LAN-web 下必须显式抛「桌面端独占」错误，禁止静默回退到预览罐头。
 	 */
 	readonly web?: true;
 	/**
 	 * HTTP 契约列：该成员在 /api 上的端点（见 webRoutes）。与 web 列正交。
 	 *
 	 * **route = 该成员确实有独立 REST 端点**（browserApi 与手机端按此路径调用）。
-	 * **web = 该成员在 LAN-web 运行时也必须可用**——它是给守卫用的**能力声明**，
-	 * 生产代码不读它（browserApi 直接按 webRoutes 手写适配；没有独立端点的能力显式抛
-	 * 「桌面端独占」）。overrideParity.test.ts 依据它要求每个成员都有守卫探针，
-	 * 并在「挂端点」与「走 /api/state 轮询」（POLL_WEB_KEYS）之间二选一。
+	 * **web = 该成员在 LAN-web 运行时也必须可用**——能力声明，见上。
+	 * 两列不互相蕴含：有 route 未必有 web（手机端专用端点），
+	 * 有 web 未必有 route（走 /api/state 轮询的能力）。
 	 *
-	 * 两列不互相蕴含，也不表示某个具体客户端会调用：mobile.js 有一批只在手机端使用的
-	 * 端点（agents.getMessages、sessions.readMessageFullText、agents.sendUiResponse…）
-	 * 标了 route 却没标 web。判断「谁调用了哪条路径」请查 webRouteParity.test.ts 的静态核对。
+	 * 两列也都不表示某个具体客户端会调用：判断「谁调用了哪条路径」请查
+	 * webRouteParity.test.ts 的静态核对，它扫 mobile.js 与降级页的路由字面量。
 	 */
 	readonly route?: WebRestRoute;
 }
@@ -236,9 +239,29 @@ export const webRoutes = {
 	},
 } as const satisfies WebRouteTable;
 
-/** 路径模板里的命名占位符（`:agentId` → "agentId"），按出现顺序。 */
+/** 路径段是否整体就是一个占位符（`:agentId`），而不是把占位符嵌在字面量里。 */
+function isPlaceholderSegment(segment: string): boolean {
+	return /^:[A-Za-z0-9_]+$/.test(segment);
+}
+
+/**
+ * 路径模板里的命名占位符（`:agentId` → "agentId"），按出现顺序。
+ *
+ * 只认**独占一段**的占位符：`/agents/:agentId/full-text:entryId` 这种段内写法
+ * 在服务端正则里会被当成字面量（见 webRouteRegex），客户端却能拼出 URL——
+ * 于是「客户端拼得出、服务端永远 404」，正是本模块要消灭的漂移。因此段内出现
+ * `:` 一律当作模板错误，让它在第一次调用时就炸掉。
+ */
 export function webRoutePathParams(template: string): string[] {
-	return (template.match(/:([A-Za-z0-9_]+)/g) ?? []).map((token) => token.slice(1));
+	return template.split("/").flatMap((segment) => {
+		if (!segment.includes(":")) return [];
+		if (!isPlaceholderSegment(segment)) {
+			throw new Error(
+				`web 路由占位符必须独占一段: ${template}（"${segment}" 里含 ':'，写成独立段才能被两侧一致解析）`,
+			);
+		}
+		return [segment.slice(1)];
+	});
 }
 
 /**
@@ -250,10 +273,12 @@ const webRouteRegexCache = new Map<string, RegExp>();
 function webRouteRegex(template: string): RegExp {
 	const cached = webRouteRegexCache.get(template);
 	if (cached) return cached;
+	// 先用参数解析器校验模板形状（段内 ':' 会抛错），保证两侧语法同源。
+	webRoutePathParams(template);
 	const pattern = template
 		.split("/")
 		.map((segment) =>
-			segment.startsWith(":") ? "([^/]+)" : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+			isPlaceholderSegment(segment) ? "([^/]+)" : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
 		)
 		.join("/");
 	// 唯一一处 /api 前缀字面量：模板都以它为根，客户端/服务端不重复声明。
@@ -306,9 +331,12 @@ export function webRouteUrl(route: WebRestRoute, params: Readonly<Record<string,
 			`web 路由参数不匹配: ${route.method} ${route.path}（缺 [${missing.join(", ")}]，多 [${extra.join(", ")}]）`,
 		);
 	}
-	const path = route.path.replace(/:([A-Za-z0-9_]+)/g, (_token, name: string) =>
-		encodeURIComponent(params[name]),
-	);
+	const path = route.path
+		.split("/")
+		.map((segment) =>
+			isPlaceholderSegment(segment) ? encodeURIComponent(params[segment.slice(1)]) : segment,
+		)
+		.join("/");
 	return `/api${path}`;
 }
 
@@ -377,6 +405,7 @@ export const ipcTable = {
 		readMessageFullText: {
 			channel: "sessions:read-message-full-text",
 			kind: "invoke",
+			web: true,
 			route: webRoutes.sessions.readMessageFullText,
 		},
 		readArchivedMessages: { channel: "sessions:read-archived-messages", kind: "invoke" },
@@ -635,7 +664,12 @@ export const ipcTable = {
 	},
 	agents: {
 		list: { channel: "agents:list", kind: "invoke", web: true },
-		getMessages: { channel: "agents:get-messages", kind: "invoke", route: webRoutes.agents.getMessages },
+		getMessages: {
+			channel: "agents:get-messages",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.getMessages,
+		},
 		getHistoryPage: { channel: "agents:get-history-page", kind: "invoke" },
 		create: { channel: "agents:create", kind: "invoke", web: true, route: webRoutes.agents.create },
 		historyPage: { channel: "agents:history-page", kind: "invoke", web: true, route: webRoutes.agents.historyPage },
@@ -647,17 +681,20 @@ export const ipcTable = {
 		abortAndRestoreQueue: {
 			channel: "agents:abort-and-restore-queue",
 			kind: "invoke",
+			web: true,
 			route: webRoutes.agents.abortAndRestoreQueue,
 		},
 		/** 从 omp steering/followUp 队列撤回一条 chip；结果以服务端确认 removed 为准。 */
 		removeQueuedMessage: {
 			channel: "agents:remove-queued-message",
 			kind: "invoke",
+			web: true,
 			route: webRoutes.agents.removeQueuedMessage,
 		},
 		promoteQueuedMessage: {
 			channel: "agents:promote-queued-message",
 			kind: "invoke",
+			web: true,
 			route: webRoutes.agents.promoteQueuedMessage,
 		},
 		exportHtml: { channel: "agents:export-html", kind: "invoke" },
@@ -763,12 +800,22 @@ export const ipcTable = {
 		/** Agent Extension UI 协议：主进程 → 渲染进程，推送扩展的 UI 请求（select/confirm/input/editor） */
 		onUiRequest: { channel: "agents:ui-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 渲染进程 → 主进程，传递用户在 UI 请求中的响应（选中的选项、输入的文本等） */
-		sendUiResponse: { channel: "agents:ui-response", kind: "invoke", route: webRoutes.agents.sendUiResponse },
+		sendUiResponse: {
+			channel: "agents:ui-response",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.sendUiResponse,
+		},
 		notifyAsk: { channel: "agents:notify-ask", kind: "invoke" },
 		/** 项目信任确认：主进程 → 渲染进程，启动 Agent 前请求用户对含 .pi 资源的项目做信任决策 */
 		onTrustRequest: { channel: "agents:trust-request", kind: "subscribe", pushFrom: "agent-event-bridge" },
 		/** 项目信任确认：渲染进程 → 主进程，回传用户的信任选择（trust-remember/trust-session/deny） */
-		respondTrustRequest: { channel: "agents:trust-response", kind: "invoke", route: webRoutes.agents.respondTrustRequest },
+		respondTrustRequest: {
+			channel: "agents:trust-response",
+			kind: "invoke",
+			web: true,
+			route: webRoutes.agents.respondTrustRequest,
+		},
 	},
 	pet: {
 		/** 宠物窗监听主进程推送的聚合状态 */

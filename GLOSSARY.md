@@ -197,6 +197,10 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：新增/修改任何 `/api` 端点只改 `webRoutes` 与 `ipcTable` 的 `route` 列，不在客户端手抄路径字符串。`route`（该成员确实有独立 REST 端点）与 `web`（该成员在 LAN-web 下也必须可用，是给守卫用的能力声明）**互不蕴含**：有 `route` 未必有 `web`（手机端专用端点），有 `web` 未必有 `route`（走 `/api/state` 轮询的能力）。两者的一致性由 `overrideParity.test.ts`（守卫探针）与 `webRouteParity.test.ts`（静态核对三端调用）各自把守。
 
+**模板语法归本 module 独占**：占位符必须独占一整段（`/agents/:agentId/...`，不允许 `/x/full-text:entryId`）。客户端拼 URL 与服务端正则匹配是两条独立实现，段内写法会让客户端拼出字面量路径、服务端却按字面量 `:` 匹配——「拼得出、永远 404」且不报错。`webRoutePathParams` 对段内 `:` 直接抛错，客户端与服务端都经它校验，语法因此只有一处。
+
+**`web` 列是能力声明，不是可选项**：生产代码不读它，漏标就没有守卫探针——`browserApi` 掉一个实现会被 `previewApi` 的 `async () => undefined` 静默接住，全套测试仍然绿。
+
 ### ConfigDraft（配置草稿）
 设置弹框 / 配置弹框 / 模型角色 tab 三处编辑「已落盘配置」的**唯一草稿语义**（`renderer/src/utils/configDraft.ts`，零 React 依赖的纯函数）。`value` 是正在编辑的值，`base` 是它唯一的比较对象；脏不脏一律由**值 diff** 得出，而不是「改过哪些字段」——后者让「改回原值」仍然显示未保存，是此前三处共有的 bug。
 
