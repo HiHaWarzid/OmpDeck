@@ -3,7 +3,6 @@ import { memo, useMemo, useState, type ReactNode } from "react";
 import {
 	type ToolGroupItem,
 	parseToolArgs,
-	getToolFilePath,
 	countTextLines,
 	getToolEditDiff,
 } from "../AppUtils";
@@ -31,7 +30,11 @@ import { showNotice } from "../../../utils/notice";
 import { writeClipboard } from "../../../utils/clipboard";
 import type { ChatMessage, ImageContent, TodoItem } from "../../../../../shared/types";
 import { extractTodoItems, isTodoWriteToolName } from "../../../../../shared/todo";
-import { toolArgSummary } from "../../../../../shared/sessionDisplayContract";
+import {
+	shortText,
+	toolArgPath,
+	toolArgSummary,
+} from "../../../../../shared/sessionDisplayContract";
 import { formatDuration, stripAnsi } from "../format";
 import type { DiffFileHandler } from "../types";
 
@@ -59,20 +62,17 @@ function toolIcon(toolName: string): ReactNode {
 	return <Wrench size={15} />;
 }
 /** 从工具消息 meta 中提取副标题（文件路径或命令），让 trigger 行能体现工具作用对象。
- *  参数键优先级由 shared/sessionDisplayContract 统一定义，手机端拿到的是
- *  服务端用同一函数算好的 meta.summary，避免两端对同一工具显示不同对象。 */
+ *  参数键优先级与单行长度上限由 shared/sessionDisplayContract 统一定义；手机端拿到的是
+ *  服务端用同一组函数算好的 meta.summary，因此两端对同一工具显示同一行文本。 */
 function getToolSubtitle(message: ChatMessage): string {
-	return toolArgSummary(message.meta?.args, message.meta) ?? "";
+	return shortText(toolArgSummary(message.meta?.args, message.meta) ?? "");
 }
 
-function getToolArgFilePath(args: Record<string, unknown> | undefined): string | undefined {
-	return getToolFilePath(args);
-}
 function getToolDiffTarget(message: ChatMessage): { path: string; originalContent: string; content: string; changedLines: number } | undefined {
 	const toolName = getToolName(message);
 	if (!/write|edit|create|patch/i.test(toolName)) return undefined;
 	const args = parseToolArgs(message.meta?.args);
-	const path = getToolArgFilePath(args);
+	const path = toolArgPath(args);
 	if (!args || !path) return undefined;
 	if (/write|create/i.test(toolName)) {
 		const content = typeof args.content === "string"

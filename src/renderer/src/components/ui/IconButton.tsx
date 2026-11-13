@@ -57,7 +57,8 @@ export function IconButton(
 
 export function CloseIconButton(props: {
 	label: string;
-	onClick: () => void;
+	/** 可省略：由 Radix Dialog.Close asChild 注入 */
+	onClick?: () => void;
 	className?: string;
 }) {
 	return (

@@ -1,7 +1,9 @@
 import type { AgentMessagesDelta, ChatMessage } from "../../../shared/types";
-
-/** 历史条数上限：与 App 的 PROMPT_HISTORY_LIMIT 保持一致（发送保存/基线重建/会话文件补全统一使用）。 */
-const PROMPT_HISTORY_LIMIT = 100;
+import {
+	mergePromptHistory,
+	PROMPT_HISTORY_LIMIT,
+	shouldRecordPrompt,
+} from "../composer/composerModule";
 
 /**
  * prompt 历史重建所需的上下文。原实现（App.rebuildPromptHistory）从组件闭包读取
@@ -51,35 +53,12 @@ export type ResolveMessagesDeltaResult = {
 };
 
 /**
- * 合并两份“最新在前、各自去重”的历史列表：incoming 是权威较新来源放前面，
- * existing（持久化/发送记录）补充更早的条目；按文本去重（与 App 发送路径一致），
- * 空白条目丢弃，结果限长。
- */
-function mergePromptHistory(
-	existing: string[] | undefined,
-	incoming: string[],
-	limit: number,
-): string[] {
-	const seen = new Set<string>();
-	const merged: string[] = [];
-	for (const text of [...incoming, ...(existing ?? [])]) {
-		const trimmed = text.trim();
-		if (!trimmed || seen.has(trimmed)) continue;
-		seen.add(trimmed);
-		merged.push(trimmed);
-	}
-	return merged.slice(0, limit);
-}
-
-/**
  * 与 App.rebuildPromptHistory 的用户消息提取一致：只取 user 角色、非空文本、
  * 不以 "!" 开头的消息（bash 快捷命令与 sendPrompt 保存路径保持一致，不进历史）。
  */
 function collectUserPrompts(messages: ChatMessage[]): string[] {
 	return messages
-		.filter(
-			(m) => m.role === "user" && m.text?.trim() && !m.text.trim().startsWith("!"),
-		)
+		.filter((m) => m.role === "user" && Boolean(m.text) && shouldRecordPrompt(m.text))
 		.map((m) => m.text.trim());
 }
 

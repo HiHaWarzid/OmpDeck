@@ -12,7 +12,11 @@
  */
 
 import type { ChatMessage, ImageContent } from "../../shared/types";
+import { stripAnsi } from "../../shared/sessionDisplayContract";
 import { isBlobImageRef } from "./sessionBlobs";
+
+// ANSI 清理规则只有 shared contract 一份（桌面/手机同源）；这里只保持旧导入路径可用。
+export { stripAnsi };
 
 /** 工具结果文本截断阈值（字符数）；超出时 meta 标记 truncated 并缓存全文供「查看完整输出」。 */
 export const MAX_TOOL_RESULT_CHARS = 8000;
@@ -27,11 +31,6 @@ export function safeJson(value: unknown): string {
 	} catch {
 		return String(value);
 	}
-}
-
-/** 清理 ANSI 转义码（模型思考内容中常见终端颜色序列）。 */
-export function stripAnsi(text: string): string {
-	return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 }
 
 /** 工具结果单次保留的图片上限：截图/读图类工具一次通常 1~3 张，超出部分只留文本。 */

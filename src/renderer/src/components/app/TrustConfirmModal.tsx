@@ -1,4 +1,5 @@
 import { t } from "../../i18n";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 
 /**
  * 项目信任确认弹窗。
@@ -13,8 +14,9 @@ import { t } from "../../i18n";
  *   - trust-session：仅本次会话信任，不落盘
  *   - deny：拒绝信任，阻止 Agent 创建并记录 false 避免重复打扰
  *
- * 样式复用 config-modal-overlay / config-modal-dialog / config-btn，与 ConfirmDialog 风格一致。
- * 遮罩不绑定 onClick 关闭，强制用户做出明确选择，避免误关后 Agent 卡在等待。
+ * 三选一复用共享 ConfirmDialog（取消位 = 拒绝），Esc 等同于拒绝：
+ * 用户明确关闭弹窗时按最保守的决策处理，既不会静默信任项目，也不会把 Agent 挂在等待态。
+ * 遮罩点击不关闭："误点弹窗外" 与 "明确拒绝并落盘" 必须区分开，拒绝会被持久化。
  */
 export function TrustConfirmModal(props: {
 	cwd: string;
@@ -22,35 +24,22 @@ export function TrustConfirmModal(props: {
 	onChoose: (choice: "trust-remember" | "trust-session" | "deny") => void;
 }) {
 	return (
-		<div className="config-modal-overlay">
-			<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
-				<strong>{t("agent.trust.title")}</strong>
-				<p>{t("agent.trust.message")}</p>
-				<p
-					style={{
-						wordBreak: "break-all",
-						fontFamily: "var(--font-family-mono)",
-						fontSize: "var(--font-size-sm)",
-						color: "var(--color-text-muted)",
-					}}
-				>
-					{t("agent.trust.project")}: {props.cwd}
-				</p>
-				<div className="config-modal-actions">
-					<button className="config-btn" onClick={() => props.onChoose("deny")}>
-						{t("agent.trust.deny")}
-					</button>
-					<button className="config-btn" onClick={() => props.onChoose("trust-session")}>
-						{t("agent.trust.trustSession")}
-					</button>
-					<button
-						className="config-btn primary"
-						onClick={() => props.onChoose("trust-remember")}
-					>
-						{t("agent.trust.trustRemember")}
-					</button>
-				</div>
-			</div>
-		</div>
+		<ConfirmDialog
+			title={t("agent.trust.title")}
+			message={t("agent.trust.message")}
+			confirmLabel={t("agent.trust.trustRemember")}
+			cancelLabel={t("agent.trust.deny")}
+			closeOnOutsideClick={false}
+			onCancel={() => props.onChoose("deny")}
+			onConfirm={() => props.onChoose("trust-remember")}
+			secondaryAction={{
+				label: t("agent.trust.trustSession"),
+				onClick: () => props.onChoose("trust-session"),
+			}}
+		>
+			<p className="modal-radix-confirm-detail">
+				{t("agent.trust.project")}: {props.cwd}
+			</p>
+		</ConfirmDialog>
 	);
 }

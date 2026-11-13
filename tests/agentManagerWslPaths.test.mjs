@@ -152,6 +152,12 @@ function loadAgentManager() {
 	// 依赖顺序：todo（共享解析，无运行时依赖）<- sessionEntryIds <- messageTextUtils <- askQuestionCard <- messageTimeline <- sessionJsonl；streamGate 独立。
 	registry["../../shared/todo"] = loadModule("src/shared/todo.ts", "todo.ts");
 	registry["../../shared/piCommands"] = loadModule("src/shared/piCommands.ts", "piCommands.ts");
+	// messageTextUtils 现从 shared/sessionDisplayContract 取 stripAnsi；该模块只值导入无运行时依赖，
+	// 直接注入真实现，避免测试文件的 require 在 tests/ 下找不到 src/shared。
+	registry["../../shared/sessionDisplayContract"] = loadModule(
+		"src/shared/sessionDisplayContract.ts",
+		"sessionDisplayContract.ts",
+	);
 	registry["./sessionEntryIds"] = loadModule("src/main/pi/sessionEntryIds.ts", "sessionEntryIds.ts");
 	registry["./messageTextUtils"] = loadModule("src/main/pi/messageTextUtils.ts", "messageTextUtils.ts");
 	registry["./askQuestionCard"] = loadModule("src/main/pi/askQuestionCard.ts", "askQuestionCard.ts");

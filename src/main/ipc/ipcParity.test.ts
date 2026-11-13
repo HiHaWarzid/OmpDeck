@@ -117,7 +117,7 @@ const moduleRegistrations = [
 		module: "agentHandlers",
 		map: registerAgentHandlers({
 			agentManager: stubs,
-			terminalManager: stubs,
+			sessionCommands: stubs,
 			appLogger: stubs,
 			getMainWindow: () => null,
 		}),

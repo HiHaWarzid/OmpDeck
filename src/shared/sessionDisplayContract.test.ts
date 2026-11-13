@@ -4,11 +4,18 @@ import {
 	COMPACT_THINKING_LIMIT,
 	COMPACT_TOOL_TEXT_LIMIT,
 	TOOL_SUMMARY_MAX_CHARS,
+	attachDisplayMeta,
 	compactChatMessage,
 	deliveryKind,
+	displayPath,
+	formatTimestamp,
 	isTopLevelSessionSummary,
+	sessionStatusKind,
 	shortText,
+	stripAnsi,
+	toolArgPath,
 	toolArgSummary,
+	toolStatusKind,
 	toolSummaryFromMeta,
 } from "./sessionDisplayContract";
 
@@ -87,6 +94,93 @@ describe("deliveryKind", () => {
 		expect(deliveryKind(undefined)).toBeNull();
 		expect(deliveryKind("other")).toBeNull();
 	});
+
+	it("已派生的语义值可重复解析（compact 幂等）", () => {
+		expect(deliveryKind("follow-up")).toBe("follow-up");
+	});
+});
+
+describe("formatTimestamp", () => {
+	it("short 与 full 是同一实现的两种呈现形式", () => {
+		const at = Date.UTC(2026, 0, 2, 3, 4, 5);
+		expect(formatTimestamp(at)).toBe(formatTimestamp(at, "short"));
+		expect(formatTimestamp(at)).not.toBe(formatTimestamp(at, "full"));
+		expect(formatTimestamp(at, "full")).toBe(new Date(at).toLocaleString());
+	});
+});
+
+describe("stripAnsi", () => {
+	it("去掉转义码，无转义码时返回同一字符串对象", () => {
+		expect(stripAnsi("\x1b[31mred\x1b[0m text")).toBe("red text");
+		const clean = "clean text";
+		expect(stripAnsi(clean)).toBe(clean);
+	});
+});
+
+describe("displayPath", () => {
+	const home = "C:/Users/me";
+
+	it("tail：折叠 home 前缀，超长时保留尾部", () => {
+		expect(displayPath("C:\\Users\\me\\proj\\a.ts", { home })).toBe("~/proj/a.ts");
+		const long = `C:/Users/me/${"segment/".repeat(6)}file.ts`;
+		const shown = displayPath(long, { home });
+		expect(shown.startsWith("...")).toBe(true);
+		expect(shown.endsWith("file.ts")).toBe(true);
+	});
+
+	it("head：保留末两段，段数不足时原样返回", () => {
+		expect(displayPath("C:\\sessions\\parent\\child.jsonl", { style: "head" })).toBe(
+			".../parent/child.jsonl",
+		);
+		expect(displayPath("C:/only", { style: "head" })).toBe("C:/only");
+		expect(displayPath(undefined)).toBe("");
+	});
+});
+
+describe("toolArgPath", () => {
+	it("只认路径类键，不拿命令/搜索词冒充文件路径", () => {
+		expect(toolArgPath({ path: "a.ts", command: "ls" })).toBe("a.ts");
+		expect(toolArgPath({ targetPath: "b.ts" })).toBe("b.ts");
+		expect(toolArgPath({ command: "ls" })).toBeUndefined();
+		expect(toolArgPath(undefined)).toBeUndefined();
+	});
+});
+
+describe("toolStatusKind", () => {
+	it("显式 status 优先，其次正文首字符标记", () => {
+		expect(toolStatusKind({ status: "running" })).toBe("running");
+		expect(toolStatusKind({ status: "error" })).toBe("error");
+		expect(toolStatusKind({ isError: true })).toBe("error");
+		expect(toolStatusKind({}, "▶ bash")).toBe("running");
+		expect(toolStatusKind({}, "✗ bash")).toBe("error");
+		expect(toolStatusKind({}, "✓ bash")).toBe("done");
+	});
+});
+
+describe("sessionStatusKind", () => {
+	it("五个契约状态，未知值归一到 idle", () => {
+		expect(sessionStatusKind("running")).toBe("running");
+		expect(sessionStatusKind("starting")).toBe("starting");
+		expect(sessionStatusKind("error")).toBe("error");
+		expect(sessionStatusKind("closed")).toBe("closed");
+		expect(sessionStatusKind(undefined)).toBe("idle");
+		expect(sessionStatusKind("weird")).toBe("idle");
+	});
+});
+
+describe("attachDisplayMeta", () => {
+	it("不截断文本，只补派生字段（详情端点复用）", () => {
+		const text = "x".repeat(COMPACT_TOOL_TEXT_LIMIT + 5);
+		const attached = attachDisplayMeta(toolMessage({ text }));
+		expect(attached.text).toBe(text);
+		expect(attached.meta).toMatchObject({ statusText: "完成", statusGlyph: "✓" });
+		expect(attached.meta?.hasMore).toBeUndefined();
+	});
+
+	it("重复调用返回同一对象", () => {
+		const attached = attachDisplayMeta(toolMessage({ text: "✓ bash" }));
+		expect(attachDisplayMeta(attached)).toBe(attached);
+	});
 });
 
 describe("compactChatMessage", () => {
@@ -117,15 +211,25 @@ describe("compactChatMessage", () => {
 		expect(compacted.meta?.summary).toBe("npm test");
 	});
 
-	it("投递策略写成语义值 delivery", () => {
-		const compacted = compactChatMessage(
-			toolMessage({ role: "user", text: "继续", meta: { streamingBehavior: "followUp" } }),
-		);
-		expect(compacted.meta?.delivery).toBe("follow-up");
+	it("无附加内容时不产生新对象（非 tool 且无投递语义）", () => {
+		const message = toolMessage({ role: "assistant", text: "answer" });
+		expect(compactChatMessage(message)).toBe(message);
 	});
 
-	it("无附加内容时原样返回（不产生新对象）", () => {
-		const message = toolMessage();
-		expect(compactChatMessage(message)).toBe(message);
+	it("tool 消息始终附加状态三件套，供手机端直接渲染", () => {
+		const compacted = compactChatMessage(toolMessage({ meta: { status: "running" } }));
+		expect(compacted.meta).toMatchObject({
+			statusKind: "running",
+			statusText: "运行中",
+			statusGlyph: "▶",
+		});
+	});
+
+	it("投递语义同时产出语义值与文案，且重复 compact 幂等", () => {
+		const once = compactChatMessage(
+			toolMessage({ role: "user", text: "继续", meta: { streamingBehavior: "followUp" } }),
+		);
+		expect(once.meta).toMatchObject({ delivery: "follow-up", deliveryText: "结束后排队" });
+		expect(compactChatMessage(once)).toBe(once);
 	});
 });

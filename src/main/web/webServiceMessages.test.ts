@@ -169,6 +169,8 @@ describe("手机端消息增量契约", () => {
 		expect(data.projects).toBeTruthy();
 		expect(data.agents).toBeTruthy();
 		expect(data).not.toHaveProperty("messagesByAgent");
+		// 手机端状态文案由服务端派生（agent.statusText），不自己维护中文表。
+		expect(data.agents).toMatchObject([{ status: "idle", statusText: "空闲" }]);
 	});
 
 	test("sessions 接口可按 topLevel 过滤子会话", async () => {
@@ -262,6 +264,12 @@ describe("手机端消息增量契约", () => {
 		expect((data.messages as ChatMessage[]).map((message) => message.id)).toEqual(["m2", "m3"]);
 	});
 
+	test("runtime 端点把状态归一为共享契约文案", async () => {
+		const { data } = await getJson("/api/agents/agent-1/runtime");
+		// runtime 状态为空时回退 /api/state 的 agent 状态；文案由服务端派生，手机端只渲染。
+		expect(data.state).toMatchObject({ statusText: "空闲" });
+	});
+
 	test("compact 裁剪 tool 文本和 thinking，并保留完整内容详情", async () => {
 		const { data } = await getJson("/api/agents/agent-1/messages?tail=40&compact=1");
 		const list = data.messages as ChatMessage[];
@@ -271,12 +279,19 @@ describe("手机端消息增量契约", () => {
 		expect(tool.meta).toMatchObject({ hasMore: true, fullLength: 2048 });
 		expect(assistant.thinking).toHaveLength(800);
 		expect(assistant.meta).toMatchObject({ thinkingHasMore: true, fullThinkingLength: 2048 });
-		// 手机端不复制展示规则：摘要与投递语义由服务端按共享契约预先写好。
+		// 手机端不复制展示规则：摘要、状态与投递语义/文案由服务端按共享契约预先写好。
 		expect(tool.meta?.summary).toBe("npm test");
+		expect(tool.meta).toMatchObject({ statusText: "完成", statusGlyph: "✓" });
 		expect(list.find((message) => message.id === "m1")?.meta?.delivery).toBe("follow-up");
+		expect(list.find((message) => message.id === "m1")?.meta?.deliveryText).toBe("结束后排队");
 
 		const detail = await getJson("/api/agents/agent-1/messages/m2");
-		expect(detail.data.message).toMatchObject({ id: "m2", text: messages[1].text });
+		expect(detail.data.message).toMatchObject({
+			id: "m2",
+			text: messages[1].text,
+			// 详情端点不截断，但派生字段仍要补齐（展开后替换 compact 消息）。
+			meta: { statusText: "完成" },
+		});
 	});
 
 	test("history-page 的 compact 同样裁剪折叠内容", async () => {
@@ -327,7 +342,10 @@ describe("手机端消息增量契约", () => {
 				}),
 			});
 			expect(response.status).toBe(200);
-			expect(await response.json()).toEqual({ result: { accepted: true } });
+			// deliveryText：手机端「已排队」提示由服务端派生，客户端不再硬编码投递文案。
+			expect(await response.json()).toEqual({
+				result: { accepted: true, deliveryText: "结束后排队" },
+			});
 			expect(captured).toEqual({
 				agentId: "agent-1",
 				message: "看看这张图",

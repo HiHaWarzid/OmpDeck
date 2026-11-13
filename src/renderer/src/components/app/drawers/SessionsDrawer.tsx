@@ -5,7 +5,9 @@ import { getSessionTreeProjection, normalizeSessionPathForCompare } from "../../
 import { t } from "../../../i18n";
 import { showNotice } from "../../../utils/notice";
 import { Button } from "../../ui/Button";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import type { Project, SessionSummary } from "../../../../../shared/types";
+import { formatTimestamp } from "../../../../../shared/sessionDisplayContract";
 
 /** 首屏渲染的顶层会话数；「加载更多」每次追加同样的数量（子会话不受影响）。 */
 const SESSION_TOP_LEVEL_PAGE_SIZE = 50;
@@ -226,7 +228,7 @@ export function SessionsPanel(props: {
 										</span>
 									)}
 									<small>
-										{new Date(session.updatedAt).toLocaleString()} ·{" "}
+										{formatTimestamp(session.updatedAt, "full")} ·{" "}
 										{t("drawer.sessionMessages", {
 											count: session.messageCount,
 										})}
@@ -329,7 +331,7 @@ export function SessionsPanel(props: {
 										<strong>{child.name || t("common.untitled")}</strong>
 										<span className="session-source-badge subagent">{t("drawer.subagentSession")}</span>
 										<small>
-											{new Date(child.updatedAt).toLocaleString()} ·{" "}
+											{formatTimestamp(child.updatedAt, "full")} ·{" "}
 											{t("drawer.sessionMessages", {
 												count: child.messageCount,
 											})}
@@ -358,42 +360,32 @@ export function SessionsPanel(props: {
 			{deleteConfirmSession && (() => {
 					const deleteChildren = getChildren(deleteConfirmSession.filePath);
 					return (
-				<div className="session-delete-confirm-backdrop" onClick={() => setDeleteConfirmSession(null)}>
-					<section
-						className="session-delete-confirm"
-						onClick={(event) => event.stopPropagation()}
-					>
-						<strong>{t("drawer.sessionDeleteTitle")}</strong>
-						<p>
-							{deleteChildren.length > 0
-								? t("drawer.sessionDeleteBodyWithChildren", {
-										name: deleteConfirmSession.name || t("common.untitled"),
-										count: deleteChildren.length,
-									})
-								: t("drawer.sessionDeleteBody", {
-										name: deleteConfirmSession.name || t("common.untitled"),
-									})}
-						</p>
-						<div className="session-delete-confirm-actions">
-							<button onClick={() => setDeleteConfirmSession(null)}>{t("common.cancel")}</button>
-							<button
-								className="danger"
-								onClick={() => {
-									const target = deleteConfirmSession;
-									setDeleteConfirmSession(null);
-									void runSessionAction(
-										target,
-										"delete",
-										() => props.onDelete(target),
-										t("drawer.sessionDeleted"),
-									);
-								}}
-							>
-								{t("common.delete")}
-							</button>
-						</div>
-					</section>
-				</div>
+				<ConfirmDialog
+					title={t("drawer.sessionDeleteTitle")}
+					message={
+						deleteChildren.length > 0
+							? t("drawer.sessionDeleteBodyWithChildren", {
+									name: deleteConfirmSession.name || t("common.untitled"),
+									count: deleteChildren.length,
+								})
+							: t("drawer.sessionDeleteBody", {
+									name: deleteConfirmSession.name || t("common.untitled"),
+								})
+					}
+					danger
+					confirmLabel={t("common.delete")}
+					onCancel={() => setDeleteConfirmSession(null)}
+					onConfirm={() => {
+						const target = deleteConfirmSession;
+						setDeleteConfirmSession(null);
+						void runSessionAction(
+							target,
+							"delete",
+							() => props.onDelete(target),
+							t("drawer.sessionDeleted"),
+						);
+					}}
+				/>
 			); })()
 		}
 		</div>

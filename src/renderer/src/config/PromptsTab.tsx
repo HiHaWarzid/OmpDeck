@@ -7,7 +7,7 @@ import type {
 	PiPromptTemplateSummary,
 } from "../../../shared/types";
 import { t } from "../i18n";
-import { CloseIconButton } from "../components/ui/IconButton";
+import { ModalSurface } from "../components/ui/ModalSurface";
 import { LazyMonacoEditor } from "../components/ui/LazyMonacoEditor";
 import { PromptStoreTab } from "./PromptStoreTab";
 
@@ -242,38 +242,28 @@ export function PromptsTab(props: {
 
 				{/* 编辑弹框 */}
 				{props.editingTemplate && (
-				<div
-					className="prompts-editor-backdrop"
-					onClick={props.onCancelEdit}
+				<ModalSurface
+					open
+					onRequestClose={props.onCancelEdit}
+					size="medium"
+					title={`${props.editingTemplate.name}.md`}
+					className="prompts-editor-modal"
+						elevated
+					headerActions={
+						showHint ? <span className="file-diff-hint">{t("config.promptSaveHint")}</span> : undefined
+					}
 				>
-					<div
-						className="prompts-editor-modal"
-						onClick={(e) => e.stopPropagation()}
-					>
-						<div className="file-diff-header">
-							<span className="file-diff-header-file">
-								{props.editingTemplate.name}.md
-								{showHint && <span className="file-diff-hint">{t("config.promptSaveHint")}</span>}
-							</span>
-							<div className="file-diff-header-actions">
-								<CloseIconButton
-									label={t("common.close")}
-									onClick={props.onCancelEdit}
-								/>
-							</div>
+					{props.editLoading ? (
+						<div className="config-empty">{t("common.loading")}</div>
+					) : (
+						<div className="prompts-monaco-wrap">
+							<LazyMonacoEditor
+								value={props.editContent}
+								onChange={props.onChangeEditContent}
+							/>
 						</div>
-						{props.editLoading ? (
-							<div className="config-empty">{t("common.loading")}</div>
-						) : (
-							<div className="prompts-monaco-wrap">
-								<LazyMonacoEditor
-									value={props.editContent}
-									onChange={props.onChangeEditContent}
-								/>
-							</div>
-						)}
-					</div>
-				</div>
+					)}
+				</ModalSurface>
 			)}
 				</>
 			)}

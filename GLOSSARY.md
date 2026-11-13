@@ -177,3 +177,11 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 主进程、桌面渲染层、手机端共用的**展示推导唯一实现**（`src/shared/sessionDisplayContract.ts`）：顶层会话扁平过滤（`isTopLevelSessionSummary`）、工具参数摘要键优先级（`toolArgSummary` / `toolSummaryFromMeta`）、compact 截断标记（`compactChatMessage` 的 `hasMore/fullLength`、`thinkingHasMore/fullThinkingLength`）、投递语义（`deliveryKind` → `follow-up` / `steer`）。
 
 规则：手机端是 classic script，不 import 该模块；它消费服务端 compact 时**附加的派生字段** `meta.summary` 与 `meta.delivery`。因此任何新的展示规则要么进本模块并由服务端序列化，要么留在单一客户端，不允许两端各写一份。桌面侧栏的树形投影（含 orphan 恢复）语义不同，不属于本契约，仍由 `agentListDisplay.getSessionTreeProjection` 实现。
+
+### SessionCommands（会话变更命令）
+客户端可发起的会话变更的唯一入口（`main/pi/sessionCommands.ts`）：`create` / `send` / `abort` / `abortAndRestoreQueue` / `stop` / `restart` / `removeQueuedMessage` / `promoteQueuedMessage`。它拥有三件以前散落在各门（桌面 IPC、手机 HTTP）的事：**终端与 agent 生命周期配对**（stop/restart 必须先 `closeAgent` 再停进程，手机端曾漏关 pty）、**文本归一与语义结果透传**（trim 后交给 AgentManager；空文本且无图片时其 rejected 结果原样返回，纯图片放行）、**统一审计日志**。
+
+规则：任何新的客户端门只允许调这 8 个方法，不得直接对 `AgentManager` 的变更方法再拼一遍「校验 → 关终端 → 停进程」。读路径、运行控制（归 `AgentControl`）与 AFK 编排不经过本 module——AFK 创建的 agent 没有桌面终端，且它在域内把 AgentManager 当 spawn 工具用。
+
+### ShutdownSequence（停机顺序）
+退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。

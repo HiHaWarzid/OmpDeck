@@ -5,18 +5,25 @@
 
 import type { ReactNode } from "react";
 import type { ChatMessage, FileTreeNode, ImageContent, PiCommand } from "../../../../shared/types";
+import {
+	displayPath as displayPathFromContract,
+	formatTimestamp,
+	stripAnsi,
+	toolArgPath,
+} from "../../../../shared/sessionDisplayContract";
 import { computeThinkingTiming } from "../../utils/thinkingTiming";
 import { formatFilePathRef } from "./RichInput";
 import type { SessionModifiedFile } from "./types";
 
-/* ── ANSI 清理 ── */
+/* ── 展示规则转发 ── */
 
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+// 时间 / ANSI 的唯一实现在 shared/sessionDisplayContract；这里保留旧名字，
+// 因为组件与 App.tsx 仍按 `formatTime` / `stripAnsi` 引入，禁止再复制算法。
+export { stripAnsi };
 
-export function stripAnsi(text: string): string {
-	// 绝大多数消息文本不含转义码；先做一次 O(n) 扫描，命中则原样返回同一字符串对象，
-	// 省掉 replace 的整串分配（20Hz 流式重算整窗消息文本时就是这条路径）。
-	return text.includes("\x1b") ? text.replace(ANSI_RE, "") : text;
+/** 旧名字的薄转发：默认取 short 呈现形式（侧栏/时间线）。 */
+export function formatTime(timestamp: number) {
+	return formatTimestamp(timestamp);
 }
 
 export function stripThinkingTags(text: string): string {
@@ -25,21 +32,8 @@ export function stripThinkingTags(text: string): string {
 
 /* ── 时间和摘要 ── */
 
-// 复用同一个 Intl 实例：侧栏/时间线/大纲会按行大量调用 formatTime，
-// 每次 new Date().toLocaleString 都会重建格式化器。
-const TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
-	month: "2-digit",
-	day: "2-digit",
-	hour: "2-digit",
-	minute: "2-digit",
-});
-
-export function formatTime(timestamp: number) {
-	return TIME_FORMATTER.format(timestamp);
-}
-
 export function summarizeMessage(text: string) {
-	const cleaned = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+	const cleaned = stripAnsi(text);
 	const firstLine =
 		cleaned
 			.replace(/```[\s\S]*?```/g, " ")
@@ -63,15 +57,12 @@ function getHomePathPrefix() {
 	return match?.[1] ?? "C:/Users/14012";
 }
 
+/**
+ * 侧栏/抽屉的项目路径展示：截断策略与 format 由 shared 契约统一定义，
+ * 这里只负责补上「当前用户 home」这一项渲染层环境信息（契约不碰 DOM）。
+ */
 export function displayPath(path?: string) {
-	if (!path) return "";
-	const home = getHomePathPrefix();
-	const normalized = path.replace(/\\/g, "/");
-	const friendly =
-		home && normalized.toLowerCase().startsWith(home.toLowerCase())
-			? `~${normalized.slice(home.length)}`
-			: normalized;
-	return friendly.length > 36 ? `...${friendly.slice(-35)}` : friendly;
+	return displayPathFromContract(path, { home: getHomePathPrefix() });
 }
 
 /**
@@ -812,6 +803,8 @@ export function buildSuggestionItems(
 
 /* ── 工具参数解析 ── */
 
+/** 工具参数对象化：唯一实现是 shared 契约的 toolArgSummary/toolArgPath 内部解析，
+ *  渲染层只需要对象本身（diff/改动行数），因此保留这一层薄封装。 */
 export function parseToolArgs(value: unknown): Record<string, unknown> | undefined {
 	if (!value) return undefined;
 	if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -825,26 +818,6 @@ export function parseToolArgs(value: unknown): Record<string, unknown> | undefin
 	} catch {
 		return undefined;
 	}
-}
-
-export function getToolFilePath(args: any): string | undefined {
-	if (!args) return undefined;
-	if (typeof args === "string" && args.trim()) {
-		try { args = JSON.parse(args); } catch { return undefined; }
-	}
-	if (typeof args !== "object") return undefined;
-	const a = args as Record<string, unknown>;
-	return typeof a.filePath === "string" && a.filePath ? a.filePath
-		: typeof a.file_path === "string" && a.file_path ? a.file_path
-		: typeof a.path === "string" && a.path ? a.path
-		: typeof a.targetPath === "string" && a.targetPath ? a.targetPath
-		: typeof a.target_path === "string" && a.target_path ? a.target_path
-		: typeof a.outputPath === "string" && a.outputPath ? a.outputPath
-		: typeof a.output_path === "string" && a.output_path ? a.output_path
-		: typeof a.file === "string" && a.file ? a.file
-		: typeof a.fileName === "string" && a.fileName ? a.fileName
-		: typeof a.filename === "string" && a.filename ? a.filename
-		: undefined;
 }
 
 export function countTextLines(value: string): number {
@@ -927,7 +900,7 @@ export function buildModifiedFiles(messages: ChatMessage[]): SessionModifiedFile
 		const status: string = String(msg.meta?.status ?? "done");
 		// 只收集文件写入/编辑类的工具调用，作为右侧 Files 与会话结束摘要的统一数据源。
 		if (!toolName || !/write|edit|create|patch/i.test(toolName)) continue;
-		const filePath = getToolFilePath(args);
+		const filePath = toolArgPath(args);
 		if (!filePath) continue;
 		const previous = byPath.get(filePath);
 		// 同一路径再次被修改时移动到 Map 末尾，右侧修改清单才能按"最新修改"展示。

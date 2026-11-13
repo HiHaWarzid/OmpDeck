@@ -536,13 +536,10 @@
 		return appState.projects.find((project) => project.id === id)?.name || id;
 	}
 
+	/** 状态文案由服务端按 shared/sessionDisplayContract 派生（agent.statusText）；
+	 *  手机端不再维护中文状态表，也不再自己把 status 映射成文案。 */
 	function statusLabel(agent) {
-		if (!agent) return "";
-		if (agent.status === "running") return "运行中";
-		if (agent.status === "starting") return "启动中";
-		if (agent.status === "error") return "错误";
-		if (agent.status === "closed") return "已关闭";
-		return "空闲";
+		return (agent && agent.statusText) || "";
 	}
 
 	function thinkingLabel(level) {
@@ -1098,7 +1095,9 @@
 			chatMessages = stateApi.removeAcknowledgedOptimistic(chatMessages, list);
 			lastMessageId = stateApi.lastRealMessageId(chatMessages) || lastMessageId;
 			messageVersion = messagesData?.version || messageVersion;
-			const runtime = runtimeData?.state || {};
+			// runtime 拉取失败时保留上一次成功结果：否则标题会退回打开会话时的旧文案，
+			// 与仍从 activeAgent.status 推导出来的停止按钮互相矛盾。
+			const runtime = runtimeData?.state || currentRuntime || {};
 			currentRuntime = runtime;
 			// runtime 接口失败时用 state 里的 agent 状态兜底，避免正在运行的会话丢掉停止按钮。
 			const status = runtime.isStreaming
@@ -1107,7 +1106,10 @@
 			running = status === "running";
 			if (activeAgent) activeAgent.status = status;
 			const model = runtime.modelName || runtime.modelId || "";
-			const subtitle = [statusLabel({ status }), model].filter(Boolean).join(" · ");
+			// 状态文案（含 streaming 归一）由服务端派生；手机端只渲染。
+			const subtitle = [runtime.statusText || activeAgent?.statusText || "", model]
+				.filter(Boolean)
+				.join(" · ");
 			if (subtitle !== lastStatus) {
 				lastStatus = subtitle;
 				const subtitleEl = $("subtitle");
@@ -1468,16 +1470,11 @@
 		return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 	}
 
-	/** 工具卡片副标题：服务端 compact 时已用 shared/sessionDisplayContract 算好
-	 *  meta.summary（参数键优先级唯一实现）；这里只保留 detailText / result 兜底，
-	 *  避免手机端再维护一份参数键表。 */
+	/** 工具卡片副标题：服务端 compact / 详情端点已用 shared/sessionDisplayContract 算好
+	 *  meta.summary（参数键优先级唯一实现）；这里只对「旧服务端没有 summary」的响应
+	 *  保留一个 result 兜底，不再复制 detailText 正文行解析。 */
 	function toolSummary(meta) {
 		if (typeof meta.summary === "string" && meta.summary) return meta.summary;
-		const detailLine = String(meta.detailText || "")
-			.split("\n")
-			.map((line) => line.trim())
-			.find((line) => line && !/^(工具|状态|参数|结果|详情)：/.test(line));
-		if (detailLine) return shortText(detailLine);
 		return shortText(meta.result);
 	}
 
@@ -1526,19 +1523,13 @@
 		const meta = message.meta || {};
 		const toolMatch = /^([✓✗▶])\s*([^\s]+)/.exec(String(body || ""));
 		const toolName = toolNameLabel(String(meta.toolName || toolMatch?.[2] || "工具"));
-		const toolError =
-			meta.isError === true || meta.status === "error" || toolMatch?.[1] === "✗";
-		const toolStatus =
-			meta.status === "running" || toolMatch?.[1] === "▶" ? "▶" : toolError ? "✗" : "✓";
+		// 状态三件套（glyph/error/文案）与投递文案都由服务端按共享契约写好，
+		// 手机端不再解析 meta.status / streamingBehavior，也不维护中文表。
+		const toolStatus = typeof meta.statusGlyph === "string" ? meta.statusGlyph : "";
+		const toolError = meta.statusKind === "error";
+		const toolState = typeof meta.statusText === "string" ? meta.statusText : "";
 		const duration = durationText(meta.durationMs);
-		// 语义值（follow-up / steer）由服务端按共享契约写入 meta.delivery；
-		// 手机端只做中文文案，不再解析 streamingBehavior 原始值。
-		const delivery =
-			meta.delivery === "follow-up"
-				? "排队到下一轮"
-				: meta.delivery === "steer"
-					? "已加入当前回合"
-					: "";
+		const delivery = typeof meta.deliveryText === "string" ? meta.deliveryText : "";
 		const toolDetail = role === "tool" ? toolSummary(meta) : "";
 		const text = role === "tool" ? toolLabel(body) : body;
 		const textRemaining = Number.isFinite(Number(meta.fullLength))
@@ -1575,6 +1566,7 @@
 			toolDetail,
 			toolError,
 			toolStatus,
+			toolState,
 			delivery,
 			optimistic: Boolean(message.optimistic),
 		};
@@ -1600,7 +1592,7 @@
 			const detail = item.toolDetail
 				? `<span class="tool-detail">${escapeHtml(item.toolDetail)}</span>`
 				: "";
-			const toolState = item.toolError ? "失败" : item.toolStatus === "▶" ? "运行中" : "完成";
+			const toolState = item.toolState;
 			const toolAriaLabel = `${item.toolName}，${toolState}${item.toolDetail ? `，${item.toolDetail}` : ""}`;
 			return `<button class="msg tool${item.toolError ? " tool-error" : ""}" type="button" ${attrs} data-tool-id="${escapeHtml(item.id)}" aria-label="${escapeHtml(toolAriaLabel)}"><span class="tool-status" aria-hidden="true">${escapeHtml(item.toolStatus)}</span><span class="tool-main"><span class="tool-name">${escapeHtml(item.toolName)}</span>${detail}</span>${item.duration ? `<span class="tool-duration">${escapeHtml(item.duration)}</span>` : ""}</button>`;
 		}
@@ -1633,7 +1625,11 @@
 					// 折叠起来只剩“工具 · N 次”，等于把过程信息全部藏掉。
 					const running = group.some((entry) => entry.toolStatus === "▶");
 					const failed = group.some((entry) => entry.toolError);
-					const state = running ? "运行中" : failed ? "有失败" : "完成";
+					// 组状态复用每条工具消息的服务端文案，手机端不再拼中文状态词。
+					const state =
+						(group.find((entry) => entry.toolStatus === "▶") ||
+							group.find((entry) => entry.toolError) ||
+							group[group.length - 1])?.toolState || "";
 					items.push({
 						key: `group:${group[0].id}`,
 						html: `<div class="tool-group"><div class="tool-group-title"><span>执行过程 · ${group.length} 步</span><span class="tool-group-state${running ? " running" : failed ? " error" : ""}">${state}</span></div>${group
@@ -1887,8 +1883,7 @@
 		const message = mergedMessages().find((item) => item.id === messageId);
 		if (!message) return;
 		const info = messageView(message);
-		const status =
-			info.toolStatus === "▶" ? "运行中" : info.toolError ? "失败" : "完成";
+		const status = info.toolState;
 		openSheet(`${info.toolName} · ${status}`, toolSheetHtml(message));
 	}
 
@@ -2143,7 +2138,8 @@
 				toast(result?.error || "发送失败");
 				return;
 			}
-			if (behavior) toast(behavior === "followUp" ? "已排队到下一轮" : "已加入当前回合");
+			const deliveryText = typeof result?.deliveryText === "string" ? result.deliveryText : "";
+			if (behavior && deliveryText) toast(deliveryText);
 			if (isCurrentRequest(requestEpoch, agentId)) {
 				// 已受理后刷新失败不能按发送失败回填输入框，否则会重复发送。
 				await refreshChat({ initial: true }).catch(() => undefined);

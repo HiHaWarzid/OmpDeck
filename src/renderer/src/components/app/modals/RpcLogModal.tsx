@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { t } from "../../../i18n";
 import { writeClipboard } from "../../../utils/clipboard";
-import { CloseIconButton } from "../../ui/IconButton";
+import { ModalSurface } from "../../ui/ModalSurface";
 
 export function RpcLogModal(props: {
 	logs: Array<{
@@ -38,100 +38,93 @@ export function RpcLogModal(props: {
 		writeClipboard(logs.map(formatRpcLogForCopy).join("\n"));
 
 	return (
-		<div className="modal-backdrop" onClick={props.onClose}>
-			<div className="rpc-log-modal" onClick={(e) => e.stopPropagation()}>
-				<div className="modal-header rpc-log-header">
-					<strong>
-						{t("rpc.title", {
-							visible: visibleLogs.length,
-							total: props.logs.length,
-						})}
-					</strong>
-					<div className="modal-header-actions rpc-log-header-actions">
-						<button className="config-btn primary" onClick={() => copyLogs(props.logs)}>
-							{t("common.copyAll")}
-						</button>
-						<button className="config-btn blue" onClick={() => copyLogs(visibleLogs)}>
-							{t("common.copyVisible")}
-						</button>
-						<CloseIconButton
-							label={t("common.close")}
-							onClick={props.onClose}
-						/>
-					</div>
+		<ModalSurface
+			open
+			onRequestClose={props.onClose}
+			title={t("rpc.title", { visible: visibleLogs.length, total: props.logs.length })}
+			className="rpc-log-modal"
+			headerActions={
+			<>
+				<button className="config-btn primary" onClick={() => copyLogs(props.logs)}>
+					{t("common.copyAll")}
+				</button>
+				<button className="config-btn blue" onClick={() => copyLogs(visibleLogs)}>
+					{t("common.copyVisible")}
+				</button>
+			</>
+			}
+		>
+			<div className="rpc-log-toolbar">
+				<div className="rpc-log-filter-tabs">
+					<button
+						className={directionFilter === "all" ? "active" : ""}
+						onClick={() => setDirectionFilter("all")}
+					>
+						{t("rpc.filterAll")}
+					</button>
+					<button
+						className={directionFilter === "send" ? "active" : ""}
+						onClick={() => setDirectionFilter("send")}
+					>
+						{t("rpc.filterSend")}
+					</button>
+					<button
+						className={directionFilter === "recv" ? "active" : ""}
+						onClick={() => setDirectionFilter("recv")}
+					>
+						{t("rpc.filterReceive")}
+					</button>
 				</div>
-				<div className="rpc-log-toolbar">
-					<div className="rpc-log-filter-tabs">
-						<button
-							className={directionFilter === "all" ? "active" : ""}
-							onClick={() => setDirectionFilter("all")}
-						>
-							{t("rpc.filterAll")}
-						</button>
-						<button
-							className={directionFilter === "send" ? "active" : ""}
-							onClick={() => setDirectionFilter("send")}
-						>
-							{t("rpc.filterSend")}
-						</button>
-						<button
-							className={directionFilter === "recv" ? "active" : ""}
-							onClick={() => setDirectionFilter("recv")}
-						>
-							{t("rpc.filterReceive")}
-						</button>
-					</div>
-					<input
-						value={keyword}
-						onChange={(event) => setKeyword(event.target.value)}
-						placeholder={t("rpc.searchPlaceholder")}
-					/>
-				</div>
-				<div className="rpc-log-list" ref={panelRef}>
-					{visibleLogs.map((log) => {
-						const jsonText = JSON.stringify(log.data ?? {}, null, 2);
-						return (
-							<div key={log.id} className="rpc-log-entry-wrap">
-								<div
-									className={`rpc-log-entry ${log.direction === "send" ? "log-send" : "log-recv"}`}
-									onClick={() =>
-										setExpandedId(expandedId === log.id ? null : log.id)
-									}
-								>
-									<time>
-										{new Date(log.time).toLocaleTimeString(undefined, {
-											hour: "2-digit",
-											minute: "2-digit",
-											second: "2-digit",
-										})}
-									</time>
-									<span className="log-direction">
-										{log.direction === "send" ? "→" : "←"}
-									</span>
-									<span className="log-summary">{log.summary}</span>
-									<div className="rpc-log-entry-actions" onClick={(event) => event.stopPropagation()}>
-										<button onClick={() => writeClipboard(formatRpcLogForCopy(log))}>
-											{t("common.copy")}
-										</button>
-										<button onClick={() => writeClipboard(jsonText)}>
-											{t("rpc.copyJson")}
-										</button>
-									</div>
-								</div>
-								{expandedId === log.id && log.data != null && (
-									<pre className="rpc-log-detail">{jsonText}</pre>
-								)}
-							</div>
-						);
-					})}
-					{visibleLogs.length === 0 && (
-						<div className="rpc-log-empty">
-							{t("rpc.empty")}
-						</div>
-					)}
-				</div>
+				<input
+					value={keyword}
+					onChange={(event) => setKeyword(event.target.value)}
+					placeholder={t("rpc.searchPlaceholder")}
+				/>
 			</div>
-		</div>
+			<div className="rpc-log-list" ref={panelRef}>
+				{visibleLogs.map((log) => {
+					const jsonText = JSON.stringify(log.data ?? {}, null, 2);
+					return (
+						<div key={log.id} className="rpc-log-entry-wrap">
+							<div
+								className={`rpc-log-entry ${log.direction === "send" ? "log-send" : "log-recv"}`}
+								onClick={() =>
+									setExpandedId(expandedId === log.id ? null : log.id)
+								}
+							>
+								<time>
+									{new Date(log.time).toLocaleTimeString(undefined, {
+										hour: "2-digit",
+										minute: "2-digit",
+										second: "2-digit",
+									})}
+								</time>
+								<span className="log-direction">
+									{log.direction === "send" ? "→" : "←"}
+								</span>
+								<span className="log-summary">{log.summary}</span>
+								<div className="rpc-log-entry-actions" onClick={(event) => event.stopPropagation()}>
+									<button onClick={() => writeClipboard(formatRpcLogForCopy(log))}>
+										{t("common.copy")}
+									</button>
+									<button onClick={() => writeClipboard(jsonText)}>
+										{t("rpc.copyJson")}
+									</button>
+								</div>
+							</div>
+							{expandedId === log.id && log.data != null && (
+								<pre className="rpc-log-detail">{jsonText}</pre>
+							)}
+						</div>
+					);
+				})}
+				{visibleLogs.length === 0 && (
+					<div className="rpc-log-empty">
+						{t("rpc.empty")}
+					</div>
+				)}
+			</div>
+		</ModalSurface>
 	);
 }
 function formatRpcLogForCopy(log: {

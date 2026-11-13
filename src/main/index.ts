@@ -206,6 +206,7 @@ import type {
 import { ProjectStore } from "./projects/ProjectStore";
 import { FileSystemService } from "./fs/FileSystemService";
 import { AgentManager } from "./pi/AgentManager";
+import { SessionCommands } from "./pi/sessionCommands";
 import { createAgentEventSink } from "./pi/agentEventSink";
 import { createElectronAgentEventBridge, type ElectronAgentEventBridge } from "./ipc/agentEventBridge";
 import { PiLocator } from "./pi/PiLocator";
@@ -219,6 +220,7 @@ import { OpenCodeImportAdapter } from "./sessions/adapters/opencodeImportAdapter
 import { ClaudeImportAdapter } from "./sessions/adapters/claudeImportAdapter";
 import { CodexImportAdapter } from "./sessions/adapters/codexImportAdapter";
 import { OpenSessionSnapshot } from "./sessions/OpenSessionSnapshot";
+import { ShutdownSequence } from "./lifecycle/shutdownSequence";
 import { SettingsStore } from "./settings/SettingsStore";
 import { applyDesktopProxy } from "./settings/DesktopProxy";
 import { GitService } from "./git/GitService";
@@ -342,6 +344,8 @@ let worktreeService: WorktreeService;
 let gitService: GitService;
 let piLocator: PiLocator;
 let agentManager: AgentManager;
+/** 客户端会话变更的统一入口（IPC / HTTP 共用）；终端回收与审计在 module 内。 */
+let sessionCommands: SessionCommands;
 let openSessionSnapshot: OpenSessionSnapshot | null = null;
 let afkOrchestrator: AfkOrchestrator;
 let configManager: ConfigManager;
@@ -353,6 +357,29 @@ let projectResourceManager: ProjectResourceManager;
 let webServiceManager: WebServiceManager;
 let remoteAccessManager: RemoteAccessManager;
 let terminalManager: TerminalSessionManager;
+/**
+ * 停机顺序的唯一实现（退出 / 重启共用）。端口用闭包读模块级 let，
+ * 因此可以在服务构造之前创建——真正调用发生在 app ready 之后。
+ */
+const shutdownSequence = new ShutdownSequence({
+	flushSettings: () => settingsStore.flushSave(),
+	flushSummaryCache: () => sessionScanner?.flushSummaryCache() ?? Promise.resolve(),
+	markCleanExit: () => openSessionSnapshot?.markCleanExit(),
+	stopRemoteAccess: () => remoteAccessManager?.dispose(),
+	stopWebService: () => webServiceManager?.stop(),
+	closeSessionScanner: () => sessionScanner?.close(),
+	closeTerminals: () => terminalManager?.closeAll(),
+	stopAgents: () => agentManager?.stopAll(),
+	stopPet: () => {
+		petSystem?.stop();
+		petSystem = null;
+	},
+	stopQuickGen: () => quickGen?.stop(),
+	dumpPerf: () => perfDump(),
+	warn: (message, error) => {
+		void appLogger?.warn("settings", message, error);
+	},
+});
 let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
 let rpcLogger: RpcLogger;
@@ -565,49 +592,11 @@ function setupTray() {
 }
 
 /**
- * 退出/重启共用的停机清理（shutdown）。
- *
- * 两条退出路径必须走同一套顺序：
- * - before-quit（正常退出）：同步 handler，只能 fire-and-forget；
- * - restartApp（重启）：async，可以 await 刷盘完成再 relaunch。
- * 共用函数保证"重启丢刷盘"这类分叉 bug 不再出现：要改顺序只改一处。
- *
- * 顺序说明：
- * 1. 刷盘优先（settings + 摘要缓存）：内存态落盘，后续 stop 不再产生新写入；
- * 2. 停对外服务（webService）：不再接受新请求；
- * 3. 关终端与 agent 进程：长耗时，fire-and-forget；
- * 4. 停宠物/速记进程、倒性能水位：纯本地收尾。
+ * 退出/重启共用的停机入口：全部顺序、同步性与幂等语义在 `ShutdownSequence` 内。
+ * 保留此薄包装只因为 before-quit / restartApp 在 index.ts 中调度。
  */
 function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
-	const flush = Promise.all([
-		settingsStore.flushSave().catch((error) => {
-			void appLogger?.warn("settings", "Failed to flush settings on shutdown", error);
-		}),
-		sessionScanner?.flushSummaryCache().catch(() => undefined) ?? Promise.resolve(),
-	]);
-	const stop = () => {
-		// 正常退出必须先落盘「干净退出」标记：漏了这一步，下次启动会把上次的会话当成崩溃恢复。
-		// 同步写在这里是必要的——before-quit 之后进程随时可能被系统收走。
-		openSessionSnapshot?.markCleanExit();
-		// 先撤掉 Tailscale Serve，再停 Web 服务，避免短暂留下指向死端口的入口。
-		// 退出路径不 await：off 命令由独立进程完成，新实例启动时会重新配置。
-		void remoteAccessManager?.dispose();
-		void webServiceManager?.stop();
-		// 关闭会话目录 watcher，避免进程退出前仍持有目录句柄。
-		void sessionScanner?.close();
-		terminalManager?.closeAll();
-		void agentManager?.stopAll();
-		petSystem?.stop();
-		petSystem = null;
-		quickGen?.stop();
-		perfDump();
-	};
-	if (!opts.awaitFlush) {
-		void flush;
-		stop();
-		return;
-	}
-	return flush.then(stop);
+	return shutdownSequence.run(opts);
 }
 
 /**
@@ -1167,7 +1156,7 @@ function registerIpc() {
 		registerAfkHandlers({ orchestrator: afkOrchestrator }),
 		registerAgentHandlers({
 			agentManager,
-			terminalManager,
+			sessionCommands,
 			appLogger,
 			getMainWindow: () => mainWindow,
 			notificationIcon,
@@ -1351,6 +1340,13 @@ app.whenReady().then(async () => {
 			projectIds: [...new Set(crashedRun.sessions.map((session) => session.projectId))],
 		});
 	}
+	// 会话命令 module：所有客户端门（桌面 IPC / 手机 HTTP）的 create/send/stop/restart/
+	// 队列变更都走这里。terminal 用闭包延迟取实例——它在下方才构造，但命令只在应用运行后到达。
+	sessionCommands = new SessionCommands({
+		agents: agentManager,
+		terminal: { closeAgent: (agentId) => terminalManager.closeAgent(agentId) },
+		log: appLogger,
+	});
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),
 		listAgents: () => agentManager.list(),
@@ -1359,10 +1355,11 @@ app.whenReady().then(async () => {
 			return sessionScanner.list(project?.path);
 		},
 		getMessages: (agentId) => agentManager.getMessages(agentId),
-		createAgent: (input) => agentManager.create(input),
-		sendPrompt: (input) => agentManager.sendPrompt(input),
-		stopAgent: (agentId) => agentManager.stop(agentId),
-		abortAgent: async (agentId) => agentManager.abort(agentId),
+		createAgent: (input) => sessionCommands.create(input),
+		sendPrompt: (input) => sessionCommands.send(input),
+		// 手机端 /stop 同样要关终端：之前直连 AgentManager 让 pty 留在后台。
+		stopAgent: (agentId) => sessionCommands.stop(agentId),
+		abortAgent: async (agentId) => sessionCommands.abort(agentId),
 		sendUiResponse: async (agentId, requestId, response) => {
 			agentManager.interactions.respond(agentId, requestId, response);
 		},
@@ -1392,11 +1389,11 @@ app.whenReady().then(async () => {
 		setAutoCompaction: (agentId, enabled) =>
 			agentManager.control.apply(agentId, { kind: "auto-compaction", enabled }),
 		setTodos: (agentId, phases) => agentManager.control.apply(agentId, { kind: "todos", phases }),
-		abortAndRestoreQueue: (agentId) => agentManager.abortAndRestoreQueue(agentId),
+		abortAndRestoreQueue: (agentId) => sessionCommands.abortAndRestoreQueue(agentId),
 		removeQueuedMessage: (agentId, message, queue) =>
-			agentManager.removeQueuedMessage(agentId, message, queue),
+			sessionCommands.removeQueuedMessage(agentId, message, queue),
 		promoteQueuedMessage: (agentId, message) =>
-			agentManager.promoteQueuedMessage(agentId, message),
+			sessionCommands.promoteQueuedMessage(agentId, message),
 	});
 	// 远程访问只配置 Tailscale Serve，转发目标始终是回环 Web 服务。
 	remoteAccessManager = new RemoteAccessManager({

@@ -19,7 +19,9 @@ import {
 import QRCode from "qrcode";
 import { t } from "../../i18n";
 import { Button } from "../ui/Button";
-import { CloseIconButton, IconButton } from "../ui/IconButton";
+import { IconButton } from "../ui/IconButton";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { ModalSurface } from "../ui/ModalSurface";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import { ModelRolesTab } from "./ModelRolesTab";
@@ -183,29 +185,25 @@ class SettingsModalErrorBoundary extends Component<
 	override render() {
 		if (!this.state.error) return this.props.children;
 		return (
-			<div className="modal-backdrop" onClick={this.props.onClose}>
-				<div className="settings-modal" onClick={(e) => e.stopPropagation()}>
-					<div className="modal-header">
-						<strong>{t("settings.loadFailed")}</strong>
-						<CloseIconButton
-							label={t("common.close")}
-							onClick={this.props.onClose}
-						/>
-					</div>
-					<div className="settings-layout">
-						<div className="settings-content" style={{ padding: "var(--space-5)" }}>
-							<div className="config-diagnostic-card">
-								<div>
-									<strong>{t("settings.renderCrashed")}</strong>
-									<span>{this.state.error.message}</span>
-									<small>{t("settings.renderCrashedHelp")}</small>
-								</div>
-								<pre>{this.state.error.stack ?? this.state.error.message}</pre>
-							</div>
+			<ModalSurface
+				open
+				onRequestClose={this.props.onClose}
+				title={t("settings.loadFailed")}
+				className="settings-modal"
+			>
+			<div className="settings-layout">
+				<div className="settings-content settings-content-flush">
+					<div className="config-diagnostic-card">
+						<div>
+							<strong>{t("settings.renderCrashed")}</strong>
+							<span>{this.state.error.message}</span>
+							<small>{t("settings.renderCrashedHelp")}</small>
 						</div>
+						<pre>{this.state.error.stack ?? this.state.error.message}</pre>
 					</div>
 				</div>
 			</div>
+			</ModalSurface>
 		);
 	}
 }
@@ -324,29 +322,6 @@ function SettingsModalContent(props: SettingsModalProps) {
 		setWebPortDraft(String(baseSnapshotRef.current.webServicePort));
 	};
 
-	/** 关闭弹框：有未保存变更时弹出确认对话框，无变更时直接关闭 */
-	const handleClose = () => {
-		if (dirtyFields.size > 0) {
-			setCloseConfirmOpen(true);
-		} else {
-			props.onClose();
-		}
-	};
-
-	/** 关闭确认弹框时选择保存并关闭；保存失败则留在弹框里让用户修正。 */
-	const handleSaveAndClose = async () => {
-		const ok = await saveAll();
-		setCloseConfirmOpen(false);
-		if (ok) props.onClose();
-	};
-
-	/** 关闭确认弹框时选择放弃更改 */
-	const handleDiscardAndClose = () => {
-		setCloseConfirmOpen(false);
-		props.onClose();
-	};
-
-	const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
 	const [perAreaFontSize, setPerAreaFontSize] = useState(
 		draftSettings.uiFontSize !== null ||
@@ -738,1374 +713,1347 @@ function SettingsModalContent(props: SettingsModalProps) {
 		draftSettings.webServiceHost,
 	);
 
+	// 未保存守卫由 ModalSurface 统一提供：dirty 时先确认，并给出「保存并关闭」。
 	return (
-		<div className="modal-backdrop" onClick={handleClose}>
-			<div
-				className="settings-modal"
-				onClick={(e) => e.stopPropagation()}
-			>
-				<div className="modal-header">
-					<strong>{t("settings.title")}</strong>
-					<div className="modal-header-actions" style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
-						{/* 全局保存/取消按钮：仅在存在未保存变更时显示，样式与配置弹框的导入/导出按钮一致 */}
-						{hasDirtyChanges && (
-							<>
-								<button
-									className="config-btn primary"
-									disabled={saving}
-									onClick={() => void saveAll()}
-								>
-									{t("common.save")}
-								</button>
-								<button className="config-btn" onClick={cancelAll}>
-									{t("common.cancel")}
-								</button>
-							</>
+		<ModalSurface
+			open
+			onRequestClose={props.onClose}
+			dirty={hasDirtyChanges}
+			saving={saving}
+			onSaveBeforeClose={saveAll}
+			title={t("settings.title")}
+			className="settings-modal"
+			headerActions={
+				/* 全局保存/取消按钮：仅在存在未保存变更时显示，样式与配置弹框的导入/导出按钮一致 */
+				hasDirtyChanges ? (
+					<>
+						<button
+							className="config-btn primary"
+							disabled={saving}
+							onClick={() => void saveAll()}
+						>
+							{t("common.save")}
+						</button>
+						<button className="config-btn" onClick={cancelAll}>
+							{t("common.cancel")}
+						</button>
+					</>
+				) : undefined
+			}
+		>
+			<div className="settings-layout">
+				<nav className="settings-tabs" aria-label={t("settings.title")}>
+				{tabs.map((tab) => (
+					<button
+						key={tab.id}
+						className={activeTab === tab.id ? "active" : ""}
+						onClick={() => {
+							setActiveTab(tab.id);
+							try {
+								localStorage.setItem(SETTINGS_LAST_TAB_KEY, tab.id);
+							} catch {
+								// localStorage 不可用时静默忽略，仅本次会话内切换生效
+							}
+						}}
+					>
+						<span className="settings-tab-icon">{tab.icon}</span>
+						<strong>{tab.label}</strong>
+					</button>
+				))}
+			</nav>
+			<div className="settings-panel">
+				{/* ── 常用设置 tab ── */}
+				{activeTab === "common" && (
+					<>
+						{!isWebRuntime && (
+							<SettingsSection
+								title={t("settings.remoteAccess")}
+								description={t("settings.remoteAccessDesc")}
+							>
+								<SettingSwitch
+									title={t("settings.remoteAccessEnable")}
+									description={
+										remoteBusy
+											? t("settings.remoteAccessStarting")
+											: props.settings.remoteAccessEnabled
+												? t("settings.remoteAccessOnDesc")
+												: t("settings.remoteAccessOffDesc")
+									}
+									checked={props.settings.remoteAccessEnabled === true}
+									disabled={props.webServiceChanging || remoteBusy}
+									onChange={(checked) => void applyPhoneAccess(checked)}
+								/>
+								<div className="web-endpoint-panel">
+									<div className="web-endpoint-summary">
+										<span className={remoteStatus?.state === "running" ? "online" : ""} />
+										<div>
+											<strong>
+												{remoteStatus?.url || t("settings.remoteAccessNotRunning")}
+											</strong>
+											<small>{remoteStateText}</small>
+										</div>
+										<div className="web-endpoint-actions">
+											{remoteStatus?.url && (
+												<IconButton
+													label={t("settings.remoteAccessCopy")}
+													onClick={() => void copyRemoteUrl()}
+												>
+													<Copy size={15} />
+												</IconButton>
+											)}
+											{remoteStatus?.state !== "running" && props.settings.remoteAccessEnabled && (
+												<Button
+													buttonSize="sm"
+													disabled={remoteBusy}
+													onClick={() => void retryRemoteAccess()}
+												>
+													{remoteBusy
+														? t("settings.remoteAccessStarting")
+														: t("settings.remoteAccessRetry")}
+												</Button>
+											)}
+										</div>
+									</div>
+									{remoteErrorText && (
+										<small className="web-token-warning">{remoteErrorText}</small>
+									)}
+									{remoteStatus?.state === "running" && !webStatus?.token && (
+										<small className="web-token-warning">
+											{t("settings.remoteAccessTokenMissing")}
+										</small>
+									)}
+									{remoteQr && webStatus?.token && (
+										<div className="web-token-qr">
+											<img
+												src={remoteQr}
+												alt={t("settings.remoteAccessQrAlt")}
+												width={180}
+												height={180}
+											/>
+											<div>
+												<strong>{t("settings.remoteAccessScan")}</strong>
+												<small>
+													{remoteStatus?.url} · {t("settings.remoteAccessScanHint")}
+												</small>
+											</div>
+										</div>
+									)}
+									{remoteUsesLanHttp &&
+										(props.settings.remoteAccessEnabled ||
+											draftSettings.webServiceEnabled) && (
+											<small className="web-token-warning">
+												{t("settings.webTokenHttpWarning")}
+											</small>
+										)}
+									<small className="web-token-warning">
+										{t("settings.remoteAccessSecurity")}
+									</small>
+								</div>
+							</SettingsSection>
 						)}
-						<CloseIconButton
-							label={t("common.close")}
-							onClick={handleClose}
-						/>
-					</div>
-				</div>
-				<div className="settings-layout">
-					<nav className="settings-tabs" aria-label={t("settings.title")}>
-						{tabs.map((tab) => (
-							<button
-								key={tab.id}
-								className={activeTab === tab.id ? "active" : ""}
-								onClick={() => {
-									setActiveTab(tab.id);
-									try {
-										localStorage.setItem(SETTINGS_LAST_TAB_KEY, tab.id);
-									} catch {
-										// localStorage 不可用时静默忽略，仅本次会话内切换生效
+						<SettingsSection title={t("settings.interface")}>
+							<div className="setting-field">
+								<span>
+									{t("settings.theme")}
+									<DirtyMarker dirty={isDirty("theme")} label={t("settings.theme")} />
+								</span>
+								<SelectField
+									value={draftSettings.theme}
+									options={themeOptions}
+									onChange={(value) =>
+										updateDraft({ theme: value as AppSettings["theme"] })
+									}
+								/>
+							</div>
+							<div className="setting-field">
+								<span>
+									{t("settings.language")}
+									<DirtyMarker dirty={isDirty("language")} label={t("settings.language")} />
+								</span>
+								<SelectField
+									value={draftSettings.language}
+									options={languageOptions}
+									onChange={(value) =>
+										updateDraft({ language: value as AppSettings["language"] })
+									}
+								/>
+							</div>
+							<div className="setting-field setting-zoom-field">
+								<span>
+									{t("settings.zoomFactor")}
+									<DirtyMarker dirty={isDirty("zoomFactor")} label={t("settings.zoomFactor")} />
+								</span>
+								<div className="setting-zoom-control">
+									<IconButton
+										className="icon-button setting-zoom-button"
+										label={t("settings.zoomOut")}
+										disabled={draftSettings.zoomFactor <= ZOOM_FACTOR_MIN}
+										onClick={() => changeZoomFactor(-ZOOM_FACTOR_STEP)}
+									>
+										<Minus size={16} strokeWidth={2.2} aria-hidden="true" />
+									</IconButton>
+									<output className="setting-zoom-value" aria-live="polite">
+										{Math.round(draftSettings.zoomFactor * 100)}%
+									</output>
+									<IconButton
+										className="icon-button setting-zoom-button"
+										label={t("settings.zoomIn")}
+										disabled={draftSettings.zoomFactor >= ZOOM_FACTOR_MAX}
+										onClick={() => changeZoomFactor(ZOOM_FACTOR_STEP)}
+									>
+										<Plus size={16} strokeWidth={2.2} aria-hidden="true" />
+									</IconButton>
+								</div>
+							</div>
+						</SettingsSection>
+						<SettingsSection title={t("settings.typography")}>
+							<div className="setting-field">
+								<span>
+									{t("settings.fontSize")}
+									<DirtyMarker dirty={isDirty("fontSize")} label={t("settings.fontSize")} />
+								</span>
+								<SelectField
+									value={draftSettings.fontSize}
+									options={fontSizeOptions}
+									onChange={(value) =>
+										updateDraft({ fontSize: value as AppSettings["fontSize"] })
+									}
+								/>
+							</div>
+							<SettingSwitch
+								title={t("settings.fontSizePerArea")}
+								description={t("settings.fontSizePerAreaDesc")}
+								checked={perAreaFontSize}
+								onChange={(checked) => {
+									setPerAreaFontSize(checked);
+									if (!checked) {
+										updateDraft({ uiFontSize: null, chatFontSize: null, inputFontSize: null });
 									}
 								}}
-							>
-								<span className="settings-tab-icon">{tab.icon}</span>
-								<strong>{tab.label}</strong>
-							</button>
-						))}
-					</nav>
-					<div className="settings-panel">
-						{/* ── 常用设置 tab ── */}
-						{activeTab === "common" && (
-							<>
-								{!isWebRuntime && (
-									<SettingsSection
-										title={t("settings.remoteAccess")}
-										description={t("settings.remoteAccessDesc")}
-									>
-										<SettingSwitch
-											title={t("settings.remoteAccessEnable")}
-											description={
-												remoteBusy
-													? t("settings.remoteAccessStarting")
-													: props.settings.remoteAccessEnabled
-														? t("settings.remoteAccessOnDesc")
-														: t("settings.remoteAccessOffDesc")
-											}
-											checked={props.settings.remoteAccessEnabled === true}
-											disabled={props.webServiceChanging || remoteBusy}
-											onChange={(checked) => void applyPhoneAccess(checked)}
-										/>
-										<div className="web-endpoint-panel">
-											<div className="web-endpoint-summary">
-												<span className={remoteStatus?.state === "running" ? "online" : ""} />
-												<div>
-													<strong>
-														{remoteStatus?.url || t("settings.remoteAccessNotRunning")}
-													</strong>
-													<small>{remoteStateText}</small>
-												</div>
-												<div className="web-endpoint-actions">
-													{remoteStatus?.url && (
-														<IconButton
-															label={t("settings.remoteAccessCopy")}
-															onClick={() => void copyRemoteUrl()}
-														>
-															<Copy size={15} />
-														</IconButton>
-													)}
-													{remoteStatus?.state !== "running" && props.settings.remoteAccessEnabled && (
-														<Button
-															buttonSize="sm"
-															disabled={remoteBusy}
-															onClick={() => void retryRemoteAccess()}
-														>
-															{remoteBusy
-																? t("settings.remoteAccessStarting")
-																: t("settings.remoteAccessRetry")}
-														</Button>
-													)}
-												</div>
-											</div>
-											{remoteErrorText && (
-												<small className="web-token-warning">{remoteErrorText}</small>
-											)}
-											{remoteStatus?.state === "running" && !webStatus?.token && (
-												<small className="web-token-warning">
-													{t("settings.remoteAccessTokenMissing")}
-												</small>
-											)}
-											{remoteQr && webStatus?.token && (
-												<div className="web-token-qr">
-													<img
-														src={remoteQr}
-														alt={t("settings.remoteAccessQrAlt")}
-														width={180}
-														height={180}
-													/>
-													<div>
-														<strong>{t("settings.remoteAccessScan")}</strong>
-														<small>
-															{remoteStatus?.url} · {t("settings.remoteAccessScanHint")}
-														</small>
-													</div>
-												</div>
-											)}
-											{remoteUsesLanHttp &&
-												(props.settings.remoteAccessEnabled ||
-													draftSettings.webServiceEnabled) && (
-													<small className="web-token-warning">
-														{t("settings.webTokenHttpWarning")}
-													</small>
-												)}
-											<small className="web-token-warning">
-												{t("settings.remoteAccessSecurity")}
-											</small>
-										</div>
-									</SettingsSection>
-								)}
-								<SettingsSection title={t("settings.interface")}>
+							/>
+							{perAreaFontSize && (
+								<>
 									<div className="setting-field">
 										<span>
-											{t("settings.theme")}
-											<DirtyMarker dirty={isDirty("theme")} label={t("settings.theme")} />
+											{t("settings.uiFontSize")}
+											<DirtyMarker dirty={isDirty("uiFontSize")} label={t("settings.uiFontSize")} />
 										</span>
 										<SelectField
-											value={draftSettings.theme}
-											options={themeOptions}
-											onChange={(value) =>
-												updateDraft({ theme: value as AppSettings["theme"] })
-											}
-										/>
-									</div>
-									<div className="setting-field">
-										<span>
-											{t("settings.language")}
-											<DirtyMarker dirty={isDirty("language")} label={t("settings.language")} />
-										</span>
-										<SelectField
-											value={draftSettings.language}
-											options={languageOptions}
-											onChange={(value) =>
-												updateDraft({ language: value as AppSettings["language"] })
-											}
-										/>
-									</div>
-									<div className="setting-field setting-zoom-field">
-										<span>
-											{t("settings.zoomFactor")}
-											<DirtyMarker dirty={isDirty("zoomFactor")} label={t("settings.zoomFactor")} />
-										</span>
-										<div className="setting-zoom-control">
-											<IconButton
-												className="icon-button setting-zoom-button"
-												label={t("settings.zoomOut")}
-												disabled={draftSettings.zoomFactor <= ZOOM_FACTOR_MIN}
-												onClick={() => changeZoomFactor(-ZOOM_FACTOR_STEP)}
-											>
-												<Minus size={16} strokeWidth={2.2} aria-hidden="true" />
-											</IconButton>
-											<output className="setting-zoom-value" aria-live="polite">
-												{Math.round(draftSettings.zoomFactor * 100)}%
-											</output>
-											<IconButton
-												className="icon-button setting-zoom-button"
-												label={t("settings.zoomIn")}
-												disabled={draftSettings.zoomFactor >= ZOOM_FACTOR_MAX}
-												onClick={() => changeZoomFactor(ZOOM_FACTOR_STEP)}
-											>
-												<Plus size={16} strokeWidth={2.2} aria-hidden="true" />
-											</IconButton>
-										</div>
-									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.typography")}>
-									<div className="setting-field">
-										<span>
-											{t("settings.fontSize")}
-											<DirtyMarker dirty={isDirty("fontSize")} label={t("settings.fontSize")} />
-										</span>
-										<SelectField
-											value={draftSettings.fontSize}
+											value={draftSettings.uiFontSize ?? draftSettings.fontSize}
 											options={fontSizeOptions}
 											onChange={(value) =>
-												updateDraft({ fontSize: value as AppSettings["fontSize"] })
+												updateDraft({ uiFontSize: value as AppSettings["uiFontSize"] })
 											}
 										/>
 									</div>
-									<SettingSwitch
-										title={t("settings.fontSizePerArea")}
-										description={t("settings.fontSizePerAreaDesc")}
-										checked={perAreaFontSize}
-										onChange={(checked) => {
-											setPerAreaFontSize(checked);
-											if (!checked) {
-												updateDraft({ uiFontSize: null, chatFontSize: null, inputFontSize: null });
-											}
-										}}
-									/>
-									{perAreaFontSize && (
-										<>
-											<div className="setting-field">
-												<span>
-													{t("settings.uiFontSize")}
-													<DirtyMarker dirty={isDirty("uiFontSize")} label={t("settings.uiFontSize")} />
-												</span>
-												<SelectField
-													value={draftSettings.uiFontSize ?? draftSettings.fontSize}
-													options={fontSizeOptions}
-													onChange={(value) =>
-														updateDraft({ uiFontSize: value as AppSettings["uiFontSize"] })
-													}
-												/>
-											</div>
-											<div className="setting-field">
-												<span>
-													{t("settings.chatFontSize")}
-													<DirtyMarker dirty={isDirty("chatFontSize")} label={t("settings.chatFontSize")} />
-												</span>
-												<SelectField
-													value={draftSettings.chatFontSize ?? draftSettings.fontSize}
-													options={fontSizeOptions}
-													onChange={(value) =>
-														updateDraft({ chatFontSize: value as AppSettings["chatFontSize"] })
-													}
-												/>
-											</div>
-											<div className="setting-field">
-												<span>
-													{t("settings.inputFontSize")}
-													<DirtyMarker dirty={isDirty("inputFontSize")} label={t("settings.inputFontSize")} />
-												</span>
-												<SelectField
-													value={draftSettings.inputFontSize ?? draftSettings.fontSize}
-													options={fontSizeOptions}
-													onChange={(value) =>
-														updateDraft({ inputFontSize: value as AppSettings["inputFontSize"] })
-													}
-												/>
-											</div>
-										</>
-									)}
-									{/* 不接 setting-divider：上方 SettingSwitch 已有 border-bottom，再画线会双线 */}
-									<div className="setting-field setting-field--after-switch">
+									<div className="setting-field">
 										<span>
-											{t("settings.fontFamilyBase")}
-											<DirtyMarker dirty={isDirty("fontFamilyBase")} label={t("settings.fontFamilyBase")} />
+											{t("settings.chatFontSize")}
+											<DirtyMarker dirty={isDirty("chatFontSize")} label={t("settings.chatFontSize")} />
 										</span>
 										<SelectField
-											value={draftSettings.fontFamilyBase}
-											options={fontBaseOptions}
+											value={draftSettings.chatFontSize ?? draftSettings.fontSize}
+											options={fontSizeOptions}
 											onChange={(value) =>
-												updateDraft({ fontFamilyBase: value as AppSettings["fontFamilyBase"] })
+												updateDraft({ chatFontSize: value as AppSettings["chatFontSize"] })
 											}
 										/>
 									</div>
-									{draftSettings.fontFamilyBase === "custom" && (
-										<TextField
-											className="setting-field"
-											label={t("settings.fontFamilyBaseCustomField")}
-											value={draftSettings.fontFamilyBaseCustom}
-											placeholder={t("settings.fontFamilyBaseCustomPlaceholder")}
-											onChange={(value) =>
-												updateDraft({ fontFamilyBaseCustom: value })
-											}
-										/>
-									)}
-									<hr className="setting-divider" />
 									<div className="setting-field">
 										<span>
-											{t("settings.fontFamilyMono")}
-											<DirtyMarker dirty={isDirty("fontFamilyMono")} label={t("settings.fontFamilyMono")} />
+											{t("settings.inputFontSize")}
+											<DirtyMarker dirty={isDirty("inputFontSize")} label={t("settings.inputFontSize")} />
 										</span>
 										<SelectField
-											value={draftSettings.fontFamilyMono}
-											options={fontMonoOptions}
+											value={draftSettings.inputFontSize ?? draftSettings.fontSize}
+											options={fontSizeOptions}
 											onChange={(value) =>
-												updateDraft({ fontFamilyMono: value as AppSettings["fontFamilyMono"] })
+												updateDraft({ inputFontSize: value as AppSettings["inputFontSize"] })
 											}
 										/>
 									</div>
-									{draftSettings.fontFamilyMono === "custom" && (
-										<TextField
-											className="setting-field"
-											label={t("settings.fontFamilyMonoCustomField")}
-											value={draftSettings.fontFamilyMonoCustom}
-											placeholder={t("settings.fontFamilyMonoCustomPlaceholder")}
-											onChange={(value) =>
-												updateDraft({ fontFamilyMonoCustom: value })
-											}
-										/>
-									)}
-								</SettingsSection>
-								<SettingsSection title={t("settings.notificationSection")}>
-									<div className="setting-field">
-										<span>
-											{t("settings.inputShortcut")}
-											<DirtyMarker dirty={isDirty("sendShortcut")} label={t("settings.inputShortcut")} />
-										</span>
-										<SelectField
-											value={draftSettings.sendShortcut}
-											options={sendShortcutOptions}
-											onChange={(value) =>
-												updateDraft({ sendShortcut: value as AppSettings["sendShortcut"] })
-											}
-										/>
-									</div>
-									<div className="setting-field">
-										<span>
-											{t("settings.linkOpenMode")}
-											<DirtyMarker dirty={isDirty("linkOpenMode")} label={t("settings.linkOpenMode")} />
-										</span>
-										<SelectField
-											value={draftSettings.linkOpenMode}
-											options={linkOpenModeOptions}
-											onChange={(value) =>
-												updateDraft({ linkOpenMode: value as AppSettings["linkOpenMode"] })
-											}
-										/>
-									</div>
-									<SettingSwitch
-										title={t("settings.closeToTray")}
-										checked={draftSettings.closeToTray}
-										onChange={(checked) =>
-											updateDraft({ closeToTray: checked })
-										}
+								</>
+							)}
+							{/* 不接 setting-divider：上方 SettingSwitch 已有 border-bottom，再画线会双线 */}
+							<div className="setting-field setting-field--after-switch">
+								<span>
+									{t("settings.fontFamilyBase")}
+									<DirtyMarker dirty={isDirty("fontFamilyBase")} label={t("settings.fontFamilyBase")} />
+								</span>
+								<SelectField
+									value={draftSettings.fontFamilyBase}
+									options={fontBaseOptions}
+									onChange={(value) =>
+										updateDraft({ fontFamilyBase: value as AppSettings["fontFamilyBase"] })
+									}
+								/>
+							</div>
+							{draftSettings.fontFamilyBase === "custom" && (
+								<TextField
+									className="setting-field"
+									label={t("settings.fontFamilyBaseCustomField")}
+									value={draftSettings.fontFamilyBaseCustom}
+									placeholder={t("settings.fontFamilyBaseCustomPlaceholder")}
+									onChange={(value) =>
+										updateDraft({ fontFamilyBaseCustom: value })
+									}
+								/>
+							)}
+							<hr className="setting-divider" />
+							<div className="setting-field">
+								<span>
+									{t("settings.fontFamilyMono")}
+									<DirtyMarker dirty={isDirty("fontFamilyMono")} label={t("settings.fontFamilyMono")} />
+								</span>
+								<SelectField
+									value={draftSettings.fontFamilyMono}
+									options={fontMonoOptions}
+									onChange={(value) =>
+										updateDraft({ fontFamilyMono: value as AppSettings["fontFamilyMono"] })
+									}
+								/>
+							</div>
+							{draftSettings.fontFamilyMono === "custom" && (
+								<TextField
+									className="setting-field"
+									label={t("settings.fontFamilyMonoCustomField")}
+									value={draftSettings.fontFamilyMonoCustom}
+									placeholder={t("settings.fontFamilyMonoCustomPlaceholder")}
+									onChange={(value) =>
+										updateDraft({ fontFamilyMonoCustom: value })
+									}
+								/>
+							)}
+						</SettingsSection>
+						<SettingsSection title={t("settings.notificationSection")}>
+							<div className="setting-field">
+								<span>
+									{t("settings.inputShortcut")}
+									<DirtyMarker dirty={isDirty("sendShortcut")} label={t("settings.inputShortcut")} />
+								</span>
+								<SelectField
+									value={draftSettings.sendShortcut}
+									options={sendShortcutOptions}
+									onChange={(value) =>
+										updateDraft({ sendShortcut: value as AppSettings["sendShortcut"] })
+									}
+								/>
+							</div>
+							<div className="setting-field">
+								<span>
+									{t("settings.linkOpenMode")}
+									<DirtyMarker dirty={isDirty("linkOpenMode")} label={t("settings.linkOpenMode")} />
+								</span>
+								<SelectField
+									value={draftSettings.linkOpenMode}
+									options={linkOpenModeOptions}
+									onChange={(value) =>
+										updateDraft({ linkOpenMode: value as AppSettings["linkOpenMode"] })
+									}
+								/>
+							</div>
+							<SettingSwitch
+								title={t("settings.closeToTray")}
+								checked={draftSettings.closeToTray}
+								onChange={(checked) =>
+									updateDraft({ closeToTray: checked })
+								}
+							/>
+							<SettingSwitch
+								title={t("settings.singleInstance")}
+								description={t("settings.singleInstanceDesc")}
+								checked={draftSettings.singleInstance}
+								onChange={(checked) =>
+									updateDraft({ singleInstance: checked })
+								}
+							/>
+							<SettingSwitch
+								title={t("settings.enableNotifications")}
+								checked={draftSettings.enableNotifications}
+								onChange={(checked) =>
+									updateDraft({ enableNotifications: checked })
+								}
+							/>
+						</SettingsSection>
+						<SettingsSection title={t("settings.advanced")}>
+							<div className="setting-field">
+								<span>
+									{t("settings.rpcTimeout")}
+									<DirtyMarker dirty={isDirty("rpcTimeout")} label={t("settings.rpcTimeout")} />
+								</span>
+								<input
+									type="number"
+									value={String(Math.round(draftSettings.rpcTimeout / 1000))}
+									onChange={(e) => {
+										const seconds = Math.max(600, parseInt(e.target.value) || 600);
+										updateDraft({ rpcTimeout: seconds * 1000 });
+									}}
+								/>
+								<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+									{t("settings.rpcTimeoutDesc")}
+								</small>
+							</div>
+							<div className="setting-field">
+								<span>
+									{t("settings.maxEditorFileSize")}
+									<DirtyMarker dirty={isDirty("maxEditorFileSizeMB")} label={t("settings.maxEditorFileSize")} />
+								</span>
+								<input
+									type="number"
+									value={String(draftSettings.maxEditorFileSizeMB)}
+									onChange={(e) => {
+										const mb = Math.max(1, parseInt(e.target.value) || 5);
+										updateDraft({ maxEditorFileSizeMB: mb });
+									}}
+								/>
+								<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+									{t("settings.maxEditorFileSizeDesc")}
+								</small>
+							</div>
+						</SettingsSection>
+						<SettingsSection title={t("settings.git")}>
+							<SettingSwitch
+								title={t("settings.gitManagement")}
+								description={t("settings.gitManagementDesc")}
+								checked={draftSettings.enableGitManagement}
+								onChange={(checked) =>
+									updateDraft({ enableGitManagement: checked })
+								}
+							/>
+							{draftSettings.enableGitManagement && (
+								<SettingTextarea
+									title={t("settings.gitCommitMessagePrompt")}
+									description={t("settings.gitCommitMessagePromptDesc")}
+									value={draftSettings.gitCommitMessagePrompt}
+									onChange={(value) => updateDraft({ gitCommitMessagePrompt: value })}
+								/>
+							)}
+						</SettingsSection>
+					</>
+				)}
+				{/* ── 外观设置 tab ── */}
+				{activeTab === "appearance" && (
+					<>
+						<SettingsSection title={t("settings.interface")}>
+							<div className="setting-field">
+								<span>
+									{t("settings.startupWindowMode")}
+									<DirtyMarker
+										dirty={isDirty("startupWindowMode")}
+										label={t("settings.startupWindowMode")}
 									/>
-									<SettingSwitch
-										title={t("settings.singleInstance")}
-										description={t("settings.singleInstanceDesc")}
-										checked={draftSettings.singleInstance}
-										onChange={(checked) =>
-											updateDraft({ singleInstance: checked })
-										}
-									/>
-									<SettingSwitch
-										title={t("settings.enableNotifications")}
-										checked={draftSettings.enableNotifications}
-										onChange={(checked) =>
-											updateDraft({ enableNotifications: checked })
-										}
-									/>
-								</SettingsSection>
-								<SettingsSection title={t("settings.advanced")}>
-									<div className="setting-field">
-										<span>
-											{t("settings.rpcTimeout")}
-											<DirtyMarker dirty={isDirty("rpcTimeout")} label={t("settings.rpcTimeout")} />
-										</span>
-										<input
-											type="number"
-											value={String(Math.round(draftSettings.rpcTimeout / 1000))}
-											onChange={(e) => {
-												const seconds = Math.max(600, parseInt(e.target.value) || 600);
-												updateDraft({ rpcTimeout: seconds * 1000 });
-											}}
-										/>
-										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
-											{t("settings.rpcTimeoutDesc")}
-										</small>
-									</div>
-									<div className="setting-field">
-										<span>
-											{t("settings.maxEditorFileSize")}
-											<DirtyMarker dirty={isDirty("maxEditorFileSizeMB")} label={t("settings.maxEditorFileSize")} />
-										</span>
-										<input
-											type="number"
-											value={String(draftSettings.maxEditorFileSizeMB)}
-											onChange={(e) => {
-												const mb = Math.max(1, parseInt(e.target.value) || 5);
-												updateDraft({ maxEditorFileSizeMB: mb });
-											}}
-										/>
-										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
-											{t("settings.maxEditorFileSizeDesc")}
-										</small>
-									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.git")}>
-									<SettingSwitch
-										title={t("settings.gitManagement")}
-										description={t("settings.gitManagementDesc")}
-										checked={draftSettings.enableGitManagement}
-										onChange={(checked) =>
-											updateDraft({ enableGitManagement: checked })
-										}
-									/>
-									{draftSettings.enableGitManagement && (
-										<SettingTextarea
-											title={t("settings.gitCommitMessagePrompt")}
-											description={t("settings.gitCommitMessagePromptDesc")}
-											value={draftSettings.gitCommitMessagePrompt}
-											onChange={(value) => updateDraft({ gitCommitMessagePrompt: value })}
-										/>
-									)}
-								</SettingsSection>
-							</>
+								</span>
+								<SelectField
+									value={draftSettings.startupWindowMode}
+									options={startupWindowModeOptions}
+									onChange={(value) =>
+										updateDraft({
+											startupWindowMode: value as AppSettings["startupWindowMode"],
+										})
+									}
+								/>
+								<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+									{t("settings.startupWindowModeDesc")}
+								</small>
+							</div>
+							<div className="setting-field">
+								<span>
+									{t("settings.lightBackground")}
+									<DirtyMarker dirty={isDirty("lightBackground")} label={t("settings.lightBackground")} />
+								</span>
+								<SelectField
+									disabled={lightBackgroundDisabled}
+									value={draftSettings.lightBackground}
+									options={lightBackgroundOptions}
+									onChange={(value) =>
+										updateDraft({ lightBackground: value as AppSettings["lightBackground"] })
+									}
+								/>
+							</div>
+							<SettingSwitch
+								title={t("settings.nativeTitleBar")}
+								checked={draftSettings.useNativeTitleBar}
+								onChange={(checked) =>
+									updateDraft({ useNativeTitleBar: checked })
+								}
+							/>
+							<SettingSwitch
+								title={t("settings.nativeMenu")}
+								checked={draftSettings.showNativeMenu}
+								onChange={(checked) =>
+									updateDraft({ showNativeMenu: checked })
+								}
+							/>
+						</SettingsSection>
+						<SettingsSection title={t("settings.contentMaxWidth")} description={t("settings.contentMaxWidthDesc")}>
+							<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 480 }}>
+								<input
+									type="range"
+									min="800"
+									max="1400"
+									step="25"
+									value={draftSettings.contentMaxWidth}
+									onChange={(event) => updateDraft({ contentMaxWidth: parseInt(event.target.value) })}
+									style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
+								/>
+								<span style={{
+									fontFamily: "var(--font-family-business)",
+									fontSize: "var(--font-size-sm)",
+									color: "var(--color-text-muted)",
+									minWidth: 80,
+									textAlign: "right",
+								}}>
+									{draftSettings.contentMaxWidth === 1400
+										? t("settings.contentMaxWidthUnlimited")
+										: `${draftSettings.contentMaxWidth}px`}
+								</span>
+							</div>
+						</SettingsSection>
+					</>
+				)}
+				{/* ── 代理设置 tab ── */}
+				{activeTab === "proxy" && (
+					<>
+						{/* 未保存更改的提示横幅 */}
+						{proxyDirty && (
+							<div className="setting-proxy-unsaved-bar">
+								<span className="setting-proxy-unsaved-dot" />
+								<span>{t("settings.proxyUnsaved")}</span>
+								<small>{t("settings.proxyApplyHint")}</small>
+							</div>
 						)}
-						{/* ── 外观设置 tab ── */}
-						{activeTab === "appearance" && (
-							<>
-								<SettingsSection title={t("settings.interface")}>
-									<div className="setting-field">
-										<span>
-											{t("settings.startupWindowMode")}
-											<DirtyMarker
-												dirty={isDirty("startupWindowMode")}
-												label={t("settings.startupWindowMode")}
-											/>
-										</span>
-										<SelectField
-											value={draftSettings.startupWindowMode}
-											options={startupWindowModeOptions}
-											onChange={(value) =>
-												updateDraft({
-													startupWindowMode: value as AppSettings["startupWindowMode"],
-												})
-											}
-										/>
-										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
-											{t("settings.startupWindowModeDesc")}
-										</small>
-									</div>
-									<div className="setting-field">
-										<span>
-											{t("settings.lightBackground")}
-											<DirtyMarker dirty={isDirty("lightBackground")} label={t("settings.lightBackground")} />
-										</span>
-										<SelectField
-											disabled={lightBackgroundDisabled}
-											value={draftSettings.lightBackground}
-											options={lightBackgroundOptions}
-											onChange={(value) =>
-												updateDraft({ lightBackground: value as AppSettings["lightBackground"] })
-											}
-										/>
-									</div>
-									<SettingSwitch
-										title={t("settings.nativeTitleBar")}
-										checked={draftSettings.useNativeTitleBar}
-										onChange={(checked) =>
-											updateDraft({ useNativeTitleBar: checked })
+						<SettingsSection
+							title={t("settings.piProxy")}
+							description={t("settings.piProxyDesc")}
+						>
+							<SettingSwitch
+								title={t("settings.enablePiProxy")}
+								description={t("settings.settingTakesEffectAfterRestart")}
+								checked={draftSettings.piProxyEnabled}
+								onChange={(checked) =>
+									updateDraft({ piProxyEnabled: checked })
+								}
+							/>
+							{draftSettings.piProxyEnabled && (
+								<div className="setting-proxy-panel">
+									<TextField
+										className="setting-field"
+										label={t("settings.proxyUrl")}
+										value={draftSettings.piProxyUrl}
+										placeholder="http://127.0.0.1:7890"
+										onChange={(value) =>
+											updateDraft({ piProxyUrl: value })
 										}
 									/>
-									<SettingSwitch
-										title={t("settings.nativeMenu")}
-										checked={draftSettings.showNativeMenu}
-										onChange={(checked) =>
-											updateDraft({ showNativeMenu: checked })
+									<TextField
+										className="setting-field"
+										label={t("settings.proxyBypass")}
+										value={draftSettings.piProxyBypass}
+										placeholder="localhost,127.0.0.1,::1"
+										description={t("settings.noProxyHint")}
+										onChange={(value) =>
+											updateDraft({ piProxyBypass: value })
 										}
 									/>
-								</SettingsSection>
-								<SettingsSection title={t("settings.contentMaxWidth")} description={t("settings.contentMaxWidthDesc")}>
-									<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 480 }}>
-										<input
-											type="range"
-											min="800"
-											max="1400"
-											step="25"
-											value={draftSettings.contentMaxWidth}
-											onChange={(event) => updateDraft({ contentMaxWidth: parseInt(event.target.value) })}
-											style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
-										/>
-										<span style={{
-											fontFamily: "var(--font-family-business)",
-											fontSize: "var(--font-size-sm)",
-											color: "var(--color-text-muted)",
-											minWidth: 80,
-											textAlign: "right",
-										}}>
-											{draftSettings.contentMaxWidth === 1400
-												? t("settings.contentMaxWidthUnlimited")
-												: `${draftSettings.contentMaxWidth}px`}
-										</span>
-									</div>
-								</SettingsSection>
-							</>
-						)}
-						{/* ── 代理设置 tab ── */}
-						{activeTab === "proxy" && (
-							<>
-								{/* 未保存更改的提示横幅 */}
-								{proxyDirty && (
-									<div className="setting-proxy-unsaved-bar">
-										<span className="setting-proxy-unsaved-dot" />
-										<span>{t("settings.proxyUnsaved")}</span>
-										<small>{t("settings.proxyApplyHint")}</small>
-									</div>
-								)}
-								<SettingsSection
-									title={t("settings.piProxy")}
-									description={t("settings.piProxyDesc")}
-								>
-									<SettingSwitch
-										title={t("settings.enablePiProxy")}
-										description={t("settings.settingTakesEffectAfterRestart")}
-										checked={draftSettings.piProxyEnabled}
-										onChange={(checked) =>
-											updateDraft({ piProxyEnabled: checked })
-										}
-									/>
-									{draftSettings.piProxyEnabled && (
-										<div className="setting-proxy-panel">
-											<TextField
-												className="setting-field"
-												label={t("settings.proxyUrl")}
-												value={draftSettings.piProxyUrl}
-												placeholder="http://127.0.0.1:7890"
-												onChange={(value) =>
-													updateDraft({ piProxyUrl: value })
-												}
-											/>
-											<TextField
-												className="setting-field"
-												label={t("settings.proxyBypass")}
-												value={draftSettings.piProxyBypass}
-												placeholder="localhost,127.0.0.1,::1"
-												description={t("settings.noProxyHint")}
-												onChange={(value) =>
-													updateDraft({ piProxyBypass: value })
-												}
-											/>
-											<div className="setting-row">
-												<div>
-													<strong>{t("settings.proxyTest")}</strong>
-													<small>{t("settings.proxyNoApiKey")}</small>
-													{props.piProxyNotice && (
-														<small className={`setting-status ${props.piProxyNoticeTone}`}>
-															{props.piProxyNotice}
-														</small>
-													)}
-												</div>
-												<Button
-													onClick={props.onTestPiProxy}
-													disabled={props.piProxyChecking}
-												>
-													{props.piProxyChecking
-														? t("settings.testingProxy")
-														: t("settings.testProxy")}
-												</Button>
-											</div>
-										</div>
-									)}
-								</SettingsSection>
-								<SettingsSection
-									title={t("settings.desktopProxy")}
-									description={t("settings.desktopProxyDesc")}
-								>
-									<SettingSwitch
-										title={t("settings.enableDesktopProxy")}
-										description={t("settings.desktopProxyDesc")}
-										checked={draftSettings.desktopProxyEnabled}
-										onChange={(checked) =>
-											updateDraft({ desktopProxyEnabled: checked })
-										}
-									/>
-									{draftSettings.desktopProxyEnabled && (
-										<div className="setting-proxy-panel">
-											<TextField
-												className="setting-field"
-												label={t("settings.proxyUrl")}
-												value={draftSettings.desktopProxyUrl}
-												placeholder="http://127.0.0.1:7890"
-												onChange={(value) =>
-													updateDraft({ desktopProxyUrl: value })
-												}
-											/>
-											<TextField
-												className="setting-field"
-												label={t("settings.proxyBypass")}
-												value={draftSettings.desktopProxyBypass}
-												placeholder="localhost,127.0.0.1,::1"
-												description={t("settings.electronProxyHint")}
-												onChange={(value) =>
-													updateDraft({ desktopProxyBypass: value })
-												}
-											/>
-										</div>
-									)}
-								</SettingsSection>
-								{/* 代理变更走全局草稿：顶部统一保存/取消，不再在 tab 底部重复放按钮 */}
-							</>
-						)}
-						{/* ── 开发设置 tab（含 Web 服务） ── */}
-						{activeTab === "dev" && (
-							<>
-								<SettingsSection title={t("settings.environment")}>
-									{/* Pi CLI 状态：安装检测 + 路径信息 + 重新检测 */}
-									<div className="setting-pi-status">
-										<div className="setting-pi-status-indicator">
-											<span
-												className={"pi-status-dot " + (props.piStatus?.installed ? "online" : "offline")}
-											/>
-											<div className="setting-pi-status-text">
-												<div className="setting-pi-status-title">
-													<strong>omp CLI</strong>
-													{/* 检测状态与版本状态放在标题同行，小字号弱化，避免与路径信息抢行 */}
-													<span className="setting-pi-status-version">
-														{props.piStatus
-															? props.piStatus.installed
-																? t("settings.foundPi", {
-																		version: props.piStatus.version ?? "omp",
-																	})
-																: t("settings.piMissing")
-															: t("settings.piCliAvailable")}
-														{/* 版本状态并入同一行：当前版本即「已找到」的版本，只补充最新状态；有更新时显示目标版本，无更新时直接给结论 */}
-														{props.piUpdateCheck &&
-															(props.piUpdateCheck.currentVersion || props.piUpdateCheck.latestVersion) && (
-																<>
-																	{" · "}
-																	{props.piUpdateCheck.hasUpdate ? (
-																		<span className="setting-status warning">
-																			{t("settings.piUpdateTo", {
-																				latest: props.piUpdateCheck.latestVersion ?? "?",
-																			})}
-																		</span>
-																	) : (
-																		<span className="setting-status success">
-																			{t("settings.piUpToDate")}
-																		</span>
-																	)}
-																	{props.piUpdateCheck.error && (
-																		<span className="setting-status error">
-																			{props.piUpdateCheck.error}
-																		</span>
-																	)}
-																</>
-															)}
-													</span>
-												</div>
-												{piPath && (
-													<span className="setting-path">
-														{piPath}
-													</span>
-												)}
-												{props.piStatus && !props.piStatus.installed && props.piStatus.error && (
-													<span className="setting-status error">
-														{props.piStatus.error}
-													</span>
-												)}
-											</div>
-										</div>
-										<div className="setting-inline-actions">
-											<Button onClick={props.onCheckPi} disabled={props.piChecking}>
-												{props.piChecking
-													? t("settings.detecting")
-													: t("settings.detectEnvironment")}
-											</Button>
-											{props.onClearCheckFlag && (
-												<Button
-													className="setting-btn-secondary"
-													onClick={props.onClearCheckFlag}
-												>
-													{t("environment.clearCheckFlag")}
-												</Button>
-											)}
-											<Button
-												onClick={props.onCheckPiUpdate}
-												loading={props.piUpdateChecking}
-												disabled={draftSettings.disableUpdateCheck}
-											>
-												{t("settings.checkPiUpdate")}
-											</Button>
-											<Button
-												onClick={props.onUpdatePi}
-												loading={props.piUpdating}
-												disabled={
-													draftSettings.disableUpdateCheck ||
-													(!props.piUpdateCheck?.hasUpdate &&
-														!props.piUpdateCheck?.error)
-												}
-											>
-												{t("settings.updatePi")}
-											</Button>
-										</div>
-									</div>
-									{props.piUpdateResult && (
-										<pre className="setting-update-output">
-											{props.piUpdateResult.command}
-											{"\n"}
-											{props.piUpdateResult.output}
-										</pre>
-									)}
-
-									<hr className="setting-divider" />
-
-									{/* Pi 来源：Windows 原生 / WSL（仅 Windows 可见） */}
-									{props.appInfo.platform === "win32" && (
-									<div className="setting-pi-source-block">
-										<div className="setting-pi-source-row">
-											<span>{t("settings.piSource.label")}</span>
-											<SelectField
-												value={draftSettings.wslEnabled ? "wsl" : "windows"}
-												options={[
-													{ value: "windows", label: t("settings.piSource.windows") },
-													{ value: "wsl", label: t("settings.piSource.wsl") },
-												]}
-												onChange={(value) => {
-													updateDraft({ wslEnabled: value === "wsl" });
-													setWslValidation(null);
-												}}
-											/>
-										</div>
-										{draftSettings.wslEnabled && (
-											<div className="setting-pi-wsl-config">
-												<div className="setting-wsl-fields">
-													{wslDistros.length > 0 ? (
-														<SelectField
-															className="setting-field"
-															label={t("settings.wsl.distro")}
-															value={draftSettings.wslDistro}
-															options={distroOptions}
-															onChange={(value) => {
-																updateDraft({ wslDistro: value });
-																setWslValidation(null);
-															}}
-														/>
-													) : (
-														<TextField
-															className="setting-field"
-															label={t("settings.wsl.distro")}
-															value={draftSettings.wslDistro}
-															onChange={(value) => {
-																updateDraft({ wslDistro: value });
-																setWslValidation(null);
-															}}
-															placeholder="Ubuntu"
-														/>
-													)}
-													{wslDistrosLoading && (
-														<small className="setting-status info">{t("settings.wsl.detectingDistros")}</small>
-													)}
-													<div className="setting-wsl-user-row">
-														<TextField
-															className="setting-field"
-															label={t("settings.wsl.user")}
-															value={wslUserInput}
-															onChange={(value) => {
-																setWslUserInput(value);
-																setWslValidation(null);
-															}}
-															placeholder="root"
-														/>
-														<Button
-															buttonSize="sm"
-															disabled={!wslUserInput.trim() || wslValidating}
-															loading={wslValidating}
-															onClick={handleValidateWslUser}
-														>
-															{t("settings.wsl.validateUser")}
-														</Button>
-													</div>
-												</div>
-												{wslValidation && (
-													<div className={`setting-wsl-validation ${wslValidation.ok ? "success" : "error"}`}>
-														{wslValidation.ok ? (
-															<>
-																<small className="setting-status success">
-																	{t("settings.wsl.validationOk", {
-																		user: wslValidation.whoami,
-																		distro: draftSettings.wslDistro,
-																	})}
-																</small>
-																{wslValidation.piVersion ? (
-																	<small className="setting-status success">
-																		{t("settings.wsl.piDetected", { version: wslValidation.piVersion })}
-																	</small>
-																) : (
-																	<small className="setting-status warning">
-																		{wslValidation.error || t("settings.wsl.piNotInstalled")}
-																	</small>
-																)}
-															</>
-														) : (
-															<small className="setting-status error">{wslValidation.error}</small>
-														)}
-													</div>
-												)}
-											</div>
-										)}
-									</div>
-									)}
-
-									<hr className="setting-divider" />
-
-									{/* 自定义 Pi 路径：操作按钮与输入框同行，提示与校验结果同列，压缩垂直空间 */}
-									<div className="setting-pi-path-panel">
-										<div className="setting-pi-path-row">
-											<TextField
-												className="setting-field"
-												label={t("settings.customPiPath")}
-												value={props.customPiPath}
-												placeholder={
-													piPath ||
-													"D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
-												}
-												disabled={props.customPathValidating}
-												onChange={props.onCustomPathChange}
-											/>
-											<div className="setting-pi-path-actions">
-												<Button
-													buttonSize="sm"
-													onClick={props.onValidateCustomPath}
-													disabled={!props.customPiPath.trim() || props.customPathValidating}
-												>
-													{props.customPathValidating
-														? t("settings.validating")
-														: t("settings.validatePiPath")}
-												</Button>
-												<Button
-													buttonSize="sm"
-													onClick={props.onClearCustomPath}
-													disabled={!props.settings.customPiPath || props.customPathValidating}
-												>
-													{t("settings.clearCustomPiPath")}
-												</Button>
-											</div>
-										</div>
-										<div className="setting-pi-path-hint">
-											<small className="ui-field-description">
-												{t("settings.customPiPathHint")}
-											</small>
-											{props.customPathResult && (
-												<small className={`setting-status ${props.customPathResult.installed ? "success" : "error"}`}>
-													{props.customPathResult.installed
-														? t("settings.validatePassed", {
-																value:
-																	props.customPathResult.command ??
-																	props.customPathResult.version ??
-																	"omp",
-															})
-														: t("settings.validateFailed", {
-																error:
-																	props.customPathResult.error ??
-																	t("environment.unableToRun"),
-															})}
+									<div className="setting-row">
+										<div>
+											<strong>{t("settings.proxyTest")}</strong>
+											<small>{t("settings.proxyNoApiKey")}</small>
+											{props.piProxyNotice && (
+												<small className={`setting-status ${props.piProxyNoticeTone}`}>
+													{props.piProxyNotice}
 												</small>
 											)}
 										</div>
+										<Button
+											onClick={props.onTestPiProxy}
+											disabled={props.piProxyChecking}
+										>
+											{props.piProxyChecking
+												? t("settings.testingProxy")
+												: t("settings.testProxy")}
+										</Button>
 									</div>
-
-									<hr className="setting-divider" />
-
-									{/* 版本与更新 */}
-									<div className="setting-row">
-										<div>
-											<strong>OmpDeck</strong>
-											<span style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
-												v{props.appInfo.version}
+								</div>
+							)}
+						</SettingsSection>
+						<SettingsSection
+							title={t("settings.desktopProxy")}
+							description={t("settings.desktopProxyDesc")}
+						>
+							<SettingSwitch
+								title={t("settings.enableDesktopProxy")}
+								description={t("settings.desktopProxyDesc")}
+								checked={draftSettings.desktopProxyEnabled}
+								onChange={(checked) =>
+									updateDraft({ desktopProxyEnabled: checked })
+								}
+							/>
+							{draftSettings.desktopProxyEnabled && (
+								<div className="setting-proxy-panel">
+									<TextField
+										className="setting-field"
+										label={t("settings.proxyUrl")}
+										value={draftSettings.desktopProxyUrl}
+										placeholder="http://127.0.0.1:7890"
+										onChange={(value) =>
+											updateDraft({ desktopProxyUrl: value })
+										}
+									/>
+									<TextField
+										className="setting-field"
+										label={t("settings.proxyBypass")}
+										value={draftSettings.desktopProxyBypass}
+										placeholder="localhost,127.0.0.1,::1"
+										description={t("settings.electronProxyHint")}
+										onChange={(value) =>
+											updateDraft({ desktopProxyBypass: value })
+										}
+									/>
+								</div>
+							)}
+						</SettingsSection>
+						{/* 代理变更走全局草稿：顶部统一保存/取消，不再在 tab 底部重复放按钮 */}
+					</>
+				)}
+				{/* ── 开发设置 tab（含 Web 服务） ── */}
+				{activeTab === "dev" && (
+					<>
+						<SettingsSection title={t("settings.environment")}>
+							{/* Pi CLI 状态：安装检测 + 路径信息 + 重新检测 */}
+							<div className="setting-pi-status">
+								<div className="setting-pi-status-indicator">
+									<span
+										className={"pi-status-dot " + (props.piStatus?.installed ? "online" : "offline")}
+									/>
+									<div className="setting-pi-status-text">
+										<div className="setting-pi-status-title">
+											<strong>omp CLI</strong>
+											{/* 检测状态与版本状态放在标题同行，小字号弱化，避免与路径信息抢行 */}
+											<span className="setting-pi-status-version">
+												{props.piStatus
+													? props.piStatus.installed
+														? t("settings.foundPi", {
+																version: props.piStatus.version ?? "omp",
+															})
+														: t("settings.piMissing")
+													: t("settings.piCliAvailable")}
+												{/* 版本状态并入同一行：当前版本即「已找到」的版本，只补充最新状态；有更新时显示目标版本，无更新时直接给结论 */}
+												{props.piUpdateCheck &&
+													(props.piUpdateCheck.currentVersion || props.piUpdateCheck.latestVersion) && (
+														<>
+															{" · "}
+															{props.piUpdateCheck.hasUpdate ? (
+																<span className="setting-status warning">
+																	{t("settings.piUpdateTo", {
+																		latest: props.piUpdateCheck.latestVersion ?? "?",
+																	})}
+																</span>
+															) : (
+																<span className="setting-status success">
+																	{t("settings.piUpToDate")}
+																</span>
+															)}
+															{props.piUpdateCheck.error && (
+																<span className="setting-status error">
+																	{props.piUpdateCheck.error}
+																</span>
+															)}
+														</>
+													)}
 											</span>
 										</div>
-										<div className="setting-inline-actions">
-											<Button
-												onClick={draftSettings.disableUpdateCheck ? undefined : props.onCheckUpdate}
-												loading={props.updateChecking}
-												disabled={draftSettings.disableUpdateCheck}
-											>
-												{draftSettings.disableUpdateCheck
-													? t("settings.updateCheckDisabled")
-													: t("settings.checkUpdate")}
-											</Button>
-										</div>
-									</div>
-									<hr className="setting-divider" />
-
-									{/* 禁用版本检测 */}
-									<SettingSwitch
-										title={t("settings.disableUpdateCheck")}
-										description={t("settings.disableUpdateCheckDesc")}
-										checked={draftSettings.disableUpdateCheck}
-										onChange={(checked) =>
-											updateDraft({ disableUpdateCheck: checked })
-										}
-									/>
-
-									{/* Electron Chromium 沙箱：与 pi Agent 无关，改完需整应用重启。 */}
-									<SettingSwitch
-										title={t("settings.electronSandbox")}
-										description={t("settings.electronSandboxDesc")}
-										checked={draftSettings.electronChromiumSandbox}
-										onChange={(checked) =>
-											updateDraft({ electronChromiumSandbox: checked })
-										}
-									/>
-
-									{/* Agent RPC 启动诊断：改完后需重启 Agent。
-									    不要再插 setting-divider：SettingSwitch 已有 border-bottom，叠 divider 会双线。 */}
-									<div className="setting-row setting-row--section-label">
-										<div>
-											<strong>{t("settings.piRpcStartup")}</strong>
-											<small>{t("settings.piRpcStartupDesc")}</small>
-										</div>
-									</div>
-									<SettingSwitch
-										title={t("settings.piRpcOffline")}
-										description={t("settings.piRpcOfflineDesc")}
-										checked={draftSettings.piRpcOffline}
-										onChange={(checked) => updateDraft({ piRpcOffline: checked })}
-									/>
-									<SettingSwitch
-										title={t("settings.piRpcNoExtensions")}
-										description={t("settings.piRpcNoExtensionsDesc")}
-										checked={draftSettings.piRpcNoExtensions}
-										onChange={(checked) => updateDraft({ piRpcNoExtensions: checked })}
-									/>
-									<SettingSwitch
-										title={t("settings.piRpcNoSkills")}
-										description={t("settings.piRpcNoSkillsDesc")}
-										checked={draftSettings.piRpcNoSkills}
-										onChange={(checked) => updateDraft({ piRpcNoSkills: checked })}
-									/>
-								</SettingsSection>
-								<SettingsSection title={t("settings.debug")}>
-									<div className="setting-row">
-										<div>
-											<strong>{t("settings.restartApp")}</strong>
-											<small>{t("settings.restartAppDesc")}</small>
-										</div>
-										<Button onClick={props.onRestartApp}>
-											{t("settings.restartAppButton")}
-										</Button>
-									</div>
-									<div className="setting-row">
-										<div>
-											<strong>{t("settings.devTools")}</strong>
-											<small>{t("settings.devToolsDesc")}</small>
-										</div>
-										<Button onClick={props.onToggleDevTools}>
-											{t("settings.toggle")}
-										</Button>
-									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.webLocalService")} description={t("settings.webLocalServiceDesc")}>
-									<SettingSwitch
-										title={t("settings.enableWebService")}
-										description={
-											props.webServiceChanging
-												? t("settings.webOpening")
-												: t("settings.webOffDesc")
-										}
-										checked={draftSettings.webServiceEnabled}
-										disabled={props.webServiceChanging}
-										onChange={(checked) =>
-											updateDraft({
-												webServiceEnabled: checked,
-												// 与后端一致：关闭 Web 服务会级联关闭远程访问，
-												// 草稿也要同步，避免重新打开 Web 时远程开关“复活”。
-												...(checked ? {} : { remoteAccessEnabled: false }),
-											})
-										}
-									/>
-									<div className="web-endpoint-panel">
-										<SelectField
-											label={t("settings.webHost")}
-											value={draftSettings.webServiceHost}
-											disabled={props.webServiceChanging}
-											options={[
-												{ value: "127.0.0.1", label: t("settings.webHostLoopback") },
-												{ value: "0.0.0.0", label: t("settings.webHostLan") },
-											]}
-											onChange={(value) => updateDraft({ webServiceHost: value })}
-											description={t("settings.webHostDesc")}
-										/>
-										<div className="web-endpoint-grid">
-											<div className="web-endpoint-metric">
-												<span>{t("common.host")}</span>
-												<code>{draftSettings.webServiceHost}</code>
-											</div>
-											<label className="web-endpoint-metric editable">
-												<span>{t("common.port")}</span>
-												<input
-													type="number"
-													min={1}
-													max={65535}
-													value={webPortDraft}
-													disabled={props.webServiceChanging}
-													onChange={(event) => setWebPortDraft(event.target.value)}
-													onBlur={applyWebPortDraft}
-													onKeyDown={(event) => {
-														if (event.key === "Enter") {
-															event.preventDefault();
-															applyWebPortDraft();
-															event.currentTarget.blur();
-														}
-													}}
-												/>
-											</label>
-										</div>
-										<div className="web-endpoint-summary">
-											<span className={draftSettings.webServiceEnabled ? "online" : ""} />
-											<div>
-												<strong>
-													{webStatus?.url ||
-														`http://127.0.0.1:${webPortDraft || draftSettings.webServicePort}`}
-												</strong>
-												<small>
-													{webStatus?.lanUrls && webStatus.lanUrls.length > 1
-														? webStatus.lanUrls.join(" · ")
-														: t("settings.localWebHint")}
-												</small>
-											</div>
-											<Button
-												buttonSize="sm"
-												disabled={!draftSettings.webServiceEnabled}
-												onClick={() =>
-													props.onOpenWebService(webPortDraft || String(draftSettings.webServicePort))
-												}
-											>
-												{t("common.open")}
-											</Button>
-										</div>
-										{draftSettings.webServiceEnabled && webStatus?.token && (
-											<div className="web-token-panel">
-												<div className="web-token-head">
-													<div>
-														<strong>{t("settings.webToken")}</strong>
-														<small>{t("settings.webTokenDesc")}</small>
-													</div>
-													<div className="web-token-actions">
-														<IconButton
-															label={webTokenVisible ? t("settings.webTokenHide") : t("settings.webTokenShow")}
-															onClick={() => setWebTokenVisible((value) => !value)}
-														>
-															{webTokenVisible ? <EyeOff size={15} /> : <Eye size={15} />}
-														</IconButton>
-														<IconButton
-															label={t("settings.webTokenCopy")}
-															onClick={() => void copyWebUrl()}
-														>
-															<Copy size={15} />
-														</IconButton>
-														{!isWebRuntime && (
-															<IconButton
-																label={t("settings.webTokenRotate")}
-																disabled={webTokenBusy}
-																onClick={() => void rotateWebToken()}
-															>
-																<RefreshCw size={15} className={webTokenBusy ? "spin" : ""} />
-															</IconButton>
-														)}
-													</div>
-												</div>
-												<code className="web-token-value">
-													{webTokenVisible ? webStatus.token : "••••••••••••••••"}
-												</code>
-												{!isWebRuntime && (
-													<SelectField
-														label={t("settings.webTokenTtl")}
-														value={String(draftSettings.webServiceTokenTtlDays ?? 30)}
-														options={[
-															{ value: "1", label: t("settings.webTokenTtl1") },
-															{ value: "7", label: t("settings.webTokenTtl7") },
-															{ value: "30", label: t("settings.webTokenTtl30") },
-															{ value: "0", label: t("settings.webTokenTtlNever") },
-														]}
-														onChange={(value) =>
-															updateDraft({ webServiceTokenTtlDays: Number(value) })
-														}
-													/>
-												)}
-												{webQr && !webUrlIsLoopback && (
-													<div className="web-token-qr">
-														<img src={webQr} alt={t("settings.webTokenQrAlt")} width={180} height={180} />
-														<div>
-															<strong>{t("settings.webTokenScan")}</strong>
-															<small>
-																{webStatus.url} · {t("settings.webTokenScanHint")}
-															</small>
-														</div>
-													</div>
-												)}
-												{webUrlIsLoopback && (
-													<small className="web-token-warning">{t("settings.webTokenLoopbackWarning")}</small>
-												)}
-												{!webUrlIsLoopback && webStatus.url.startsWith("http://") && (
-													<small className="web-token-warning">{t("settings.webTokenHttpWarning")}</small>
-												)}
-											</div>
+										{piPath && (
+											<span className="setting-path">
+												{piPath}
+											</span>
+										)}
+										{props.piStatus && !props.piStatus.installed && props.piStatus.error && (
+											<span className="setting-status error">
+												{props.piStatus.error}
+											</span>
 										)}
 									</div>
-								</SettingsSection>
-
-								<SettingsSection title={t("settings.privacy")}>
-									<SettingSwitch
-										title={t("settings.telemetry")}
-										description={t("settings.telemetryDesc")}
-										checked={draftSettings.telemetryEnabled}
-										onChange={(checked) =>
-											updateDraft({ telemetryEnabled: checked })
+								</div>
+								<div className="setting-inline-actions">
+									<Button onClick={props.onCheckPi} disabled={props.piChecking}>
+										{props.piChecking
+											? t("settings.detecting")
+											: t("settings.detectEnvironment")}
+									</Button>
+									{props.onClearCheckFlag && (
+										<Button
+											className="setting-btn-secondary"
+											onClick={props.onClearCheckFlag}
+										>
+											{t("environment.clearCheckFlag")}
+										</Button>
+									)}
+									<Button
+										onClick={props.onCheckPiUpdate}
+										loading={props.piUpdateChecking}
+										disabled={draftSettings.disableUpdateCheck}
+									>
+										{t("settings.checkPiUpdate")}
+									</Button>
+									<Button
+										onClick={props.onUpdatePi}
+										loading={props.piUpdating}
+										disabled={
+											draftSettings.disableUpdateCheck ||
+											(!props.piUpdateCheck?.hasUpdate &&
+												!props.piUpdateCheck?.error)
 										}
-									/>
-								</SettingsSection>
-							</>
-						)}
-						{/* ── 桌面宠物 tab ── */}
-						{activeTab === "pet" && (
-							<>
-								<SettingsSection title={t("settings.pet.title")} description={t("settings.pet.sectionDesc")}>
-									<SettingSwitch
-										title={t("settings.pet.enable")}
-										description={t("settings.pet.enableDesc")}
-										checked={draftSettings.petEnabled}
-										onChange={(value) => updateDraft({ petEnabled: value })}
-									/>
-									<SettingSwitch
-										title={t("settings.pet.alwaysOnTop")}
-										description={t("settings.pet.alwaysOnTopDesc")}
-										checked={draftSettings.petAlwaysOnTop}
-										onChange={(value) => updateDraft({ petAlwaysOnTop: value })}
-									/>
-									<SettingSwitch
-										title={t("settings.pet.patrol")}
-										description={t("settings.pet.patrolDesc")}
-										checked={draftSettings.petPatrolEnabled ?? true}
-										onChange={(value) => updateDraft({ petPatrolEnabled: value })}
-									/>
-								</SettingsSection>
-								<SettingsSection title={t("settings.pet.patrolPause")} description={t("settings.pet.patrolPauseDesc")}>
-									<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 320 }}>
-										<input
-											type="range"
-											min="1"
-											max="30"
-											step="1"
-											value={draftSettings.petPatrolPauseMin ?? 5}
-											onChange={(event) => updateDraft({ petPatrolPauseMin: parseInt(event.target.value) })}
-											style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
-										/>
-										<span style={{
-											fontFamily: "var(--font-family-business)",
-											fontSize: "var(--font-size-sm)",
-											color: "var(--color-text-muted)",
-											minWidth: 60,
-											textAlign: "right",
-										}}>
-											{draftSettings.petPatrolPauseMin ?? 5} min
-										</span>
-									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.pet.choose")}>
+									>
+										{t("settings.updatePi")}
+									</Button>
+								</div>
+							</div>
+							{props.piUpdateResult && (
+								<pre className="setting-update-output">
+									{props.piUpdateResult.command}
+									{"\n"}
+									{props.piUpdateResult.output}
+								</pre>
+							)}
+
+							<hr className="setting-divider" />
+
+							{/* Pi 来源：Windows 原生 / WSL（仅 Windows 可见） */}
+							{props.appInfo.platform === "win32" && (
+							<div className="setting-pi-source-block">
+								<div className="setting-pi-source-row">
+									<span>{t("settings.piSource.label")}</span>
 									<SelectField
-										className="setting-field"
-										label={t("settings.pet.choose")}
-										value={draftSettings.petId}
-										options={petOptions}
-										onChange={(value) => {
-											setPetPreviewMode("__auto");
-											updateDraft({ petId: value });
-										}}
-									/>
-									<small className="setting-status">{t("settings.pet.petdexHint")}</small>
-									{(() => {
-										const selected = petList.find((pet) => pet.id === draftSettings.petId);
-										return (
-											<>
-												{selected && (
-													<div className="pet-chooser-preview-row" style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", marginTop: 8 }}>
-														<PetChooserPreview pet={selected} mode={petPreviewMode} />
-														<div style={{ minWidth: 0, flex: 1 }}>
-															<strong style={{ display: "block", fontSize: "var(--font-size-control)", color: "var(--color-text-primary)" }}>{selected.displayName}</strong>
-															{selected.description && (
-																<small className="setting-status" style={{ display: "block", marginTop: 2 }}>{selected.description}</small>
-															)}
-														</div>
-													</div>
-												)}
-											</>
-										);
-									})()}
-								</SettingsSection>
-								<SettingsSection title={t("settings.pet.scale")} description={t("settings.pet.scaleDesc")}>
-									<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 320 }}>
-										<input
-											type="range"
-											min="0.3"
-											max="2.0"
-											step="0.05"
-											value={draftSettings.petScale ?? 1}
-											onChange={(event) => updateDraft({ petScale: parseFloat(event.target.value) })}
-											style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
-										/>
-										<span style={{
-											fontFamily: "var(--font-family-business)",
-											fontSize: "var(--font-size-sm)",
-											color: "var(--color-text-muted)",
-											minWidth: 36,
-											textAlign: "right",
-										}}>
-											{((draftSettings.petScale ?? 1) * 100).toFixed(0)}%
-										</span>
-									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.pet.preview")} description={t("settings.pet.previewDesc")}>
-									<SelectField
-										className="setting-field"
-										label={t("settings.pet.previewMode")}
-										value={petPreviewMode}
+										value={draftSettings.wslEnabled ? "wsl" : "windows"}
 										options={[
-											{ value: "__auto", label: t("settings.pet.previewAuto") },
-											{ value: "idle", label: "idle (row 0)" },
-											{ value: "running", label: "running (row 7)" },
-											{ value: "failed", label: "failed (row 5)" },
-											{ value: "waiting", label: "waiting (row 6)" },
-											{ value: "waving", label: "waving (row 3)" },
-											{ value: "running-right", label: "running-right (row 1)" },
-											{ value: "running-left", label: "running-left (row 2)" },
-											{ value: "jumping", label: "jumping (row 4)" },
-											{ value: "review", label: "review (row 8)" },
+											{ value: "windows", label: t("settings.piSource.windows") },
+											{ value: "wsl", label: t("settings.piSource.wsl") },
 										]}
 										onChange={(value) => {
-											setPetPreviewMode(value);
-											void window.piDesktop.pet.setPreviewMode(value === "__auto" ? "" : value);
+											updateDraft({ wslEnabled: value === "wsl" });
+											setWslValidation(null);
 										}}
 									/>
-									<div className="setting-inline-actions pet-test-actions">
-										<Button
-											buttonSize="sm"
-											variant="danger"
-											onClick={() => void window.piDesktop.pet.testNotify("error")}
-										>
-											{t("settings.pet.testError")}
-										</Button>
-										<Button
-											buttonSize="sm"
-											onClick={() => void window.piDesktop.pet.testNotify("done")}
-										>
-											{t("settings.pet.testDone")}
-										</Button>
-									</div>
-								</SettingsSection>
-							</>
-						)}
-						{/* ── 存储与日志 tab ── */}
-						{activeTab === "storage" && (
-							<StorageTab
-								settings={draftSettings}
-								onChange={updateDraft}
-							/>
-						)}
-						{/* ── 模型角色 tab ── */}
-						{activeTab === "roles" && (
-							<ModelRolesTab />
-						)}
-						{/* ── AFK 编排 tab ── */}
-						{activeTab === "afk" && (
-							<>
-								<SettingsSection title={t("afk.title")}>
-									<SettingSwitch
-										title={t("afk.enabled")}
-										description={t("afk.enabledDesc")}
-										checked={draftSettings.afk.enabled}
-										onChange={(checked) =>
-											updateDraft({ afk: { ...draftSettings.afk, enabled: checked } })
-										}
-									/>
-									<div className="setting-field">
-										<span className="setting-label">{t("afk.targetProject")}</span>
-										{afkProjectOptions.length === 0 ? (
-											<span className="setting-hint">{t("afk.targetProjectPlaceholder")}</span>
-										) : (
-											// B 方案多项目轮转：checkbox 列表（项目数量少，不用 SelectField 多选定制）。
-											// SettingsStore 归一化保证 targetProjectIds 恒为数组（normalizeAfkSettings），无需兜底。
-											afkProjectOptions.map((option) => {
-												const selected = draftSettings.afk.targetProjectIds.includes(option.value);
-												return (
-													<label key={option.value} className="afk-project-option">
-														<input
-															type="checkbox"
-															checked={selected}
-															onChange={(event) => {
-																const current = draftSettings.afk.targetProjectIds;
-																const next = event.target.checked
-																	? [...current, option.value]
-																	: current.filter((id) => id !== option.value);
-																updateDraft({
-																	afk: { ...draftSettings.afk, targetProjectIds: next },
-																});
-															}}
-														/>
-														<span>{option.label}</span>
-													</label>
-												);
-											})
+								</div>
+								{draftSettings.wslEnabled && (
+									<div className="setting-pi-wsl-config">
+										<div className="setting-wsl-fields">
+											{wslDistros.length > 0 ? (
+												<SelectField
+													className="setting-field"
+													label={t("settings.wsl.distro")}
+													value={draftSettings.wslDistro}
+													options={distroOptions}
+													onChange={(value) => {
+														updateDraft({ wslDistro: value });
+														setWslValidation(null);
+													}}
+												/>
+											) : (
+												<TextField
+													className="setting-field"
+													label={t("settings.wsl.distro")}
+													value={draftSettings.wslDistro}
+													onChange={(value) => {
+														updateDraft({ wslDistro: value });
+														setWslValidation(null);
+													}}
+													placeholder="Ubuntu"
+												/>
+											)}
+											{wslDistrosLoading && (
+												<small className="setting-status info">{t("settings.wsl.detectingDistros")}</small>
+											)}
+											<div className="setting-wsl-user-row">
+												<TextField
+													className="setting-field"
+													label={t("settings.wsl.user")}
+													value={wslUserInput}
+													onChange={(value) => {
+														setWslUserInput(value);
+														setWslValidation(null);
+													}}
+													placeholder="root"
+												/>
+												<Button
+													buttonSize="sm"
+													disabled={!wslUserInput.trim() || wslValidating}
+													loading={wslValidating}
+													onClick={handleValidateWslUser}
+												>
+													{t("settings.wsl.validateUser")}
+												</Button>
+											</div>
+										</div>
+										{wslValidation && (
+											<div className={`setting-wsl-validation ${wslValidation.ok ? "success" : "error"}`}>
+												{wslValidation.ok ? (
+													<>
+														<small className="setting-status success">
+															{t("settings.wsl.validationOk", {
+																user: wslValidation.whoami,
+																distro: draftSettings.wslDistro,
+															})}
+														</small>
+														{wslValidation.piVersion ? (
+															<small className="setting-status success">
+																{t("settings.wsl.piDetected", { version: wslValidation.piVersion })}
+															</small>
+														) : (
+															<small className="setting-status warning">
+																{wslValidation.error || t("settings.wsl.piNotInstalled")}
+															</small>
+														)}
+													</>
+												) : (
+													<small className="setting-status error">{wslValidation.error}</small>
+												)}
+											</div>
 										)}
 									</div>
-									<TextField
-										className="setting-field"
-										label={t("afk.pollInterval")}
-										type="number"
-										min={1}
-										value={String(Math.round((draftSettings.afk.pollIntervalMs || 60000) / 1000))}
-										onChange={(value) =>
-											updateDraft({
-												afk: {
-													...draftSettings.afk,
-													pollIntervalMs: Math.max(1, Math.round(Number(value) || 60)) * 1000,
-												},
-											})
-										}
-									/>
-									<TextField
-										className="setting-field"
-										label={t("afk.timeout")}
-										type="number"
-										min={1}
-										value={String(Math.round((draftSettings.afk.timeoutMs || 1800000) / 60000))}
-										onChange={(value) =>
-											updateDraft({
-												afk: {
-													...draftSettings.afk,
-													timeoutMs: Math.max(1, Math.round(Number(value) || 30)) * 60000,
-												},
-											})
-										}
-									/>
-								</SettingsSection>
-							</>
-						)}
-					</div>
-				</div>
-				{/* 未保存变更确认对话框 */}
-				{closeConfirmOpen && (
-					<div className="config-modal-overlay" onClick={() => setCloseConfirmOpen(false)}>
-						<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
-							<strong>{t("settings.unsavedTitle")}</strong>
-							<p>{t("settings.unsavedMessage")}</p>
-							<div className="config-modal-actions">
-								<button className="config-btn" onClick={() => setCloseConfirmOpen(false)}>
-									{t("common.cancel")}
-								</button>
-								<button className="config-btn danger" onClick={handleDiscardAndClose}>
-									{t("settings.discardChanges")}
-								</button>
-								<button
-									className="config-btn primary"
-									disabled={saving}
-									onClick={() => void handleSaveAndClose()}
-								>
-									{t("settings.saveAndClose")}
-								</button>
+								)}
 							</div>
-						</div>
-					</div>
+							)}
+
+							<hr className="setting-divider" />
+
+							{/* 自定义 Pi 路径：操作按钮与输入框同行，提示与校验结果同列，压缩垂直空间 */}
+							<div className="setting-pi-path-panel">
+								<div className="setting-pi-path-row">
+									<TextField
+										className="setting-field"
+										label={t("settings.customPiPath")}
+										value={props.customPiPath}
+										placeholder={
+											piPath ||
+											"D\\:\\mise-data\\installs\\node\\24 13 0\\omp.cmd"
+										}
+										disabled={props.customPathValidating}
+										onChange={props.onCustomPathChange}
+									/>
+									<div className="setting-pi-path-actions">
+										<Button
+											buttonSize="sm"
+											onClick={props.onValidateCustomPath}
+											disabled={!props.customPiPath.trim() || props.customPathValidating}
+										>
+											{props.customPathValidating
+												? t("settings.validating")
+												: t("settings.validatePiPath")}
+										</Button>
+										<Button
+											buttonSize="sm"
+											onClick={props.onClearCustomPath}
+											disabled={!props.settings.customPiPath || props.customPathValidating}
+										>
+											{t("settings.clearCustomPiPath")}
+										</Button>
+									</div>
+								</div>
+								<div className="setting-pi-path-hint">
+									<small className="ui-field-description">
+										{t("settings.customPiPathHint")}
+									</small>
+									{props.customPathResult && (
+										<small className={`setting-status ${props.customPathResult.installed ? "success" : "error"}`}>
+											{props.customPathResult.installed
+												? t("settings.validatePassed", {
+														value:
+															props.customPathResult.command ??
+															props.customPathResult.version ??
+															"omp",
+													})
+												: t("settings.validateFailed", {
+														error:
+															props.customPathResult.error ??
+															t("environment.unableToRun"),
+													})}
+										</small>
+									)}
+								</div>
+							</div>
+
+							<hr className="setting-divider" />
+
+							{/* 版本与更新 */}
+							<div className="setting-row">
+								<div>
+									<strong>OmpDeck</strong>
+									<span style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+										v{props.appInfo.version}
+									</span>
+								</div>
+								<div className="setting-inline-actions">
+									<Button
+										onClick={draftSettings.disableUpdateCheck ? undefined : props.onCheckUpdate}
+										loading={props.updateChecking}
+										disabled={draftSettings.disableUpdateCheck}
+									>
+										{draftSettings.disableUpdateCheck
+											? t("settings.updateCheckDisabled")
+											: t("settings.checkUpdate")}
+									</Button>
+								</div>
+							</div>
+							<hr className="setting-divider" />
+
+							{/* 禁用版本检测 */}
+							<SettingSwitch
+								title={t("settings.disableUpdateCheck")}
+								description={t("settings.disableUpdateCheckDesc")}
+								checked={draftSettings.disableUpdateCheck}
+								onChange={(checked) =>
+									updateDraft({ disableUpdateCheck: checked })
+								}
+							/>
+
+							{/* Electron Chromium 沙箱：与 pi Agent 无关，改完需整应用重启。 */}
+							<SettingSwitch
+								title={t("settings.electronSandbox")}
+								description={t("settings.electronSandboxDesc")}
+								checked={draftSettings.electronChromiumSandbox}
+								onChange={(checked) =>
+									updateDraft({ electronChromiumSandbox: checked })
+								}
+							/>
+
+							{/* Agent RPC 启动诊断：改完后需重启 Agent。
+							    不要再插 setting-divider：SettingSwitch 已有 border-bottom，叠 divider 会双线。 */}
+							<div className="setting-row setting-row--section-label">
+								<div>
+									<strong>{t("settings.piRpcStartup")}</strong>
+									<small>{t("settings.piRpcStartupDesc")}</small>
+								</div>
+							</div>
+							<SettingSwitch
+								title={t("settings.piRpcOffline")}
+								description={t("settings.piRpcOfflineDesc")}
+								checked={draftSettings.piRpcOffline}
+								onChange={(checked) => updateDraft({ piRpcOffline: checked })}
+							/>
+							<SettingSwitch
+								title={t("settings.piRpcNoExtensions")}
+								description={t("settings.piRpcNoExtensionsDesc")}
+								checked={draftSettings.piRpcNoExtensions}
+								onChange={(checked) => updateDraft({ piRpcNoExtensions: checked })}
+							/>
+							<SettingSwitch
+								title={t("settings.piRpcNoSkills")}
+								description={t("settings.piRpcNoSkillsDesc")}
+								checked={draftSettings.piRpcNoSkills}
+								onChange={(checked) => updateDraft({ piRpcNoSkills: checked })}
+							/>
+						</SettingsSection>
+						<SettingsSection title={t("settings.debug")}>
+							<div className="setting-row">
+								<div>
+									<strong>{t("settings.restartApp")}</strong>
+									<small>{t("settings.restartAppDesc")}</small>
+								</div>
+								<Button onClick={props.onRestartApp}>
+									{t("settings.restartAppButton")}
+								</Button>
+							</div>
+							<div className="setting-row">
+								<div>
+									<strong>{t("settings.devTools")}</strong>
+									<small>{t("settings.devToolsDesc")}</small>
+								</div>
+								<Button onClick={props.onToggleDevTools}>
+									{t("settings.toggle")}
+								</Button>
+							</div>
+						</SettingsSection>
+						<SettingsSection title={t("settings.webLocalService")} description={t("settings.webLocalServiceDesc")}>
+							<SettingSwitch
+								title={t("settings.enableWebService")}
+								description={
+									props.webServiceChanging
+										? t("settings.webOpening")
+										: t("settings.webOffDesc")
+								}
+								checked={draftSettings.webServiceEnabled}
+								disabled={props.webServiceChanging}
+								onChange={(checked) =>
+									updateDraft({
+										webServiceEnabled: checked,
+										// 与后端一致：关闭 Web 服务会级联关闭远程访问，
+										// 草稿也要同步，避免重新打开 Web 时远程开关“复活”。
+										...(checked ? {} : { remoteAccessEnabled: false }),
+									})
+								}
+							/>
+							<div className="web-endpoint-panel">
+								<SelectField
+									label={t("settings.webHost")}
+									value={draftSettings.webServiceHost}
+									disabled={props.webServiceChanging}
+									options={[
+										{ value: "127.0.0.1", label: t("settings.webHostLoopback") },
+										{ value: "0.0.0.0", label: t("settings.webHostLan") },
+									]}
+									onChange={(value) => updateDraft({ webServiceHost: value })}
+									description={t("settings.webHostDesc")}
+								/>
+								<div className="web-endpoint-grid">
+									<div className="web-endpoint-metric">
+										<span>{t("common.host")}</span>
+										<code>{draftSettings.webServiceHost}</code>
+									</div>
+									<label className="web-endpoint-metric editable">
+										<span>{t("common.port")}</span>
+										<input
+											type="number"
+											min={1}
+											max={65535}
+											value={webPortDraft}
+											disabled={props.webServiceChanging}
+											onChange={(event) => setWebPortDraft(event.target.value)}
+											onBlur={applyWebPortDraft}
+											onKeyDown={(event) => {
+												if (event.key === "Enter") {
+													event.preventDefault();
+													applyWebPortDraft();
+													event.currentTarget.blur();
+												}
+											}}
+										/>
+									</label>
+								</div>
+								<div className="web-endpoint-summary">
+									<span className={draftSettings.webServiceEnabled ? "online" : ""} />
+									<div>
+										<strong>
+											{webStatus?.url ||
+												`http://127.0.0.1:${webPortDraft || draftSettings.webServicePort}`}
+										</strong>
+										<small>
+											{webStatus?.lanUrls && webStatus.lanUrls.length > 1
+												? webStatus.lanUrls.join(" · ")
+												: t("settings.localWebHint")}
+										</small>
+									</div>
+									<Button
+										buttonSize="sm"
+										disabled={!draftSettings.webServiceEnabled}
+										onClick={() =>
+											props.onOpenWebService(webPortDraft || String(draftSettings.webServicePort))
+										}
+									>
+										{t("common.open")}
+									</Button>
+								</div>
+								{draftSettings.webServiceEnabled && webStatus?.token && (
+									<div className="web-token-panel">
+										<div className="web-token-head">
+											<div>
+												<strong>{t("settings.webToken")}</strong>
+												<small>{t("settings.webTokenDesc")}</small>
+											</div>
+											<div className="web-token-actions">
+												<IconButton
+													label={webTokenVisible ? t("settings.webTokenHide") : t("settings.webTokenShow")}
+													onClick={() => setWebTokenVisible((value) => !value)}
+												>
+													{webTokenVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+												</IconButton>
+												<IconButton
+													label={t("settings.webTokenCopy")}
+													onClick={() => void copyWebUrl()}
+												>
+													<Copy size={15} />
+												</IconButton>
+												{!isWebRuntime && (
+													<IconButton
+														label={t("settings.webTokenRotate")}
+														disabled={webTokenBusy}
+														onClick={() => void rotateWebToken()}
+													>
+														<RefreshCw size={15} className={webTokenBusy ? "spin" : ""} />
+													</IconButton>
+												)}
+											</div>
+										</div>
+										<code className="web-token-value">
+											{webTokenVisible ? webStatus.token : "••••••••••••••••"}
+										</code>
+										{!isWebRuntime && (
+											<SelectField
+												label={t("settings.webTokenTtl")}
+												value={String(draftSettings.webServiceTokenTtlDays ?? 30)}
+												options={[
+													{ value: "1", label: t("settings.webTokenTtl1") },
+													{ value: "7", label: t("settings.webTokenTtl7") },
+													{ value: "30", label: t("settings.webTokenTtl30") },
+													{ value: "0", label: t("settings.webTokenTtlNever") },
+												]}
+												onChange={(value) =>
+													updateDraft({ webServiceTokenTtlDays: Number(value) })
+												}
+											/>
+										)}
+										{webQr && !webUrlIsLoopback && (
+											<div className="web-token-qr">
+												<img src={webQr} alt={t("settings.webTokenQrAlt")} width={180} height={180} />
+												<div>
+													<strong>{t("settings.webTokenScan")}</strong>
+													<small>
+														{webStatus.url} · {t("settings.webTokenScanHint")}
+													</small>
+												</div>
+											</div>
+										)}
+										{webUrlIsLoopback && (
+											<small className="web-token-warning">{t("settings.webTokenLoopbackWarning")}</small>
+										)}
+										{!webUrlIsLoopback && webStatus.url.startsWith("http://") && (
+											<small className="web-token-warning">{t("settings.webTokenHttpWarning")}</small>
+										)}
+									</div>
+								)}
+							</div>
+						</SettingsSection>
+
+						<SettingsSection title={t("settings.privacy")}>
+							<SettingSwitch
+								title={t("settings.telemetry")}
+								description={t("settings.telemetryDesc")}
+								checked={draftSettings.telemetryEnabled}
+								onChange={(checked) =>
+									updateDraft({ telemetryEnabled: checked })
+								}
+							/>
+						</SettingsSection>
+					</>
+				)}
+				{/* ── 桌面宠物 tab ── */}
+				{activeTab === "pet" && (
+					<>
+						<SettingsSection title={t("settings.pet.title")} description={t("settings.pet.sectionDesc")}>
+							<SettingSwitch
+								title={t("settings.pet.enable")}
+								description={t("settings.pet.enableDesc")}
+								checked={draftSettings.petEnabled}
+								onChange={(value) => updateDraft({ petEnabled: value })}
+							/>
+							<SettingSwitch
+								title={t("settings.pet.alwaysOnTop")}
+								description={t("settings.pet.alwaysOnTopDesc")}
+								checked={draftSettings.petAlwaysOnTop}
+								onChange={(value) => updateDraft({ petAlwaysOnTop: value })}
+							/>
+							<SettingSwitch
+								title={t("settings.pet.patrol")}
+								description={t("settings.pet.patrolDesc")}
+								checked={draftSettings.petPatrolEnabled ?? true}
+								onChange={(value) => updateDraft({ petPatrolEnabled: value })}
+							/>
+						</SettingsSection>
+						<SettingsSection title={t("settings.pet.patrolPause")} description={t("settings.pet.patrolPauseDesc")}>
+							<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 320 }}>
+								<input
+									type="range"
+									min="1"
+									max="30"
+									step="1"
+									value={draftSettings.petPatrolPauseMin ?? 5}
+									onChange={(event) => updateDraft({ petPatrolPauseMin: parseInt(event.target.value) })}
+									style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
+								/>
+								<span style={{
+									fontFamily: "var(--font-family-business)",
+									fontSize: "var(--font-size-sm)",
+									color: "var(--color-text-muted)",
+									minWidth: 60,
+									textAlign: "right",
+								}}>
+									{draftSettings.petPatrolPauseMin ?? 5} min
+								</span>
+							</div>
+						</SettingsSection>
+						<SettingsSection title={t("settings.pet.choose")}>
+							<SelectField
+								className="setting-field"
+								label={t("settings.pet.choose")}
+								value={draftSettings.petId}
+								options={petOptions}
+								onChange={(value) => {
+									setPetPreviewMode("__auto");
+									updateDraft({ petId: value });
+								}}
+							/>
+							<small className="setting-status">{t("settings.pet.petdexHint")}</small>
+							{(() => {
+								const selected = petList.find((pet) => pet.id === draftSettings.petId);
+								return (
+									<>
+										{selected && (
+											<div className="pet-chooser-preview-row" style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", marginTop: 8 }}>
+												<PetChooserPreview pet={selected} mode={petPreviewMode} />
+												<div style={{ minWidth: 0, flex: 1 }}>
+													<strong style={{ display: "block", fontSize: "var(--font-size-control)", color: "var(--color-text-primary)" }}>{selected.displayName}</strong>
+													{selected.description && (
+														<small className="setting-status" style={{ display: "block", marginTop: 2 }}>{selected.description}</small>
+													)}
+												</div>
+											</div>
+										)}
+									</>
+								);
+							})()}
+						</SettingsSection>
+						<SettingsSection title={t("settings.pet.scale")} description={t("settings.pet.scaleDesc")}>
+							<div style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", maxWidth: 320 }}>
+								<input
+									type="range"
+									min="0.3"
+									max="2.0"
+									step="0.05"
+									value={draftSettings.petScale ?? 1}
+									onChange={(event) => updateDraft({ petScale: parseFloat(event.target.value) })}
+									style={{ flex: 1, accentColor: "var(--color-accent)", direction: "rtl" }}
+								/>
+								<span style={{
+									fontFamily: "var(--font-family-business)",
+									fontSize: "var(--font-size-sm)",
+									color: "var(--color-text-muted)",
+									minWidth: 36,
+									textAlign: "right",
+								}}>
+									{((draftSettings.petScale ?? 1) * 100).toFixed(0)}%
+								</span>
+							</div>
+						</SettingsSection>
+						<SettingsSection title={t("settings.pet.preview")} description={t("settings.pet.previewDesc")}>
+							<SelectField
+								className="setting-field"
+								label={t("settings.pet.previewMode")}
+								value={petPreviewMode}
+								options={[
+									{ value: "__auto", label: t("settings.pet.previewAuto") },
+									{ value: "idle", label: "idle (row 0)" },
+									{ value: "running", label: "running (row 7)" },
+									{ value: "failed", label: "failed (row 5)" },
+									{ value: "waiting", label: "waiting (row 6)" },
+									{ value: "waving", label: "waving (row 3)" },
+									{ value: "running-right", label: "running-right (row 1)" },
+									{ value: "running-left", label: "running-left (row 2)" },
+									{ value: "jumping", label: "jumping (row 4)" },
+									{ value: "review", label: "review (row 8)" },
+								]}
+								onChange={(value) => {
+									setPetPreviewMode(value);
+									void window.piDesktop.pet.setPreviewMode(value === "__auto" ? "" : value);
+								}}
+							/>
+							<div className="setting-inline-actions pet-test-actions">
+								<Button
+									buttonSize="sm"
+									variant="danger"
+									onClick={() => void window.piDesktop.pet.testNotify("error")}
+								>
+									{t("settings.pet.testError")}
+								</Button>
+								<Button
+									buttonSize="sm"
+									onClick={() => void window.piDesktop.pet.testNotify("done")}
+								>
+									{t("settings.pet.testDone")}
+								</Button>
+							</div>
+						</SettingsSection>
+					</>
+				)}
+				{/* ── 存储与日志 tab ── */}
+				{activeTab === "storage" && (
+					<StorageTab
+						settings={draftSettings}
+						onChange={updateDraft}
+					/>
+				)}
+				{/* ── 模型角色 tab ── */}
+				{activeTab === "roles" && (
+					<ModelRolesTab />
+				)}
+				{/* ── AFK 编排 tab ── */}
+				{activeTab === "afk" && (
+					<>
+						<SettingsSection title={t("afk.title")}>
+							<SettingSwitch
+								title={t("afk.enabled")}
+								description={t("afk.enabledDesc")}
+								checked={draftSettings.afk.enabled}
+								onChange={(checked) =>
+									updateDraft({ afk: { ...draftSettings.afk, enabled: checked } })
+								}
+							/>
+							<div className="setting-field">
+								<span className="setting-label">{t("afk.targetProject")}</span>
+								{afkProjectOptions.length === 0 ? (
+									<span className="setting-hint">{t("afk.targetProjectPlaceholder")}</span>
+								) : (
+									// B 方案多项目轮转：checkbox 列表（项目数量少，不用 SelectField 多选定制）。
+									// SettingsStore 归一化保证 targetProjectIds 恒为数组（normalizeAfkSettings），无需兜底。
+									afkProjectOptions.map((option) => {
+										const selected = draftSettings.afk.targetProjectIds.includes(option.value);
+										return (
+											<label key={option.value} className="afk-project-option">
+												<input
+													type="checkbox"
+													checked={selected}
+													onChange={(event) => {
+														const current = draftSettings.afk.targetProjectIds;
+														const next = event.target.checked
+															? [...current, option.value]
+															: current.filter((id) => id !== option.value);
+														updateDraft({
+															afk: { ...draftSettings.afk, targetProjectIds: next },
+														});
+													}}
+												/>
+												<span>{option.label}</span>
+											</label>
+										);
+									})
+								)}
+							</div>
+							<TextField
+								className="setting-field"
+								label={t("afk.pollInterval")}
+								type="number"
+								min={1}
+								value={String(Math.round((draftSettings.afk.pollIntervalMs || 60000) / 1000))}
+								onChange={(value) =>
+									updateDraft({
+										afk: {
+											...draftSettings.afk,
+											pollIntervalMs: Math.max(1, Math.round(Number(value) || 60)) * 1000,
+										},
+									})
+								}
+							/>
+							<TextField
+								className="setting-field"
+								label={t("afk.timeout")}
+								type="number"
+								min={1}
+								value={String(Math.round((draftSettings.afk.timeoutMs || 1800000) / 60000))}
+								onChange={(value) =>
+									updateDraft({
+										afk: {
+											...draftSettings.afk,
+											timeoutMs: Math.max(1, Math.round(Number(value) || 30)) * 60000,
+										},
+									})
+								}
+							/>
+						</SettingsSection>
+					</>
 				)}
 			</div>
-		</div>
+			</div>
+		</ModalSurface>
 	);
 }
 
@@ -2253,23 +2201,13 @@ function StorageTab(props: {
 	return (
 		<>
 			{confirmDialog && (
-				<div className="config-modal-overlay" onClick={() => setConfirmDialog(null)}>
-					<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
-						<strong>{confirmDialog.title}</strong>
-						<p>{confirmDialog.message}</p>
-						<div className="config-modal-actions">
-							<button className="config-btn" onClick={() => setConfirmDialog(null)}>
-								{t("common.cancel")}
-							</button>
-							<button
-								className="config-btn danger"
-								onClick={confirmDialog.onConfirm}
-							>
-								{t("common.confirm")}
-							</button>
-						</div>
-					</div>
-				</div>
+				<ConfirmDialog
+					title={confirmDialog.title}
+					message={confirmDialog.message}
+					danger
+					onConfirm={confirmDialog.onConfirm}
+					onCancel={() => setConfirmDialog(null)}
+				/>
 			)}
 			<SettingsSection title={t("settings.storage.appLogs")}>
 				<div className="setting-row">

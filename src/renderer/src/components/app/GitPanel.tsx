@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
-import { ConfirmDialog } from "./menus/ContextMenus";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { showNotice } from "../../utils/notice";
 import { sameResourceGroups } from "../../utils/gitResourceGroups";
 import {

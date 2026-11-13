@@ -19,6 +19,9 @@ function loadAppUtils() {
   const require = (id) => {
     if (id === "./RichInput") return { formatFilePathRef: () => "" };
     if (id === "../../utils/thinkingTiming") return { computeThinkingTiming: () => 0 };
+    // 展示规则转发层；被测函数不依赖这些实现，只需形状正确。
+    if (id === "../../../../shared/sessionDisplayContract")
+      return { displayPath: (p) => p, formatTimestamp: () => "", stripAnsi: (v) => String(v ?? ""), toolArgPath: () => null };
     throw new Error(`unexpected import in AppUtils: ${id}`);
   };
   const sandbox = { exports: {}, require, location: { href: "file:///Users/test/app" } };

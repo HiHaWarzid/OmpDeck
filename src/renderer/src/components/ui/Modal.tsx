@@ -1,76 +1,38 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import type { ReactNode } from "react";
+import { ModalSurface, type ModalSurfaceSize } from "./ModalSurface";
 
-export type ModalSize = "full" | "medium" | "small";
+export type ModalSize = ModalSurfaceSize;
 
 export interface ModalProps {
 	/** 是否显示弹框 */
 	open: boolean;
 	/** 关闭弹框回调 */
 	onClose: () => void;
-	/** 弹框标题（可选）。传 title 时自动展示 header 区域 */
+	/** 弹框标题（可选）。传 title 时自动展示 header 区域与关闭按钮 */
 	title?: string;
 	/** 弹框尺寸，对应预设的宽高 */
 	size?: ModalSize;
 	/** 主体内容 */
 	children: ReactNode;
-	/** 额外的根元素 class */
-	className?: string;
-	/** 额外的 content wrapper class */
+	/** 额外的 content wrapper class（业务布局类） */
 	contentClassName?: string;
 }
 
 /**
- * 基于 Radix UI Dialog 的共享弹框组件。
- * 遵循 AGENTS.md 弹框尺寸规范：
- * - full:  width/height → min(1300px / 850px, calc(100vw - 48px) / calc(100vh - 48px))
- * - medium: width → min(800px, calc(100vw - 48px))，高度自适应
- * - small:  width → min(480px, calc(100vw - 48px))，高度自适应
- *
- * 默认使用 Portal 渲染，不受父容器 z-index / overflow 影响。
+ * 基于 ModalSurface 的通用弹框入口。
+ * 尺寸规范 / 圆角 / 阴影 / backdrop / Esc / 焦点陷阱都由 ModalSurface 统一提供，
+ * 这里只保留「标题 + 尺寸 + 内容」的简单签名。
  */
-export function Modal({
-	open,
-	onClose,
-	title,
-	size = "full",
-	children,
-	className,
-	contentClassName,
-}: ModalProps) {
+export function Modal({ open, onClose, title, size = "full", children, contentClassName }: ModalProps) {
 	return (
-		<Dialog.Root open={open} onOpenChange={(open) => !open && onClose()}>
-			<Dialog.Portal>
-				<Dialog.Overlay
-					className={["modal-radix-overlay", className].filter(Boolean).join(" ")}
-				/>
-				<Dialog.Content
-					className={[
-						"modal-radix-content",
-						`modal-radix-${size}`,
-						contentClassName,
-					]
-						.filter(Boolean)
-						.join(" ")}
-				>
-					{title && (
-						<div className="modal-header">
-							<Dialog.Title asChild>
-								<strong>{title}</strong>
-							</Dialog.Title>
-							<Dialog.Close asChild>
-								<button
-									type="button"
-									aria-label="Close"
-								>
-									✕
-								</button>
-							</Dialog.Close>
-						</div>
-					)}
-					{children}
-				</Dialog.Content>
-			</Dialog.Portal>
-		</Dialog.Root>
+		<ModalSurface
+			open={open}
+			onRequestClose={onClose}
+			title={title}
+			size={size}
+			className={contentClassName}
+		>
+			{children}
+		</ModalSurface>
 	);
 }

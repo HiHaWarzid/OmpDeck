@@ -1,6 +1,7 @@
 /** 会话管理弹窗：批量重命名/删除/分叉会话。 */
 import { useState } from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
+import { ModalSurface } from "../../ui/ModalSurface";
 import { t } from "../../../i18n";
 import type { SessionSummary } from "../../../../../shared/types";
 
@@ -66,115 +67,106 @@ export function SessionManagerModal(props: {
 	};
 
 	return (
-		<div className="modal-backdrop" onClick={props.onClose}>
-			<section className="session-manager-modal" onClick={(e) => e.stopPropagation()}>
-				<header className="modal-header">
-					<div>
-						<strong>{t("menu.manageSessions")}</strong>
-						<small>{filteredSessions.length} / {props.sessions.length} sessions</small>
-					</div>
-					<button
-						className="modal-close"
-						onClick={props.onClose}
-						aria-label={t("common.close")}
-					>
-						<X size={18} strokeWidth={2} />
-					</button>
-				</header>
+		<ModalSurface
+			open
+			onRequestClose={props.onClose}
+			title={t("menu.manageSessions")}
+			subtitle={`${filteredSessions.length} / ${props.sessions.length} sessions`}
+			className="session-manager-modal"
+		>
 
-				<div className="session-manager-toolbar">
-					<div className="session-manager-toolbar-left">
-						<label className="session-manager-select-all">
-							<input
-								type="checkbox"
-								checked={selectAll}
-								onChange={handleToggleAll}
-							/>
-							{t("common.selectAll")}
-						</label>
-						<div className="session-manager-source-filters">
-							{SOURCES.map((source) => (
-								<button
-									key={source}
-									className={`session-source-btn${activeSources.has(source) ? " active" : ""}`}
-									onClick={() => toggleSource(source)}
-								>
-									{t(`sessionSource.${source}` as any)}
-								</button>
-							))}
-						</div>
-					</div>
-					{selected.size > 0 && (
-						<button
-							className="session-manager-delete-btn"
-							onClick={handleDeleteSelected}
-						>
-							{t("common.deleteSelected", { count: selected.size })}
-						</button>
-					)}
-				</div>
-
-				<div className="session-manager-list">
-					{filteredSessions.map((session) => {
-						const isChecked = selected.has(session.filePath);
-						return (
-							<div
-								key={session.filePath}
-								className={`session-manager-row${isChecked ? " selected" : ""}`}
+			<div className="session-manager-toolbar">
+				<div className="session-manager-toolbar-left">
+					<label className="session-manager-select-all">
+						<input
+							type="checkbox"
+							checked={selectAll}
+							onChange={handleToggleAll}
+						/>
+						{t("common.selectAll")}
+					</label>
+					<div className="session-manager-source-filters">
+						{SOURCES.map((source) => (
+							<button
+								key={source}
+								className={`session-source-btn${activeSources.has(source) ? " active" : ""}`}
+								onClick={() => toggleSource(source)}
 							>
-								<label className="session-manager-row-checkbox">
-									<input
-										type="checkbox"
-										checked={isChecked}
-										onChange={() => handleToggle(session.filePath)}
-									/>
-								</label>
-								<div
-									className="session-manager-row-info"
-									onClick={() => handleToggle(session.filePath)}
-								>
-									<div className="session-manager-row-name">
-										{session.name || session.preview?.slice(0, 60) || t("common.untitled")}
-									</div>
-									{session.source && session.source !== "pi" && (
-										<span className={`session-source-badge ${session.source}`}>
-											{t(`sessionSource.${session.source}` as any)}
-										</span>
-									)}
-									{session.degraded && (
-										<span className="session-degraded-badge" title={t("drawer.sessionDegraded")}>
-											<AlertTriangle size={12} strokeWidth={2} aria-hidden="true" />
-										</span>
-									)}
-								</div>
-								<div className="session-manager-row-actions">
-									<button
-										className="session-manager-action-btn"
-										onClick={() => props.onRename(session)}
-										title={t("common.rename")}
-									>
-										{t("common.rename")}
-									</button>
-									<button
-										className="session-manager-action-btn"
-										onClick={() => props.onExport(session)}
-										title={t("menu.exportHtml")}
-									>
-										{t("menu.exportHtml")}
-									</button>
-									<button
-										className="session-manager-action-btn danger"
-										onClick={() => props.onDelete([session])}
-										title={t("common.delete")}
-									>
-										{t("common.delete")}
-									</button>
-								</div>
-							</div>
-						);
-					})}
+								{t(`sessionSource.${source}` as any)}
+							</button>
+						))}
+					</div>
 				</div>
-			</section>
-		</div>
+				{selected.size > 0 && (
+					<button
+						className="session-manager-delete-btn"
+						onClick={handleDeleteSelected}
+					>
+						{t("common.deleteSelected", { count: selected.size })}
+					</button>
+				)}
+			</div>
+
+			<div className="session-manager-list">
+				{filteredSessions.map((session) => {
+					const isChecked = selected.has(session.filePath);
+					return (
+						<div
+							key={session.filePath}
+							className={`session-manager-row${isChecked ? " selected" : ""}`}
+						>
+							<label className="session-manager-row-checkbox">
+								<input
+									type="checkbox"
+									checked={isChecked}
+									onChange={() => handleToggle(session.filePath)}
+								/>
+							</label>
+							<div
+								className="session-manager-row-info"
+								onClick={() => handleToggle(session.filePath)}
+							>
+								<div className="session-manager-row-name">
+									{session.name || session.preview?.slice(0, 60) || t("common.untitled")}
+								</div>
+								{session.source && session.source !== "pi" && (
+									<span className={`session-source-badge ${session.source}`}>
+										{t(`sessionSource.${session.source}` as any)}
+									</span>
+								)}
+								{session.degraded && (
+									<span className="session-degraded-badge" title={t("drawer.sessionDegraded")}>
+										<AlertTriangle size={12} strokeWidth={2} aria-hidden="true" />
+									</span>
+								)}
+							</div>
+							<div className="session-manager-row-actions">
+								<button
+									className="session-manager-action-btn"
+									onClick={() => props.onRename(session)}
+									title={t("common.rename")}
+								>
+									{t("common.rename")}
+								</button>
+								<button
+									className="session-manager-action-btn"
+									onClick={() => props.onExport(session)}
+									title={t("menu.exportHtml")}
+								>
+									{t("menu.exportHtml")}
+								</button>
+								<button
+									className="session-manager-action-btn danger"
+									onClick={() => props.onDelete([session])}
+									title={t("common.delete")}
+								>
+									{t("common.delete")}
+								</button>
+							</div>
+						</div>
+					);
+				})}
+			</div>
+		</ModalSurface>
 	);
 }

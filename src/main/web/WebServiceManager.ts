@@ -21,8 +21,13 @@ import type {
 import type { PiDesktopApi } from "../../shared/api";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import {
+	attachDisplayMeta,
 	compactChatMessage,
+	DELIVERY_LABELS,
+	deliveryKind,
 	isTopLevelSessionSummary,
+	SESSION_STATUS_LABELS,
+	sessionStatusKind,
 } from "../../shared/sessionDisplayContract";
 import {
 	ensureWebTokenState,
@@ -156,6 +161,17 @@ type _WebAgentDepsDriftGuard = {
 const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
 
 /** 顶层会话规则已收口到 shared/sessionDisplayContract（服务端与手机首页同一实现）。 */
+
+/**
+ * /api/state 的 agent 视图：在 AgentTab 上附加手机端直接渲染的状态文案。
+ * 手机端（classic script）不 import 契约、也不维护中文状态表，只读 `statusText`。
+ */
+type WebAgentView = AgentTab & { statusText: string };
+
+/** 三个状态出口（light 状态、完整状态、创建会话）必须用同一份文案，故统一走这个投影。 */
+function toWebAgentView(agent: AgentTab): WebAgentView {
+	return { ...agent, statusText: SESSION_STATUS_LABELS[sessionStatusKind(agent.status)] };
+}
 
 /**
  * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 1000ms
@@ -389,7 +405,7 @@ export class WebServiceManager {
 				if (url.searchParams.get("light") === "1") {
 					this.sendJson(request, response, {
 						projects: this.deps.listProjects(),
-						agents: this.deps.listAgents(),
+						agents: this.deps.listAgents().map(toWebAgentView),
 						// 手机端在等待新建会话时轮询这里，才能弹出项目信任确认；
 						// 信任请求本身只有 requestId/cwd/projectName，不含会话内容。
 						trustRequests: this.deps.listTrustRequests(),
@@ -431,7 +447,7 @@ export class WebServiceManager {
 					noSession: body.noSession,
 				});
 				this.invalidateStateCache();
-				this.sendJson(request, response, { agent });
+				this.sendJson(request, response, { agent: toWebAgentView(agent) });
 				return;
 			}
 			const messagesMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages$/);
@@ -545,7 +561,9 @@ export class WebServiceManager {
 					this.sendError(response, 404, "消息不存在", "message_not_found");
 					return;
 				}
-				this.sendJson(request, response, { message });
+				// 详情端点不截断（展开全文用），但仍要补派生字段：手机端展开后替换掉
+				// compact 消息，不能因此丢掉摘要/状态标签。
+				this.sendJson(request, response, { message: attachDisplayMeta(message) });
 				return;
 			}
 			const historyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/history-page$/);
@@ -615,7 +633,12 @@ export class WebServiceManager {
 				// prompt endpoint is a transport for SendPromptResult. Semantic rejection is still
 				// a successful HTTP exchange so browser clients can distinguish rejected from
 				// post-write unknown instead of collapsing both into a thrown fetch error.
-				this.sendJson(request, response, { result });
+				// deliveryText：手机端发送后的「已排队/已接管」提示也由服务端派生，
+				// 客户端不再各写一份中文投递文案。
+				const delivery = deliveryKind(body.streamingBehavior);
+				this.sendJson(request, response, {
+					result: delivery ? { ...result, deliveryText: DELIVERY_LABELS[delivery] } : result,
+				});
 				return;
 			}
 			// abort 只停止当前回合，保留 pi 进程和会话；/stop 才会关闭会话。
@@ -677,8 +700,22 @@ export class WebServiceManager {
 			}
 			const runtimeMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/runtime$/);
 			if (runtimeMatch && request.method === "GET") {
-				const state = await this.deps.runtimeState(decodeURIComponent(runtimeMatch[1]));
-				this.sendJson(request, response, { state });
+				const agentId = decodeURIComponent(runtimeMatch[1]);
+				const state = await this.deps.runtimeState(agentId);
+				// 手机端头部副标题的状态文案由此派生：isStreaming 优先，其次 runtime 自带
+				// 的 status（老版本主进程），最后回退 /api/state 的 agent 状态。
+				const agentStatus = this.deps.listAgents().find((agent) => agent.id === agentId)?.status;
+				const rawStatus =
+					!state.isStreaming && "status" in state && typeof state.status === "string"
+						? state.status
+						: agentStatus;
+				const status = state.isStreaming ? "running" : rawStatus;
+				this.sendJson(request, response, {
+					state: {
+						...state,
+						statusText: SESSION_STATUS_LABELS[sessionStatusKind(status)],
+					},
+				});
 				return;
 			}
 			const cycleModelMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/cycle-model$/);
@@ -983,7 +1020,8 @@ export class WebServiceManager {
 		}
 		const state = {
 			projects,
-			agents,
+			// statusText 只是 status 的派生投影，指纹仍用原始 agents（status 变化已覆盖）。
+			agents: agents.map(toWebAgentView),
 			messagesByAgent: Object.fromEntries(
 				agents.map((agent) => [agent.id, messagesByAgent.get(agent.id) ?? []]),
 			),

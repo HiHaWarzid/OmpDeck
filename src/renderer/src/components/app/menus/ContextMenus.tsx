@@ -1,36 +1,8 @@
-/** 右键菜单与确认框：文件/项目/智能体会话上下文菜单及通用确认弹窗。 */
+/** 右键菜单：文件/项目/智能体会话上下文菜单。 */
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { t } from "../../../i18n";
 import type { AgentTab, FileTreeNode, Project, SessionSummary } from "../../../../../shared/types";
 
-export function ConfirmDialog(props: {
-	title: string;
-	message: string;
-	onConfirm: () => void;
-	onCancel: () => void;
-	confirmLabel?: string;
-	danger?: boolean;
-}) {
-	return (
-		<div className="config-modal-overlay" onClick={props.onCancel}>
-			<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
-				<strong>{props.title}</strong>
-				<p>{props.message}</p>
-				<div className="config-modal-actions">
-					<button className="config-btn" onClick={props.onCancel}>
-						{t("common.cancel")}
-					</button>
-					<button
-						className={`config-btn${props.danger ? " danger" : " primary"}`}
-						onClick={props.onConfirm}
-					>
-						{props.confirmLabel ?? t("common.confirm")}
-					</button>
-				</div>
-			</div>
-		</div>
-	);
-}
 export function FileContextMenu(props: {
 	menu: { x: number; y: number; node: FileTreeNode };
 	onClose: () => void;

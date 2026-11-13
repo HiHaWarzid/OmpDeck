@@ -2,7 +2,8 @@
  * Agent IPC handler：Agent 生命周期（创建/停止/重启/克隆）、消息收发、模型/思考级别切换。
  *
  * 从 index.ts 的 registerIpc() 迁移而来。
- * agentsStop / agentsRestart 调用 terminalManager.closeAgent 清理终端会话。
+ * 客户端可发起的会话变更（create/send/stop/restart/队列）委托给 SessionCommands，
+ * 终端回收、输入校验与审计日志由该 module 保证，handler 只做参数透传与 wire 层校验。
  */
 import type { BrowserWindow, NativeImage } from "electron";
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";
@@ -10,13 +11,14 @@ import type { PiDesktopApi } from "../../shared/api";
 import type { AgentTodoPhase, AgentUiAskAnswer, CreateAgentInput, SendPromptInput, SendPromptResult, WebAgentHistoryPageInput } from "../../shared/types";
 import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
-import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
+import type { SessionCommands } from "../pi/sessionCommands";
 import type { AppLogger } from "../logging/AppLogger";
 import { showAppNotification } from "../notifications";
 
 interface AgentHandlerDeps {
 	agentManager: AgentManager;
-	terminalManager: TerminalSessionManager;
+	/** 会话变更（create/send/stop/restart/队列）统一入口；终端回收由它保证。 */
+	sessionCommands: SessionCommands;
 	appLogger: AppLogger;
 	getMainWindow: () => BrowserWindow | null;
 	/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
@@ -38,7 +40,7 @@ type AgentHandlerMaps = {
 };
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps {
-	const { agentManager, terminalManager, appLogger, getMainWindow, notificationIcon } = deps;
+	const { agentManager, sessionCommands, appLogger, getMainWindow, notificationIcon } = deps;
 
 	return {
 		agents: {
@@ -77,34 +79,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 					platform: process.platform,
 					arch: process.arch,
 				});
-				try {
-					const tab = await agentManager.create(input);
-					void appLogger.info("agent", "Agent create IPC completed", {
-						agentId: tab.id,
-						projectId: input.projectId,
-						status: tab.status,
-						sessionPath: tab.sessionPath,
-					});
-					void appLogger.info("agent", "Agent created", {
-						agentId: tab.id,
-						projectId: input.projectId,
-						title: tab.title,
-						sessionPath: tab.sessionPath,
-					});
-					return tab;
-				} catch (error) {
-					// createUnlocked 内部已尽量吞掉 pi 启动失败；这里兜底信任/项目查找等前置异常，
-					// 保证 IPC 层也有结构化日志，方便 Mac 闪退类反馈对照 userData/logs。
-					void appLogger.error("agent", "Agent create IPC failed", {
-						projectId: input.projectId,
-						sessionPath: input.sessionPath,
-						error: error instanceof Error ? error.message : String(error),
-						stack: error instanceof Error ? error.stack : undefined,
-						platform: process.platform,
-						arch: process.arch,
-					});
-					throw error;
-				}
+				// 创建完成的审计日志由 SessionCommands 统一记录（桌面/手机/AFK 同形）。
+				return sessionCommands.create(input);
 			},
 			historyPage: async (_event, input: WebAgentHistoryPageInput) => {
 				if (!input?.agentId) throw new Error("agentId 不能为空");
@@ -116,56 +92,22 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				return result;
 			},
 			stop: async (_event, agentId: string) => {
-				terminalManager.closeAgent(agentId);
-				await agentManager.stop(agentId);
-				void appLogger.info("agent", "Agent stopped", { agentId });
+				// 终端回收 + 停止 pi 进程是同一语义，缺一不可；由 SessionCommands 保证顺序。
+				await sessionCommands.stop(agentId);
 			},
-			prompt: async (_event, input: SendPromptInput) => {
-				const result = await agentManager.sendPrompt(input);
-				void appLogger.info("agent", "Prompt sent", {
-					agentId: input.agentId,
-					messageLength: input.message.length,
-					imageCount: input.images?.length ?? 0,
-					streamingBehavior: input.streamingBehavior,
-				});
-				return result;
-			},
-			abort: async (_event, agentId: string) => {
-				const result = await agentManager.abort(agentId);
-				void appLogger.info("agent", "Agent aborted", { agentId });
-				return result;
-			},
-			abortAndRestoreQueue: async (_event, agentId: string) => {
-				const result = await agentManager.abortAndRestoreQueue(agentId);
-				void appLogger.info("agent", "Agent aborted and queue restored", {
-					agentId,
-					steering: result.steering.length,
-					followUp: result.followUp.length,
-				});
-				return result;
-			},
+			prompt: async (_event, input: SendPromptInput) =>
+				sessionCommands.send(input),
+			abort: async (_event, agentId: string) => sessionCommands.abort(agentId),
+			abortAndRestoreQueue: async (_event, agentId: string) =>
+				sessionCommands.abortAndRestoreQueue(agentId),
 			removeQueuedMessage: async (
 				_event,
 				agentId: string,
 				message: string,
 				queue: "steering" | "followUp",
-			) => {
-				const result = await agentManager.removeQueuedMessage(agentId, message, queue);
-				void appLogger.info("agent", "Queued message removed", {
-					agentId,
-					queue,
-					removed: result.removed,
-				});
-				return result;
-			},
-			promoteQueuedMessage: async (_event, agentId: string, message: string) => {
-				const result = await agentManager.promoteQueuedMessage(agentId, message);
-				void appLogger.info("agent", "Queued message promoted", {
-					agentId,
-					promoted: result.promoted,
-				});
-				return result;
-			},
+			) => sessionCommands.removeQueuedMessage(agentId, message, queue),
+			promoteQueuedMessage: async (_event, agentId: string, message: string) =>
+				sessionCommands.promoteQueuedMessage(agentId, message),
 			exportHtml: async (_event, agentId: string) =>
 				// pi RPC export_html 返回 { path }（data 未在 AgentManager 侧定型，此处按契约收敛）
 				agentManager.exportHtml(agentId) as Promise<{ path: string }>,
@@ -204,12 +146,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				void appLogger.info("agent", "Agent reloaded", { agentId });
 				return result;
 			},
-			restart: async (_event, agentId: string) => {
-				terminalManager.closeAgent(agentId);
-				const result = await agentManager.restart(agentId);
-				void appLogger.info("agent", "Agent restarted", { agentId });
-				return result;
-			},
+			restart: async (_event, agentId: string) => sessionCommands.restart(agentId),
 			compact: async (_event, agentId: string, prompt?: string) => {
 				void appLogger.info("agent", "Agent compact IPC called", { agentId, prompt });
 				try {

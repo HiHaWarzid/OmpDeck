@@ -1,15 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { PiDesktopApi } from "../../../shared/api";
 import type { AppLogEntry, AppLogLevel } from "../../../shared/types";
+import { formatTimestamp } from "../../../shared/sessionDisplayContract";
 import { SelectField } from "../components/ui/SelectField";
 import { t } from "../i18n";
 
 const api: PiDesktopApi = (window as unknown as { piDesktop: PiDesktopApi }).piDesktop;
 const LEVELS: Array<AppLogLevel | "all"> = ["all", "debug", "info", "warn", "error"];
-
-function formatTime(time: number) {
-	return new Date(time).toLocaleString();
-}
 
 function formatDetail(detail: unknown) {
 	if (detail == null) return "";
@@ -109,7 +106,7 @@ export function LogsTab() {
 						return (
 							<article key={entry.id} className={`log-row ${entry.level}`}>
 								<button className="log-row-main" onClick={() => setExpandedId(expanded ? null : entry.id)}>
-									<span className="log-time">{formatTime(entry.time)}</span>
+									<span className="log-time">{formatTimestamp(entry.time, "full")}</span>
 									<span className={`log-level ${entry.level}`}>{entry.level}</span>
 									<span className="log-scope">{entry.scope}</span>
 									<span className="log-message">{entry.message}</span>

@@ -9,7 +9,7 @@ import type { EntryKind, WorkspaceAction } from "../sessionWorkspace";
  *
  * 迁入后键 = 条目键，离场即回收；订阅者按 (key, slice) 精确唤醒。
  * 服务端队列（runtimeState.queuedMessages）不在本切片：它是服务端事实，
- * 由 runtime 切片承载，二者在 UI 层合并成待发送行（utils/queueChips）。
+ * 由 runtime 切片承载，二者在 UI 层合并成待发送行（composer/composerModule.buildQueueRows）。
  */
 
 /** 本地「投递结果未知」提示：omp 可能已接收，不能重试也不能伪造撤回。 */

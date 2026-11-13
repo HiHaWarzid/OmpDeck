@@ -9,6 +9,7 @@ import remarkGfm from "remark-gfm";
 import { defaultUrlTransform } from "react-markdown";
 
 import { isBinaryExtension } from "../../utils/isTextFile";
+import { ModalSurface } from "../ui/ModalSurface";
 import { KATEX_REHYPE_PLUGIN } from "../../utils/markdownKatex";
 
 let monacoSetupOnce = false;
@@ -298,7 +299,8 @@ export function FileDiffViewer(props: {
 	};
 
 	const displayMode = props.displayMode ?? "drawer";
-	const headerContent = (
+	// 关闭入口统一走 ModalSurface 的带守卫 requestClose（弹层为 dirty=编辑中未保存时先确认）。
+	const renderHeader = (onClose: () => void) => (
 		<>
 			{props.tabs && props.tabs.length > 1 && (
 				<div className="file-diff-tab-bar">
@@ -394,7 +396,7 @@ export function FileDiffViewer(props: {
 							{displayMode === "modal" ? <Minimize2 size={15} /> : <Maximize size={15} />}
 						</button>
 					)}
-					<button className="file-diff-close" onClick={handleClose} aria-label={t("common.close")}>
+					<button className="file-diff-close" onClick={onClose} aria-label={t("common.close")}>
 						<X size={18} />
 					</button>
 				</div>
@@ -457,17 +459,21 @@ export function FileDiffViewer(props: {
 
 	if (displayMode === "modal") {
 		return (
-			<div className="modal-backdrop" onClick={readOnly ? handleClose : undefined}>
-				<div className="file-diff-modal" onClick={(e) => e.stopPropagation()}>
-					{headerContent}
-				</div>
-			</div>
+			<ModalSurface
+				open
+				onRequestClose={handleClose}
+				dirty={!readOnly && dirty}
+				ariaLabel={fileName}
+				className="file-diff-modal"
+			>
+				{(requestClose) => renderHeader(requestClose)}
+			</ModalSurface>
 		);
 	}
 
 	return (
 		<div className="file-diff-viewer">
-			{headerContent}
+			{renderHeader(handleClose)}
 		</div>
 	);
 }

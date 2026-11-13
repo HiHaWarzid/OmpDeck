@@ -9935,157 +9935,16 @@ body.is-composer-resizing .composer-resize-handle::after {
   color: var(--color-accent);
 }
 
-.rename-dialog-backdrop {
-  z-index: 132;
-  display: grid;
-  place-items: center;
-}
-.rename-dialog {
-  width: min(420px, calc(100vw - 40px));
+/* 重命名弹层：外壳（overlay/焦点/Esc/关闭）由 ModalSurface 提供，这里只留内容区栅格。 */
+.rename-dialog-form {
   display: grid;
   gap: var(--space-4);
   padding: var(--space-4);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-xl);
-  background: var(--color-bg-panel);
-  box-shadow: var(--shadow-modal);
-}
-.rename-dialog-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-}
-.rename-dialog-header strong {
-  color: var(--color-text-primary);
-  font-size: var(--font-size-title);
-  line-height: var(--line-height-title);
-}
-.rename-dialog-header button {
-  width: var(--control-height-md);
-  height: var(--control-height-md);
-  display: grid;
-  place-items: center;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--color-text-tertiary);
-}
-.rename-dialog-header button:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-.rename-dialog input {
-  width: 100%;
-  height: var(--control-height-lg);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  padding: 0 var(--space-3);
-  background: var(--color-bg-panel);
-  color: var(--color-text-primary);
-  font-size: var(--font-size-body);
-  outline: none;
-}
-.rename-dialog input:focus {
-  border-color: var(--color-accent);
-  box-shadow: var(--focus-ring);
 }
 .rename-dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-2);
-}
-.rename-dialog-actions button {
-  min-width: 72px;
-  height: var(--control-height-md);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  padding: 0 var(--space-3);
-  background: var(--color-bg-panel);
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-control);
-}
-.rename-dialog-actions button:hover {
-  border-color: var(--color-border-strong);
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
-}
-.rename-dialog-actions button[type="submit"] {
-  min-width: 88px;
-  border-color: var(--color-accent);
-  background: var(--color-accent);
-  color: var(--color-text-inverse);
-}
-.rename-dialog-actions button[type="submit"]:hover {
-  border-color: var(--color-accent-strong);
-  background: var(--color-accent-strong);
-  color: var(--color-text-inverse);
-}
-
-.session-delete-confirm-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 130;
-  display: grid;
-  place-items: center;
-  background: var(--overlay-backdrop-soft);
-}
-.session-delete-confirm {
-  width: min(360px, calc(100vw - 48px));
-  padding: 18px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-panel);
-  box-shadow: var(--shadow-popover);
-  animation: picker-check-in 0.16s ease-out;
-}
-.session-delete-confirm strong {
-  display: block;
-  color: var(--color-text-primary);
-  font-size: var(--font-size-title);
-  line-height: var(--line-height-title);
-  margin-bottom: var(--space-2);
-}
-.session-delete-confirm p {
-  margin: 0;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-control);
-  line-height: var(--line-height-control);
-}
-.session-delete-confirm-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--space-2);
-  margin-top: var(--space-4);
-}
-.session-delete-confirm-actions button {
-  height: var(--control-height-md);
-  padding: 0 var(--space-3);
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--color-bg-panel);
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-caption);
-  cursor: pointer;
-}
-.session-delete-confirm-actions button:hover {
-  background: var(--color-bg-hover);
-}
-.session-delete-confirm-actions button.danger {
-  border-color: color-mix(
-    in srgb,
-    var(--color-danger) 22%,
-    var(--color-border-subtle)
-  );
-  background: var(--color-danger-soft);
-  color: var(--color-danger);
-}
-.session-delete-confirm-actions button.danger:hover {
-  background: color-mix(
-    in srgb,
-    var(--color-danger-soft) 86%,
-    var(--color-bg-panel)
-  );
 }
 
 .session-history-modal.command-palette {
@@ -10193,6 +10052,15 @@ body.is-composer-resizing .composer-resize-handle::after {
   z-index: 940;
 }
 
+/* 嵌套弹层：父弹层 content 是 110，内嵌层 overlay/content 需各抬一层才能压住父层。 */
+.modal-radix-overlay-elevated {
+  z-index: 115;
+}
+
+.modal-radix-content-elevated {
+  z-index: 116;
+}
+
 /* Content（弹框主体）*/
 .modal-radix-content {
   position: fixed;
@@ -10227,6 +10095,81 @@ body.is-composer-resizing .composer-resize-handle::after {
   max-height: min(400px, calc(100vh - 48px));
 }
 
+/* 关闭动画：ModalSurface 在 open=false 后保留一个动画周期再卸载子树 */
+.modal-radix-closing {
+  pointer-events: none;
+  animation: modal-radix-fade-out 0.12s ease-in forwards;
+}
+.modal-radix-content.modal-radix-closing {
+  animation: modal-radix-content-out 0.12s ease-in forwards;
+}
+
+/* 确认对话框：沿用 config-modal-dialog 的视觉（padding/圆角/描边/阴影 token 一致） */
+.modal-radix-confirm {
+  z-index: 120;
+  width: min(480px, calc(100vw - 48px));
+  min-width: min(360px, calc(100vw - 48px));
+  padding: 24px;
+  border: 1px solid var(--color-border-default);
+}
+.modal-radix-confirm > strong {
+  display: block;
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin-bottom: 10px;
+}
+.modal-radix-confirm-message {
+  font-size: var(--font-size-control);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+  margin: 0 0 18px;
+}
+.modal-radix-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* 说明下方补充信息（路径等） */
+.modal-radix-confirm-detail {
+  display: block;
+  margin: -8px 0 18px;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-caption);
+  color: var(--color-text-tertiary);
+  word-break: break-all;
+}
+
+/* header 中「标题 + 次要说明」的两行结构（导入弹框等） */
+.modal-header-heading {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.modal-header-heading small {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+  font-weight: 400;
+}
+
+@keyframes modal-radix-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes modal-radix-content-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.98);
+  }
+}
 @keyframes modal-radix-fade-in {
   from {
     opacity: 0;
@@ -11180,6 +11123,10 @@ body.is-composer-resizing .composer-resize-handle::after {
   grid-template-columns: 196px minmax(0, 1fr);
   flex: 1;
   background: var(--color-bg-muted);
+}
+/* 错误边界兜底面板：只有内容区，无需侧边栏留白 */
+.settings-content-flush {
+  padding: var(--space-5);
 }
 
 /* 侧边栏导航：紧凑设计，仅图标+标签 */
@@ -17078,10 +17025,6 @@ a.config-btn {
 
 /* ── 应用更新提示 ───────────────────────────── */
 
-.update-backdrop {
-  z-index: 120;
-}
-
 .update-modal {
   width: min(620px, calc(100vw - 36px));
   max-height: min(720px, calc(100vh - 48px));
@@ -17238,27 +17181,6 @@ a.config-btn {
   padding: 12px 16px 14px;
   border-top: 1px solid var(--color-border-subtle);
   background: var(--color-bg-sidebar);
-}
-
-.update-actions button {
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--color-bg-panel);
-  color: var(--color-text-primary);
-  padding: 8px 12px;
-  font-size: var(--font-size-control);
-  cursor: pointer;
-}
-
-.update-actions button.primary {
-  border-color: var(--color-accent);
-  background: var(--color-accent);
-  color: var(--color-text-inverse);
-}
-
-.update-actions button:disabled {
-  opacity: 0.6;
-  cursor: default;
 }
 
 /* 无更新可用模态框的友好提示样式 */
@@ -17471,8 +17393,6 @@ a.config-btn {
 :root[data-theme="dark"] .skill-card,
 :root[data-theme="dark"] .skill-create-card,
 :root[data-theme="dark"] .extension-card,
-:root[data-theme="dark"] .session-delete-confirm,
-:root[data-theme="dark"] .rename-dialog,
 :root[data-theme="dark"] .conversation-outline,
 :root[data-theme="dark"] .toast {
   background: var(--color-bg-panel);
@@ -17489,7 +17409,6 @@ a.config-btn {
 
 :root[data-theme="dark"] .config-btn,
 :root[data-theme="dark"] .session-rename-button,
-:root[data-theme="dark"] .update-actions button,
 :root[data-theme="dark"] .codex-import-actions button {
   background: var(--color-bg-panel);
   color: var(--color-text-primary);
@@ -17498,14 +17417,12 @@ a.config-btn {
 
 :root[data-theme="dark"] .config-btn:hover:not(:disabled),
 :root[data-theme="dark"] .session-rename-button:hover:not(:disabled),
-:root[data-theme="dark"] .update-actions button:hover,
 :root[data-theme="dark"] .codex-import-actions button:hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
 
 :root[data-theme="dark"] .config-btn.primary,
-:root[data-theme="dark"] .update-actions button.primary,
 :root[data-theme="dark"] .codex-import-actions .primary-action {
   background: var(--color-accent);
   color: var(--color-text-inverse);
@@ -18166,29 +18083,24 @@ a.config-btn {
   overflow: hidden;
 }
 
-/* 头部：品牌标题 + 项目路径 */
-.project-resources-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+/* 头部：品牌标题 + 项目路径（header 由 ModalSurface 提供，这里只做该弹层的横向布局） */
+.project-resources-dialog .modal-header {
   min-height: 60px;
   padding: 0 20px;
-  border-bottom: 1px solid var(--color-border-subtle);
-  background: var(--color-bg-panel);
 }
-.project-resources-header > div {
+.project-resources-dialog .modal-header-heading {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
 }
-.project-resources-header > div strong {
+.project-resources-dialog .modal-header-heading strong {
   font-size: var(--font-size-title);
   color: var(--color-text-primary);
   font-weight: 600;
   white-space: nowrap;
 }
-.project-resources-header > div small {
+.project-resources-dialog .modal-header-heading small {
   font-size: var(--font-size-caption);
   color: var(--color-text-tertiary);
   overflow: hidden;
@@ -18198,23 +18110,6 @@ a.config-btn {
   padding: 2px 8px;
   border-radius: var(--radius-sm);
   background: var(--color-bg-muted);
-}
-.project-resources-header > button {
-  display: grid;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  flex-shrink: 0;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--color-text-tertiary);
-  cursor: pointer;
-  transition: all 0.12s ease;
-}
-.project-resources-header > button:hover {
-  background: var(--color-bg-hover);
-  color: var(--color-text-primary);
 }
 
 /* 工具栏：Tab + 操作按钮 */
@@ -18527,37 +18422,6 @@ a.config-btn {
   color: var(--color-danger);
 }
 
-/* 项目资源内嵌确认弹框 */
-.project-resources-confirm-dialog {
-  display: grid;
-  gap: 14px;
-  max-width: 420px;
-  padding: 20px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-panel);
-  box-shadow: var(--shadow-popover);
-}
-.project-resources-confirm-dialog strong {
-  font-size: var(--font-size-body);
-  color: var(--color-text-primary);
-}
-.project-resources-confirm-dialog p {
-  margin: 0;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-control);
-  line-height: var(--line-height-body);
-}
-.project-resources-confirm-dialog .rename-dialog-actions button.danger {
-  background: var(--color-danger);
-  color: var(--color-bg-panel);
-}
-.project-resources-confirm-dialog
-  .rename-dialog-actions
-  button.danger:hover:not(:disabled) {
-  background: var(--color-danger-hover);
-}
-
 /* 项目资源内嵌编辑器 */
 .project-resources-editor-overlay {
   display: grid;
@@ -18806,47 +18670,16 @@ a.config-btn {
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-lg);
 }
-/* 编辑器弹框 */
-.prompts-editor-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--overlay-backdrop);
-  backdrop-filter: blur(3px);
-  transform: translateZ(0);
-}
+/* 弹层外壳（header/Esc/遮罩）由 ModalSurface 提供，这里只负责编辑器布局 */
 .prompts-editor-modal {
   width: min(800px, calc(100vw - 80px));
   height: min(600px, calc(100vh - 120px));
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr;
   background: var(--color-bg-panel);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xl);
   overflow: hidden;
-}
-.prompts-editor-modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border-color);
-}
-.prompts-editor-modal-header strong {
-  font-family: var(--font-family-mono);
-  font-size: var(--font-size-control);
-  color: var(--color-accent);
-}
-.prompts-editor-modal-footer {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--border-color);
 }
 .prompts-monaco-wrap {
   width: 100%;

@@ -1,8 +1,16 @@
-/** 纯文本/时间格式化工具（无组件）：供多个组件模块共用，集中一处避免各自重复实现。 */
+/**
+ * 纯文本/时间格式化工具（无组件）：供多个组件模块共用，集中一处避免各自重复实现。
+ *
+ * 展示规则（时间、ANSI、路径、工具摘要）的唯一实现在 shared/sessionDisplayContract；
+ * 本文件只是渲染层的薄转发入口，禁止在这里再写第二套算法。
+ */
 import removeMarkdown from "remove-markdown";
 
-// ANSI 转义码正则:匹配 \x1b[...m 等终端颜色/样式序列
-const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+export {
+	formatTimestamp as formatTime,
+	stripAnsi,
+} from "../../../../shared/sessionDisplayContract";
+
 export function formatCompact(value?: number | null) {
 	if (value == null) return "-";
 	if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -22,19 +30,6 @@ export function formatDuration(ms: number): string {
 	const minutes = Math.floor(seconds / 60);
 	const remaining = seconds % 60;
 	return remaining > 0 ? `${minutes}m${remaining}s` : `${minutes}m`;
-}
-export function formatTime(timestamp: number) {
-	return new Date(timestamp).toLocaleString(undefined, {
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
-}
-/** 去除 pi 输出中的 ANSI 终端转义码,避免在 React UI 中显示原始 \e[38;5;109m 等文本 */
-export function stripAnsi(text: string): string {
-	// 与 AppUtils.stripAnsi 同一策略：无转义码时原样返回，省掉整串分配。
-	return text.includes("\x1b") ? text.replace(ANSI_RE, "") : text;
 }
 /** 去除文本中的 <thinking> 标签 */
 export function stripThinkingTags(text: string): string {

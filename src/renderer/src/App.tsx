@@ -84,10 +84,6 @@ import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
 import {
   buildComposerPromptSubmission,
-  decideComposerSubmit,
-  expandPromptTemplates,
-  getComposerEnterIntent,
-  getComposerHistoryLineBounds,
   isYesNoConfirmOptions,
   parseArgumentHint,
   translateBuiltinPromptDescription,
@@ -112,8 +108,14 @@ import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
 import {
   buildQueueRows,
+  historyKeyForAgent,
+  isSessionPathKey,
+  mergePromptHistory,
+  PROMPT_HISTORY_LIMIT,
+  resolveComposerStatusMode,
   type QueuePanelRow,
-} from "./utils/queueChips";
+} from "./composer/composerModule";
+import { useComposerController } from "./composer/useComposerController";
 import { usePersistedState } from "./hooks/usePersistedState";
 import { usePiEnvironment } from "./hooks/usePiEnvironment";
 import { useStableHandlers } from "./hooks/useStableHandlers";
@@ -155,11 +157,13 @@ import { SessionReferenceModal, type SessionReferenceResult } from "./components
 import { LazyWrapper } from "./hooks/useLazyComponent";
 import {
   AgentContextMenu,
-  ConfirmDialog,
   FileContextMenu,
   ProjectContextMenu,
   SessionContextMenu,
 } from "./components/app/menus/ContextMenus";
+import { ConfirmDialog } from "./components/ui/ConfirmDialog";
+import { ModalSurface } from "./components/ui/ModalSurface";
+import { TextField } from "./components/ui/TextField";
 import { ConversationOutline } from "./components/app/drawers/ConversationOutline";
 import {
   AgentStatusIndicator,
@@ -198,10 +202,7 @@ import {
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
 import {
-  applySuggestion,
   buildModifiedFiles,
-  buildSuggestionItems,
-  detectTrigger,
   displayPath,
   flattenFiles,
   matches,
@@ -210,13 +211,12 @@ import {
   type MessageItem,
 } from "./components/app/AppUtils";
 import {
-	formatFilePathRef,
-	getCaretOffset as getCaretOffsetOf,
-	getRichInputCaretCoords,
-	parseRichInputChips,
-	RichInput,
-	unwrapFileChipPath,
-	type RichInputChip,
+  formatFilePathRef,
+  getCaretOffset,
+  parseRichInputChips,
+  RichInput,
+  unwrapFileChipPath,
+  type RichInputChip,
 } from "./components/app/RichInput";
 // 懒加载：Monaco Editor（~17.6MB Web Worker）仅在用户打开 diff 时才加载
 const FileDiffViewer = lazyWithReload(() => import("./components/app/FileDiffViewer").then((m) => ({ default: m.FileDiffViewer })));
@@ -263,7 +263,6 @@ import type {
   ComposerAgentMode,
   AgentTodoPhase,
   CrashedRun,
-  RestoredQueuedMessage,
   ThinkingUpdate,
   WidgetLineItem,
 } from "../../shared/types";
@@ -494,6 +493,9 @@ export function App() {
   // Agent 生命周期 per-agent 状态：prompt/images/dock/drawer/promptHistory，
   // 以及 agent 替换时的原子迁移方法。queuedPrompts 已删除——待投递队列
   // 以 omp get_state.queuedMessages 为唯一事实来源。
+  // composer 深模块持有「bang 模式 / 非空」派生规则；lifecycle 构造时就要拿到回调，
+  // 这里用 ref 转发（控制器在下方构造，规则实现只此一份）。
+  const composerTextChangeRef = useRef<(text: string) => void>(() => undefined);
   const {
     getLivePrompt, setLivePrompt, setNativePrompt, stageLivePrompt,
     attachedImagesByAgent, setAttachedImagesForAgent,
@@ -501,7 +503,9 @@ export function App() {
     drawerPinnedByProject, setDrawerPinnedByProject,
     promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef,
     migratePerAgentState, commitPendingToReal,
-  } = useAgentLifecycle({ onPromptTextChange: syncComposerFlags });
+  } = useAgentLifecycle({
+    onPromptTextChange: (text) => composerTextChangeRef.current(text),
+  });
   // ── 会话工作区：结构订阅在根，切片订阅在真正渲染它的组件 ─────────────────
   // 条目成员关系 = 存活 agent tab（agents ∪ pendingAgents），键 = agentId。
   // store.subscribe 只报结构变化（焦点/成员），因此根组件不会被 20Hz 流式切片唤醒；
@@ -629,10 +633,6 @@ export function App() {
   const sendBehaviorChevronRef = useRef<HTMLButtonElement | null>(null);
   const [sessionActionsOpen, setSessionActionsOpen] = useState(false);
   const [switchingBranch, setSwitchingBranch] = useState<string | null>(null);
-  // 仅跟踪输入框中是否有非空白文本（驱动发送按钮状态），避免每键触发全量 App 重渲染。
-  const [hasComposerText, setHasComposerText] = useState(false);
-  // 仅跟踪 ! / !! 前缀变化（驱动 CSS 类和 placeholder），避免每键触发重渲染。
-  const [composerBangMode, setComposerBangMode] = useState<"none" | "bang" | "bang-bang">("none");
   /** 当前正在重启的 Agent，用于仅给对应会话显示 loading，避免切到其他 Agent 后仍被全局禁用。 */
   const [restartingAgentId, setRestartingAgentId] = useState<string | null>(null);
   /** 正在 fork 的用户消息 id；用于按钮 loading，避免连点重复 fork。 */
@@ -716,10 +716,6 @@ export function App() {
   // 侧栏过滤用延迟值：输入框即时响应，O(项目×会话) 的 filter/sort 派生计算
   // 降级为低优先级更新，避免搜索大量项目/会话时按键阻塞。
   const deferredSearch = useDeferredValue(search);
-  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
-  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(0);
-  // 记录 composer 光标位置,用于光标相关的 @ / 触发检测与建议项替换。
-  const [composerCursor, setComposerCursor] = useState(0);
   const [fileMenu, setFileMenu] = useState<{
     x: number;
     y: number;
@@ -896,7 +892,14 @@ export function App() {
     (requestId: string, response: { value?: string | boolean | null; cancelled?: boolean; confirmed?: boolean }) => {
       if (!activeAgentId) return;
       if (response.cancelled) setCancellingUi(true);
-      api.agents.sendUiResponse(activeAgentId, requestId, response);
+      const pending = api.agents.sendUiResponse(activeAgentId, requestId, response);
+      if (response.cancelled) {
+        // 取消应答的 UI 锁只覆盖 RPC 在途期：落地（成功或失败）后必须复位，
+        // 否则后续取消操作会永久显示「正在取消」。失败已由 ipc 层提示，这里静默。
+        void Promise.resolve(pending)
+          .catch(() => undefined)
+          .finally(() => setCancellingUi(false));
+      }
     },
     [activeAgentId],
   );
@@ -1027,32 +1030,7 @@ export function App() {
   // 键优先用 sessionPath（跨重启/重开稳定，agentId 是每次打开随机生成的 UUID，跨重启无意义），
   // 匿名会话没有 sessionPath 时退回 agentId。存储由 useAgentLifecycle 内的
   // usePersistedState 统一承载（键 pid:prompt-history，含读-写-ref 同步）。
-  /** 上下键导航的历史条数上限：发送保存、消息基线重建、会话文件补全统一使用。 */
-  const PROMPT_HISTORY_LIMIT = 100;
-  /** 会话路径键一定包含路径分隔符；agentId（UUID / pending-*）永不含分隔符。 */
-  function isSessionPathKey(key: string): boolean {
-    return key.includes("/") || key.includes("\\");
-  }
-  /** 按 agent 解析历史记录的稳定键：优先 sessionPath，否则退回 agentId。 */
-  function historyKeyForAgentId(agentId: string): string {
-    const agent = displayAgentsRef.current.find((a) => a.id === agentId);
-    return agent?.sessionPath ?? agentId;
-  }
-  /**
-   * 合并两份“最新在前、各自去重”的历史列表：incoming 是权威较新来源放前面，
-   * existing（持久化/发送记录）补充更早的条目；按文本去重（与发送路径一致）。
-   */
-  function mergePromptHistory(existing: string[] | undefined, incoming: string[]): string[] {
-    const seen = new Set<string>();
-    const merged: string[] = [];
-    for (const text of [...incoming, ...(existing ?? [])]) {
-      const trimmed = text.trim();
-      if (!trimmed || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      merged.push(trimmed);
-    }
-    return merged.slice(0, PROMPT_HISTORY_LIMIT);
-  }
+  // 合并/限长/键解析规则全部在 composer/composerModule.ts（此处只调用，不再有第二份实现）。
 
   // 提升历史重建：提取/合并/限长/幂等判断全部由 messageDeltaResolver 完成
   // （resolveIncomingMessagesDelta / resolveFullPullResult 的 promptHistory 结果），
@@ -1061,7 +1039,7 @@ export function App() {
   // 为 null，故意不置标记，避免真实历史基线到达时被幂等保护挡住。
   function applyPromptHistoryRebuild(agentId: string, history: string[] | null) {
     if (!history) return;
-    const key = historyKeyForAgentId(agentId);
+    const key = historyKeyForAgent(agentId, displayAgentsRef.current);
     promptHistoryInitedRef.current.add(key);
     setPromptHistory((current) => ({ ...current, [key]: history }));
     // 窗口只覆盖最近消息；异步从会话文件提取完整用户消息文本补全更早记录，不阻塞导航。
@@ -1090,23 +1068,20 @@ export function App() {
   }
 
   // transcript 运行时（增量合并 + 代数守卫 + 失同步自愈单飞）只造一次：端口读的都是
-  // ref（promptHistoryRef / displayAgentsRef，见 historyKeyForAgentId），因此首帧闭包
+  // ref（promptHistoryRef / displayAgentsRef，见 historyKeyForAgent），因此首帧闭包
   // 也能拿到最新值；自愈单飞的重跑登记表必须跨渲染存活，不能每次渲染重建。
   const transcriptRuntimeRef = useRef<TranscriptRuntime | null>(null);
   transcriptRuntimeRef.current ??= createTranscriptRuntime({
     fetchMessages: (agentId) => api.agents.getMessages(agentId),
     isActiveAgent: (agentId) => activeAgentIdRef.current === agentId,
     promptHistory: {
-      isInited: (agentId) => promptHistoryInitedRef.current.has(historyKeyForAgentId(agentId)),
-      existing: (agentId) => promptHistoryRef.current[historyKeyForAgentId(agentId)],
+      isInited: (agentId) => promptHistoryInitedRef.current.has(historyKeyForAgent(agentId, displayAgentsRef.current)),
+      existing: (agentId) => promptHistoryRef.current[historyKeyForAgent(agentId, displayAgentsRef.current)],
       rebuild: applyPromptHistoryRebuild,
     },
   });
   const transcriptRuntime = transcriptRuntimeRef.current;
 
-  const [historyIndex, setHistoryIndex] = useState(-1);
-  const [historyNavigating, setHistoryNavigating] = useState(false);
-  const [savedPrompt, setSavedPrompt] = useState("");
   // compact 在途标志按条目存放（composer 切片），不再是根级 boolean。
   const [drawer, setDrawer] = useState<DrawerPanel | null>(null);
 
@@ -1474,20 +1449,6 @@ export function App() {
   const composerRef = useRef<HTMLElement | null>(null);
   const composerBoxRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLDivElement | null>(null);
-  // RichInput 受控重渲染后,光标应恢复到的纯文本偏移(供建议选中/清除后恢复选区)。
-  const pendingComposerCaretRef = useRef<number | null>(null);
-  /**
-   * 用户主动 ESC/关闭建议面板后置 true：这条 @/& 查询被拒绝，之后无论继续
-   * 打字还是移动光标，面板都不再为它弹出；仅当用户再次输入新的 @/&（明确想
-   * 用触发功能）时复位（见 handleComposerKeyDown）。
-   */
-  const suggestionsDismissedRef = useRef(false);
-  /**
-   * 「↓ + Enter」排队到下一轮的按键状态：Enter 的 KeyboardEvent 不会携带
-   * 另一个键是否按住，只能自己记录 ArrowDown 的按下/抬起。失焦时复位，
-   * 避免切走再回来时误判为组合键。
-   */
-  const arrowDownHeldRef = useRef(false);
   const projectDragPreventClickRef = useRef(false);
 
   const scratchPad = useScratchPad();
@@ -1603,12 +1564,6 @@ export function App() {
       return changed ? next : current;
     });
   }, [displayAgents, setPromptHistory]);
-  // Agent 切换时重置历史导航状态，避免跨 Agent 泄漏 historyIndex / savedPrompt
-  useEffect(() => {
-    setHistoryIndex(-1);
-    setHistoryNavigating(false);
-    setSavedPrompt("");
-  }, [activeAgentId]);
   // prompt 文本：优先从 live ref 读取（始终保持最新），promptByAgent 在 chips 变化时兜底。
   // ref/state 双写镜像已收敛到 useAgentLifecycle（getLivePrompt / setLivePrompt /
   // setNativePrompt / stageLivePrompt），此处只做读。
@@ -1617,30 +1572,6 @@ export function App() {
   const attachedImages = activeAgentId
     ? (attachedImagesByAgent[activeAgentId] ?? [])
     : [];
-
-  /** 同步 hasComposerText / composerBangMode 等布尔状态，仅在值翻转时触发重渲染。 */
-  function syncComposerFlags(text: string) {
-    const hasContent = text.trim().length > 0;
-    setHasComposerText((prev) => (prev !== hasContent ? hasContent : prev));
-    const bangMode: "none" | "bang" | "bang-bang" = text.startsWith("!!")
-      ? "bang-bang"
-      : text.startsWith("!")
-        ? "bang"
-        : "none";
-    setComposerBangMode((prev) => (prev !== bangMode ? bangMode : prev));
-  }
-
-  function setPrompt(value: string | ((current: string) => string)) {
-    const targetAgentId = activeAgentIdRef.current;
-    if (targetAgentId) setLivePrompt(targetAgentId, value);
-  }
-
-  function setAttachedImages(
-    value: ImageContent[] | ((current: ImageContent[]) => ImageContent[]),
-  ) {
-    const targetAgentId = activeAgentIdRef.current;
-    if (targetAgentId) setAttachedImagesForAgent(targetAgentId, value);
-  }
 
   // 有 activeAgent → agent owner；空项目引导页 → project owner。状态绝不因流式/刷新被改写。
   const terminalOwner = resolveTerminalOwner(activeAgentId, activeProjectId);
@@ -1810,29 +1741,6 @@ export function App() {
         Math.max(0, composerChrome - dockHeight),
     ),
   );
-  // composerMode 基于 composerBangMode（state）而非 prompt（ref），避免每键触发重渲染。
-  // composerBangMode 仅在 ! / !! 前缀真正变化时更新。
-  const composerMode = composerBangMode === "bang-bang"
-    ? "silent-shell"
-    : composerBangMode === "bang"
-      ? "shell"
-      : currentComposerAgentMode === "plan"
-        ? "plan"
-        : null;
-  const composerStatusText =
-    composerMode === "silent-shell"
-      ? t("app.composerSilentStatus")
-      : composerMode === "shell"
-        ? t("app.composerShellStatus")
-        : composerMode === "plan"
-          ? t("app.composerPlanStatus")
-          : drawer === "files"
-          ? t("app.composerFilesStatus")
-          : drawer === "sessions"
-            ? t("app.composerSessionStatus", {
-                name: sessionsProject?.name ?? t("common.project"),
-              })
-            : (activeAgent?.sessionPath ?? "");
   const drawerContentPanel = drawer && !drawerCollapsed ? drawer : renderedDrawer;
 
   useEffect(() => {
@@ -1935,14 +1843,6 @@ export function App() {
     [activeProjectId, sessionsByProject],
   );
 
-  const suggestionItems = useMemo(
-    () =>
-      suggestionsOpen
-        ? buildSuggestionItems(prompt, composerCursor, commands, flatFiles, activeProjectSessions)
-        : [],
-    [suggestionsOpen, prompt, composerCursor, commands, flatFiles, activeProjectSessions],
-  );
-
   /** 有效命令名白名单：仅已知命令渲染为 chip */
   const visibleCommands = useMemo(
     () => filterVisibleCommands(commands),
@@ -1977,35 +1877,6 @@ export function App() {
     [validCommandNames, validFilePaths, validSessionRefs],
   );
 
-  /** 菜单光标锚定位置（屏幕坐标），仅在 suggestionsOpen 时计算。 */
-  const suggestionAnchorStyle = useMemo<React.CSSProperties | undefined>(() => {
-    if (!suggestionsOpen) return undefined;
-    const root = composerTextareaRef.current;
-    if (!root) return undefined;
-    const coords = getRichInputCaretCoords(root, composerCursor);
-    if (!coords) return undefined;
-
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const menuW = Math.min(520, vw - 120);
-    const menuH = 380;
-    const gap = 8;
-
-    // 水平：光标左对齐，超出则右贴边
-    let left = coords.left;
-    if (left + menuW > vw - 16) left = Math.max(16, vw - menuW - 16);
-
-    // 垂直：优先光标下方，空间不够则上方
-    const belowTop = coords.top + gap;
-    const aboveBottom = coords.top - gap;
-    if (belowTop + menuH <= vh - 16) {
-      return { top: belowTop, left, bottom: "auto", transform: "none" };
-    }
-    if (aboveBottom - menuH >= 0) {
-      return { top: "auto", bottom: vh - aboveBottom, left, transform: "none" };
-    }
-    return { top: "auto", bottom: 16, left, transform: "none" };
-  }, [suggestionsOpen, composerCursor]);
   const visibleAgents = useMemo(
     () =>
       displayAgents.filter((agent) =>
@@ -2252,12 +2123,8 @@ export function App() {
 
       if (request.method === "set_editor_text") {
         const editorRequest = request;
-        const text = editorRequest.text ?? "";
-        setLivePrompt(request.agentId, text);
-        if (request.agentId === activeAgentIdRef.current) {
-          setComposerCursor(text.length);
-          pendingComposerCaretRef.current = text.length;
-        }
+        // 外部写入草稿：光标意图（移到末尾/只在活跃条目上还焦）由 composer 模块统一处理。
+        composer.writeDraft(editorRequest.text ?? "", { agentId: request.agentId });
         return;
       }
 
@@ -2444,23 +2311,6 @@ export function App() {
     return () => window.removeEventListener("keydown", handler);
   }, [scratchPadToggle, scratchPadClose, scratchPadIsOpen]);
 
-  // ArrowDown 只用于判定「↓ + Enter」组合键，不拦截事件本身；
-  // 在 window 上监听 keyup/blur，保证输入框失焦或按键在别处释放时状态不会卡住。
-  useEffect(() => {
-    const handleKeyUp = (event: KeyboardEvent) => {
-      if (event.key === "ArrowDown") arrowDownHeldRef.current = false;
-    };
-    const handleBlur = () => {
-      arrowDownHeldRef.current = false;
-    };
-    window.addEventListener("keyup", handleKeyUp);
-    window.addEventListener("blur", handleBlur);
-    return () => {
-      window.removeEventListener("keyup", handleKeyUp);
-      window.removeEventListener("blur", handleBlur);
-    };
-  }, []);
-
   // 桌面宠物点击跳转：主进程通知激活某 Agent，切到对应 project + agent tab
   useEffect(() => {
     const off = api.agents.onFocusTarget((target) => {
@@ -2585,7 +2435,7 @@ export function App() {
     if (!editor || document.activeElement !== editor) return;
     // RichInput 用纯文本偏移表示光标;光标在末尾时同步滚动到底,行为与原 textarea 一致。
     const len = editor.textContent?.length ?? 0;
-    const atEnd = getCaretOffsetOf(editor) >= len;
+    const atEnd = getCaretOffset(editor) >= len;
     if (!atEnd) return;
     requestAnimationFrame(() => {
       const current = composerTextareaRef.current;
@@ -2724,11 +2574,6 @@ export function App() {
   // source:"skill" 的命令发布在同一份目录里（全局与项目级都在内），本地扫描既会
   // 与 runtime 重复，也无法跟随 /reload-plugins 更新。
 
-  useEffect(() => {
-    // 默认选中第一项（目录树根级目录），便于浏览项目结构
-    setSelectedSuggestionIndex(0);
-  }, [suggestionItems.length]);
-
   // 追踪 agent 会话开始/结束时间,计算会话时长
   // 点击外部区域自动关闭会话组合下拉
   useEffect(() => {
@@ -2753,12 +2598,8 @@ export function App() {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<{ text: string }>).detail;
       if (detail?.text) {
-        setPrompt(detail.text);
-        // 光标移至文本末尾，利用 RichInput 的 caretRef 机制在渲染后恢复
-        pendingComposerCaretRef.current = detail.text.length;
-        requestAnimationFrame(() => {
-          composerTextareaRef.current?.focus();
-        });
+        // 光标移至末尾，统一由 composer.writeDraft 处理（渲染后恢复光标）。
+        composer.writeDraft(detail.text);
       }
     };
     window.addEventListener("user-message-edit", handler);
@@ -3684,12 +3525,14 @@ export function App() {
     content: string;
     argumentHint?: string;
   }) {
-    // 插入斜线命令形式，pi 会在发送时自动展开，末尾加空格分割后续输入
-    setPrompt((prev) => {
-      const trimmed = prev ? prev.trimEnd() : "";
-      if (!trimmed) return "/" + template.name + " ";
-      return trimmed + " /" + template.name + " ";
-    });
+    // 插入斜线命令形式，pi 会在发送时自动展开，末尾加空格分割后续输入。
+    // 用 draftPort 读实时草稿（不依赖渲染镜像），光标随后落到末尾。
+    const current = getLivePrompt(activeAgentIdRef.current ?? "");
+    const trimmed = current ? current.trimEnd() : "";
+    setLivePrompt(
+      activeAgentIdRef.current ?? "",
+      trimmed ? trimmed + " /" + template.name + " " : "/" + template.name + " ",
+    );
     setPromptTemplatePickerOpen(false);
   }
 
@@ -3883,7 +3726,7 @@ export function App() {
       const restored = await api.agents.abortAndRestoreQueue(agentId);
       const messages = [...restored.steering, ...restored.followUp];
       if (messages.length > 0) {
-        appendDraftToComposer(agentId, messages);
+        composer.appendRestoredDrafts(agentId, messages);
         showToast(t("app.queueRestored", { count: String(messages.length) }), 3000);
       }
       if (restored.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
@@ -3901,41 +3744,8 @@ export function App() {
   /**
    * 队列事实来源是 omp：chip 文本、顺序都来自 runtimeState.queuedMessages。
    * 本地只保留「投递结果未知」提示（未知 = 可能已写入 omp，不能重试、不能伪造撤回）。
+   * 草稿恢复（撤回 → 输入框）由 composer 模块负责。
    */
-
-  /** 追加恢复的草稿：文字在前、图片在前，光标落到末尾，与撤回编辑的交互保持一致。 */
-  function appendDraftToComposer(
-    agentId: string,
-    messages: RestoredQueuedMessage[],
-  ) {
-    const restoredText = messages
-      .map((item) => item.text)
-      .filter((text) => text.trim())
-      .join("\n\n");
-    const restoredImages = messages.flatMap((item) => item.images ?? []);
-    if (!restoredText && restoredImages.length === 0) return;
-    const currentDraft = getLivePrompt(agentId);
-    const nextPrompt = [restoredText, currentDraft]
-      .filter((text) => text.trim())
-      .join("\n\n");
-    setLivePrompt(agentId, nextPrompt);
-    if (restoredImages.length > 0) {
-      setAttachedImagesForAgent(agentId, (current) => [
-        ...restoredImages,
-        ...current,
-      ]);
-    }
-    if (activeAgentIdRef.current === agentId) {
-      setComposerCursor(nextPrompt.length);
-      pendingComposerCaretRef.current = nextPrompt.length;
-      requestAnimationFrame(() => {
-        const editor = composerTextareaRef.current;
-        editor?.focus();
-        if (editor) editor.scrollTop = editor.scrollHeight;
-      });
-    }
-  }
-
   function addUncertainPrompt(agentId: string, text: string, error?: string) {
     dispatchToAgent(
       agentId,
@@ -3969,7 +3779,7 @@ export function App() {
       }
       if (result.imagesDropped) showToast(t("app.queuedImagesDropped"), 4000);
       if (restoreDraft) {
-        appendDraftToComposer(agentId, [
+        composer.appendRestoredDrafts(agentId, [
           { text: row.text, ...(result.images ? { images: result.images } : {}) },
         ]);
       }
@@ -4023,195 +3833,6 @@ export function App() {
     setTerminalHeight(Math.max(TERMINAL_HEIGHT_MIN, Math.round(height)));
   }
 
-  /**
-   * 用户主动拒绝当前 @/& 建议：只关面板、不动输入。
-   * 此后该查询不再唤起面板，直到用户再次输入新的 @/&（见 handleComposerKeyDown）。
-   */
-  function dismissSuggestions() {
-    setSuggestionsOpen(false);
-    suggestionsDismissedRef.current = true;
-  }
-
-  function handleComposerKeyDown(
-    event: React.KeyboardEvent<HTMLDivElement>,
-  ) {
-    if (
-      event.key === "ArrowDown" &&
-      !event.shiftKey &&
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      !(event.nativeEvent as KeyboardEvent).isComposing
-    ) {
-      arrowDownHeldRef.current = true;
-    }
-    // ESC 关闭后 suppressed：用户再次按下 @/& 触发键 = 明确开始一条新查询，
-    // 复位 dismissed，让本次输入的面板正常弹出。
-    // IME 合成中（key 为 Process/Dead）与普通字符编辑不算；只认触发键本身。
-    if (
-      suggestionsDismissedRef.current &&
-      !event.nativeEvent.isComposing &&
-      event.keyCode !== 229 &&
-      (event.key === "@" || event.key === "&" || event.key === "/")
-    ) {
-      suggestionsDismissedRef.current = false;
-    }
-    if (suggestionsOpen && suggestionItems.length > 0) {
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setSelectedSuggestionIndex((prev) =>
-          Math.min(prev + 1, suggestionItems.length - 1),
-        );
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setSelectedSuggestionIndex((prev) => Math.max(prev - 1, 0));
-        return;
-      }
-      if (event.key === "Enter") {
-        // IME 确认时也会触发 Enter(keyCode=229 或 isComposing),不放行到建议选中。
-        if ((event.nativeEvent as KeyboardEvent).isComposing || event.keyCode === 229) return;
-        event.preventDefault();
-        const selected =
-          suggestionItems[
-            Math.min(selectedSuggestionIndex, suggestionItems.length - 1)
-          ];
-        if (selected?.disabled) return;
-        if (selected) {
-          // 以光标为锚替换触发符..光标这一段,并在下一帧恢复光标到插入项之后。
-          const el = event.currentTarget;
-          const cursor = getCaretOffsetOf(el);
-          const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-          const result = applySuggestion(liveComposerPrompt, cursor, selected.value);
-          // RichInput 的受控同步会基于 value 重渲染并恢复光标,这里同步状态即可。
-          setPrompt(result.text);
-          setComposerCursor(result.cursor);
-          pendingComposerCaretRef.current = result.cursor;
-          setSuggestionsOpen(false);
-          requestAnimationFrame(() => {
-            composerTextareaRef.current?.focus();
-          });
-        }
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        // 只关面板、不动输入：@/& 及已输入内容全部保留。
-        // 记录 dismissed：ESC 后在同一 @ 查询里继续打字不再弹回（见 onChange）。
-        dismissSuggestions();
-        requestAnimationFrame(() => {
-          composerTextareaRef.current?.focus();
-        });
-        return;
-      }
-    }
-
-    // 历史命令导航：只在光标位于第一行/最后一行时生效。
-    // 普通输入只更新 livePromptByAgentRef、不触发 App 重渲染，因此这里必须读 live 草稿，
-    // 不能用闭包里的 prompt——否则 ArrowUp 会把“上次重渲染时的半截文本”当草稿保存，
-    // ArrowDown 恢复后就会丢掉中间继续输入的内容。
-    const editor = event.currentTarget;
-    const cursorPos = getCaretOffsetOf(editor);
-    const liveComposerDraft = getLivePrompt(activeAgentIdRef.current ?? "");
-    const { isFirstLine, isLastLine } = getComposerHistoryLineBounds(
-      liveComposerDraft,
-      cursorPos,
-    );
-
-    // 当前 Agent 的历史记录（按会话路径键读取，跨重启/重开稳定）
-    const agentHistory =
-      promptHistoryRef.current[historyKeyForAgentId(activeAgentIdRef.current ?? '')] ?? [];
-
-    if (event.key === "ArrowUp" && isFirstLine && agentHistory.length > 0) {
-      event.preventDefault();
-
-      // 首次导航时保存当前 live 草稿（不是可能过期的 rendered prompt）
-      if (!historyNavigating) {
-        setSavedPrompt(liveComposerDraft);
-        setHistoryNavigating(true);
-        const newIndex = 0;
-        setHistoryIndex(newIndex);
-        setPrompt(agentHistory[newIndex]);
-      } else {
-        // 继续向上导航
-        const newIndex = Math.min(historyIndex + 1, agentHistory.length - 1);
-        if (newIndex !== historyIndex) {
-          setHistoryIndex(newIndex);
-          setPrompt(agentHistory[newIndex]);
-        }
-      }
-      return;
-    }
-
-    if (event.key === "ArrowDown" && isLastLine && historyNavigating) {
-      event.preventDefault();
-
-      if (historyIndex > 0) {
-        // 向下导航
-        const newIndex = historyIndex - 1;
-        // 防御：如果新索引越界（Agent 切换后历史更短），安全退出导航模式
-        if (newIndex >= agentHistory.length) {
-          setHistoryIndex(-1);
-          setHistoryNavigating(false);
-          setSavedPrompt("");
-          return;
-        }
-        setHistoryIndex(newIndex);
-        setPrompt(agentHistory[newIndex]);
-      } else {
-        // 回到最初输入的内容
-        setHistoryIndex(-1);
-        setHistoryNavigating(false);
-        setPrompt(savedPrompt);
-        setSavedPrompt("");
-      }
-      return;
-    }
-
-    if (event.key === "Escape") {
-      // 面板已关（或空面板）时的兜底 ESC。
-      // 如果正在历史导航,ESC 退出并恢复原始输入 —— 内容是整体替换，
-      // 不属于"拒绝某条 @ 查询"，不启动 dismissed 抑制。
-      if (historyNavigating) {
-        setSuggestionsOpen(false);
-        setPrompt(savedPrompt);
-        setHistoryIndex(-1);
-        setHistoryNavigating(false);
-        setSavedPrompt("");
-      } else {
-        // 空面板/面板已关但输入里仍有残留 @/&：同样视为用户拒绝该查询，
-        // 置 dismissed 抑制后续打字弹回（见 onChange）。
-        dismissSuggestions();
-      }
-    }
-    // 「↓ + Enter」：跳过 steer，直接把这条消息排到下一轮。
-    // 放在建议面板/历史导航分支之后，避免抢占它们对 Enter/ArrowDown 的语义。
-    if (
-      event.key === "Enter" &&
-      arrowDownHeldRef.current &&
-      !event.shiftKey &&
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      !(event.nativeEvent as KeyboardEvent).isComposing &&
-      event.keyCode !== 229
-    ) {
-      event.preventDefault();
-      // 连按 Enter 时 keyup 还没到达：立刻清掉，防止重复排队。
-      arrowDownHeldRef.current = false;
-      void sendPromptAsFollowUp();
-      return;
-    }
-    const enterIntent = getComposerEnterIntent(event, settings.sendShortcut);
-    if (enterIntent === "send") {
-      event.preventDefault();
-      void sendPrompt();
-    } else if (enterIntent === "newline") {
-      // RichInput 内部会在 Enter 未被上层 preventDefault 时手动插入 \n。
-      return;
-    }
-  }
 
   const agentStarting = isAgentStarting(activeAgent);
   const composerDisabled = !activeAgent || agentStarting;
@@ -4223,9 +3844,95 @@ export function App() {
       activeRuntimeState?.isCompacting ||
       compacting),
   );
-  // hasComposerContent 合并文本状态（hasComposerText，仅在空↔非空翻转时触发重渲染）
-  // 与图片附件；images 本身已是 state 变化即触发重渲染。
-  const hasComposerContent = hasComposerText || attachedImages.length > 0;
+  /**
+   * composer 深模块：草稿镜像、bang 模式、光标意图、建议框索引、历史导航/合并、
+   * 发送判定、粘贴/拖拽/附件规则全部在 composer/ 内；App 只做事件转发与渲染。
+   * options 每次渲染重建是刻意的（取值来自最新渲染），实现内部用 ref/state 保序。
+   */
+  const composer = useComposerController({
+    activeAgentId,
+    activeAgentIdRef,
+    textareaRef: composerTextareaRef,
+    draft: prompt,
+    draftPort: {
+      get: (agentId) => getLivePrompt(agentId),
+      set: (agentId, value) => setLivePrompt(agentId, value),
+      setNative: (agentId, value) => setNativePrompt(agentId, value, chipsKeyOf),
+      stage: (agentId, text) => stageLivePrompt(agentId, text),
+    },
+    images: attachedImages,
+    setImagesForAgent: (agentId, value) => setAttachedImagesForAgent(agentId, value),
+    appendImages: (next) => {
+      const targetAgentId = activeAgentIdRef.current;
+      if (targetAgentId) {
+        setAttachedImagesForAgent(targetAgentId, (current) => [...current, ...next]);
+      }
+    },
+    clearImages: () => {
+      const targetAgentId = activeAgentIdRef.current;
+      if (targetAgentId) setAttachedImagesForAgent(targetAgentId, []);
+    },
+    historyFor: (agentId) =>
+      promptHistoryRef.current[historyKeyForAgent(agentId, displayAgentsRef.current)] ?? [],
+    historyKeyOf: (agentId) => historyKeyForAgent(agentId, displayAgentsRef.current),
+    updateHistory: (key, update) => {
+      setPromptHistory((current) => {
+        const next = update(current[key]);
+        return current[key] === next ? current : { ...current, [key]: next };
+      });
+    },
+    commands,
+    files: flatFiles,
+    sessions: activeProjectSessions,
+    promptTemplates: promptTemplateList,
+    agentMode: currentComposerAgentMode,
+    sendShortcut: settings.sendShortcut,
+    agentStarting,
+    busy: isAgentBusy,
+    latchBusyDraft: latchBusyDraftForAgent,
+    clearBusyDraft: clearBusyDraftForAgent,
+    submitSnapshot: submitPromptSnapshot,
+    compact: (agentId, compactPrompt) => compactAgent(compactPrompt, agentId),
+    addUncertain: addUncertainPrompt,
+    notifyEmptyTemplate: (templateName) => {
+      showToast(t("app.promptTemplateEmptyBody", { name: templateName }), 4000);
+    },
+    resetConversationScroll: () => {
+      conversationRef.current?.resetAndScrollToBottom();
+    },
+    followConversationScroll: () => {
+      requestAnimationFrame(() => {
+        conversationRef.current?.scrollToBottomIfFollowing();
+      });
+    },
+    closeSendBehaviorMenu: () => setSendBehaviorMenuOpen(false),
+    resetComposerHeight: () => setComposerAutoHeight(COMPOSER_MIN_HEIGHT),
+    readClipboardPaths: () => window.piDesktop.files.getClipboardPaths?.() ?? [],
+    filePathOf: (file) => {
+      // Electron 38 起 File.path 已移除，只能走 webUtils。
+      try {
+        return window.piDesktop.files.getPathForFile?.(file) ?? null;
+      } catch {
+        return null;
+      }
+    },
+    readImageBase64: (path) => api.files.readBase64(path),
+    pickFiles: () => window.piDesktop.dialog.pickFiles({ title: t("app.attachFile") }),
+    notifyImageRejected: (reason) => {
+      showToast(
+        reason === "too-large" ? t("app.imageTooLarge") : t("app.imageUnsupported"),
+        3000,
+      );
+    },
+  });
+  // bang/plan 的状态优先级只在这里推导一次，输入框样式与 placeholder 共用。
+  const composerStatusMode = resolveComposerStatusMode(composer.bangMode, currentComposerAgentMode);
+
+  // lifecycle 在构造时就固定了回调，这里每次渲染转发到模块内的标志同步规则。
+  composerTextChangeRef.current = composer.onDraftTextChange;
+
+  // hasComposerContent 合并文本状态（仅在空↔非空翻转时触发重渲染）与图片附件。
+  const hasComposerContent = composer.hasText || attachedImages.length > 0;
   const keepBusyDraftControls = Boolean(
     activeAgentId && hasComposerContent && activeBusyDraft,
   );
@@ -4444,202 +4151,9 @@ export function App() {
     items[nextIndex]?.focus();
   }
 
-  async function sendPrompt(override?: {
-    agentId: string;
-    message: string;
-    images: ImageContent[];
-    agentMode: ComposerAgentMode;
-  }) {
-    const targetAgentId = override?.agentId ?? activeAgentId;
-    // 发送前从 DOM 直读文本，避免 contentEditable 的 IME 组合期间 handleInput 被锁导致 ref 落后于 DOM
-    if (!override && targetAgentId) {
-      const domText = (composerTextareaRef.current?.textContent ?? "").replace(/\u200B/g, "");
-      if (domText) stageLivePrompt(targetAgentId, domText);
-    }
-    const livePrompt = override?.message ?? getLivePrompt(targetAgentId ?? "");
-    const attachedImagesSnapshot = override?.images ?? attachedImages;
-    const agentMode = override?.agentMode ?? currentComposerAgentMode;
-    // 发送判定表（composerBehavior.decideComposerSubmit）：只定路线、不做副作用。
-    // expand 是纯函数，提前到副作用之前，以便一次判定覆盖 compact/空模板/busy 全部分支。
-    const message = livePrompt;
-    const { message: expandedMessage, description: templateDescription, emptyTemplateName } =
-      expandPromptTemplates(message, promptTemplateList);
-    const decision = decideComposerSubmit({
-      isOverride: Boolean(override),
-      agentStarting,
-      hasTarget: Boolean(targetAgentId),
-      message: livePrompt,
-      imageCount: attachedImagesSnapshot.length,
-      emptyTemplateName,
-    });
-    if (decision.action === "ignore") return;
-    const agentId = targetAgentId as string; // ignore 已排除无 target，后续分支必有值
-    if (!override) stageLivePrompt(agentId);
-    const images = attachedImagesSnapshot.length > 0 ? attachedImagesSnapshot : undefined;
+  // 发送/排队/压缩/空模板判定全部由 composer 模块拥有；此处只保留投递端口
+  // （submitPromptSnapshot / compactAgent / addUncertainPrompt）。
 
-    // ── /compact 命令处理 ──
-    // 与底栏“压缩”按钮同一实现：走 agents.compact RPC，而不是把 /compact 当普通 prompt 发给模型。
-    // compact 绕过队列（判定表保证忙也走压缩），且不写历史记录。
-    if (decision.action === "compact") {
-      const compactPrompt = decision.compactPrompt;
-      setLivePrompt(agentId, "");
-      setAttachedImagesForAgent(agentId, []);
-      setSuggestionsOpen(false);
-      // 清空 contentEditable 显示（仅清 ref 时 DOM 可能残留 /compact 文本）
-      if (composerTextareaRef.current) {
-        composerTextareaRef.current.textContent = "";
-      }
-      await compactAgent(compactPrompt || undefined, agentId);
-      return;
-    }
-    // 模板正文为空（UI 新建模板只写 frontmatter）时不发送：展开会产出空白消息，
-    // 被主进程拒为"消息不能为空"；这里拦截并明确提示补正文，便于定位编辑。
-    // 位置注意：拦在写历史/清输入之前——"/emptyTpl" 不是一条真实发送，
-    // 不应进历史、更不应吞掉用户输入（旧代码先清框才拦，输入被吞）。
-    if (decision.action === "block-empty-template") {
-      showToast(t("app.promptTemplateEmptyBody", { name: decision.templateName }), 4000);
-      return;
-    }
-
-    // 保存到当前 Agent 的历史记录（按会话路径键持久化到 localStorage，重启后可恢复）
-    if (message.trim() && !message.startsWith("!")) {
-      const key = historyKeyForAgentId(agentId);
-      setPromptHistory((current) => {
-        const prev = current[key] ?? [];
-        const filtered = prev.filter(cmd => cmd !== message.trim());
-        return {
-          ...current,
-          [key]: [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT),
-        };
-      });
-    }
-
-    // 重置历史导航状态
-    setHistoryIndex(-1);
-    setHistoryNavigating(false);
-    setSavedPrompt("");
-
-    // 发送前先保留快照,再立即清空 composer;运行中发送会走官方 steer 队列,
-    // 由 pi runtime 保证在当前工具调用结束后、下一次 LLM 调用前注入。
-    // 不论之前是否滚动回看，发新消息都强制自动滚到底，确保能看到 agent 的回答。
-    conversationRef.current?.resetAndScrollToBottom();
-    // Viewer 首条是独立快照，不消费恢复期间新写入真实 Agent 的第二条草稿。
-    if (!override) {
-      setLivePrompt(agentId, "");
-      setAttachedImagesForAgent(agentId, []);
-      // 发送清空：上一轮的 dismissed 抑制随文本一起作废，新输入从头开始。
-      suggestionsDismissedRef.current = false;
-    }
-    if (agentId) clearBusyDraftForAgent(agentId);
-    setSuggestionsOpen(false);
-    setSendBehaviorMenuOpen(false);
-    // 发送后强制重置自动高度：避免粘贴多行内容后 scrollHeight 残留导致 composer 无法恢复默认高度。
-    // 下一帧 DOM 同步后再跑一次 syncComposerAutoHeight，让最终高度以清空后的 scrollHeight 为准。
-    // 发送后固定 composer 高度，不再自动适配内容高度
-    // 让输入框保持固定大小，超出部分滚动显示
-    setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
-
-    // 忙时由 omp 官方 steer 队列接管（runtime 保证工具结束后、下次 LLM 调用前注入），
-    // renderer 不再自建待发队列；队列快照经 runtimeState.queuedMessages 回显。
-    const accepted = await submitPromptSnapshot(
-      agentId,
-      expandedMessage,
-      images,
-      undefined,
-      agentMode,
-      templateDescription,
-    );
-    if (accepted === "unknown") {
-      // 写 stdin 后超时/断开：omp 可能已收下，重试会重复执行，只能挂一条本地未知提示。
-      addUncertainPrompt(agentId, message);
-      return;
-    }
-    if (!accepted) {
-      // 首条失败时恢复到第二条草稿之前；不要预写 live ref，否则会重复拼接。
-      setLivePrompt(agentId, (current) =>
-        [message, current].filter((text) => text.trim()).join("\n\n"),
-      );
-      if (images) {
-        setAttachedImagesForAgent(agentId, (current) => [...images, ...current]);
-      }
-      return;
-    }
-    // 此时用户消息已经渲染到 DOM（状态在 await 前已提交），直接滚到底部确保用户看不到消息开头。
-    // 后续流式渲染靠 ConversationPane 的 ResizeObserver 自动追踪容器高度变化持续滚动。
-    requestAnimationFrame(() => {
-      conversationRef.current?.scrollToBottomIfFollowing();
-    });
-  }
-
-  async function sendPromptAsFollowUp() {
-    const targetAgentId = activeAgentId;
-    const livePrompt = getLivePrompt(targetAgentId ?? "");
-    // 跟随发送同样走判定表：无 override 概念（isOverride=false），不做命令展开
-    //（commandRoutes=false，原样走 busy/直发）。
-    const followUpDecision = decideComposerSubmit({
-      isOverride: false,
-      agentStarting,
-      hasTarget: Boolean(targetAgentId),
-      message: livePrompt,
-      imageCount: attachedImages.length,
-      commandRoutes: false,
-    });
-    if (followUpDecision.action === "ignore") return;
-    const followUpAgentId = targetAgentId as string; // ignore 已排除无 target
-    const message = livePrompt;
-    // 在任何 await 之前清掉实时草稿，防止双击/Enter 连发读取同一份消息。
-    stageLivePrompt(followUpAgentId);
-    const images = attachedImages.length > 0 ? attachedImages : undefined;
-    conversationRef.current?.resetAndScrollToBottom();
-    setPrompt("");
-    setAttachedImages([]);
-    // 保存到当前 Agent 的历史记录（按会话路径键，与 sendPrompt 保持一致）
-    if (message.trim() && !message.startsWith("!")) {
-      const key = historyKeyForAgentId(followUpAgentId);
-      setPromptHistory((current) => {
-        const prev = current[key] ?? [];
-        const filtered = prev.filter(cmd => cmd !== message.trim());
-        return {
-          ...current,
-          [key]: [message.trim(), ...filtered].slice(0, PROMPT_HISTORY_LIMIT),
-        };
-      });
-    }
-    // 重置历史导航状态
-    setHistoryIndex(-1);
-    setHistoryNavigating(false);
-    setSavedPrompt("");
-    if (followUpAgentId) clearBusyDraftForAgent(followUpAgentId);
-    setSuggestionsOpen(false);
-    setSendBehaviorMenuOpen(false);
-    setComposerAutoHeight(COMPOSER_MIN_HEIGHT);
-
-    const accepted = await submitPromptSnapshot(
-      followUpAgentId,
-      message,
-      images,
-      "followUp",
-      currentComposerAgentMode,
-    );
-    if (accepted === "unknown") {
-      addUncertainPrompt(followUpAgentId, message);
-      return;
-    }
-    if (!accepted) {
-      stageLivePrompt(followUpAgentId, message);
-      setLivePrompt(followUpAgentId, (current) =>
-        [message, current].filter((text) => text.trim()).join("\n\n"),
-      );
-      if (images) {
-        setAttachedImagesForAgent(followUpAgentId, (current) => [...images, ...current]);
-      }
-      return;
-    }
-    // 用户消息提交后若仍贴底则跟随；后续增长交给 pane 的 ResizeObserver。
-    requestAnimationFrame(() => {
-      conversationRef.current?.scrollToBottomIfFollowing();
-    });
-  }
 
   // 已删除内置 /goal 与 startNewGoal 实现。
 
@@ -4677,20 +4191,19 @@ export function App() {
     }
   }
 
+  /**
+   * 投递端口：行为（steer/followUp/undefined）由 composer 模块的发送判定给出，
+   * 这里不再二次推断，避免两份路线规则。
+   */
   async function submitPromptSnapshot(
     agentId: string,
     message: string,
-    images?: ImageContent[],
-    streamingBehavior?: "steer" | "followUp",
+    images: ImageContent[] | undefined,
+    behavior: "steer" | "followUp" | undefined,
     agentMode: ComposerAgentMode = "normal",
     /** prompt 模板匹配到的 description，作为元数据发给 pi agent 标识意图 */
     templateDescription?: string,
   ) {
-    // 运行中发送默认 steer：omp 在工具结束后、下次 LLM 调用前注入；
-    // follow-up 入口显式传 "followUp" 走排队语义。
-    const behavior =
-      streamingBehavior ??
-      (agentId === activeAgentId && isAgentBusy ? "steer" : undefined);
     try {
       await dispatchPromptSnapshot(
         agentId,
@@ -4798,11 +4311,8 @@ export function App() {
         typeof result?.text === "string" && result.text.length > 0
           ? result.text
           : message.text;
-      setPrompt(promptText);
-      pendingComposerCaretRef.current = promptText.length;
-      requestAnimationFrame(() => {
-        composerTextareaRef.current?.focus();
-      });
+      // fork 回填草稿：光标落到末尾（composer 模块统一的光标意图）。
+      composer.writeDraft(promptText);
       // 新会话文件会出现在项目会话列表；刷新侧栏避免用户误以为还在原会话。
       if (activeProjectId) {
         void refreshProjectSessions(activeProjectId).catch(() => undefined);
@@ -4817,286 +4327,23 @@ export function App() {
     }
   }
 
-  /**
-   * 处理图片文件,转为 pi RPC 可识别的 ImageContent。
-   * 大图会压缩到最长边 2000px,避免 base64 过大导致 RPC 传输和模型上下文成本上升。
-   */
-  async function processImageFile(file: File): Promise<ImageContent | null> {
-    const maxSize = 10 * 1024 * 1024; // 原始文件 10MB 限制,避免误粘超大图片卡住渲染进程
-    if (file.size > maxSize) {
-      showToast(t("app.imageTooLarge"), 3000);
-      return null;
-    }
+  // 图片附件管线（尺寸校验/压缩）已移入 composer/imageAttachments.ts。
 
-    const validTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-    if (!validTypes.includes(file.type)) {
-      showToast(t("app.imageUnsupported"), 3000);
-      return null;
-    }
+  // 粘贴/拖拽（路径 → @引用、位图 → 附件）已移入 composer 模块。
 
-    // GIF 可能是动图,canvas 压缩会丢失动画;保留原始数据。
-    if (file.type === "image/gif") return fileToImageContent(file);
-    return resizeImageFile(file, 2000, 0.86).catch(() =>
-      fileToImageContent(file),
+  /** 移除已附加的图片（当前条目） */
+  function removeImage(index: number) {
+    const targetAgentId = activeAgentIdRef.current;
+    if (!targetAgentId) return;
+    setAttachedImagesForAgent(targetAgentId, (current) =>
+      current.filter((_, i) => i !== index),
     );
   }
 
-  function fileToImageContent(file: File): Promise<ImageContent> {
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        resolve(dataUrlToImageContent(String(reader.result), file.type));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function dataUrlToImageContent(
-    dataUrl: string,
-    fallbackMimeType: string,
-  ): ImageContent {
-    const [meta, data = ""] = dataUrl.split(",");
-    const mimeType = meta.match(/^data:(.*?);base64$/)?.[1] || fallbackMimeType;
-    return { type: "image", data, mimeType };
-  }
-
-  function resizeImageFile(
-    file: File,
-    maxEdge: number,
-    quality: number,
-  ): Promise<ImageContent> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onerror = () => reject(reader.error);
-      reader.onload = () => {
-        const image = new Image();
-        image.onerror = reject;
-        image.onload = () => {
-          const scale = Math.min(
-            1,
-            maxEdge / Math.max(image.width, image.height),
-          );
-          const width = Math.max(1, Math.round(image.width * scale));
-          const height = Math.max(1, Math.round(image.height * scale));
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          canvas.getContext("2d")?.drawImage(image, 0, 0, width, height);
-          // JPEG 更省 token/传输体积;透明 PNG/WebP 保持 PNG,避免截图透明区域变黑。
-          const outputType =
-            file.type === "image/png" ? "image/png" : "image/jpeg";
-          resolve(
-            dataUrlToImageContent(
-              canvas.toDataURL(outputType, quality),
-              outputType,
-            ),
-          );
-        };
-        image.src = String(reader.result);
-      };
-      reader.readAsDataURL(file);
-    });
-  }
-
-  /**
-   * 将本地路径以 @path 引用插入到输入框当前光标处。
-   * 与「引用文件」按钮、粘贴/拖拽文件共用同一套规则：只引用路径，不上传内容。
-   */
-  function insertFilePathRefs(paths: string[]) {
-    if (paths.length === 0) return;
-    const el = composerTextareaRef.current;
-    const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-    const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-    // 含空格路径写成 @"C:\Users\a b\file.txt"；工作区目录追加尾斜杠，避免 @src 被当成智能体。
-    const refText = paths
-      .map((p) => {
-        const cleaned = p.replace(/[/\\]+$/, "");
-        const normalized = cleaned.replace(/\\/g, "/");
-        const isDir =
-          /[/\\]$/.test(p) ||
-          flatFiles.some(
-            (node) =>
-              node.type === "directory" &&
-              (node.path === cleaned ||
-                node.path === p ||
-                node.relativePath === normalized),
-          );
-        return formatFilePathRef(p, { isDirectory: isDir });
-      })
-      .join(" ");
-    const spacer =
-      cursor > 0 &&
-      liveComposerPrompt[cursor - 1] !== " " &&
-      liveComposerPrompt[cursor - 1] !== "\n"
-        ? " "
-        : "";
-    const newText =
-      liveComposerPrompt.slice(0, cursor) +
-      spacer +
-      refText +
-      liveComposerPrompt.slice(cursor);
-    const newCursor = cursor + spacer.length + refText.length;
-    setPrompt(newText);
-    setComposerCursor(newCursor);
-    pendingComposerCaretRef.current = newCursor;
-    requestAnimationFrame(() => {
-      composerTextareaRef.current?.focus();
-    });
-  }
-
-  /** 从 File 列表解析本地路径（Electron 38 必须走 webUtils，不能用已移除的 File.path） */
-  function resolveLocalPathsFromFiles(fileList: File[]): string[] {
-    const getPath = window.piDesktop.files.getPathForFile;
-    if (!getPath) return [];
-    const paths: string[] = [];
-    for (const file of fileList) {
-      try {
-        const p = getPath(file);
-        if (p) paths.push(p);
-      } catch {
-        // 非本地文件或路径不可用时跳过
-      }
-    }
-    return paths;
-  }
-
-  /**
-   * 处理粘贴：系统文件路径以 @path 引用插入，位图/截图附加为图片。
-   * 未处理时不 preventDefault，交给 RichInput 做纯文本粘贴。
-   * preventDefault 必须在任何 await 之前同步调用，否则浏览器会先插入默认内容。
-   *
-   * 顺序说明：资源管理器复制图片文件时，剪贴板常同时带路径 + 缩略图；
-   * 必须先判定文件路径，否则会被误当成截图附加。纯截图无路径，仍走图片分支。
-   */
-  /** 判断文件扩展名是否为常见图片格式 */
-  const isImageExt = (p: string) => /(\.(png|jpe?g|gif|webp|bmp))$/i.test(p);
-
-  function handlePaste(event: React.ClipboardEvent) {
-    const items = Array.from(event.clipboardData.items);
-
-    // 1) 资源管理器复制/剪切的文件：浏览器 ClipboardEvent 通常没有 kind=file，
-    //    需通过 preload 同步读取 Electron clipboard（FileNameW / CF_HDROP 等）
-    const clipboardPaths = window.piDesktop.files.getClipboardPaths?.() ?? [];
-    if (clipboardPaths.length > 0) {
-      event.preventDefault();
-      const imagePaths = clipboardPaths.filter((p) => isImageExt(p));
-      const nonImagePaths = clipboardPaths.filter((p) => !isImageExt(p));
-      // 非图片：插入完整 @绝对路径 引用
-      if (nonImagePaths.length > 0) insertFilePathRefs(nonImagePaths);
-      // 图片文件：按附件附加（不是 @path 引用）；从磁盘读 base64，避免只拿到缩略图。
-      if (imagePaths.length > 0) {
-        void (async () => {
-          for (const path of imagePaths) {
-            try {
-              // 有界读会截断超大文件；截断的图片 base64 无法解码，宁可舍弃也不附加损坏数据。
-              const { content: dataUrl, truncated } = await api.files.readBase64(path);
-              if (!dataUrl || truncated) continue;
-              setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
-            } catch {
-              // 单张失败不阻断其余
-            }
-          }
-        })();
-      }
-      return;
-    }
-
-    // 2) 兜底：剪贴板里若有 File 对象（部分场景），用 webUtils 解析路径
-    const fileItems = items.filter((i) => i.kind === "file");
-    if (fileItems.length > 0) {
-      const files = fileItems
-        .map((i) => i.getAsFile())
-        .filter((f): f is File => Boolean(f));
-      const paths = resolveLocalPathsFromFiles(files);
-      if (paths.length > 0) {
-        event.preventDefault();
-        const imagePaths = paths.filter((p) => isImageExt(p));
-        const nonImagePaths = paths.filter((p) => !isImageExt(p));
-        if (nonImagePaths.length > 0) insertFilePathRefs(nonImagePaths);
-        if (imagePaths.length > 0) {
-          void (async () => {
-            for (const path of imagePaths) {
-              try {
-                // 同上：截断的 base64 无法解码，直接跳过。
-                const { content: dataUrl, truncated } = await api.files.readBase64(path);
-                if (!dataUrl || truncated) continue;
-                setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
-              } catch {
-                /* ignore */
-              }
-            }
-          })();
-        }
-        return;
-      }
-    }
-
-    // 3) 纯位图粘贴（截图等，无本地文件路径）：读取并附加到消息
-    const imageItems = items.filter((i) => i.type.startsWith("image/"));
-    if (imageItems.length > 0) {
-      event.preventDefault();
-      void (async () => {
-        for (const item of imageItems) {
-          const file = item.getAsFile();
-          if (!file) continue;
-          const image = await processImageFile(file);
-          if (image) setAttachedImages((prev) => [...prev, image]);
-        }
-      })();
-    }
-  }
-
-  /**
-   * 处理拖拽：本地文件/目录一律以 @path 引用插入（含图片文件，不上传内容）。
-   * 仅当无法解析本地路径且类型为 image/* 时，才退回附加图片（极少见）。
-   */
-  async function handleDrop(event: React.DragEvent) {
-    event.preventDefault();
-    const files = Array.from(event.dataTransfer.files);
-    if (files.length === 0) return;
-
-    // 优先：有本地路径 → 与「引用文件」一致，插入 @path
-    const paths = resolveLocalPathsFromFiles(files);
-    if (paths.length > 0) {
-      insertFilePathRefs(paths);
-      return;
-    }
-
-    // 兜底：无路径的图片数据（非资源管理器文件拖入）
-    for (const file of files) {
-      if (!file.type.startsWith("image/")) continue;
-      const image = await processImageFile(file);
-      if (image) setAttachedImages((prev) => [...prev, image]);
-    }
-  }
-
-  function handleDragOver(event: React.DragEvent) {
-    event.preventDefault();
-  }
-
-  /** 移除已附加的图片 */
-  function removeImage(index: number) {
-    setAttachedImages((prev) => prev.filter((_, i) => i !== index));
-  }
-
-  /** 清空所有附加图片 */
+  /** 清空所有附加图片（当前条目） */
   function clearImages() {
-    setAttachedImages([]);
-  }
-
-  /**
-   * 打开系统原生文件选择器，将选中路径以 @path 引用格式插入到消息中。
-   * 仅引用路径，不读取/上传文件内容。默认只选文件（Windows 上文件+目录并存
-   * 会退化为只选文件夹）；需要目录选择时由主进程显式开启 includeDirectories。
-   */
-  async function handleAttachFile() {
-    try {
-      const paths = await window.piDesktop.dialog.pickFiles({
-        title: t("app.attachFile"),
-      });
-      insertFilePathRefs(paths);
-    } catch {
-      // 用户取消或出错时不作处理
-    }
+    const targetAgentId = activeAgentIdRef.current;
+    if (targetAgentId) setAttachedImagesForAgent(targetAgentId, []);
   }
 
   async function updateSettings(patch: Partial<AppSettings>): Promise<boolean> {
@@ -6592,11 +5839,11 @@ export function App() {
           <div
             ref={composerBoxRef}
             className={`composer-box ${
-              composerBangMode === "bang-bang"
+              composerStatusMode === "silent-shell"
                 ? "shell-silent-mode"
-                : composerBangMode === "bang"
+                : composerStatusMode === "shell"
                   ? "shell-mode"
-                  : currentComposerAgentMode === "plan"
+                  : composerStatusMode === "plan"
                     ? "plan-mode"
                     : ""
             }`}
@@ -6611,9 +5858,9 @@ export function App() {
               ref={composerTextareaRef}
               value={prompt}
               className={
-                composerBangMode === "bang-bang"
+                composer.bangMode === "bang-bang"
                   ? "bang-bang"
-                  : composerBangMode === "bang"
+                  : composer.bangMode === "bang"
                     ? "bang"
                     : ""
               }
@@ -6621,78 +5868,30 @@ export function App() {
               validCommandNames={validCommandNames}
               validFilePaths={validFilePaths}
               validSessionRefs={validSessionRefs}
-              caretRef={pendingComposerCaretRef}
+              caretRef={composer.caretRef}
               placeholder={
                 agentStarting
                   ? t("app.agentStartingPlaceholder")
                   : !activeAgent
                     ? t("app.composerNoAgentPlaceholder")
-                    : composerBangMode === "bang-bang"
+                    : composerStatusMode === "silent-shell"
                       ? t("app.composerSilentPlaceholder")
-                      : composerBangMode === "bang"
+                      : composerStatusMode === "shell"
                         ? t("app.composerShellPlaceholder")
-                        : currentComposerAgentMode === "plan"
+                        : composerStatusMode === "plan"
                           ? t("app.composerPlanPlaceholder")
                           : settings.sendShortcut === "enter-send"
                             ? t("app.composerEnterPlaceholder")
                             : t("app.composerShortcutPlaceholder")
               }
-              onFocus={() => {
-                // 仅当光标处存在 @ / 触发器时才打开建议框,避免聚焦即弹空菜单。
-                // ESC/手动关闭后（dismissed）：面板保持关闭；只有用户再次输入
-                // @/& 触发键（见 handleComposerKeyDown）后才恢复正常唤起。
-                if (suggestionsDismissedRef.current) {
-                  setSuggestionsOpen(false);
-                  return;
-                }
-                setSuggestionsOpen(detectTrigger(prompt, composerCursor) !== null);
-              }}
-              onChange={(newValue, cursor) => {
-                const targetAgentId = activeAgentIdRef.current;
-                if (targetAgentId) {
-                  setNativePrompt(targetAgentId, newValue, chipsKeyOf);
-                }
-                if (targetAgentId) {
-                  // busyDraft：内容清空即释放；忙碌且有内容则锁定分段发送控件
-                  if (!newValue.trim()) clearBusyDraftForAgent(targetAgentId);
-                  else if (isAgentBusy) latchBusyDraftForAgent(targetAgentId);
-                }
-                if (suggestionsOpen) setComposerCursor(cursor);
-                const nextTrigger = detectTrigger(newValue, cursor);
-                const nextSuggestionsOpen = nextTrigger !== null;
-                // ESC/手动关闭后 suppressed：被拒的 @/& 查询不再唤起面板。
-                // 无论继续打字/空格/换行/删改都保持关闭——只关不弹；
-                // 复位唯一途径是用户再次按下 @/& 触发键（见 handleComposerKeyDown），
-                // 表示开始一条全新的 @/& 查询。
-                // 直接用 dismissed 判定而非 suggestionsOpen 闭包：ESC 后首个 input
-                // 可能早于 React 重渲染到达，闭包仍是旧值。
-                if (!suggestionsDismissedRef.current) {
-                  if (nextSuggestionsOpen !== suggestionsOpen) {
-                    setSuggestionsOpen(nextSuggestionsOpen);
-                  }
-                }
-                // 如果正在历史导航,检测到用户手动编辑内容则退出历史模式
-                if (historyNavigating) {
-                  const agentHistory =
-                    promptHistoryRef.current[historyKeyForAgentId(activeAgentId ?? '')] ?? [];
-                  const currentHistoryCommand = agentHistory[historyIndex];
-                  if (newValue !== currentHistoryCommand) {
-                    setHistoryIndex(-1);
-                    setHistoryNavigating(false);
-                    setSavedPrompt("");
-                  }
-                }
-              }}
-              onCursorChange={(cursor) => {
-                if (suggestionsOpen) setComposerCursor(cursor);
-              }}
-              onKeyDown={handleComposerKeyDown}
-              onPaste={handlePaste}
-              onDrop={handleDrop}
-              onDragOver={handleDragOver}
-              onBlur={() => {
-                setSuggestionsOpen(false);
-              }}
+              onFocus={composer.onFocus}
+              onChange={composer.onChange}
+              onCursorChange={composer.onCursorChange}
+              onKeyDown={composer.onKeyDown}
+              onPaste={composer.onPaste}
+              onDrop={composer.onDrop}
+              onDragOver={composer.onDragOver}
+              onBlur={composer.onBlur}
               onChipClick={(chip: RichInputChip) => {
                 if (chip.kind === "file") { openFilePath(unwrapFileChipPath(chip.raw)); }
                 if (chip.kind === "session") {
@@ -6701,34 +5900,15 @@ export function App() {
                 }
               }}
             />
-            {suggestionsOpen && !composerDisabled && (
+            {composer.suggestionsOpen && !composerDisabled && (
               <PromptSuggestions
                 prompt={prompt}
-                items={suggestionItems}
-                selectedIndex={selectedSuggestionIndex}
-                anchorStyle={suggestionAnchorStyle}
-                onSelectedIndexChange={setSelectedSuggestionIndex}
-                onClose={() => {
-                  // 点 X 与 ESC 同语义：只关面板、保留输入；置 dismissed 抑制
-                  // 后续打字弹回（见 onChange / onCursorChange）。
-                  dismissSuggestions();
-                  requestAnimationFrame(() => {
-                    composerTextareaRef.current?.focus();
-                  });
-                }}
-                onPick={(value) => {
-                  const el = composerTextareaRef.current;
-                  const cursor = el ? getCaretOffsetOf(el) : composerCursor;
-                  const liveComposerPrompt = getLivePrompt(activeAgentIdRef.current ?? "");
-                  const result = applySuggestion(liveComposerPrompt, cursor, value);
-                  setPrompt(result.text);
-                  setComposerCursor(result.cursor);
-                  pendingComposerCaretRef.current = result.cursor;
-                  setSuggestionsOpen(false);
-                  requestAnimationFrame(() => {
-                    composerTextareaRef.current?.focus();
-                  });
-                }}
+                items={composer.suggestionItems}
+                selectedIndex={composer.suggestionIndex}
+                anchorStyle={composer.suggestionAnchorStyle}
+                onSelectedIndexChange={composer.setSuggestionIndex}
+                onClose={() => composer.dismissSuggestions({ focus: true })}
+                onPick={composer.pickSuggestion}
               />
             )}
 
@@ -6769,7 +5949,7 @@ export function App() {
                   type="button"
                   className="composer-bar-btn icon"
                   disabled={isAgentBusy || agentStarting}
-                  onClick={handleAttachFile}
+                  onClick={() => void composer.attachFile()}
                   title={t("app.attachFileDesc")}
                 >
                   <Paperclip size={15} strokeWidth={1.8} />
@@ -6823,7 +6003,7 @@ export function App() {
                         className="send-behavior-primary"
                         title={isAgentBusy ? t("app.sendSteerTitle") : t("app.send")}
                         aria-label={isAgentBusy ? t("app.sendSteerTitle") : t("app.send")}
-                        onClick={() => void sendPrompt()}
+                        onClick={() => void composer.submit()}
                       >
                         <ArrowUp size={15} strokeWidth={2.4} />
                       </button>
@@ -6859,7 +6039,7 @@ export function App() {
                           aria-keyshortcuts={sendShortcutKeys.join("+")}
                           onClick={() => {
                             setSendBehaviorMenuOpen(false);
-                            void sendPrompt();
+                            void composer.submit();
                           }}
                         >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
@@ -6881,7 +6061,7 @@ export function App() {
                           aria-keyshortcuts="ArrowDown+Enter"
                           onClick={() => {
                             setSendBehaviorMenuOpen(false);
-                            void sendPromptAsFollowUp();
+                            void composer.submitFollowUp();
                           }}
                         >
                           <span className="send-behavior-option-dot" aria-hidden="true" />
@@ -6916,7 +6096,7 @@ export function App() {
                     type="button"
                     disabled={agentStarting || (!activeAgentId) || (!prompt.trim() && attachedImages.length === 0)}
                     className="composer-bar-btn send"
-                    onClick={() => void sendPrompt()}
+                    onClick={() => void composer.submit()}
                     title={t("app.send")}
                     aria-label={t("app.send")}
                   >
@@ -7373,9 +6553,10 @@ export function App() {
             const ref = formatFilePathRef(fileMenu.node.relativePath, {
               isDirectory: fileMenu.node.type === "directory",
             });
-            setPrompt(
-              (current) =>
-                `${current}${current.endsWith(" ") || current.length === 0 ? "" : " "}${ref} `,
+            const current = getLivePrompt(activeAgentIdRef.current ?? "");
+            setLivePrompt(
+              activeAgentIdRef.current ?? "",
+              `${current}${current.endsWith(" ") || current.length === 0 ? "" : " "}${ref} `,
             );
             setFileMenu(null);
           }}
@@ -7667,42 +6848,28 @@ export function App() {
         />
       )}
       {sidebarDeleteConfirm && (
-        <div
-          className="session-delete-confirm-backdrop"
-          onClick={() => setSidebarDeleteConfirm(null)}
-        >
-          <section
-            className="session-delete-confirm"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <strong>{t("drawer.sessionDeleteTitle")}</strong>
-            <p>
-              {sidebarDeleteConfirm.childCount > 0
-                ? t("drawer.sessionDeleteBodyWithChildren", {
-                    name: sidebarDeleteConfirm.session.name || t("common.untitled"),
-                    count: sidebarDeleteConfirm.childCount,
-                  })
-                : t("drawer.sessionDeleteBody", {
-                    name: sidebarDeleteConfirm.session.name || t("common.untitled"),
-                  })}
-            </p>
-            <div className="session-delete-confirm-actions">
-              <button onClick={() => setSidebarDeleteConfirm(null)}>
-                {t("common.cancel")}
-              </button>
-              <button
-                className="danger"
-                onClick={() => {
-                  const target = sidebarDeleteConfirm.session;
-                  setSidebarDeleteConfirm(null);
-                  void deleteHistorySession(target);
-                }}
-              >
-                {t("common.delete")}
-              </button>
-            </div>
-          </section>
-        </div>
+        <ConfirmDialog
+          title={t("drawer.sessionDeleteTitle")}
+          message={
+            sidebarDeleteConfirm.childCount > 0
+              ? t("drawer.sessionDeleteBodyWithChildren", {
+                  name: sidebarDeleteConfirm.session.name || t("common.untitled"),
+                  count: sidebarDeleteConfirm.childCount,
+                })
+              : t("drawer.sessionDeleteBody", {
+                  name: sidebarDeleteConfirm.session.name || t("common.untitled"),
+                })
+          }
+          cancelLabel={t("common.cancel")}
+          confirmLabel={t("common.delete")}
+          danger
+          onCancel={() => setSidebarDeleteConfirm(null)}
+          onConfirm={() => {
+            const target = sidebarDeleteConfirm.session;
+            setSidebarDeleteConfirm(null);
+            void deleteHistorySession(target);
+          }}
+        />
       )}
       {sessionManagerProject && (
         <Suspense fallback={null}>
@@ -7740,61 +6907,44 @@ export function App() {
         </Suspense>
       )}
       {(agentRenameTarget || sessionRenameTarget) && (
-        <div
-          className="modal-backdrop rename-dialog-backdrop"
-          onClick={() => {
+        <ModalSurface
+          open
+          size="small"
+          title={t("app.renameSessionTitle")}
+          onRequestClose={() => {
             if (!agentRenaming) {
               setAgentRenameTarget(null);
               setSessionRenameTarget(null);
             }
           }}
         >
-          <form
-            className="rename-dialog"
-            onClick={(event) => event.stopPropagation()}
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (agentRenameTarget) void submitAgentRename();
-              else void submitSessionRename();
-            }}
-          >
-            <div className="rename-dialog-header">
-              <strong>{t("app.renameSessionTitle")}</strong>
-              <button
-                type="button"
+          {(requestClose) => (
+            <form
+              className="rename-dialog-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (agentRenameTarget) void submitAgentRename();
+                else void submitSessionRename();
+              }}
+            >
+              <TextField
+                label={t("app.renameSessionFieldLabel")}
+                value={agentRenameValue}
+                onChange={setAgentRenameValue}
+                placeholder={t("app.renameSessionPlaceholder")}
                 disabled={agentRenaming}
-                onClick={() => {
-                  setAgentRenameTarget(null);
-                  setSessionRenameTarget(null);
-                }}
-              >
-                <X size={15} />
-              </button>
-            </div>
-            <input
-              autoFocus
-              value={agentRenameValue}
-              onChange={(event) => setAgentRenameValue(event.target.value)}
-              placeholder={t("app.renameSessionPlaceholder")}
-              disabled={agentRenaming}
-            />
-            <div className="rename-dialog-actions">
-              <button
-                type="button"
-                disabled={agentRenaming}
-                onClick={() => {
-                  setAgentRenameTarget(null);
-                  setSessionRenameTarget(null);
-                }}
-              >
-                {t("common.cancel")}
-              </button>
-              <button type="submit" disabled={agentRenaming}>
-                {agentRenaming ? t("common.saving") : t("common.save")}
-              </button>
-            </div>
-          </form>
-        </div>
+              />
+              <div className="rename-dialog-actions">
+                <Button variant="secondary" disabled={agentRenaming} onClick={requestClose}>
+                  {t("common.cancel")}
+                </Button>
+                <Button type="submit" variant="primary" loading={agentRenaming}>
+                  {t("common.save")}
+                </Button>
+              </div>
+            </form>
+          )}
+        </ModalSurface>
       )}
 
 
@@ -8307,15 +7457,14 @@ function UpdateModal(props: {
 }) {
   const progressPercent = props.progress?.percent ?? 0;
   return (
-    <div className="modal-backdrop update-backdrop">
-      <section className="update-modal">
-        <div className="modal-header">
-          <strong>
-            {t("update.availableTitle", { version: props.info.latestVersion })}
-          </strong>
-          <CloseIconButton label={t("common.close")} onClick={props.onClose} />
-        </div>
-        <div className="update-body">
+    <ModalSurface
+      open
+      size="medium"
+      className="update-modal"
+      title={t("update.availableTitle", { version: props.info.latestVersion })}
+      onRequestClose={props.onClose}
+    >
+      <div className="update-body">
           <p className="update-version-line">
             {t("update.currentLatest", {
               current: props.info.currentVersion,
@@ -8365,27 +7514,26 @@ function UpdateModal(props: {
           </div>
         </div>
         <div className="update-actions">
-          <button onClick={props.onOpenRelease}>
+          <Button variant="secondary" onClick={props.onOpenRelease}>
             {t("update.openRelease")}
-          </button>
-          <button onClick={props.onBrowserDownload}>
+          </Button>
+          <Button variant="secondary" onClick={props.onBrowserDownload}>
             {t("update.browserDownload")}
-          </button>
+          </Button>
           {props.downloadedPath ? (
-            <button className="primary" onClick={props.onInstall}>
+            <Button variant="primary" onClick={props.onInstall}>
               {t("update.installDownloaded")}
-            </button>
+            </Button>
           ) : (
-            <button
-              className="primary"
+            <Button
+              variant="primary"
               disabled={props.checking || props.downloading || !props.info.recommendedAsset}
               onClick={props.onDownload}
             >
               {props.downloading ? t("update.downloading") : t("update.downloadInApp")}
-            </button>
+            </Button>
           )}
         </div>
-      </section>
-    </div>
+    </ModalSurface>
   );
 }

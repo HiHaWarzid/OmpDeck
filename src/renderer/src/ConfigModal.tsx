@@ -13,7 +13,8 @@ import { SkillsTab } from "./config/SkillsTab";
 import { ExtensionsTab } from "./config/ExtensionsTab";
 import { EditorsTab } from "./config/EditorsTab";
 import { LogsTab } from "./config/LogsTab";
-import { CloseIconButton } from "./components/ui/IconButton";
+import { ConfirmDialog } from "./components/ui/ConfirmDialog";
+import { ModalSurface } from "./components/ui/ModalSurface";
 import { t } from "./i18n";
 import { LazyMonacoEditor } from "./components/ui/LazyMonacoEditor";
 import { translateBuiltinPromptDescription } from "./composerBehavior";
@@ -138,33 +139,29 @@ class ConfigModalErrorBoundary extends Component<
 		if (!this.state.error) return this.props.children;
 		if (!this.props.open) return null;
 		return (
-			<div className="modal-backdrop" onClick={this.props.onClose}>
-				<div className="config-modal" onClick={(e) => e.stopPropagation()}>
-					<div className="modal-header">
-						<strong>{t("config.loadFailed")}</strong>
-						<CloseIconButton
-							label={t("common.close")}
-							onClick={this.props.onClose}
-						/>
-					</div>
-					<div className="config-content">
-						<div className="config-diagnostic-card">
-							<div>
-								<strong>{t("config.renderCrashed")}</strong>
-								<span>{this.state.error.message}</span>
-								<small>
-									{t("config.renderCrashedHelpPrefix")}
-									<a href="https://pi.dev/docs/latest/models" target="_blank" rel="noreferrer">{t("config.docsModels")}</a>
-									{" / "}
-									<a href="https://pi.dev/docs/latest/settings" target="_blank" rel="noreferrer">{t("config.docsSettings")}</a>
-									{t("config.renderCrashedHelpSuffix")}
-								</small>
-							</div>
-							<pre>{this.state.error.stack ?? this.state.error.message}</pre>
+			<ModalSurface
+				open={this.props.open}
+				onRequestClose={this.props.onClose}
+				title={t("config.loadFailed")}
+				className="config-modal"
+				>
+				<div className="config-content">
+					<div className="config-diagnostic-card">
+						<div>
+							<strong>{t("config.renderCrashed")}</strong>
+							<span>{this.state.error.message}</span>
+							<small>
+								{t("config.renderCrashedHelpPrefix")}
+								<a href="https://pi.dev/docs/latest/models" target="_blank" rel="noreferrer">{t("config.docsModels")}</a>
+								{" / "}
+								<a href="https://pi.dev/docs/latest/settings" target="_blank" rel="noreferrer">{t("config.docsSettings")}</a>
+								{t("config.renderCrashedHelpSuffix")}
+							</small>
 						</div>
+						<pre>{this.state.error.stack ?? this.state.error.message}</pre>
 					</div>
 				</div>
-			</div>
+			</ModalSurface>
 		);
 	}
 }
@@ -1472,365 +1469,351 @@ function ConfigModalContent(props: ConfigModalProps) {
 	if (!open) return null;
 
 	return (
-		<div className="modal-backdrop" onClick={onClose}>
-			<div className="config-modal" onClick={(e) => e.stopPropagation()}>
-				<div className="modal-header">
-					<strong>{t("config.title")}</strong>
-					<div className="modal-header-actions">
-						{section === "config" && (
-							<>
-								<button className="config-btn primary" onClick={handleExport}>
-									{t("common.export")}
-								</button>
-								<button className="config-btn blue" onClick={handleImport}>
-									{t("common.import")}
-								</button>
-							</>
-						)}
-						<CloseIconButton label={t("common.close")} onClick={onClose} />
+		<ModalSurface
+			open={open}
+			onRequestClose={onClose}
+			title={t("config.title")}
+			className="config-modal"
+			headerActions={
+			section === "config" ? (
+				<>
+					<button className="config-btn primary" onClick={handleExport}>
+						{t("common.export")}
+					</button>
+					<button className="config-btn blue" onClick={handleImport}>
+						{t("common.import")}
+					</button>
+				</>
+			) : undefined
+			}
+		>
+
+			<div className="config-layout">
+				<aside className="config-sidebar" aria-label={t("config.title")}>
+					<div className="config-sidebar-group">
+						<span>{t("config.group.config")}</span>
+						{configNavItems.map((item) => (
+							<button
+								key={item.id}
+								className={
+									section === "config" && tab === item.id ? "active" : ""
+								}
+								onClick={() => {
+									setSection("config");
+									setTab(item.id);
+								}}
+							>
+								{item.label}
+							</button>
+						))}
 					</div>
-				</div>
+					<div className="config-sidebar-group">
+						<span>{t("config.group.agent")}</span>
+						<button
+							className={section === "extensions" ? "active" : ""}
+							onClick={() => setSection("extensions")}
+						>
+							{t("config.nav.extensions")}
+						</button>
+						<button
+							className={section === "skills" ? "active" : ""}
+							onClick={() => setSection("skills")}
+						>
+							{t("config.nav.skills")}
+						</button>
+						<button
+							className={section === "prompts" ? "active" : ""}
+							onClick={() => setSection("prompts")}
+						>
+							{t("config.nav.prompts")}
+						</button>
+					</div>
+					<div className="config-sidebar-group">
+						<span>{t("config.group.other")}</span>
+						<button
+							className={section === "editors" ? "active" : ""}
+							onClick={() => setSection("editors")}
+						>
+							{t("config.nav.editors")}
+						</button>
+					</div>
+					<div className="config-sidebar-group">
+						<span>{t("config.group.diagnostics")}</span>
+						<button
+							className={section === "logs" ? "active" : ""}
+							onClick={() => setSection("logs")}
+						>
+							{t("config.nav.logs")}
+						</button>
+					</div>
+				</aside>
 
-				<div className="config-layout">
-					<aside className="config-sidebar" aria-label={t("config.title")}>
-						<div className="config-sidebar-group">
-							<span>{t("config.group.config")}</span>
-							{configNavItems.map((item) => (
-								<button
-									key={item.id}
-									className={
-										section === "config" && tab === item.id ? "active" : ""
-									}
-									onClick={() => {
-										setSection("config");
-										setTab(item.id);
-									}}
-								>
-									{item.label}
-								</button>
-							))}
-						</div>
-						<div className="config-sidebar-group">
-							<span>{t("config.group.agent")}</span>
-							<button
-								className={section === "extensions" ? "active" : ""}
-								onClick={() => setSection("extensions")}
-							>
-								{t("config.nav.extensions")}
-							</button>
-							<button
-								className={section === "skills" ? "active" : ""}
-								onClick={() => setSection("skills")}
-							>
-								{t("config.nav.skills")}
-							</button>
-							<button
-								className={section === "prompts" ? "active" : ""}
-								onClick={() => setSection("prompts")}
-							>
-								{t("config.nav.prompts")}
-							</button>
-						</div>
-						<div className="config-sidebar-group">
-							<span>{t("config.group.other")}</span>
-							<button
-								className={section === "editors" ? "active" : ""}
-								onClick={() => setSection("editors")}
-							>
-								{t("config.nav.editors")}
-							</button>
-						</div>
-						<div className="config-sidebar-group">
-							<span>{t("config.group.diagnostics")}</span>
-							<button
-								className={section === "logs" ? "active" : ""}
-								onClick={() => setSection("logs")}
-							>
-								{t("config.nav.logs")}
-							</button>
-						</div>
-					</aside>
-
-					<main className="config-main">
-						<div className="config-content">
-					{loading && <div className="config-loading">{t("common.loading")}</div>}
-					{error && <div className="config-error">{error}</div>}
-					{section === "config" && configDiagnostic && (
-						<ConfigDiagnosticCard
-							diagnostic={configDiagnostic}
-							onOpenDocs={() => api.app.openExternal(configDiagnostic.docsUrl)}
-							onOpenRaw={() => setTab("raw")}
-						/>
-					)}
-
-					{section === "config" && !loading && tab === "models" && (
-						<ModelsTab
-							data={modelsData}
-							expandedProvider={expandedProvider}
-							addingProvider={addingProvider}
-							newProviderName={newProviderName}
-							renamingProvider={renamingProvider}
-							renameValue={renameValue}
-							fetchingProvider={fetchingProvider}
-							fetchedModels={fetchedModels}
-							fetchModelsErrorByProvider={fetchModelsErrorByProvider}
-							testingProvider={testingProvider}
-							testResult={testResult}
-							testModelIdByProvider={testModelIdByProvider}
-							saving={saving}
-							ompDefault={ompDefault}
-							onSetOmpDefault={handleSetOmpDefault}
-							onClearOmpDefault={handleClearOmpDefault}
-							onToggleProvider={(name) =>
-								setExpandedProvider(expandedProvider === name ? null : name)
-							}
-							onStartAddProvider={() => {
-								setAddingProvider(true);
-								setNewProviderName("");
-							}}
-							onCancelAddProvider={() => setAddingProvider(false)}
-							onChangeNewProviderName={setNewProviderName}
-							onConfirmAddProvider={handleAddProvider}
-							onStartRename={handleStartRename}
-							onChangeRenameValue={setRenameValue}
-							onConfirmRename={handleConfirmRename}
-							onCancelRename={handleCancelRename}
-							onDeleteProvider={handleDeleteProvider}
-							onDuplicateProvider={handleDuplicateProvider}
-							onDeleteProviders={handleDeleteProviders}
-							onAddModel={handleAddModel}
-							onUpdateModel={handleUpdateModel}
-							onUpdateModelXhigh={handleUpdateModelXhigh}
-							onDeleteModel={handleDeleteModel}
-							onFetchModels={handleFetchModels}
-							onTestProvider={handleTestProvider}
-							onChangeTestModelId={(providerName, modelId) =>
-								setTestModelIdByProvider((current) => ({
-									...current,
-									[providerName]: modelId,
-								}))
-							}
-							onClearTestResult={() => setTestResult(null)}
-							onSave={handleSaveModels}
-							onChangeProvider={(name, field, value) => {
-								const provider = modelsData.providers[name];
-								if (!provider) return;
-								setModelsData({
-									...modelsData,
-									providers: {
-										...modelsData.providers,
-										[name]: { ...provider, [field]: value },
-									},
-								});
-							}}
-						/>
-					)}
-
-					{section === "config" && !loading && tab === "auth" && (
-						<AuthTab
-							data={authData}
-							expandedAuth={expandedAuth}
-							addingAuth={addingAuth}
-							newAuthName={newAuthName}
-							saving={saving}
-							modelsData={modelsData}
-							onToggleAuth={(name) =>
-								setExpandedAuth(expandedAuth === name ? null : name)
-							}
-							onStartAddAuth={() => {
-								setAddingAuth(true);
-								setNewAuthName("");
-							}}
-							onCancelAddAuth={() => setAddingAuth(false)}
-							onChangeNewAuthName={setNewAuthName}
-							onConfirmAddAuth={(name, key) => handleAddAuth(name, key)}
-						onDeleteAuths={handleDeleteAuths}
-						onDeleteAuth={handleDeleteAuth}
-						onUpdate={handleUpdateAuth}
-						onSave={handleSaveAuth}
+				<main className="config-main">
+					<div className="config-content">
+				{loading && <div className="config-loading">{t("common.loading")}</div>}
+				{error && <div className="config-error">{error}</div>}
+				{section === "config" && configDiagnostic && (
+					<ConfigDiagnosticCard
+						diagnostic={configDiagnostic}
+						onOpenDocs={() => api.app.openExternal(configDiagnostic.docsUrl)}
+						onOpenRaw={() => setTab("raw")}
 					/>
-					)}
-
-					{section === "config" && !loading && tab === "settings" && (
-						<SettingsTab
-							data={settingsData}
-							saving={saving}
-							modelsData={modelsData}
-							discoveredModels={discoveredModels}
-							onChange={setSettingsData}
-							onSave={handleSaveSettings}
-						/>
-					)}
-
-					{section === "logs" && !loading && (
-						<LogsTab />
-					)}
-
-					{section === "skills" && !loading && (
-						editingGlobalSkill ? (
-							<div className="prompts-editor-backdrop" onClick={() => setEditingGlobalSkill(null)}>
-								<div className="prompts-editor-modal" onClick={(e) => e.stopPropagation()}>
-									<div className="file-diff-header">
-										<span className="file-diff-header-file">{editingGlobalSkill.name} · SKILL.md</span>
-										<div className="file-diff-header-actions">
-											<CloseIconButton label={t("common.close")} onClick={() => setEditingGlobalSkill(null)} />
-										</div>
-									</div>
-									{editGlobalLoading ? (
-										<div className="config-empty">{t("common.loading")}</div>
-									) : (
-										<div className="prompts-monaco-wrap">
-											<LazyMonacoEditor
-												value={editGlobalContent}
-												onChange={setEditGlobalContent}
-											/>
-									</div>
-								)}
-								{editGlobalSaved && <span className="file-diff-hint saved">{t("config.promptSavedHint")}</span>}
-							</div>
-						</div>
-					) : (
-							<SkillsTab
-							data={skillsData}
-							loading={loading}
-							creating={creatingSkill}
-							newName={newSkillName}
-							newDescription={newSkillDescription}
-							newLocationId={newSkillLocationId}
-							onRefresh={refreshSkills}
-							onOpenRoot={() => api.skills.openFolder()}
-							onChangeNewName={setNewSkillName}
-							onChangeNewDescription={setNewSkillDescription}
-							onChangeNewLocation={setNewSkillLocationId}
-							onCreate={handleCreateSkill}
-							onToggle={(skill, enabled) => handleToggleSkill(skill.path, enabled)}
-							onDelete={setDeleteSkillConfirm}
-							onEdit={handleEditGlobalSkill}
-							onRename={handleRenameGlobalSkill}
-						/>
-						)
-					)}
-
-					{section === "prompts" && !loading && (
-						<PromptsTab
-							data={promptsData}
-							loading={loading}
-							creating={creatingPrompt}
-							newName={newPromptName}
-							newDescription={newPromptDescription}
-							editingTemplate={editingPrompt}
-							editContent={editPromptContent}
-							editLoading={editPromptLoading}
-							editSaving={editPromptSaving}
-							onRefresh={refreshPrompts}
-							onOpenRoot={() => api.prompts.openFolder()}
-							onChangeNewName={setNewPromptName}
-							onChangeNewDescription={setNewPromptDescription}
-							onCreate={handleCreatePrompt}
-							onDelete={confirmDeletePrompt}
-							onEdit={handleEditPrompt}
-							onRename={handleRenamePrompt}
-							onQuickSave={handleQuickSavePrompt}
-							onCancelEdit={handleCancelEditPrompt}
-							onChangeEditContent={setEditPromptContent}
-							onSaveEdit={handleSaveEditPrompt}
-						/>
-					)}
-
-					{section === "extensions" && (
-						<ExtensionsTab
-							data={extensionsData}
-							loading={extensionsLoading}
-							uninstallingSource={uninstallingExtensionSource}
-							onRefresh={() => void refreshExtensions(true)}
-							onUninstall={setUninstallExtensionConfirm}
-						/>
-					)}
-
-					{section === "editors" && !loading && (
-						<EditorsTab />
-					)}
-
-					{section === "config" && !loading && tab === "trust" && (
-						<TrustTab
-							data={trustData}
-							saving={saving}
-							onChange={setTrustData}
-							onSave={handleSaveTrust}
-						/>
-					)}
-
-					{section === "config" && !loading && tab === "raw" && (
-						<RawTab
-							fileName={rawFileName}
-							content={rawContent}
-							saving={saving}
-							onChangeFileName={handleRawFileChange}
-							onChangeContent={setRawContent}
-							onSave={handleSaveRaw}
-						/>
-					)}
-						</div>
-					</main>
-				</div>
-
-				{deleteSkillConfirm && (
-					<div className="session-delete-confirm-backdrop" onClick={() => setDeleteSkillConfirm(null)}>
-						<div className="session-delete-confirm skill-delete-confirm" onClick={(event) => event.stopPropagation()}>
-							<strong>{t("config.deleteSkillConfirmTitle")}</strong>
-							<p>
-								{t("config.deleteSkillConfirmBody", {
-									name: deleteSkillConfirm.name,
-								})}
-							</p>
-							<small>{deleteSkillConfirm.path}</small>
-							<div className="session-delete-confirm-actions">
-								<button onClick={() => setDeleteSkillConfirm(null)}>{t("common.cancel")}</button>
-								<button className="danger" onClick={() => void confirmDeleteSkill()}>
-									{t("common.delete")}
-								</button>
-							</div>
-						</div>
-					</div>
 				)}
 
-				{uninstallExtensionConfirm && (
-					<div className="session-delete-confirm-backdrop" onClick={() => setUninstallExtensionConfirm(null)}>
-						<div className="session-delete-confirm skill-delete-confirm" onClick={(event) => event.stopPropagation()}>
-							<strong>{t("config.uninstallExtensionTitle")}</strong>
-							<p>
-								{t("config.uninstallExtensionBody", {
-									source: uninstallExtensionConfirm.source,
-								})}
-							</p>
-							{uninstallExtensionConfirm.path && <small>{uninstallExtensionConfirm.path}</small>}
-							<div className="session-delete-confirm-actions">
-								<button onClick={() => setUninstallExtensionConfirm(null)}>{t("common.cancel")}</button>
-								<button className="danger" onClick={confirmUninstallExtension}>{t("config.uninstall")}</button>
-							</div>
-						</div>
-					</div>
+				{section === "config" && !loading && tab === "models" && (
+					<ModelsTab
+						data={modelsData}
+						expandedProvider={expandedProvider}
+						addingProvider={addingProvider}
+						newProviderName={newProviderName}
+						renamingProvider={renamingProvider}
+						renameValue={renameValue}
+						fetchingProvider={fetchingProvider}
+						fetchedModels={fetchedModels}
+						fetchModelsErrorByProvider={fetchModelsErrorByProvider}
+						testingProvider={testingProvider}
+						testResult={testResult}
+						testModelIdByProvider={testModelIdByProvider}
+						saving={saving}
+						ompDefault={ompDefault}
+						onSetOmpDefault={handleSetOmpDefault}
+						onClearOmpDefault={handleClearOmpDefault}
+						onToggleProvider={(name) =>
+							setExpandedProvider(expandedProvider === name ? null : name)
+						}
+						onStartAddProvider={() => {
+							setAddingProvider(true);
+							setNewProviderName("");
+						}}
+						onCancelAddProvider={() => setAddingProvider(false)}
+						onChangeNewProviderName={setNewProviderName}
+						onConfirmAddProvider={handleAddProvider}
+						onStartRename={handleStartRename}
+						onChangeRenameValue={setRenameValue}
+						onConfirmRename={handleConfirmRename}
+						onCancelRename={handleCancelRename}
+						onDeleteProvider={handleDeleteProvider}
+						onDuplicateProvider={handleDuplicateProvider}
+						onDeleteProviders={handleDeleteProviders}
+						onAddModel={handleAddModel}
+						onUpdateModel={handleUpdateModel}
+						onUpdateModelXhigh={handleUpdateModelXhigh}
+						onDeleteModel={handleDeleteModel}
+						onFetchModels={handleFetchModels}
+						onTestProvider={handleTestProvider}
+						onChangeTestModelId={(providerName, modelId) =>
+							setTestModelIdByProvider((current) => ({
+								...current,
+								[providerName]: modelId,
+							}))
+						}
+						onClearTestResult={() => setTestResult(null)}
+						onSave={handleSaveModels}
+						onChangeProvider={(name, field, value) => {
+							const provider = modelsData.providers[name];
+							if (!provider) return;
+							setModelsData({
+								...modelsData,
+								providers: {
+									...modelsData.providers,
+									[name]: { ...provider, [field]: value },
+								},
+							});
+						}}
+					/>
 				)}
 
-				{/* toast 已改用 sonner */}
-				{deleteConfirm && (
-					<div className="config-modal-overlay" onClick={() => setDeleteConfirm(null)}>
-						<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>
-							<strong>{deleteConfirm.title}</strong>
-							<p>{deleteConfirm.message}</p>
-							<div className="config-modal-actions">
-								<button className="config-btn danger" onClick={deleteConfirm.onConfirm}>
-									{t("common.delete")}
-								</button>
-								<button className="config-btn" onClick={() => setDeleteConfirm(null)}>
-									{t("common.cancel")}
-								</button>
-							</div>
-						</div>
-					</div>
+				{section === "config" && !loading && tab === "auth" && (
+					<AuthTab
+						data={authData}
+						expandedAuth={expandedAuth}
+						addingAuth={addingAuth}
+						newAuthName={newAuthName}
+						saving={saving}
+						modelsData={modelsData}
+						onToggleAuth={(name) =>
+							setExpandedAuth(expandedAuth === name ? null : name)
+						}
+						onStartAddAuth={() => {
+							setAddingAuth(true);
+							setNewAuthName("");
+						}}
+						onCancelAddAuth={() => setAddingAuth(false)}
+						onChangeNewAuthName={setNewAuthName}
+						onConfirmAddAuth={(name, key) => handleAddAuth(name, key)}
+					onDeleteAuths={handleDeleteAuths}
+					onDeleteAuth={handleDeleteAuth}
+					onUpdate={handleUpdateAuth}
+					onSave={handleSaveAuth}
+				/>
 				)}
+
+				{section === "config" && !loading && tab === "settings" && (
+					<SettingsTab
+						data={settingsData}
+						saving={saving}
+						modelsData={modelsData}
+						discoveredModels={discoveredModels}
+						onChange={setSettingsData}
+						onSave={handleSaveSettings}
+					/>
+				)}
+
+				{section === "logs" && !loading && (
+					<LogsTab />
+				)}
+
+				{section === "skills" && !loading && (
+					editingGlobalSkill ? (
+						<ModalSurface
+							open
+							onRequestClose={() => setEditingGlobalSkill(null)}
+							size="medium"
+							title={`${editingGlobalSkill.name} · SKILL.md`}
+							className="prompts-editor-modal"
+						elevated
+						>
+							{editGlobalLoading ? (
+								<div className="config-empty">{t("common.loading")}</div>
+							) : (
+								<div className="prompts-monaco-wrap">
+									<LazyMonacoEditor
+										value={editGlobalContent}
+										onChange={setEditGlobalContent}
+									/>
+							</div>
+							)}
+							{editGlobalSaved && <span className="file-diff-hint saved">{t("config.promptSavedHint")}</span>}
+						</ModalSurface>
+				) : (
+						<SkillsTab
+						data={skillsData}
+						loading={loading}
+						creating={creatingSkill}
+						newName={newSkillName}
+						newDescription={newSkillDescription}
+						newLocationId={newSkillLocationId}
+						onRefresh={refreshSkills}
+						onOpenRoot={() => api.skills.openFolder()}
+						onChangeNewName={setNewSkillName}
+						onChangeNewDescription={setNewSkillDescription}
+						onChangeNewLocation={setNewSkillLocationId}
+						onCreate={handleCreateSkill}
+						onToggle={(skill, enabled) => handleToggleSkill(skill.path, enabled)}
+						onDelete={setDeleteSkillConfirm}
+						onEdit={handleEditGlobalSkill}
+						onRename={handleRenameGlobalSkill}
+					/>
+					)
+				)}
+
+				{section === "prompts" && !loading && (
+					<PromptsTab
+						data={promptsData}
+						loading={loading}
+						creating={creatingPrompt}
+						newName={newPromptName}
+						newDescription={newPromptDescription}
+						editingTemplate={editingPrompt}
+						editContent={editPromptContent}
+						editLoading={editPromptLoading}
+						editSaving={editPromptSaving}
+						onRefresh={refreshPrompts}
+						onOpenRoot={() => api.prompts.openFolder()}
+						onChangeNewName={setNewPromptName}
+						onChangeNewDescription={setNewPromptDescription}
+						onCreate={handleCreatePrompt}
+						onDelete={confirmDeletePrompt}
+						onEdit={handleEditPrompt}
+						onRename={handleRenamePrompt}
+						onQuickSave={handleQuickSavePrompt}
+						onCancelEdit={handleCancelEditPrompt}
+						onChangeEditContent={setEditPromptContent}
+						onSaveEdit={handleSaveEditPrompt}
+					/>
+				)}
+
+				{section === "extensions" && (
+					<ExtensionsTab
+						data={extensionsData}
+						loading={extensionsLoading}
+						uninstallingSource={uninstallingExtensionSource}
+						onRefresh={() => void refreshExtensions(true)}
+						onUninstall={setUninstallExtensionConfirm}
+					/>
+				)}
+
+				{section === "editors" && !loading && (
+					<EditorsTab />
+				)}
+
+				{section === "config" && !loading && tab === "trust" && (
+					<TrustTab
+						data={trustData}
+						saving={saving}
+						onChange={setTrustData}
+						onSave={handleSaveTrust}
+					/>
+				)}
+
+				{section === "config" && !loading && tab === "raw" && (
+					<RawTab
+						fileName={rawFileName}
+						content={rawContent}
+						saving={saving}
+						onChangeFileName={handleRawFileChange}
+						onChangeContent={setRawContent}
+						onSave={handleSaveRaw}
+					/>
+				)}
+					</div>
+				</main>
 			</div>
-		</div>
+
+			{deleteSkillConfirm && (
+				<ConfirmDialog
+					title={t("config.deleteSkillConfirmTitle")}
+					message={t("config.deleteSkillConfirmBody", {
+						name: deleteSkillConfirm.name,
+					})}
+					danger
+					confirmLabel={t("common.delete")}
+					onConfirm={() => void confirmDeleteSkill()}
+					onCancel={() => setDeleteSkillConfirm(null)}
+				>
+					<small className="modal-radix-confirm-detail">{deleteSkillConfirm.path}</small>
+				</ConfirmDialog>
+			)}
+
+			{uninstallExtensionConfirm && (
+				<ConfirmDialog
+					title={t("config.uninstallExtensionTitle")}
+					message={t("config.uninstallExtensionBody", {
+						source: uninstallExtensionConfirm.source,
+					})}
+					danger
+					confirmLabel={t("config.uninstall")}
+					onConfirm={confirmUninstallExtension}
+					onCancel={() => setUninstallExtensionConfirm(null)}
+				>
+					{uninstallExtensionConfirm.path ? (
+						<small className="modal-radix-confirm-detail">{uninstallExtensionConfirm.path}</small>
+					) : null}
+				</ConfirmDialog>
+			)}
+
+			{/* toast 已改用 sonner */}
+			{deleteConfirm && (
+				<ConfirmDialog
+					title={deleteConfirm.title}
+					message={deleteConfirm.message}
+					danger
+					confirmLabel={t("common.delete")}
+					onConfirm={deleteConfirm.onConfirm}
+					onCancel={() => setDeleteConfirm(null)}
+				/>
+			)}
+		</ModalSurface>
 	);
 }
 
