@@ -99,6 +99,23 @@ All notable changes to PiDeck are documented here.
   the pre-mutation grouping until the next 30 s poll; the fallback refresh ran
   while the mutation lock was still held and was merged away. It now runs after
   the lock is released, silently, so the error message stays on screen.
+- **A failed re-attach after compaction no longer reports success** — When pi exits
+  during `/compact`, the compaction may already be on disk and OmpDeck re-attaches to
+  the same session. A failed re-attach used to be swallowed: `compact()` still resolved,
+  the UI showed "Context compacted", and the session was in fact unusable. The failure
+  now surfaces with its reason.
+- **A model-restore failure no longer marks a live session closed** — When the new
+  process came up but `set_model` was rejected, the session was fully usable yet shown
+  as closed with a "restart manually" hint. That case is now a retryable error state;
+  only an actual process restart failure shows as closed.
+- **Saving settings keeps in-flight edits** — After a save the settings are re-read from
+  disk (omp may normalize written values); anything typed during that window was
+  overwritten by an older disk value and the draft was marked clean. Only fields the
+  user did not touch again are aligned now, and clicking Save no longer goes silent
+  because the click event was mistaken for its argument.
+- **Saving a model preset keeps other unsaved edits** — Preset save/delete only writes
+  `modelPresets` but rebuilt the drafts of cycle order, fallback chains, provider order
+  and roleStorage, discarding unsaved text. Each surface is now refreshed on its own.
 
 ## v0.6.7 - 2026-07-29
 

@@ -101,7 +101,7 @@ Visual editors for Models (provider cards + model grid), Auth (API key managemen
 
 ![Slash commands and session history](docs/images/slash-commands.png)
 
-Built-in slash command suggestions panel with descriptions, alongside the session history drawer for browsing and restoring past conversations.
+Built-in slash command suggestions panel with descriptions; past conversations are browsed and restored from the project menu session manager and the sidebar session list.
 
 ### File Tree & Session Actions
 
@@ -129,7 +129,7 @@ OmpDeck
 ├─ React Renderer
 │  ├─ Project & agent list
 │  ├─ Chat timeline with streaming
-│  ├─ File / history drawers
+│  ├─ File / Git / browser drawers
 │  ├─ Configuration and Skill modal (Configuration / Skills)
 │  ├─ Agent-scoped Terminal Dock
 │  ├─ Model & context status bar
