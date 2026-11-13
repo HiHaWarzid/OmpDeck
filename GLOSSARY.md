@@ -247,9 +247,12 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 ### 面板钉选（Pinned）
 钉选后：关闭按钮失效（只能用「取消钉选」）、切换其他工具 Tab 无效（`openPanel` 被拒）、面板在项目切换时随记录恢复。钉选按项目存储。
 
-**清盘只在项目真正被删除时发生**（`project-removed` 意图）：删项目、删 worktree 的子项目。**不在可见项目列表缩小时清盘**——`projects` 是按 WSL/Windows 环境过滤后的列表，另一个环境的项目会临时「消失」，据此裁剪会误删它们的钉选记录。
+**清盘只在项目记录真正消失时发生**（`projects-removed` 意图，host 方法 `forgetProjects(ids)`）：删项目、删 worktree 的子项目、关闭工作区模式（`ProjectStore.clearWorktreeChildren` 清空该父项目下全部子项目）。**不在可见项目列表缩小时清盘**——`projects` 是按 WSL/Windows 环境过滤后的列表，另一个环境的项目会临时「消失」，据此裁剪会误删它们的钉选记录。
 
-判定「真正被删除」用**前后列表差集**，而不是比对被点的那一个 id：删除父项目时 `ProjectStore.remove` 会按 `worktreeParentId` 连带删掉它的 worktree 子项目，子项目的记录同样不能留下。
+判定「真正消失」用**前后列表差集**，且差集计算只有一份实现（`App.syncVanishedProjects`）：`remove` 与 `toggleWorktreeEnabled` 都会连带删掉一批项目记录，曾被点的那一个 id 不足以描述结果。清盘接口按**集合**而非单个 id 表达，正是为了让新增删除路径不会漏掉其中一部分。
+
+### ToolPanel 与 sessions 入口分离
+`openPanel` 只接受 `ToolPanel`（`files` / `git` / `browser`），历史会话面板必须走 `openSessions(projectId)`。两条入口的持久化语义不同：工具面板落盘并按项目恢复，历史会话面板不落盘、靠 `sessionsProjectId` 触发按项目刷新。合并成一个接受 `DrawerPanel` 的入口会让调用方误以为 `openPanel("sessions")` 等价于 `openSessions(id)`。
 
 ### 已知历史值（`editor`）
 旧版把 `editor` 当成独立面板值。现在编辑器是 files 的子视图：`DrawerPanel` 类型不再含 `editor`，只有 localStorage 读入时接受该值并折叠为 `files`（`normalizePanel`）。
