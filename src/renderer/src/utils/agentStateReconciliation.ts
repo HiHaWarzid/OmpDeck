@@ -20,8 +20,6 @@ export interface AgentStateReconciliation {
 	nextActiveAgentId: string | undefined;
 	/** 当前仍存活的 agent id 集合（含 pending），用于裁剪 per-agent 状态。 */
 	draftIds: Set<string>;
-	/** 当前有真实 agent 的 project id 集合，用于按项目裁剪 drawerPinned。 */
-	activeProjectIds: Set<string>;
 }
 
 export function reconcileAgentState(
@@ -60,7 +58,6 @@ export function reconcileAgentState(
 			...nextAgents.map((agent) => agent.id),
 			...remainingPendingAgents.map((agent) => agent.id),
 		]),
-		activeProjectIds: new Set(nextAgents.map((agent) => agent.projectId)),
 	};
 }
 

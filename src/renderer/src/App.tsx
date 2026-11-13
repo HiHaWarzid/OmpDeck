@@ -141,6 +141,8 @@ import { useAgentSessions, isPendingAgentId } from "./hooks/useAgentSessions";
 import { useProjectTree } from "./hooks/useProjectTree";
 import { useAgentLifecycle } from "./hooks/useAgentLifecycle";
 import { useSessionImport } from "./hooks/useSessionImport";
+import { useSessionPanelHost } from "./hooks/useSessionPanelHost";
+import { isToolPanel } from "./components/app/panel/sessionPanelState";
 import { reconcileAgentState, sameAgentTabList } from "./utils/agentStateReconciliation";
 import { sessionWorkspaceStore } from "./workspace/store";
 import { useWorkspaceSlice } from "./workspace/hooks";
@@ -192,7 +194,7 @@ import {
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
 } from "./components/app/widgets/widgetKeys";
-import type { DrawerPanel, WidgetLine } from "./components/app/types";
+import type { WidgetLine } from "./components/app/types";
 import { BROWSER_HOME_URL, navigateTo } from "./components/app/browserNavigation";
 import { ConversationOutlineHost, ConversationPane, type ConversationPaneHandle } from "./components/app/ConversationPane";
 import { SidebarTree } from "./components/app/sidebar/SidebarTree";
@@ -333,7 +335,6 @@ const COMPOSER_DOCK_CHIP_ROW_HEIGHT = 34;
 // dock 展开块的可用性下限；与 chip 行一起构成终端高度预算里给 dock 预留的空间。
 const COMPOSER_DOCK_MIN_BODY_HEIGHT = 120;
 const COMPOSER_DOCK_MIN_HEIGHT = COMPOSER_DOCK_CHIP_ROW_HEIGHT + COMPOSER_DOCK_MIN_BODY_HEIGHT;
-const DRAWER_ANIMATION_MS = 120;
 const TERMINAL_DOCK_MOTION_MS = 180;
 const AGENT_CREATE_TIMEOUT_MS = 60_000;
 // 共享空分支信息：GitPanel / composer 分支栏都读这份默认值，且 GitPanel 的 memo 判据
@@ -500,7 +501,6 @@ export function App() {
     getLivePrompt, setLivePrompt, setNativePrompt, stageLivePrompt,
     attachedImagesByAgent, setAttachedImagesForAgent,
     terminalDockStateByOwner, setTerminalDockOpen, setTerminalDockCollapsed, pruneTerminalDock,
-    drawerPinnedByProject, setDrawerPinnedByProject,
     promptHistory, setPromptHistory, promptHistoryRef, promptHistoryInitedRef,
     migratePerAgentState, commitPendingToReal,
   } = useAgentLifecycle({
@@ -781,19 +781,6 @@ export function App() {
   	y: number;
   	projectId: string;
   } | null>(null);
-  /** 编辑器展示模式：弹框或侧栏 */
-  const [editorMode, setEditorMode] = useState<"modal" | "drawer">("drawer");
-  const toggleEditorMode = useCallback(() => {
-    setEditorMode((prev) => {
-      const next = prev === "modal" ? "drawer" : "modal";
-      if (next === "drawer") {
-        // 侧栏编辑器挂在「文件」Tab 下，避免切到独立 editor 面板后丢失 Files/Git/Browser chrome
-        setDrawer("files");
-        setDrawerCollapsed(false);
-      }
-      return next;
-    });
-  }, []);
   /** Editor tab：文件中转查看/差异查看。条数与正文估算内存双重受限。 */
   const EDITOR_TAB_LIMIT = 5;
   const EDITOR_TAB_TEXT_BUDGET = 24 * 1024 * 1024;
@@ -839,9 +826,7 @@ export function App() {
       return;
     }
     // 最小化必须真正恢复 Git 抽屉，不能只移除 modal 后把用户留在其他面板。
-    lastToolDrawerRef.current = "git";
-    setDrawer("git");
-    setDrawerCollapsed(false);
+    panelHost.openPanel("git");
     setGitDiffDisplayMode("drawer");
   }, [gitDiffDisplayMode]);
   const editorTabAccessSequenceRef = useRef(0);
@@ -1083,100 +1068,10 @@ export function App() {
   const transcriptRuntime = transcriptRuntimeRef.current;
 
   // compact 在途标志按条目存放（composer 切片），不再是根级 boolean。
-  const [drawer, setDrawer] = useState<DrawerPanel | null>(null);
+  // 右侧面板（文件/Git/浏览器/历史会话）的状态与规则全部归 useSessionPanelHost 所有：
+  // 根组件只读派生视图、调意图方法（声明在 settings 之后，因为 Git 开关来自 settings）。
 
-  useEffect(() => {
-    // 详情仍在抽屉模式时，用户切换到其他面板应关闭快照，并且即使内容尚未返回也要废弃在途读取；
-    // modal 模式允许底层面板变化，最小化时会显式恢复 Git 抽屉。
-    if (drawer !== "git" && gitDiffDisplayMode === "drawer") {
-      gitDiffRequestSequenceRef.current += 1;
-      if (gitDrawerDiff) setGitDrawerDiff(null);
-    }
-  }, [drawer, gitDiffDisplayMode, gitDrawerDiff]);
 
-  // ── 按项目目录持久化抽屉面板状态和展开目录（localStorage） ──
-  // 文件侧边栏属于项目目录，所有在该项目下运行的 agent 共享同一套展开与面板状态。
-  const PROJECT_DRAWER_KEY_PREFIX = "pid:project-drawer:";
-  const PROJECT_EXPANDED_DIRS_KEY_PREFIX = "pid:project-expanded-dirs:";
-
-  const saveDrawerState = useCallback((projectId: string, panel: DrawerPanel | null, pinned: boolean) => {
-    try {
-      localStorage.setItem(PROJECT_DRAWER_KEY_PREFIX + projectId, JSON.stringify({ panel, pinned }));
-    } catch { /* localStorage 不可用时静默忽略 */ }
-  }, []);
-
-  const loadDrawerState = useCallback((projectId: string): { panel: DrawerPanel | null; pinned: boolean } | null => {
-    try {
-      const key = PROJECT_DRAWER_KEY_PREFIX + projectId;
-      let raw = localStorage.getItem(key);
-      if (!raw) {
-        // 兼容旧版按 agent 保存的数据：尝试从该项目的任意 agent 读取并迁移到项目级
-        const legacyAgents = agentsRef.current.filter((a) => a.projectId === projectId).map((a) => a.id);
-        for (const agentId of legacyAgents) {
-          const oldKey = `pid:agent-drawer:${agentId}`;
-          const value = localStorage.getItem(oldKey);
-          if (value) {
-            if (!localStorage.getItem(key)) localStorage.setItem(key, value);
-            localStorage.removeItem(oldKey);
-            raw = value;
-            break;
-          }
-        }
-      }
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object" && (parsed.panel === null || ["files", "sessions", "browser", "editor", "git"].includes(parsed.panel))) {
-          return parsed;
-        }
-      }
-    } catch { /* ignore */ }
-    return null;
-  }, []);
-
-  const saveExpandedDirs = useCallback((projectId: string, dirs: Set<string>) => {
-    try {
-      localStorage.setItem(PROJECT_EXPANDED_DIRS_KEY_PREFIX + projectId, JSON.stringify([...dirs]));
-    } catch { /* ignore */ }
-  }, []);
-
-  const loadExpandedDirs = useCallback((projectId: string): Set<string> => {
-    try {
-      const key = PROJECT_EXPANDED_DIRS_KEY_PREFIX + projectId;
-      let raw = localStorage.getItem(key);
-      if (!raw) {
-        const legacyAgents = agentsRef.current.filter((a) => a.projectId === projectId).map((a) => a.id);
-        for (const agentId of legacyAgents) {
-          const oldKey = `pid:agent-expanded-dirs:${agentId}`;
-          const value = localStorage.getItem(oldKey);
-          if (value) {
-            if (!localStorage.getItem(key)) localStorage.setItem(key, value);
-            localStorage.removeItem(oldKey);
-            raw = value;
-            break;
-          }
-        }
-      }
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) return new Set(arr);
-      }
-    } catch { /* ignore */ }
-    return new Set();
-  }, []);
-  const [renderedDrawer, setRenderedDrawer] = useState<DrawerPanel | null>(null);
-  const drawerUnmountTimerRef = useRef<number | null>(null);
-  /** 打开文件编辑器前所在的抽屉面板（兼容旧路径）；新路径编辑器固定挂在 files Tab */
-  const prevDrawerPanelRef = useRef<DrawerPanel | null>(null);
-  /** 最近一次右侧工具 Tab（文件/Git/浏览器），供标题栏一键展开恢复 */
-  const lastToolDrawerRef = useRef<"files" | "git" | "browser">("files");
-  // 兼容旧路径：drawer=editor 统一落到 files Tab（编辑器作为 files 子视图）
-  useEffect(() => {
-    if (drawer === "editor") {
-      lastToolDrawerRef.current = "files";
-      setDrawer("files");
-    }
-  }, [drawer]);
-  const [sessionsProjectId, setSessionsProjectId] = useState<string>();
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [afkOpen, setAfkOpen] = useState(false);
@@ -1256,6 +1151,46 @@ export function App() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+  // 右侧面板（文件/Git/浏览器/历史会话）的唯一所有者：状态、持久化、收起动画、
+  // 钉选与 Git 开关规则都在 useSessionPanelHost 里，App 只消费派生视图 + 意图方法。
+  const panelHost = useSessionPanelHost({
+    activeProjectId,
+    gitEnabled: settings.enableGitManagement,
+    legacyAgentIdsFor: (projectId) =>
+      agentsRef.current
+        .filter((agent) => agent.projectId === projectId)
+        .map((agent) => agent.id),
+    onRefreshFiles: (projectId) => void refreshFiles(projectId, true),
+  });
+  const drawer = panelHost.panel;
+  const drawerCollapsed = panelHost.collapsed;
+  const drawerPinned = panelHost.pinned;
+  const drawerContentPanel = panelHost.contentPanel;
+  const expandedDirs = panelHost.expandedDirs;
+  const sessionsProjectId = panelHost.sessionsProjectId;
+
+  useEffect(() => {
+    // 详情仍在抽屉模式时，用户切换到其他面板应关闭快照，并且即使内容尚未返回也要废弃在途读取；
+    // modal 模式允许底层面板变化，最小化时会显式恢复 Git 抽屉。
+    if (drawer !== "git" && gitDiffDisplayMode === "drawer") {
+      gitDiffRequestSequenceRef.current += 1;
+      if (gitDrawerDiff) setGitDrawerDiff(null);
+    }
+  }, [drawer, gitDiffDisplayMode, gitDrawerDiff]);
+
+  /** 编辑器展示模式：弹框或侧栏 */
+  const [editorMode, setEditorMode] = useState<"modal" | "drawer">("drawer");
+  // host 对象每次渲染都是新的；意图方法本身恒定，取出来当依赖才能保住这个回调的引用稳定。
+  const { openPanel: openDrawerPanel } = panelHost;
+  const toggleEditorMode = useCallback(() => {
+    const next = editorMode === "modal" ? "drawer" : "modal";
+    setEditorMode(next);
+    // 侧栏编辑器挂在「文件」Tab 下，避免切到独立 editor 面板后丢失 Files/Git/Browser chrome。
+    // 打开面板是副作用，必须留在 updater 之外：StrictMode 会二次调用 updater，
+    // 面板归约会因此重复发 persist / refresh-files 两种副作用。
+    if (next === "drawer") openDrawerPanel("files");
+  }, [editorMode, openDrawerPanel]);
+
   // 后台 ask 通知去重：同一 requestId 只弹一次（扩展可能重发同一请求）。
   const notifiedAskRequestIdsRef = useRef<Set<string>>(new Set());
   const [piProxyNotice, setPiProxyNotice] = useState("");
@@ -1432,8 +1367,6 @@ export function App() {
   useEffect(() => {
     lastCollapseProjectRef.current = activeProjectId;
   }, [activeProjectId]);
-  const [drawerCollapsed, setDrawerCollapsed] = useState(false);
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const chatPaneRef = useRef<HTMLElement | null>(null);
   const sessionComboRef = useRef<HTMLDivElement | null>(null);
   const chatHeaderRef = useRef<HTMLElement | null>(null);
@@ -1452,76 +1385,6 @@ export function App() {
   const projectDragPreventClickRef = useRef(false);
 
   const scratchPad = useScratchPad();
-
-  // 当活跃项目切换时，从 localStorage 恢复该项目的抽屉面板状态和展开目录。
-  // 文件侧边栏属于项目目录，因此按 projectId 持久化，同一项目下的不同 agent 共享状态。
-  useEffect(() => {
-    if (!activeProjectId) {
-      setDrawer(null);
-      setDrawerPinnedByProject((current) => current);
-      setExpandedDirs(new Set());
-      return;
-    }
-    const projectId = activeProjectId;
-    const savedState = loadDrawerState(projectId);
-    if (savedState) {
-      const panel: DrawerPanel | null = savedState.panel;
-      const canRestorePanel = panel !== "git" || settings.enableGitManagement;
-      if (savedState.pinned && panel && canRestorePanel) {
-        setDrawerPinnedByProject((current) => {
-          if (current[projectId] === panel) return current;
-          return { ...current, [projectId]: panel };
-        });
-      } else {
-        setDrawerPinnedByProject((current) => {
-          const next = { ...current };
-          delete next[projectId];
-          return next;
-        });
-      }
-      if (panel && canRestorePanel) {
-        if (panel === "files" || panel === "git" || panel === "browser") {
-          lastToolDrawerRef.current = panel;
-        }
-        if (panel === "sessions") {
-          // 恢复历史会话面板时同步归属项目：下方 freshness effect 依赖它按当前项目刷新列表，
-          // 否则恢复路径会展示上一个项目的残留数据（删除/复制等操作也会落到错误的项目）。
-          setSessionsProjectId(projectId);
-        }
-        setDrawer(panel);
-        setDrawerCollapsed(false);
-      } else {
-        setDrawer(null);
-      }
-    } else {
-      // 该项目没有持久化记录时，明确关闭抽屉并清除钉选，避免上一项目的状态泄漏。
-      setDrawer(null);
-      setDrawerPinnedByProject((current) => {
-        const next = { ...current };
-        delete next[projectId];
-        return next;
-      });
-    }
-    const dirs = loadExpandedDirs(projectId);
-    setExpandedDirs(dirs);
-  }, [activeProjectId, loadDrawerState, loadExpandedDirs, settings.enableGitManagement]);
-
-  useEffect(() => {
-    if (settings.enableGitManagement) return;
-
-    // 关闭功能时同步移除当前项目的 Git 抽屉及钉选状态，避免隐藏入口后留下无法操作的面板。
-    setDrawer((current) => current === "git" ? null : current);
-    setDrawerPinnedByProject((current) => {
-      const next = Object.fromEntries(
-        Object.entries(current).filter(([, panel]) => panel !== "git"),
-      );
-      return Object.keys(next).length === Object.keys(current).length ? current : next;
-    });
-    if (activeProjectId) {
-      const saved = loadDrawerState(activeProjectId);
-      if (saved?.panel === "git") saveDrawerState(activeProjectId, null, false);
-    }
-  }, [activeProjectId, loadDrawerState, saveDrawerState, settings.enableGitManagement]);
 
   // 历史会话面板激活时总是拉取最新列表：抽屉面板会随项目从 localStorage 恢复，
   // 若只在显式打开时刷新，恢复路径会展示上一个项目的残留列表或空列表（表现为“点了没反应”）。
@@ -1622,10 +1485,6 @@ export function App() {
     };
   }, [activeTerminalOwnerKey, terminalDockOwnerKey, terminalDockMounted, terminalOpen]);
 
-  const drawerPinnedPanel = activeProjectId
-    ? drawerPinnedByProject[activeProjectId]
-    : undefined;
-  const drawerPinned = Boolean(drawerPinnedPanel);
   // dock chip 的 TODO 进度；任务列表本体仍由 NativeTodoPanel 渲染，计数与“上一轮”判定
   // 走同一个 helper，避免 chip 标签和列表里的来源提示各算一套。
   const activeRuntimeState = agentRuntimeState;
@@ -1741,39 +1600,6 @@ export function App() {
         Math.max(0, composerChrome - dockHeight),
     ),
   );
-  const drawerContentPanel = drawer && !drawerCollapsed ? drawer : renderedDrawer;
-
-  useEffect(() => {
-    if (!drawerPinnedPanel) return;
-    if (drawer !== drawerPinnedPanel) setDrawer(drawerPinnedPanel);
-    if (drawerCollapsed) setDrawerCollapsed(false);
-  }, [drawer, drawerCollapsed, drawerPinnedPanel]);
-
-  useEffect(() => {
-    if (drawerUnmountTimerRef.current) {
-      window.clearTimeout(drawerUnmountTimerRef.current);
-      drawerUnmountTimerRef.current = null;
-    }
-
-    if (drawer && !drawerCollapsed) {
-      setRenderedDrawer(drawer);
-      return;
-    }
-
-    if (!renderedDrawer) return;
-    // 抽屉收回时保留最后内容，等 Grid 列宽过渡结束后再卸载；否则文字会先消失，再空壳收回。
-    drawerUnmountTimerRef.current = window.setTimeout(() => {
-      setRenderedDrawer(null);
-      drawerUnmountTimerRef.current = null;
-    }, DRAWER_ANIMATION_MS);
-
-    return () => {
-      if (drawerUnmountTimerRef.current) {
-        window.clearTimeout(drawerUnmountTimerRef.current);
-        drawerUnmountTimerRef.current = null;
-      }
-    };
-  }, [drawer, drawerCollapsed, renderedDrawer]);
 
   useEffect(() => {
     document.documentElement.lang = resolvedLocale;
@@ -2038,7 +1864,6 @@ export function App() {
         pendingReplacementById,
         nextActiveAgentId,
         draftIds,
-        activeProjectIds,
       } = reconcileAgentState(
         pendingAgentsRef.current,
         nextAgents,
@@ -2052,8 +1877,9 @@ export function App() {
       // 让近千行侧栏子树跟着 20Hz 重渲染（见 sameAgentTabList 注释）。
       setAgents((current) => (sameAgentTabList(current, nextAgents) ? current : nextAgents));
       setActiveAgentId(nextActiveAgentId);
-      // 原子迁移所有 per-agent 状态切片（prompt/images/terminalDock/drawerPinned/promptHistory）
-      migratePerAgentState(pendingReplacementById, draftIds, activeProjectIds);
+      // 原子迁移所有 per-agent 状态切片（prompt/images/terminalDock/promptHistory）；
+      // 面板钉选归 host 的 pinnedByProject，不在这个迁移集里。
+      migratePerAgentState(pendingReplacementById, draftIds);
       // transcript 条目对账：迁移重启占位期间的消息、回收已关闭 agent 的条目。
       // liveIds 必须含占位（重启占位参与 liveIds），避免旧进程移除时聊天记录闪空。
       reconcileTranscriptEntries(pendingReplacementById, draftIds);
@@ -2077,9 +1903,7 @@ export function App() {
     // 直接在原始 runtimeState 事件上识别 tool true→false，避免 React 把很快的
     // tool_start/tool_end 批量成一次 render 后漏掉 steer 的投递窗口。
     const offOpenInBrowser = api.app.onOpenInBrowser?.((url: string) => {
-      lastToolDrawerRef.current = "browser";
-      setDrawer("browser");
-      setDrawerCollapsed(false);
+      panelHost.openPanel("browser");
       navigateTo(url);
     });
     const offRuntimeState = api.agents.onRuntimeState((payload) => {
@@ -2331,6 +2155,9 @@ export function App() {
     setSessionLoadingByProject((current) =>
       pruneRecordKeys(current, projectIds),
     );
+    // 面板钉选不在这里按可见项目裁剪：projects 只是当前环境过滤后的可见列表，
+    // 切到 WSL/Windows 模式会让另一半项目临时“消失”，据此裁剪会误删它们的钉选与持久化记录。
+    // 真正的删除走 updateAfterProjectRemoved → panelHost.forgetProject。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectIdsKey]);
 
@@ -2642,7 +2469,8 @@ export function App() {
       );
     }
 
-    setExpandedDirs(new Set());
+    // 展开目录不在这里清空：host 的项目恢复已按新项目加载并落盘，此处再置空
+    // 会把刚恢复的目录连同持久化记录一起抹掉。
     void api.files
       .list(activeProjectId)
       .then(setFiles)
@@ -2731,10 +2559,7 @@ export function App() {
     setActiveTabId(null);
     setEditorTabs([]);
     setEditorMode("drawer");
-    prevDrawerPanelRef.current = null;
-    lastToolDrawerRef.current = "files";
-    setDrawer("files");
-    setDrawerCollapsed(false);
+    panelHost.openPanel("files");
   }
 
   function viewFilePath(path: string) {
@@ -2743,10 +2568,7 @@ export function App() {
     openEditorTab(path, "view");
     // 侧栏编辑器嵌在「文件」Tab 内，顶部 Files/Git/Browser 始终可见，可一键返回文件树
     setEditorMode("drawer");
-    prevDrawerPanelRef.current = "files";
-    lastToolDrawerRef.current = "files";
-    setDrawer("files");
-    setDrawerCollapsed(false);
+    panelHost.openPanel("files");
   }
 
   function diffFilePath(path: string, originalContent?: string, content?: string) {
@@ -2762,7 +2584,7 @@ export function App() {
     // 工具 diff 与 Git diff 共享弹窗层；打开普通 diff 时先关闭 Git 快照，避免两个 backdrop 叠加。
     closeGitDiff();
     setEditorMode("modal");
-    setDrawer(null);
+    panelHost.hide();
     openEditorTab(path, "diff", resolvedOriginal, resolvedModified);
   }
 
@@ -2855,10 +2677,8 @@ export function App() {
   async function openProjectSessions(project: Project) {
     setProjectMenu(null);
     setActiveProjectId(project.id);
-    setSessionsProjectId(project.id);
     setSessions([]);
-    setDrawer("sessions");
-    setDrawerCollapsed(false);
+    panelHost.openSessions(project.id);
     await refreshSessionHistory(project.id);
   }
 
@@ -3182,13 +3002,15 @@ export function App() {
       return updated;
     });
     forgetProject(removedProjectId);
+    // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
+    // 所以「调了 remove」不等于「记录真没了」。只有确认它从可见列表里消失才清面板记录，
+    // 否则聊天项目会在一次无效删除后丢掉自己的面板与钉选。
+    const existedBefore = projectsRef.current.some((project) => project.id === removedProjectId);
+    const stillExists = next.some((project) => project.id === removedProjectId);
+    if (existedBefore && !stillExists) panelHost.forgetProject(removedProjectId);
     if (activeProjectId === removedProjectId) {
       setActiveProjectId(next[0]?.id);
       setActiveAgentId(undefined);
-    }
-    if (sessionsProjectId === removedProjectId) {
-      setSessionsProjectId(undefined);
-      if (drawer === "sessions") setDrawer(null);
     }
   }
 
@@ -4544,8 +4366,15 @@ export function App() {
       if (!removed) {
         throw new Error(t("app.worktreeRemoveNotFound"));
       }
+      const before = new Set(projectsRef.current.map((project) => project.id));
       const next = await api.projects.list();
       setProjects(next);
+      // 主进程连带删掉了该 worktree 的子项目记录；这里同步清它的面板钉选与持久化记录，
+      // 否则同一路径再次注册成项目时会带着旧面板回来。
+      const alive = new Set(next.map((project) => project.id));
+      for (const projectId of before) {
+        if (!alive.has(projectId)) panelHost.forgetProject(projectId);
+      }
       await refreshWorktrees(parentProjectId);
       showToast(t("app.worktreeRemoved"));
     } catch (e) {
@@ -4597,124 +4426,56 @@ export function App() {
     });
   }
 
-  /** 右侧工具栏 Tab 面板（文件/Git/浏览器），与 editor/sessions 区分 */
-  function isToolDrawerPanel(panel: DrawerPanel | null | undefined): panel is "files" | "git" | "browser" {
-    return panel === "files" || panel === "git" || panel === "browser";
-  }
-
-  function openDrawer(panel: DrawerPanel) {
-    if (panel === "git" && !settings.enableGitManagement) return;
-    if (drawerPinned && panel !== drawerPinnedPanel) return;
-    if (panel !== "git") setGitDrawerDiff(null);
-    if (panel === "sessions" && activeProjectId) {
-      setSessionsProjectId(activeProjectId);
-      void refreshSessions(activeProjectId);
-    }
-    // 打开文件面板时触发一次静默刷新，确保目录结构是最新的，避免上次打开时文件已有变更但未刷新。
-    if (panel === "files" && activeProjectId) {
-      void refreshFiles(activeProjectId, true);
-    }
-    if (isToolDrawerPanel(panel)) {
-      lastToolDrawerRef.current = panel;
-    }
-    setDrawer((current) => {
-      if (current === panel) return drawerPinned ? current : null;
-      // 持久化当前项目的抽屉面板状态
-      if (activeProjectId) saveDrawerState(activeProjectId, panel, drawerPinned);
-      return panel;
-    });
-  }
-
-  /** 切换右侧工具 Tab：始终打开目标面板，不走 openDrawer 的“再点一次关闭”逻辑 */
+  /** 切换右侧工具 Tab：始终打开目标面板（不走标题栏按钮的折叠/展开切换） */
   function switchToolDrawer(panel: "files" | "git" | "browser") {
-    if (panel === "git" && !settings.enableGitManagement) return;
-    if (drawerPinned && drawerPinnedPanel && drawerPinnedPanel !== panel) return;
-    if (panel !== "git") setGitDrawerDiff(null);
-    if (panel === "files" && activeProjectId) {
-      void refreshFiles(activeProjectId, true);
-    }
-    lastToolDrawerRef.current = panel;
-    setDrawerCollapsed(false);
-    if (activeProjectId) saveDrawerState(activeProjectId, panel, drawerPinned);
-    setDrawer(panel);
+    // Git 开关与钉选互斥规则在归约里统一裁决；被拒时面板与详情快照都保持原样。
+    const accepted = panelHost.openPanel(panel);
+    if (accepted && panel !== "git") setGitDrawerDiff(null);
   }
 
   /** 标题栏右侧按钮：关闭态打开上次工具面板；展开态折叠；已折叠则展开 */
   function toggleRightDrawer() {
-    if (!drawer) {
-      const preferred =
-        lastToolDrawerRef.current === "git" && !settings.enableGitManagement
-          ? "files"
-          : lastToolDrawerRef.current;
-      switchToolDrawer(preferred);
-      return;
-    }
-    if (drawerCollapsed) {
-      setDrawerCollapsed(false);
-      return;
-    }
-    if (drawerPinned) return;
-    setDrawerCollapsed(true);
+    panelHost.toggleHeader();
   }
 
   function closeDrawer() {
+    // 钉选时关闭是空操作：连 Git 详情快照也不该被清掉，否则面板开着但详情消失。
     if (drawerPinned) return;
-    if (activeProjectId) saveDrawerState(activeProjectId, null, false);
     setGitDrawerDiff(null);
-    setDrawer(null);
-  }
-
-  function collapseDrawer() {
-    if (drawerPinned) return;
-    setDrawerCollapsed(true);
+    panelHost.close();
   }
 
   function toggleDrawerPinned() {
-    if (!activeProjectId || !drawer) return;
-    const willPin = !drawerPinned;
-    setDrawerPinnedByProject((current) => {
-      const next = { ...current };
-      if (next[activeProjectId]) delete next[activeProjectId];
-      else next[activeProjectId] = drawer;
-      return next;
-    });
-    // 持久化钉选状态
-    saveDrawerState(activeProjectId, drawer, willPin);
+    panelHost.togglePin();
+  }
+
+  function collapseDrawer() {
+    panelHost.collapse();
   }
 
   function toggleDirectory(path: string) {
-    // 文件树默认折叠,只有用户显式展开目录才显示子项,避免大仓库一打开就产生视觉噪音。
-    setExpandedDirs((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      // 持久化展开状态到 localStorage，切换回此项目时恢复
-      if (activeProjectId) saveExpandedDirs(activeProjectId, next);
-      return next;
-    });
+    panelHost.toggleDirectory(path);
   }
 
   function collapseAllDirectories() {
-    const collapsedDirs = new Set<string>();
-    setExpandedDirs(collapsedDirs);
-    // 全部收起同样持久化，避免用户切换项目后又恢复此前展开的目录。
-    if (activeProjectId) saveExpandedDirs(activeProjectId, collapsedDirs);
+    panelHost.collapseAllDirectories();
   }
 
+  /**
+   * 全部展开只描述“展开哪些目录”，目录集合来自当前文件树；持久化与状态写入仍归 host。
+   * 遍历留在 App，因为 files 树是 App 的输入，host 不该知道文件内容。
+   */
   function expandAllDirectories() {
-    // 收集当前文件树中的所有目录路径并全部展开，方便用户快速浏览完整结构。
     const allDirs = new Set<string>();
     const collectDirs = (nodes: FileTreeNode[]) => {
       for (const node of nodes) {
-        if (node.type === "directory") {
-          allDirs.add(node.path);
-          if (node.children) collectDirs(node.children);
-        }
+        if (node.type !== "directory") continue;
+        allDirs.add(node.path);
+        if (node.children) collectDirs(node.children);
       }
     };
     collectDirs(files);
-    setExpandedDirs(allDirs);
-    if (activeProjectId) saveExpandedDirs(activeProjectId, allDirs);
+    panelHost.replaceExpandedDirs(allDirs);
   }
 
   function startResize(target: "list" | "drawer", event: PointerEvent) {
@@ -4743,7 +4504,7 @@ export function App() {
             Math.max(minDrawerWidth, startDrawerWidth - delta),
           );
           latestDrawerWidth = next;
-          setDrawerCollapsed(!drawerPinned && next <= 190);
+          panelHost.resizeCollapse(next <= 190);
           setDrawerWidthState(next);
         }
       });
@@ -4821,17 +4582,13 @@ export function App() {
     }
     const fileUrl = 'file:///' + filePath.split('\\').join('/');
     navigateTo(fileUrl);
-    lastToolDrawerRef.current = "browser";
-    setDrawer("browser");
-    setDrawerCollapsed(false);
+    panelHost.openPanel("browser");
   };
 
   /** 侧栏官网入口：走内置浏览器面板，不再把用户甩到系统默认浏览器 */
   const handleOpenHomepageInBrowser = () => {
     navigateTo(BROWSER_HOME_URL);
-    lastToolDrawerRef.current = "browser";
-    setDrawer("browser");
-    setDrawerCollapsed(false);
+    panelHost.openPanel("browser");
   };
 
   // SidebarTree 是 memo 边界：侧栏处理函数每帧重建会让浅比较恒失败，
@@ -4872,7 +4629,7 @@ export function App() {
           "--list-width": `${listCollapsed ? 0 : listWidth}px`,
           "--list-expanded-width": `${listWidth}px`,
           "--list-hover-width": `${Math.max(190, listWidth)}px`,
-          // Grid 列宽过渡期间保留内容；退出结束后再由 renderedDrawer 卸载。
+          // Grid 列宽过渡期间保留内容；过渡结束后再由 panelHost.contentPanel 卸载。
           "--drawer-width": `${drawer && !drawerCollapsed ? drawerWidth : 0}px`,
           "--drawer-col-w": `${drawer && !drawerCollapsed ? drawerWidth : 0}px`,
           "--drawer-splitter-w": `${drawer && !drawerCollapsed ? 6 : 0}px`,
@@ -6213,7 +5970,7 @@ export function App() {
         data-rendered={Boolean(drawerContentPanel)}
       >
         {/* editor 面板已并入 files 子视图；渲染时把残留 editor 视作 files，避免 chrome 闪断 */}
-        {(isToolDrawerPanel(drawerContentPanel) || drawerContentPanel === "editor") && !drawerCollapsed && !(drawerContentPanel === "browser" && browserFullscreen) ? (
+        {isToolPanel(drawerContentPanel) && !drawerCollapsed && !(drawerContentPanel === "browser" && browserFullscreen) ? (
           <>
             {/* 统一右侧工具栏：文件 / Git / 浏览器 Tab，避免各面板再套一层大标题头 */}
             <div className="drawer-chrome">
@@ -6221,8 +5978,8 @@ export function App() {
                 <button
                   type="button"
                   role="tab"
-                  className={`drawer-tab${drawerContentPanel === "files" || drawerContentPanel === "editor" ? " active" : ""}`}
-                  aria-selected={drawerContentPanel === "files" || drawerContentPanel === "editor"}
+                  className={`drawer-tab${drawerContentPanel === "files" ? " active" : ""}`}
+                  aria-selected={drawerContentPanel === "files"}
                   onClick={() => switchToolDrawer("files")}
                 >
                   {t("drawer.tabFiles")}
@@ -6275,7 +6032,7 @@ export function App() {
                 <Suspense fallback={LazyPanelFallback}>
                   <BrowserPanel
                     hideChromeClose
-                    onClose={() => setDrawer(null)}
+                    onClose={() => panelHost.hide()}
                     onToggleFullscreen={() => setBrowserFullscreen(true)}
                   />
                 </Suspense>
@@ -6329,7 +6086,7 @@ export function App() {
               </div>
             )}
 
-            {(drawerContentPanel === "files" || drawerContentPanel === "editor") && (
+            {(drawerContentPanel === "files") && (
               <div className="drawer-content-frame">
                 {/* 文件列表 + 侧栏编辑器子视图：打开编辑器时覆盖列表，保留顶部 Files/Git/Browser Tab */}
                 <div
@@ -6518,7 +6275,7 @@ export function App() {
         <button
           className="drawer-restore"
           title={t("drawer.expandPanel")}
-          onClick={() => setDrawerCollapsed(false)}
+          onClick={() => panelHost.restore()}
         >
           <ChevronLeft size={16} />
         </button>
@@ -7415,9 +7172,7 @@ filePath={gitDrawerDiff.filePath}
                 onClose={() => setBrowserFullscreen(false)}
                 onMinimize={() => {
                   setBrowserFullscreen(false);
-                  lastToolDrawerRef.current = "browser";
-                  setDrawer("browser");
-                  setDrawerCollapsed(false);
+                  panelHost.openPanel("browser");
                 }}
               />
             </Suspense>

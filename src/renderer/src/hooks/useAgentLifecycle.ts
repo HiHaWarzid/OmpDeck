@@ -2,7 +2,7 @@
  * useAgentLifecycle — Agent 生命周期状态 Hook
  *
  * 独占 App.tsx 中按 agent 隔离的状态切片（prompt / images / terminalDock /
- * drawerPinned / promptHistory），将 agent 替换（pending→real、重启、关闭）
+ * promptHistory），将 agent 替换（pending→real、重启、关闭）
  * 这个 seam 变成两个原子事务方法：
  *
  * - migratePerAgentState: onState 推送时一次性迁移所有 per-agent 状态
@@ -24,7 +24,6 @@ import {
 	setTerminalDockOpen as applyTerminalDockOpen,
 	type TerminalDockStateByOwner,
 } from "../terminalDockState";
-import type { DrawerPanel } from "../components/app/types";
 
 /**
  * 将 per-agent record 按 replacementById 迁移键并按 liveIds 裁剪。
@@ -86,11 +85,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 	// ── 终端 Dock 状态（按 owner 隔离：agent 或 project） ──
 	const [terminalDockStateByOwner, setTerminalDockStateByOwner] =
 		useState<TerminalDockStateByOwner>({});
-
-	// ── 抽屉面板 pinned（按 project 隔离） ──
-	const [drawerPinnedByProject, setDrawerPinnedByProject] = useState<
-		Record<string, DrawerPanel>
-	>({});
 
 	// ── prompt 历史（按 agent 隔离，localStorage 持久化） ──
 	// 存储键/迁移逻辑沿用 App 原实现（pid:prompt-history，JSON 整表存取）；
@@ -230,31 +224,17 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 	 *
 	 * @param replacementById 旧 agentId → 新 agentId 的映射（pending 被真实 tab 替换）
 	 * @param draftIds 当前存活的 agent id 集合（含 pending），不在集合内的键被裁剪
-	 * @param activeProjectIds 当前有活跃 agent 的 project id 集合，用于裁剪 drawerPinned
 	 */
 	const migratePerAgentState = useCallback(
 		(
 			replacementById: Map<string, string>,
 			draftIds: Set<string>,
-			activeProjectIds: Set<string>,
 		) => {
-			// 仅迁移/裁剪 agent 键；project 键留给 projects+displayAgents effect。
+			// 只迁移/裁剪 agent 键；按 project 隔离的状态（终端 Dock、面板钉选）不受 agent 替换影响。
 			// 禁止用 agentId 集合 prune project 键（流式 onState 会误关 Dock）。
 			setTerminalDockStateByOwner((current) =>
 				migrateTerminalDockAgentState(current, replacementById, draftIds),
 			);
-			setDrawerPinnedByProject((current) => {
-				const projectIds = Object.keys(current);
-				// 没有键被裁剪时保持原引用，避免 50ms 的 onState 推送造成无谓重渲染。
-				if (projectIds.every((projectId) => activeProjectIds.has(projectId))) {
-					return current;
-				}
-				return Object.fromEntries(
-					Object.entries(current).filter(([projectId]) =>
-						activeProjectIds.has(projectId),
-					),
-				);
-			});
 			setPromptByAgent((current) => {
 				const next = migrateAgentRecord(current, replacementById, draftIds);
 				livePromptByAgentRef.current = migrateAgentRecord(
@@ -288,7 +268,7 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 	/**
 	 * createAgent 成功时将 pending 草稿迁移到真实 tab。
 	 *
-	 * 仅迁移 prompt 和 images——terminalDock/drawerPinned 按 project 隔离不受
+	 * 仅迁移 prompt 和 images——terminalDock/drawer 按 project 隔离不受
 	 * agentId 替换影响，待投递队列由 omp 持有。
 	 */
 	const commitPendingToReal = useCallback(
@@ -328,9 +308,6 @@ export function useAgentLifecycle(options: UseAgentLifecycleOptions = {}) {
 		setTerminalDockOpen,
 		setTerminalDockCollapsed,
 		pruneTerminalDock,
-		// 抽屉 pinned
-		drawerPinnedByProject,
-		setDrawerPinnedByProject,
 		// prompt 历史
 		promptHistory,
 		setPromptHistory,

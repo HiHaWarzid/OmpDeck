@@ -185,3 +185,28 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。
+
+# 右侧面板（Renderer 领域术语）
+
+> 第四领域：右侧面板（文件 / Git / 浏览器 / 历史会话）的状态机，源自架构评审候选 1「Collapse the right-panel FSM into one module」。维护规则同上。
+
+## 术语
+
+### SessionPanelHost（右侧面板宿主）
+右侧面板状态的**唯一所有者**：`hooks/useSessionPanelHost.ts`（React 适配器：收起动画 timer、项目切换恢复一次性触发、副作用落地）+ `components/app/panel/sessionPanelState.ts`（纯归约）。App 只消费派生视图与意图方法，拿不到 raw setter。
+
+规则：新增面板行为先改归约里的一条 intent，不在 App 里加 setter 或受控 effect。归约必须是纯函数（无 localStorage、无 React），否则「接口即测试面」失效。
+
+### PanelState（面板状态）
+一次性持有 `panel`（当前面板）、`collapsed`（用户收起）、`pinnedByProject`（按项目钉选）、`lastToolPanel`（标题栏一键展开要恢复的 Tab）、`sessionsProjectId`（历史面板正在看哪个项目）。以前散在 App 的 5 个 useState + 3 个 ref。
+
+### PanelEffect（面板副作用）
+归约**不执行**的副作用，由 host 落地：`persist`（写项目级 localStorage）、`refresh-files`（拉文件树）。归约只声明「该持久化成什么」，因此纯归约可单测，持久化语义只有一处。
+
+### 面板钉选（Pinned）
+钉选后：关闭按钮失效（只能用「取消钉选」）、切换其他工具 Tab 无效（`openPanel` 被拒）、面板在项目切换时随记录恢复。钉选按项目存储。
+
+**清盘只在项目真正被删除时发生**（`project-removed` 意图）：删项目、删 worktree 的子项目。**不在可见项目列表缩小时清盘**——`projects` 是按 WSL/Windows 环境过滤后的列表，另一个环境的项目会临时「消失」，据此裁剪会误删它们的钉选记录。
+
+### 已知历史值（`editor`）
+旧版把 `editor` 当成独立面板值。现在编辑器是 files 的子视图：`DrawerPanel` 类型不再含 `editor`，只有 localStorage 读入时接受该值并折叠为 `files`（`normalizePanel`）。

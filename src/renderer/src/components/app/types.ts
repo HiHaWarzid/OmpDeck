@@ -1,7 +1,8 @@
 /** 组件层共享类型：DrawerPanel 等被多个模块引用的形状集中在此，避免模块之间互相 import 组件文件。 */
 import type { WidgetLineItem } from "../../../../shared/types";
 
-export type DrawerPanel = "files" | "sessions" | "browser" | "editor" | "git";
+/** 右侧面板；历史值 "editor" 已并入 files，仅存在于旧版 localStorage 记录里 */
+export type DrawerPanel = "files" | "sessions" | "browser" | "git";
 export type SessionModifiedFile = {
 	path: string;
 	toolName: string;
