@@ -120,7 +120,6 @@ export function isRpcLogWorthy(entry: { direction: string; data: unknown }): boo
 import {
 	createStreamGateState,
 	isStreamGateSealed,
-	noteAbortSettled,
 	openStreamGateForNewRun,
 	sealStreamGate,
 	type StreamGateState,
@@ -148,24 +147,25 @@ import {
 	closeRun as closeAgentRun,
 	createRunState,
 	decideSettle,
-	hasLocalWork,
 	isRunSealed,
+	localWorkSignalsOf,
 	noteRunAbortSettled,
-	normalizeCount,
 	sealRun,
-	RUN_SILENCE_FORCE_IDLE_MS,
-	SETTLE_POLL_TIMEOUT_MS,
 	type AgentRunState,
-	type LocalWorkSignals,
 	type PiStateFields,
 } from "./agentRunState";
+import { AgentRunSupervisor } from "./agentRunSupervisor";
+import {
+	runProcessReplacement,
+	shouldAutoReattach,
+	type ReplacementEffects,
+	type ReplacementTarget,
+} from "./agentProcessReplacement";
 import {
   updateActiveToolCalls,
   type ActiveToolCallState,
 } from "../../shared/toolRuntimeState";
 import {
-	ABORT_SETTLED_FALLBACK_MS,
-	AGENT_SETTLED_TIMEOUT_MS,
 	normalizePiBoolean,
 	resolveSettle,
 } from "./settleReducer";
@@ -296,8 +296,6 @@ export class AgentManager {
 	 * 同时短于绝大多数 LLM 首 token 时间。
 	 */
 	private static readonly EMPTY_RESPONSE_TIMEOUT_MS = 30_000;
-	/** per-agent 空响应兜底定时器实例；与 EMPTY_RESPONSE_TIMEOUT_MS 配对使用。 */
-	private readonly emptyResponseTimers = new Map<string, NodeJS.Timeout>();
 	/**
 	 * 空响应兜底实际超时（毫秒）。默认 = EMPTY_RESPONSE_TIMEOUT_MS；测试可通过构造参数
 	 * 注入更小值以避免 30s 真实等待。
@@ -310,7 +308,8 @@ export class AgentManager {
 	 * 新 run 开始则直接撤销定时器。
 	 */
 	private static readonly SESSION_END_NOTIFY_DELAY_MS = 2_500;
-	private readonly sessionEndNotifyTimers = new Map<string, NodeJS.Timeout>();
+	/** 扩展命令（不进 agent run）后的即时空闲复查窗口。 */
+	private static readonly EXTENSION_COMMAND_IDLE_CHECK_MS = 100;
 	/**
 	 * 模型/鉴权配置版本号。omp 只在进程启动时读取 models.yml / auth.json，
 	 * 也没有 reload_config RPC（dist 内无该命令），因此配置保存后运行中的会话
@@ -961,7 +960,7 @@ export class AgentManager {
 			projectPath: project.path,
 			slot: runtime.slot,
 			lease: runtime.slot.lease,
-			onExit: (payload) => this.handleCreateProcessExit(id, runtime, payload),
+			onExit: (payload) => void this.handleProcessExit(id, runtime, payload, "create"),
 		});
 
 		let client: PiRpcClient;
@@ -1406,12 +1405,14 @@ export class AgentManager {
 				// 证据：@earendil-works/pi-coding-agent/dist/core/agent-session.js 中 AgentSession.prompt()
 				//      先调用 _tryExecuteExtensionCommand()；命中后 return，不再调用 _runAgentPrompt()。
 				// 推导：不能等 agent_end；只有 Pi get_state 明确报告无剩余工作时才恢复 idle。
-				this.scheduleIdleCheckAfterExtensionCommand(input.agentId);
+				this.runSupervisor(runtime).scheduleIdleCheck(
+					AgentManager.EXTENSION_COMMAND_IDLE_CHECK_MS,
+				);
 			} else {
 				// 非扩展命令：omp 真的去问上游 provider，必须挂空响应兜底。
 				// commandcode / 类 API 网关会在 HTTP 200 + 空 stream 后挂死，没有这个兜底
 				// 用户只能看到"半天没反应"，状态机一直停在 running。
-				this.scheduleEmptyResponseFallback(runtime);
+				this.runSupervisor(runtime).scheduleEmptyResponse();
 			}
 			return { accepted: true };
 		} catch (error) {
@@ -1789,7 +1790,7 @@ export class AgentManager {
 	): Promise<Record<string, unknown> | undefined> {
 		const runtime = this.requireRuntime(agentId);
 		// 用户主动停止的会话不应再弹"已完成"。
-		this.cancelSessionEndNotification(agentId);
+		this.runSupervisor(runtime).cancelSessionEndNotification();
 
 		// pi 在等待 extension_ui_response 时（如 ask_question），不发 abort 也能处理，
 		// 但必须解除 pending 请求的阻塞，否则 pi 不会继续读取 stdin 中的后续命令。
@@ -1804,7 +1805,7 @@ export class AgentManager {
 		// 事件在 abort settled 前一律丢弃。必须在发送 abort RPC 之前完成，避免事件处理函数
 		// 在 RPC 发出后、handlePiEvent 返回前收到管道中的旧事件并重建 assistant 消息。
 		sealRun(runtime.run, Date.now());
-		this.scheduleAbortSettledFallback(runtime);
+		this.runSupervisor(runtime).noteAbortSealed();
 
 		const abortRequest = runtime.slot.process.client
 			.request(command, 10_000)
@@ -1918,17 +1919,31 @@ export class AgentManager {
 
 			// 如果进程在压缩期间退出（部分 pi 版本压缩后会重启），
 			// RPC 会因连接断开失败，但压缩可能已写入 session。尝试重连同一会话。
+			// 压缩重启也是「换掉一个 child」，同样交给进程替换编排：这里再手写一遍收尾
+			// 就会漏掉 idle / lastError 收口（状态停留 closed 会让 UI 以为会话已死）。
 			if (!processAlive && runtime.tab.sessionPath) {
 				void this.appLogger?.info("agent", "Compact: process exited, reattaching", {
 					agentId,
 				});
-				await this.reattachProcess(agentId, runtime.tab.sessionPath);
-				await this.loadMessages(agentId).catch(() => undefined);
-				this.addMessage(runtime, "system", "会话压缩完成");
-				void this.appLogger?.info("agent", "Compact: reattach succeeded", {
-					agentId,
-					totalElapsedMs: Date.now() - startTime,
-				});
+				// 进程已死读不到 get_state，只能退回本会话最近一次已知模型。
+				const selection = runtime.lastModelSelection ?? {};
+				await runProcessReplacement(
+					this.replacementTarget(runtime),
+					selection,
+					this.replacementEffects(agentId, runtime, {
+						// sessionPath 由编排模块校验后传入，这里不必再判空。
+						replaceProcess: (_target, validatedPath) =>
+							this.reattachProcess(agentId, validatedPath),
+					}),
+					{
+						success: "会话压缩完成",
+						failure: (message) =>
+							`会话压缩完成，但 Agent 自动重连失败（${message}）。请手动重启 Agent。`,
+						// 旧 child 已退出且新 child 没起来：停在 error 会让 UI 以为还能发消息。
+						statusOnFailure: "closed",
+						logScope: "Compact reattach",
+					},
+				);
 			} else {
 				// 会话过小 / Already compacted / 鉴权失败等：把可读错误抛给渲染进程 toast。
 				throw error;
@@ -1993,7 +2008,7 @@ export class AgentManager {
 			projectPath: project.path,
 			slot: runtime.slot,
 			lease,
-			onExit: (payload) => this.handleReattachProcessExit(agentId, runtime, payload),
+			onExit: (payload) => void this.handleProcessExit(agentId, runtime, payload, "reattach"),
 		});
 		const client = await child.start(sessionPath);
 		const restartDiag = child.getDiagnostics();
@@ -2012,7 +2027,10 @@ export class AgentManager {
 			runtime.tab.sessionId = data?.sessionId ?? runtime.tab.sessionId;
 			runtime.tab.sessionPath = data?.sessionFile ?? sessionPath;
 			runtime.tab.title = data?.sessionName ?? runtime.tab.title;
-			runtime.tab.status = "idle";
+			// 刻意不在这里写 status：进程可继续接收消息 ≠ 这次重连已完成。
+			// 替换路径还要 restoreSelection（模型/思考档），提前写 idle 会让窗口内的 prompt
+			// 在替身上线、选择未恢复时就投递出去。终态由调用方决定：
+			// runProcessReplacement 在恢复后写 idle，compact 兜底由 finishManualCompaction 收口。
 			runtime.appliedConfigEpoch = startEpoch;
 			// 进程退出型压缩可能来不及发 compaction_end；重连成功即表示 Pi 已可继续接收消息。
 			runtime.rpcCompacting = false;
@@ -2055,35 +2073,20 @@ export class AgentManager {
 
 		runtime.configApplyPromise = (async () => {
 			const selection = await this.readRuntimeSelection(runtime);
-			runtime.tab.status = "starting";
-			this.emitState();
 			try {
-				await this.replaceRuntimeProcess(agentId, runtime);
-				await this.restoreRuntimeSelection(runtime, selection);
-				runtime.tab.status = "idle";
-				delete runtime.tab.lastError;
-				this.addMessage(runtime, "system", "模型配置已更新，会话已自动重连");
-				void this.appLogger?.info("agent", "Config applied via process reattach", {
-					agentId,
-					epoch: runtime.appliedConfigEpoch,
-				});
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				runtime.tab.status = "error";
-				runtime.tab.lastError = message;
-				this.addMessage(
-					runtime,
-					"error",
-					`应用最新模型配置失败（${message}）。请手动重启 Agent。`,
+				await runProcessReplacement(
+					this.replacementTarget(runtime),
+					selection,
+					this.replacementEffects(agentId, runtime),
+					{
+						success: "模型配置已更新，会话已自动重连",
+						failure: (message) => `应用最新模型配置失败（${message}）。请手动重启 Agent。`,
+						logScope: "Config reattach",
+					},
 				);
-				void this.appLogger?.error("agent", "Config reattach failed", {
-					agentId,
-					error: message,
-				});
 			} finally {
+				// 锁必须无条件清掉：否则后续 sendPrompt 会永远 await 一个已完成的 promise。
 				runtime.configApplyPromise = undefined;
-				this.emitState();
-				void this.emitRuntimeState(agentId);
 			}
 		})();
 		await runtime.configApplyPromise;
@@ -2128,55 +2131,92 @@ export class AgentManager {
 			}
 
 			const sessionPath = runtime.tab.sessionPath;
-			if (!sessionPath) {
-				runtime.healingDeveloperRole = false;
-				runtime.configApplyPromise = undefined;
-				return;
-			}
-			runtime.tab.status = "starting";
-			this.emitState();
-			try {
-				await this.replaceRuntimeProcess(agentId, runtime);
-				await this.restoreRuntimeSelection(runtime, selection);
-				runtime.tab.status = "idle";
-				delete runtime.tab.lastError;
-				this.addMessage(
-					runtime,
-					"system",
-					configChanged
+			if (!sessionPath) return;
+			await runProcessReplacement(
+				this.replacementTarget(runtime),
+				selection,
+				this.replacementEffects(agentId, runtime),
+				{
+					success: configChanged
 						? `上游不支持 developer 角色，已自动关闭 ${selection.provider} 的该兼容项并重连会话。请重新发送上一条消息。`
 						: "上游不支持 developer 角色，已重连会话以应用最新模型配置。请重新发送上一条消息。",
-				);
-				void this.appLogger?.info("agent", "Recovered from developer-role rejection", {
-					agentId,
-					provider: selection.provider,
-					configChanged,
-				});
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				runtime.tab.status = "error";
-				runtime.tab.lastError = message;
-				this.addMessage(
-					runtime,
-					"error",
-					`检测到上游拒绝 developer 角色，但自动重连失败（${message}）。请手动重启 Agent。`,
-				);
-			} finally {
-				runtime.healingDeveloperRole = false;
-				runtime.configApplyPromise = undefined;
-				this.emitState();
-				void this.emitRuntimeState(agentId);
-			}
-		})();
+					failure: (message) =>
+						`检测到上游拒绝 developer 角色，但自动重连失败（${message}）。请手动重启 Agent。`,
+					logScope: "Recovered from developer-role rejection",
+				},
+			);
+		})().finally(() => {
+			// 守卫复位必须无条件执行，否则一次失败就永久关掉该会话的自愈能力。
+			// 同时也解除 sendPrompt 的等待锁，避免后续消息永远挂着。
+			runtime.healingDeveloperRole = false;
+			runtime.configApplyPromise = undefined;
+		});
 		// 自愈期间若有新 prompt 到达，sendPrompt 会先 await 这次重连，
 		// 避免把消息发给即将被替换的旧进程。
 		runtime.configApplyPromise = task;
 	}
 
+	/**
+	 * 进程替换编排的副作用适配器：四个调用点（自动重连、配置落后、developer 自愈、
+	 * 二次重连）共用同一份映射，避免各自手写「谁负责 emitState / 谁负责 addMessage」。
+	 */
+	private replacementEffects(
+		agentId: string,
+		runtime: AgentRuntime,
+		options: {
+			/**
+			 * 替换动作本身。默认走 replaceRuntimeProcess（先退役并停掉旧 child 再重连）；
+			 * 进程退出后的自动重连必须传 reattachProcess——旧 child 已经死了，
+			 * 再 retire/stop 一次只会对着尸体告警。
+			 */
+			replaceProcess?: (target: ReplacementTarget, sessionPath: string) => Promise<void>;
+		} = {},
+	): ReplacementEffects<ReplacementTarget> {
+		const replaceProcess =
+			options.replaceProcess ??
+			((_target, sessionPath) => this.replaceRuntimeProcess(agentId, runtime, sessionPath));
+		return {
+			replaceProcess,
+			restoreSelection: (_target, selection) => this.restoreRuntimeSelection(runtime, selection),
+			addMessage: (_target, role, text) => this.addMessage(runtime, role, text),
+			emitState: () => this.emitState(),
+			emitRuntimeState: (id) => void this.emitRuntimeState(id),
+			logInfo: (message, detail) => void this.appLogger?.info("agent", message, detail),
+			logError: (message, detail) => void this.appLogger?.error("agent", message, detail),
+		};
+	}
+
+	/**
+	 * 把 runtime.tab 投影成编排模块需要的窄面门面：只暴露状态、错误与 session 路径。
+	 * 用 getter/setter 直连 tab，模块写入的状态即真实 tab 状态，无需回写。
+	 */
+	private replacementTarget(runtime: AgentRuntime): ReplacementTarget {
+		return {
+			agentId: runtime.tab.id,
+			get sessionPath() {
+				return runtime.tab.sessionPath;
+			},
+			get status() {
+				return runtime.tab.status;
+			},
+			set status(next) {
+				runtime.tab.status = next;
+			},
+			get lastError() {
+				return runtime.tab.lastError;
+			},
+			set lastError(next) {
+				runtime.tab.lastError = next;
+			},
+		};
+	}
+
 	/** 停掉旧 child 再按同一 session 重连，避免两个 omp 同时持有会话文件。 */
-	private async replaceRuntimeProcess(agentId: string, runtime: AgentRuntime): Promise<void> {
-		const sessionPath = runtime.tab.sessionPath;
-		if (!sessionPath) throw new Error("会话尚未落盘，无法重连");
+	private async replaceRuntimeProcess(
+		agentId: string,
+		runtime: AgentRuntime,
+		sessionPath: string,
+	): Promise<void> {
 		const oldProcess = runtime.slot.retire();
 		try {
 			await oldProcess.stop();
@@ -2225,6 +2265,10 @@ export class AgentManager {
 	/**
 	 * 重连后的进程按默认角色选模型；恢复用户在本会话里显式选过的模型和思考档，
 	 * 避免「只是保存了配置，会话却悄悄换模型」。
+	 *
+	 * 失败必须**抛出**：进程换了但模型/思考档没跟上，会话仍停在 idle 并弹「已重连」，
+	 * 用户看到的是一个在用错模型的会话。抛出让 ProcessReplacement 统一落 error + lastError，
+	 * 把「重连失败」和失败原因一起交给用户（模块契约见 agentProcessReplacement.ts）。
 	 */
 	private async restoreRuntimeSelection(
 		runtime: AgentRuntime,
@@ -2239,12 +2283,13 @@ export class AgentManager {
 				)
 				.catch((error: unknown) => ({ success: false, error: String(error) }));
 			if (!response.success) {
-				void this.appLogger?.warn("agent", "Restore model after reattach failed", {
+				void this.appLogger?.error("agent", "Restore model after reattach failed", {
 					agentId: runtime.tab.id,
 					provider: selection.provider,
 					modelId: selection.modelId,
 					error: response.error,
 				});
+				throw new Error(`恢复模型失败（${response.error || selection.modelId}）`);
 			}
 		}
 		if (selection.thinkingLevel) {
@@ -2255,11 +2300,12 @@ export class AgentManager {
 				)
 				.catch((error: unknown) => ({ success: false, error: String(error) }));
 			if (!response.success) {
-				void this.appLogger?.warn("agent", "Restore thinking level after reattach failed", {
+				void this.appLogger?.error("agent", "Restore thinking level after reattach failed", {
 					agentId: runtime.tab.id,
 					level: selection.thinkingLevel,
 					error: response.error,
 				});
+				throw new Error(`恢复思考档失败（${response.error || selection.thinkingLevel}）`);
 			}
 		}
 	}
@@ -2912,7 +2958,7 @@ export class AgentManager {
 				const remote: PiStateFields = { isStreaming: state.isStreaming, isCompacting: state.isCompacting };
 				const decision = decideSettle({
 					run: runtime.run,
-					local: this.localWorkSignals(runtime),
+					local: localWorkSignalsOf(runtime),
 					remote,
 					now: Date.now(),
 					timeoutMs: 0,
@@ -3725,9 +3771,8 @@ export class AgentManager {
 		this.agents.delete(agentId);
 		this.lastEmittedTabStatus.delete(agentId);
 		this.clearStreamGate(runtime);
-		// agent 退役时清空响应兜底/结束通知定时器，避免退役后回调误打到空 runtime。
-		this.clearEmptyResponseTimer(runtime);
-		this.cancelSessionEndNotification(agentId);
+		// agent 退役时清空全部兜底/通知定时器，避免退役后回调误打到已摘除的 runtime。
+		this.runSupervisor(runtime).dispose();
 		this.retiringProcesses.add(child);
 		this.emitState();
 		return child;
@@ -3891,45 +3936,58 @@ export class AgentManager {
 		});
 	}
 
-	/** createUnlocked 路径的进程 exit：支持压缩后自动重连，其余标 closed。 */
-	private handleCreateProcessExit(
+	/**
+	 * 进程退出的唯一处理入口（create 与 reattach 两条路径共用）。
+	 *
+	 * 两条路径此前各有一份逐行相同的「单次自动重连」实现，唯一差别是 create 路径多一个
+	 * 压缩中短路与一条非 0 退出的诊断卡。合并后由 `origin` 区分日志口径，差异显式化。
+	 */
+	private async handleProcessExit(
 		agentId: string,
 		runtime: AgentRuntime,
 		payload: { code: number | null; signal: string | null },
-	) {
+		origin: "create" | "reattach",
+	): Promise<void> {
 		const tab = runtime.tab;
 		if (runtime.modelRefreshing) return;
-		if (runtime.compacting) {
+		// 压缩期间进程退出是已知形态：压缩结果已落盘，交给上层压缩流程重连，此处不再抢跑。
+		if (origin === "create" && runtime.compacting) {
 			tab.status = "closed";
 			this.emitState();
 			return;
 		}
-		if (!runtime.autoRestartAttempted && tab.sessionPath && payload.code === 0) {
+		if (
+			shouldAutoReattach({
+				sessionPath: tab.sessionPath,
+				exitCode: payload.code,
+				alreadyAttempted: runtime.autoRestartAttempted,
+			})
+		) {
 			runtime.autoRestartAttempted = true;
-			tab.status = "starting";
-			// 自动重连开始即恢复：清掉进程 error 留下的 lastError，避免重连成功后展示陈旧错误。
-			delete tab.lastError;
-			this.emitState();
-			this.reattachProcess(agentId, tab.sessionPath)
-				.then(() => {
-					tab.status = "idle";
-					this.addMessage(runtime, "system", "会话压缩完成，Agent 已自动重连");
-					this.emitState();
-				})
-				.catch((error) => {
-					tab.status = "closed";
-					void this.appLogger?.error("agent", "Auto reattach after clean exit failed", {
-						agentId,
-						error: error instanceof Error ? error.message : String(error),
-					});
-					this.addMessage(runtime, "error", "Agent 进程意外退出，自动重连失败");
-					this.emitState();
-				});
+			await runProcessReplacement(
+				this.replacementTarget(runtime),
+				{},
+				this.replacementEffects(agentId, runtime, {
+					// sessionPath 由编排模块校验后传入（非空）：缺失时连同措辞一起在那里收口，
+					// 这里不再重复判空——否则同一个前置条件会有两份不同报错。
+					replaceProcess: (_target, validatedPath) =>
+						this.reattachProcess(agentId, validatedPath),
+				}),
+				{
+					success: "会话压缩完成，Agent 已自动重连",
+					failure: () => "Agent 进程意外退出，自动重连失败",
+					// 进程已退出：失败后必须落 closed，停在 error 会让 UI 以为还能发消息。
+					statusOnFailure: "closed",
+					logScope: origin === "create" ? "Auto reattach after clean exit" : "Reattach auto-restart",
+				},
+			);
 			return;
 		}
 		tab.status = "closed";
 		// 非 0 退出且还没写过错误卡时，补一条可排查信息（避免用户只看到 closed）。
-		if (payload.code !== 0 && payload.code !== null) {
+		// 只在 create 路径写：自动重连的 child 非 0 退出时已经有一张「自动重连失败」错误卡，
+		// 再贴一张「omp RPC 启动失败」会把退出原因误归到启动阶段。
+		if (origin === "create" && payload.code !== 0 && payload.code !== null) {
 			const diag = runtime.slot.process.getDiagnostics();
 			this.addMessage(
 				runtime,
@@ -3940,40 +3998,6 @@ export class AgentManager {
 				),
 			);
 		}
-		this.emitState();
-	}
-
-	/** reattach 路径的进程 exit：同样做单次自动重连保护。 */
-	private handleReattachProcessExit(
-		agentId: string,
-		runtime: AgentRuntime,
-		payload: { code: number | null; signal: string | null },
-	) {
-		if (runtime.modelRefreshing) return;
-		if (!runtime.autoRestartAttempted && runtime.tab.sessionPath && payload.code === 0) {
-			runtime.autoRestartAttempted = true;
-			runtime.tab.status = "starting";
-			// 自动重连开始即恢复：清掉进程 error 留下的 lastError。
-			delete runtime.tab.lastError;
-			this.emitState();
-			this.reattachProcess(agentId, runtime.tab.sessionPath)
-				.then(() => {
-					runtime.tab.status = "idle";
-					this.addMessage(runtime, "system", "会话压缩完成，Agent 已自动重连");
-					this.emitState();
-				})
-				.catch((error) => {
-					runtime.tab.status = "closed";
-					void this.appLogger?.error("agent", "Reattach auto-restart failed", {
-						agentId,
-						error: error instanceof Error ? error.message : String(error),
-					});
-					this.addMessage(runtime, "error", "Agent 进程意外退出，自动重连失败");
-					this.emitState();
-				});
-			return;
-		}
-		runtime.tab.status = "closed";
 		this.emitState();
 	}
 
@@ -4061,9 +4085,10 @@ export class AgentManager {
 		// 对一个已不存在的 runtime 改状态只会造成内存泄漏与 UI 串台。
 		if (!runtime) return;
 
-		// 事件流活性戳：静默兜底（forceIdleOnDeadSilence）据此判断 pi 是否真的什么都不做了。
+		// 事件流活性戳：静默兜底（AgentRunSupervisor 内的 forceIdleOnDeadSilence）据此判断 pi 是否真的什么都不做了。
 		// 必须在任何提前 return 之前刷新——流式增量、被封印丢弃的 delta 同样是活性证据。
-		runtime.lastPiEventAt = Date.now();
+		const supervisor = this.runSupervisor(runtime);
+		supervisor.noteEvent("pi");
 		// 会话结束通知的静默窗口只看用户可感知的工作事件；session_info 是标题等
 		// 元数据，不能因为它刷新时间戳而让「已完成」通知一直不弹。
 		if (
@@ -4071,7 +4096,7 @@ export class AgentManager {
 			typed.type !== "session_info_update" &&
 			typed.type !== "available_commands_update"
 		) {
-			runtime.lastWorkEventAt = runtime.lastPiEventAt;
+			supervisor.noteEvent("work");
 		}
 
 		// 扩展/RPC 调用 setSessionName 后 Pi 发 session_info_changed（旧 pi）/ session_info_update（omp）事件；
@@ -4180,19 +4205,13 @@ export class AgentManager {
 		}
 
 		if (typed.type === "agent_start") {
-			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知。
-			this.cancelSessionEndNotification(agentId);
-			// 流式生命信号：上游 provider 已开始跑 run，空响应兜底不再需要。
-			this.clearEmptyResponseTimer(runtime);
+			// 新一轮 run 已接续：撤销上一轮尚未触发的"已完成"通知、空响应窗口与空闲轮询。
+			supervisor.noteRunStarted();
 			// agent_start 表示一轮新的 agent run 开始：
 			// 1) 清理 recentlyAborted，允许状态机恢复 running
 			// 2) 推进 stream generation，解封流式闸门（唯一合法解封点）
 			runtime.run.recentlyAborted = false;
 			this.openAgentStream(runtime);
-			if (runtime.settleCheckTimer) {
-				clearTimeout(runtime.settleCheckTimer);
-				runtime.settleCheckTimer = undefined;
-			}
 			runtime.tab.status = "running";
 			// 新一轮回答开始即恢复：清掉上次 error 的 lastError（如 auto_retry_end 失败后重新触发）。
 			delete runtime.tab.lastError;
@@ -4208,7 +4227,7 @@ export class AgentManager {
 
 		if (typed.type === "message_start" && typed.message?.role === "assistant") {
 			// 流式生命信号：assistant 首个 message 到达，空响应兜底不再需要。
-			this.clearEmptyResponseTimer(runtime);
+			supervisor.clearEmptyResponse();
 			// abort 封印后的残留 assistant 事件应丢弃，防止误重新激活流式状态。
 			if (this.isAgentStreamSealed(runtime)) {
 				return;
@@ -4222,7 +4241,7 @@ export class AgentManager {
 		if (typed.type === "auto_retry_start") {
 			// 流式生命信号：pi 进入自动重试窗口（说明上游在尝试 provider 切换），
 			// 不算空响应，兜底清掉。
-			this.clearEmptyResponseTimer(runtime);
+			supervisor.clearEmptyResponse();
 			this.upsertRetryStatusMessage(runtime, typed, "running");
 			// 用户已主动中止时不重新激活 running 状态，避免 abort 后 auto-retry 事件误覆盖 state
 			if (!runtime.run.recentlyAborted) {
@@ -4283,7 +4302,7 @@ export class AgentManager {
 				runtime.tab.status = "running";
 			}
 			// omp 的压缩完成后不再有 settled 事件：重新调度空闲检查，避免 UI 停在 running
-			this.scheduleSettleCheck(runtime, agentId);
+			supervisor.scheduleSettleCheck();
 			this.emitState();
 			void this.emitRuntimeState(agentId);
 			void this.appLogger?.info("agent", "Compaction ended", {
@@ -4298,14 +4317,14 @@ export class AgentManager {
 
 		if (typed.type === "agent_end") {
 			// 一次 run 结束：清理空响应兜底定时器，避免 run 结束后兜底误触发。
-			this.clearEmptyResponseTimer(runtime);
+			supervisor.noteRunEnded();
 			// agent_end 只表示一次底层 run 结束；Pi 之后仍可能执行自动重试、自动压缩，
 			// 或压缩后继续 queued follow-up。最终空闲必须等 agent_settled，避免中途误判 idle。
 			runtime.transcript.activeAssistantMessageId = undefined;
 			runtime.transcript.toolMessageIds.clear();
 			// run 结束意味着本轮工具必然已结束。长任务中最后一个工具的 end 事件可能
 			// 丢失（并行工具批次、错误/中断路径），残留 toolExecuting 会让空闲检查
-			// （markIdleIfPiReportsNoWork）永远判 busy，UI 卡在 running、三点指示器
+			// （pollIdleOnce）永远判 busy，UI 卡在 running、三点指示器
 			// 无法消失。这里统一清残留；若 omp 实际还有排队工作，空闲检查的
 			// get_state（queuedMessageCount）会正确判定并继续保持 running。
 			runtime.activeToolCalls.clear();
@@ -4387,8 +4406,8 @@ export class AgentManager {
 
 			// 兜底：omp 没有 agent_settled 事件（旧 pi 才有），
 			// 定时查询 get_state 确认是否已无工作可做，避免 UI 动画永久卡住。
-			// 压缩完成后会重新调度；agent_settled 正常触发时 markIdleIfPiReportsNoWork 会因 status!=="running" 提前返回。
-			this.scheduleSettleCheck(runtime, agentId);
+			// 压缩完成后会重新调度；agent_settled 正常触发时轮询会因 status!=="running" 提前返回。
+			supervisor.scheduleSettleCheck();
 		}
 
 		if (typed.type === "queue_update") {
@@ -4420,12 +4439,8 @@ export class AgentManager {
 			// 置 recentlyAborted=true，此处若为 true 说明是用户手动停止后的收尾，
 			// 不再发「已完成」系统通知（用户主动中止，无需提醒）。
 			const settledAfterAbort = runtime.run.recentlyAborted;
-			this.noteAgentAbortSettled(runtime);
+			supervisor.noteAbortSettled();
 			runtime.run.recentlyAborted = false;
-			if (runtime.settleCheckTimer) {
-				clearTimeout(runtime.settleCheckTimer);
-				runtime.settleCheckTimer = undefined;
-			}
 			// 事件路径：agent_settled / session_settled 到达即无条件收口 idle（reason 'event'）。
 			// 转移判定仍走同一决策器（settledAt 分支），便于单点维护事件路径语义。
 			const settleDecision = resolveSettle({ isStreaming: undefined, now: Date.now(), settledAt: Date.now() });
@@ -4437,19 +4452,19 @@ export class AgentManager {
 				// Pi 的最终稳定点：没有自动重试、自动压缩、压缩 retry 或 queued follow-up
 				// 会继续执行，此时才允许恢复 idle 并通知用户完成。
 				// 语义事件：仅当本次把 busy 状态收口为 idle 时发 settled——若兜底轮询
-				// （markIdleIfPiReportsNoWork）已先置 idle，此处幂等跳过，避免重复通知。
+				// （pollIdleOnce）已先置 idle，此处幂等跳过，避免重复通知。
 				const settledFromBusy =
 					runtime.tab.status === "running" || runtime.tab.status === "starting";
-				// 清态语义与轮询/静默兜底收口共用（见 finishRunAsIdle）：
-				// 转录运行态、工具残留、压缩标志一律清掉，闸门保持封印（由 noteAgentAbortSettled
+				// 清态语义与轮询/静默兜底收口共用（见 settleRuntimeIdle）：
+				// 转录运行态、工具残留、压缩标志一律清掉，闸门保持封印（由 noteAbortSettled
 				// 与下一轮 agent_start 管理），否则 settled 与 start 之间的残留 delta 会被
 				// 放行，重新长出已被中止的气泡（abortStreamRegression 的原始问题）。
-				this.finishRunAsIdle(runtime, agentId, settledFromBusy);
+				this.settleRuntimeIdle(runtime, settledFromBusy);
 
 				const messages = runtime.transcript.messages;
 				const lastMessage = messages[messages.length - 1];
 				if (lastMessage?.role === "assistant" && !settledAfterAbort) {
-					this.scheduleSessionEndNotification(runtime, agentId);
+					supervisor.scheduleSessionEndNotification();
 				}
 			}
 		}
@@ -4801,172 +4816,25 @@ export class AgentManager {
 		this.scheduleMessageEmit(runtime, true);
 	}
 
-	private scheduleIdleCheckAfterExtensionCommand(agentId: string) {
-		const timer = setTimeout(() => {
-			void this.markIdleIfPiReportsNoWork(agentId);
-		}, 100);
-		timer.unref?.();
-	}
-
 	/**
-	 * 调度一次最终空闲检查（omp / 新 pi 的 settled 事件之前的兜底）。
-	 * agent_end / auto_compaction_end 后调用；延迟后通过 get_state 校验
-	 * （isSettled/isStreaming/isCompacting/pendingMessageCount）确认 pi 已无工作才置 idle，
-	 * 因此提前检查不会误判压缩中或 queued follow-up 为完成。
-	 * 窗口时长收敛在 settleReducer.AGENT_SETTLED_TIMEOUT_MS；pi 报忙碌且事件流静默时
-	 * 本检查会自我重排（见 rearmSettleCheck），直到收口或 pi 重新产出事件。
-	 */
-	private scheduleSettleCheck(runtime: AgentRuntime, agentId: string) {
-		clearTimeout(runtime.settleCheckTimer);
-		runtime.settleCheckTimer = setTimeout(() => {
-			runtime.settleCheckTimer = undefined;
-			void this.markIdleIfPiReportsNoWork(agentId);
-		}, AGENT_SETTLED_TIMEOUT_MS);
-		runtime.settleCheckTimer.unref?.();
-	}
-
-	/**
-	 * 再排一次空闲检查：pi 报了忙碌却又不推任何事件时，必须继续观察——
-	 * 只查一次就放弃（原实现）意味着陈旧忙碌标志永远没人清，UI 永久停在 running。
-	 * 只在事件流已静默时重排：pi 仍在推事件说明 run 明显活着，重排只会白烧 RPC 与日志，
-	 * 等下一次 agent_end / 压缩结束重新调度即可。
-	 */
-	private rearmSettleCheck(runtime: AgentRuntime, agentId: string) {
-		const lastEvent = runtime.lastPiEventAt ?? 0;
-		if (Date.now() - lastEvent < AGENT_SETTLED_TIMEOUT_MS) return;
-		this.scheduleSettleCheck(runtime, agentId);
-	}
-
-	/** 自动重试是否仍在进行（upsertRetryStatusMessage 写入 meta.status="running" 表示退避等待中）。 */
-	private isAutoRetryPending(runtime: AgentRuntime): boolean {
-		const messageId = runtime.transcript.retryStatusMessageId;
-		if (messageId === undefined) return false;
-		const message = runtime.transcript.messages.find((item) => item.id === messageId);
-		return message?.meta?.status === "running";
-	}
-
-	/**
-	 * 运行收口：清本地运行痕迹、置 idle 并广播。三条收口路径共用同一份清态语义：
-	 * agent_settled / session_settled 事件、轮询判定无工作、静默兜底强制收口。
+	 * 运行收口：清本地运行痕迹并广播（status 由监督器置 idle）。
+	 * 三条收口路径共用同一份清态语义：agent_settled / session_settled 事件、
+	 * 轮询判定无工作、静默兜底强制收口。
 	 *
 	 * 刻意不动 stream gate：封印与解封只由 abort 与 agent_start 管理，settled 与下一个
 	 * start 之间的残留 delta 必须继续被丢弃（abortStreamRegression 的原始问题）。
 	 */
-	private finishRunAsIdle(runtime: AgentRuntime, agentId: string, notifySettled: boolean) {
+	private settleRuntimeIdle(runtime: AgentRuntime, notifySettled: boolean) {
 		runtime.tab.status = "idle";
 		resetTranscriptRun(runtime.transcript);
 		runtime.activeToolCalls.clear();
 		runtime.toolExecuting = null;
 		runtime.rpcCompacting = false;
-		this.thinkingEmitter.cancel(agentId);
-		this.emitThinking(agentId, "");
+		this.thinkingEmitter.cancel(runtime.tab.id);
+		this.emitThinking(runtime.tab.id, "");
 		this.emitState();
-		void this.emitRuntimeState(agentId);
-		if (notifySettled) this.events.publish({ kind: "settled", agentId });
-	}
-
-	/**
-	 * 静默兜底：pi 报告仍有工作，但事件流已完全静默超过 RUN_SILENCE_FORCE_IDLE_MS 时，
-	 * 判定忙碌标志是陈旧真值，强制收口 idle——否则三点指示器与侧边栏状态永久停在 running。
-	 *
-	 * 录制故障正是这一形态：agent_end 之后 6 分钟零事件（pi 日志证实无压缩、无重试、无后续轮次），
-	 * 而 get_state 一直报忙碌，一次性兜底轮询被挡回后再无观察者，用户只能手动停止。
-	 *
-	 * 反向误判（把真实长任务当成空闲）由这些条件共同压低：
-	 *  - pi 只要还在推任何事件（含流式增量）就会刷新 lastPiEventAt，静默窗口从头计算；
-	 *  - 本地忙碌信号（等待回答的扩展 UI 请求、压缩中、工具执行中）与自动重试窗口一律不收口；
-	 *  - agent_start（新 run 开始）会清掉本兜底定时器，run 期间的轮询不会走到这里。
-	 * 返回 true 表示本轮已处理（强制收口或状态已被其它路径接管），调用方不再重排轮询。
-	 */
-	private forceIdleOnDeadSilence(
-		runtime: AgentRuntime,
-		agentId: string,
-		remote: PiStateFields,
-	): boolean {
-		const silentMs = Date.now() - (runtime.lastPiEventAt ?? Date.now());
-		if (silentMs < RUN_SILENCE_FORCE_IDLE_MS) return false;
-		// get_state 往返期间状态可能已被事件路径接管（agent_settled 置 idle / agent_start 置 running）。
-		if (runtime.tab.status !== "running") return true;
-		// 本地忙碌信号以最新为准：往返期间可能刚起压缩、刚进入等待提问。
-		if (hasLocalWork(this.localWorkSignals(runtime))) return false;
-		if (this.isAutoRetryPending(runtime)) return false;
-
-		// 远端排队计数不阻止收口：pi 若真有排队的 follow-up，它会立刻开新 run 并推
-		// agent_start（那时 status 变 running，本兜底自然失效）；而该计数与陈旧忙碌标志
-		// 同样可能不可信，用它挡住收口等于把故障原样保留。仅作为日志证据记录。
-		const queued =
-			normalizeCount(remote.pendingMessageCount) + normalizeCount(remote.queuedMessageCount);
-		void this.appLogger?.warn("agent", "pi 静默兜底：强制收口 idle", {
-			agentId,
-			silentMs,
-			queuedMessages: queued,
-			remoteIsStreaming: remote.isStreaming,
-			remoteIsCompacting: remote.isCompacting,
-			remoteIsSettled: remote.isSettled,
-		});
-		this.finishRunAsIdle(runtime, agentId, true);
-		return true;
-	}
-
-	private async markIdleIfPiReportsNoWork(agentId: string) {
-		const runtime = this.agents.get(agentId);
-		if (!runtime || runtime.tab.status !== "running") return;
-		// 本地忙碌信号：命中任一即无需 RPC 查询（省一次 get_state）。
-		// 但不能就此放弃观察：本地信号也可能陈旧，且 pi 可能已经空闲——重排一次，
-		// 等本地信号消失或静默兜底窗口到点后再下结论。
-		const local = this.localWorkSignals(runtime);
-		if (hasLocalWork(local)) {
-			this.rearmSettleCheck(runtime, agentId);
-			return;
-		}
-
-		const response = await runtime.slot.process.client
-			.request({ type: "get_state" }, 10_000)
-			.catch(() => undefined);
-		if (!response?.success || !response.data) {
-			// RPC 失败/无数据同样是"未能确认"：重排继续观察，而不是把 run 永远挂着。
-			this.rearmSettleCheck(runtime, agentId);
-			return;
-		}
-
-		// 统一收口到 agentRunState.decideSettle：isStreaming/isSettled 严格归一化、gate 封印（wait）、
-		// 本地/远端忙碌信号与 abort 兜底截止的裁定全部在单一决策器里完成。
-		// 轮询已触发（无论 100ms 扩展命令窗口还是 1200ms settle 窗口）：timeoutMs 有值即有权
-		// 给出 no-work 结论。
-		// get_state 的 data 走本应用自有协议：只读可选字段，逐个在决策器内归一化，
-		// 因此这里按已知形态收口一次，避免在读取点散布断言。
-		const remoteState = response.data as PiStateFields;
-		const decision = decideSettle({
-			run: runtime.run,
-			local,
-			remote: remoteState,
-			now: Date.now(),
-			timeoutMs: SETTLE_POLL_TIMEOUT_MS,
-		});
-		// wait：abort 封印中，poll 不得越过 gate 抢先置 idle 发 settled
-		//（原实现不查 gate 会误发）。gate 的解封由 abort 兜底定时器负责，无需重排。
-		if (decision.decision === "wait") return;
-		if (decision.decision === "stay-running") {
-			// pi 仍报忙碌：真忙则等它推事件，标志陈旧则由静默兜底收口。
-			if (!this.forceIdleOnDeadSilence(runtime, agentId, remoteState)) {
-				this.rearmSettleCheck(runtime, agentId);
-			}
-			return;
-		}
-		if (decision.reason === "abort-fallback") {
-			// 封印窗口已超时（兜底定时器已/即将解封）：按 settled 解封即可。
-			// 不置 idle、不发 settled——abort 已把 status 置 idle，settled 通知留给
-			// 真实 agent_settled 或重发后的正常收口，避免 abort 误报完成。
-			this.noteAgentAbortSettled(runtime);
-			return;
-		}
-		// 判定收敛为 idle 期间的竞态：get_state 往返期间事件路径可能已收口或新 run 已开始，
-		// 此时再收口会重复发 settled（重复"已完成"通知），直接放弃本次结论。
-		if (runtime.tab.status !== "running") return;
-		// 语义事件：omp 无 agent_settled 事件，本函数（get_state 校验后确认无后续工作）
-		// 就是 omp 下唯一真实的 settled 汇聚点；进入本函数时 status 必为 running，
-		// 因此不会与 agent_settled 分支重复发（该分支先到会清掉本兜底定时器）。
-		this.finishRunAsIdle(runtime, agentId, true);
+		void this.emitRuntimeState(runtime.tab.id);
+		if (notifySettled) this.events.publish({ kind: "settled", agentId: runtime.tab.id });
 	}
 
 	private requireRuntime(agentId: string) {
@@ -4976,173 +4844,98 @@ export class AgentManager {
 	}
 
 	/**
-	 * 会话结束通知延迟触发。
+	 * per-agent 运行监督器：settle 轮询 / 静默兜底 / abort 兜底 / 空响应窗口 / 结束通知的
+	 * 唯一属主（四个定时器与事件流活性戳都在 AgentRunSupervisor 内，外部无读写点）。
 	 *
-	 * 不在 session_settled 当场弹窗：pi 判定 settle 后，最终 assistant 消息的收尾事件
-	 * 或紧接着的短工作仍可能到达（用户反馈"通知比对话结束早几秒"）。窗口结束时
-	 * 复查状态与本地忙碌信号，只有真正空闲才弹；新 run 的 agent_start 会直接撤销
-	 * 定时器。点击通知会聚焦主窗口并切到该 Agent。
+	 * 这是唯一的构造点：视图把 runtime 投影成模块需要的只读形态（status 可写），
+	 * effects 把模块的判定结果落回既有的转录/事件/日志/通知路径。逻辑不在这里——
+	 * 想改「什么时候算完成」只改 agentRunSupervisor.ts，本类只负责「完成后做什么」。
 	 */
-	private scheduleSessionEndNotification(
-		runtime: AgentRuntime,
-		agentId: string,
-		delayMs: number = AgentManager.SESSION_END_NOTIFY_DELAY_MS,
-	) {
-		// settingsStore 在单测里可能只是空桩；通知失败不应影响 settle 收口。
-		let enabled = false;
-		try {
-			enabled = this.settingsStore.get().enableNotifications;
-		} catch {
-			return;
-		}
-		if (!enabled) return;
-		const existing = this.sessionEndNotifyTimers.get(agentId);
-		if (existing) clearTimeout(existing);
-		const timer = setTimeout(() => {
-			this.sessionEndNotifyTimers.delete(agentId);
-			// 已被 stop/restart 摘除的 runtime 不再通知。
-			if (this.agents.get(agentId) !== runtime) return;
-			if (runtime.tab.status !== "idle" || runtime.run.recentlyAborted) return;
-			// 窗口结束时若仍在流式消息/工具/压缩/待回答 UI，说明这一轮并没有真的结束；
-			// 重新等一个窗口，而不是直接放弃——否则收尾事件晚到时会永远收不到通知。
-			if (
-				runtime.transcript.activeAssistantMessageId ||
-				runtime.activeToolCalls.size > 0 ||
-				runtime.toolExecuting ||
-				runtime.pendingUIRequests.size > 0 ||
-				runtime.compacting ||
-				runtime.rpcCompacting
-			) {
-				this.scheduleSessionEndNotification(runtime, agentId);
-				return;
-			}
-			// settled 到最终消息之间可能还有一段事件空档：以最后一次工作事件为准补足
-			// 静默窗口，避免通知比用户看到的最后一段输出早几秒。
-			const quietFor = Date.now() - (runtime.lastWorkEventAt ?? runtime.lastPiEventAt ?? 0);
-			const remaining = AgentManager.SESSION_END_NOTIFY_DELAY_MS - quietFor;
-			if (remaining > 0) {
-				this.scheduleSessionEndNotification(runtime, agentId, remaining);
-				return;
-			}
-			showAppNotification({
-				body: `${runtime.tab.title} 已完成响应`,
-				icon: this.notificationIcon,
+	private runSupervisor(runtime: AgentRuntime): AgentRunSupervisor {
+		if (runtime.supervisor) return runtime.supervisor;
+		const agentId = runtime.tab.id;
+		runtime.supervisor = new AgentRunSupervisor(
+			{
 				agentId,
-				getWindow: this.getWindow,
-			});
-		}, delayMs);
-		timer.unref?.();
-		this.sessionEndNotifyTimers.set(agentId, timer);
+				get status() {
+					return runtime.tab.status;
+				},
+				set status(value: AgentStatus) {
+					runtime.tab.status = value;
+				},
+				run: runtime.run,
+				transcript: runtime.transcript,
+				pendingUIRequests: runtime.pendingUIRequests,
+				// 必须用 getter：工具边沿会把整个字段换成新 Map（applyActiveToolCallState），
+				// 捕获旧引用会让监督器永远看不到新一批工具，"工具执行中"判断随后 stale，
+				// 静默兜底可能在工具仍在跑时收口 idle。
+				get activeToolCalls() {
+					return runtime.activeToolCalls;
+				},
+				get toolExecuting() {
+					return runtime.toolExecuting;
+				},
+				get compacting() {
+					return runtime.compacting;
+				},
+				get rpcCompacting() {
+					return runtime.rpcCompacting;
+				},
+			},
+			{
+				// get_state 仍走本类的 RPC 通道：模块只负责「何时查、如何判定」。
+				requestState: () =>
+					runtime.slot.process.client.request({ type: "get_state" }, 10_000),
+				// 监督器只发布一种终态（idle + settled），沿用事件引擎那条路径的语义。
+				finishAsIdle: () => this.settleRuntimeIdle(runtime, true),
+				abortSettled: () => noteRunAbortSettled(runtime.run),
+				emptyResponse: (timeoutMs) => this.applyEmptyResponse(runtime, timeoutMs),
+				notifyFinished: () =>
+					showAppNotification({
+						body: `${runtime.tab.title} 已完成响应`,
+						icon: this.notificationIcon,
+						agentId,
+						getWindow: this.getWindow,
+					}),
+				notificationsEnabled: () => {
+					// settingsStore 在单测里可能只是空桩；通知失败不应影响 settle 收口。
+					try {
+						return this.settingsStore.get().enableNotifications === true;
+					} catch {
+						return false;
+					}
+				},
+				log: (level, message, detail) => {
+					if (level === "warn") void this.appLogger?.warn("agent", message, detail);
+					else void this.appLogger?.info("agent", message, detail);
+				},
+			},
+			{
+				emptyResponseTimeoutMs: this.emptyResponseTimeoutMs,
+				notifyDelayMs: AgentManager.SESSION_END_NOTIFY_DELAY_MS,
+			},
+		);
+		return runtime.supervisor;
 	}
 
-	/** 新一轮运行开始时撤销尚未触发的结束通知（排队消息会立刻接续，不应提示完成）。 */
-	private cancelSessionEndNotification(agentId: string) {
-		const timer = this.sessionEndNotifyTimers.get(agentId);
-		if (!timer) return;
-		clearTimeout(timer);
-		this.sessionEndNotifyTimers.delete(agentId);
+	/**
+	 * 空响应兜底落地：落 lastError + 追加 chat error 卡片 + 记录证据并广播。
+	 * 置 error 由监督器完成（窗口到点仍无流式信号是它的判定），这里只施加转录与日志副作用。
+	 */
+	private applyEmptyResponse(runtime: AgentRuntime, timeoutMs: number) {
+		const raw = "Provider 接收了请求但未返回流式响应。可能是 commandcode 等代理服务在请求被 provider 接收后流被掐断；建议重试一次或换用其它模型。";
+		runtime.tab.lastError = raw;
+		this.addMessage(runtime, "error", raw);
+		void this.appLogger?.warn("agent", "Empty response fallback fired", {
+			agentId: runtime.tab.id,
+			timeoutMs,
+		});
+		this.emitState();
 	}
 
 	/** agent_start 时尝试推进 generation；若仍在等 abort settled，则只记 pending。 */
 	private openAgentStream(runtime: AgentRuntime) {
 		runtime.run.streamGate = openStreamGateForNewRun(runtime.run.streamGate);
-	}
-
-	/** abort 后的 agent_settled：结束 waiting，必要时解封 pending start。 */
-	private noteAgentAbortSettled(runtime: AgentRuntime) {
-		this.clearAbortSettledFallback(runtime);
-		noteRunAbortSettled(runtime.run);
-	}
-
-	/** 本地忙碌信号（不需要 RPC 就能判定的部分），供 settle 决策器统一组装。 */
-	private localWorkSignals(runtime: AgentRuntime): LocalWorkSignals {
-		return {
-			hasPendingUiRequest: runtime.pendingUIRequests.size > 0,
-			compacting: runtime.rpcCompacting || runtime.compacting,
-			hasActiveAssistant: runtime.transcript.activeAssistantMessageId !== undefined,
-			toolExecuting: runtime.toolExecuting,
-		};
-	}
-
-	/**
-	 * pi 偶发不发 agent_settled 时的兜底：超时后按 settled 处理，
-	 * 避免用户立刻重发时新一轮永远无法接收流式事件。
-	 */
-	private scheduleAbortSettledFallback(runtime: AgentRuntime) {
-		this.clearAbortSettledFallback(runtime);
-		const agentId = runtime.tab.id;
-		const timer = setTimeout(() => {
-			// 定时器触发时 agent 可能已被 stop 删除；重新查询，避免操作已脱离 map 的 runtime。
-			const current = this.agents.get(agentId);
-			if (!current) return;
-			current.abortSettledFallbackTimer = undefined;
-			// 仅在仍 waiting 时生效；正常 settled 路径会先 clear 定时器。
-			if (current.run.streamGate.waitingForAbortSettled) {
-				// 定时器触发即兜底截止已到：经决策器判定为 abort 兜底解封才生效，
-				// 与 markIdleIfPiReportsNoWork 共用同一判定。
-				const decision = decideSettle({
-					run: current.run,
-					local: this.localWorkSignals(current),
-					now: Date.now(),
-				});
-				if (decision.decision === "idle" && decision.reason === "abort-fallback") {
-					noteRunAbortSettled(current.run);
-				}
-			}
-		}, ABORT_SETTLED_FALLBACK_MS);
-		timer.unref?.();
-		runtime.abortSettledFallbackTimer = timer;
-	}
-
-	/**
-	 * 空响应兜底：sendPrompt accepted 后启动窗口倒计时，到点若 status 仍是 running
-	 * 且流式闸门 generation 未推进（说明 agent_start 没来），按上游 provider 空响应处理：
-	 * 落 error 状态 + 追加 chat error 卡片 + 引导重试/换 provider。
-	 *
-	 * 设计取舍：仅看 tab.status === "running" + 30s 内无流式生命信号。慢思考/长 thinking
-	 * 都会先有 message_start(assistant) 到达，不会误判；OmpDeck 既有的流式闸门不会因为
-	 * 此处置 error 而被破坏（abort 路径单独 seal generation）。
-	 */
-	private scheduleEmptyResponseFallback(runtime: AgentRuntime) {
-		this.clearEmptyResponseTimer(runtime);
-		const agentId = runtime.tab.id;
-		const timer = setTimeout(() => {
-			// agent 可能已被 stop；按 agentId 重新查，避免操作已脱离 map 的 runtime。
-			const current = this.agents.get(agentId);
-			this.emptyResponseTimers.delete(agentId);
-			if (!current) return;
-			// 已收到流式生命信号但忘了 clear（防御，正常路径都 clear 了）。
-			if (current.tab.status !== "running") return;
-			const raw = "Provider 接收了请求但未返回流式响应。可能是 commandcode 等代理服务在请求被 provider 接收后流被掐断；建议重试一次或换用其它模型。";
-			current.tab.status = "error";
-			current.tab.lastError = raw;
-			this.addMessage(current, "error", raw);
-			void this.appLogger?.warn("agent", "Empty response fallback fired", {
-				agentId,
-				timeoutMs: this.emptyResponseTimeoutMs,
-			});
-			this.emitState();
-		}, this.emptyResponseTimeoutMs);
-		timer.unref?.();
-		this.emptyResponseTimers.set(agentId, timer);
-	}
-
-	/** 流式生命信号到达 / agent 停 / 主动取消时调用，幂等。 */
-	private clearEmptyResponseTimer(runtime: AgentRuntime) {
-		const agentId = runtime.tab.id;
-		const timer = this.emptyResponseTimers.get(agentId);
-		if (timer) {
-			clearTimeout(timer);
-			this.emptyResponseTimers.delete(agentId);
-		}
-	}
-
-	private clearAbortSettledFallback(runtime: AgentRuntime) {
-		const timer = runtime.abortSettledFallbackTimer;
-		if (timer) {
-			clearTimeout(timer);
-			runtime.abortSettledFallbackTimer = undefined;
-		}
 	}
 
 	/** 当前 generation 是否已封印，封印期间所有流式事件应丢弃。 */
@@ -5152,7 +4945,6 @@ export class AgentManager {
 
 	/** agent 关闭/重建时清理 gate，避免泄漏到新生命周期。 */
 	private clearStreamGate(runtime: AgentRuntime) {
-		this.clearAbortSettledFallback(runtime);
 		closeAgentRun(runtime.run, runtime.transcript);
 		this.thinkingEmitter.cancel(runtime.tab.id);
 		this.cancelMessageEmit(runtime);
@@ -5350,26 +5142,17 @@ type AgentRuntime = {
 	/** 「IPC 基线截断」告警上次输出的时刻（毫秒）：getMessages 被高频调用，告警据此限频。 */
 	lastTranscriptTruncationWarnAt?: number;
 
-	/** 工具退出后的兜底定时器（agent_end/压缩结束后调度，见 scheduleSettleCheck） */
-	settleCheckTimer?: NodeJS.Timeout;
+	/**
+	 * 运行监督器：settle 轮询 / 静默兜底 / abort 兜底 / 空响应窗口 / 结束通知的唯一属主。
+	 * 定时器与事件流活性戳全部收在模块内，退役时 dispose 一并清理。
+	 */
+	supervisor?: AgentRunSupervisor;
 	/**
 	 * 本次 prompt 里待消费的本地斜线命令名（不含前导 "/"）。
 	 * omp 的 command_output 帧不带命令名，只能由发送方在 prompt 前记下；
 	 * 标签保留到 prompt 响应再清（同一命令可能分多帧到达）。
 	 */
 	lastLocalCommand?: string;
-	/** 最近一次 pi 推送事件（含流式增量）的时刻：settle 兜底用它判定「事件流是否完全静默」。
-	 * 只由 handlePiEvent 刷新——get_state 是我们主动发的请求，其响应不算事件流活性。
-	 */
-	lastPiEventAt?: number;
-	/**
-	 * 最近一次「用户可感知的工作事件」时刻：消息增量/工具/压缩/UI 请求等。
-	 * 会话结束通知用它做静默窗口判定；session_info 等元数据事件不刷新，
-	 * 避免标题更新把通知无限推迟。
-	 */
-	lastWorkEventAt?: number;
-	/** abort 后等 pi 确认的兜底定时器（见 scheduleAbortSettledFallback） */
-	abortSettledFallbackTimer?: NodeJS.Timeout;
 
 	// 扩展 UI 请求（abort 时需 cancel，防止 pi 等待超时）
 	pendingUIRequests: Map<string, { method: string; title: string }>;

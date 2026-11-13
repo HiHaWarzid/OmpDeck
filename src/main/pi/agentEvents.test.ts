@@ -51,11 +51,8 @@ type TestRuntime = {
 	activeToolCalls: Map<string, string>;
 	toolExecuting: string | null;
 	runtimeStateSeq: number;
-	settleCheckTimer?: NodeJS.Timeout;
-	/** 最近一次 pi 事件时刻：静默兜底按它计算事件流静默时长 */
-	lastPiEventAt?: number;
-	/** 最近一次工作事件时刻：会话结束通知按它计算静默窗口 */
-	lastWorkEventAt?: number;
+	/** 运行监督器（settle 轮询/静默兜底/通知的唯一属主），惰性创建后缓存于此。 */
+	supervisor?: unknown;
 	/** 待消费的本地斜线命令名（command_output 标注来源用） */
 	lastLocalCommand?: string;
 	pendingUIRequests: Map<string, { method: string; title: string }>;
@@ -135,6 +132,12 @@ function recordEvents(manager: AgentManager): AgentEvent[] {
 	return events;
 }
 
+/** 监督器在本测试里用到的公开接口：只按领域事件驱动，不读取内部定时器。 */
+type SupervisorInternals = {
+	noteEvent(kind: "pi" | "work"): void;
+	pollIdleOnce(): Promise<void>;
+};
+
 /**
  * 测试需触达 private 成员（agents/emitStateNow/addMessage/handlePiEvent 等）：
  * TS 的 private 仅是编译期约束，这里经 unknown 双断言收窄到本测试所需形状。
@@ -150,7 +153,7 @@ type ManagerInternals = {
 		meta?: Record<string, unknown>,
 	): void;
 	handlePiEvent(agentId: string, event: unknown): void;
-	markIdleIfPiReportsNoWork(agentId: string): Promise<void>;
+	runSupervisor(runtime: TestRuntime): SupervisorInternals;
 	emitRuntimeState(agentId: string): Promise<void>;
 };
 
@@ -271,7 +274,7 @@ test("agent_settled 事件触发 settled；重复收到时幂等不发", () => {
 	assert.deepEqual(settled, ["a1"]);
 });
 
-test("omp 无 agent_settled：markIdleIfPiReportsNoWork 兜底同样发 settled", async () => {
+test("omp 无 agent_settled：空闲轮询兜底同样发 settled", async () => {
 	const manager = makeManager();
 	const settled: string[] = [];
 	manager.eventSink.onEvent((event) => {
@@ -283,7 +286,7 @@ test("omp 无 agent_settled：markIdleIfPiReportsNoWork 兜底同样发 settled"
 	});
 	inner.agents.set("a1", runtime);
 
-	await inner.markIdleIfPiReportsNoWork("a1");
+	await inner.runSupervisor(runtime).pollIdleOnce();
 	assert.deepEqual(settled, ["a1"]);
 	assert.equal(runtime.tab.status, "idle");
 });
@@ -300,7 +303,7 @@ test("兜底检查仍有排队消息时不发 settled", async () => {
 	});
 	inner.agents.set("a1", runtime);
 
-	await inner.markIdleIfPiReportsNoWork("a1");
+	await inner.runSupervisor(runtime).pollIdleOnce();
 	assert.deepEqual(settled, []);
 	assert.equal(runtime.tab.status, "running");
 });
@@ -341,7 +344,7 @@ test("兜底轮询采信 pi 自报 isSettled：陈旧 isStreaming/isCompacting �
 	});
 	inner.agents.set("a1", runtime);
 
-	await inner.markIdleIfPiReportsNoWork("a1");
+	await inner.runSupervisor(runtime).pollIdleOnce();
 
 	assert.deepEqual(settled, ["a1"]);
 	assert.equal(runtime.tab.status, "idle");
@@ -356,9 +359,11 @@ test("兜底轮询：pi 报忙碌且事件流静默时重排下一次检查，�
 		const runtime = makeRuntime(makeTab("a1", "running"), { request });
 		inner.agents.set("a1", runtime);
 		// 静默超过轮询窗口、但还没到兜底窗口：属于"pi 报忙碌却没有任何事件"的可疑区间
-		runtime.lastPiEventAt = Date.now() - 5_000;
+		const supervisor = inner.runSupervisor(runtime);
+		supervisor.noteEvent("pi");
+		vi.setSystemTime(Date.now() + 5_000);
 
-		await inner.markIdleIfPiReportsNoWork("a1");
+		await supervisor.pollIdleOnce();
 		assert.equal(request.mock.calls.length, 1);
 		assert.equal(runtime.tab.status, "running");
 
@@ -397,9 +402,11 @@ test("静默兜底强制收口时记 warn 日志（保留陈旧标志证据）�
 			}),
 		});
 		inner.agents.set("a1", runtime);
-		runtime.lastPiEventAt = Date.now() - RUN_SILENCE_FORCE_IDLE_MS - 1_000;
+		const supervisor = inner.runSupervisor(runtime);
+		supervisor.noteEvent("pi");
+		vi.setSystemTime(Date.now() + RUN_SILENCE_FORCE_IDLE_MS + 1_000);
 
-		await inner.markIdleIfPiReportsNoWork("a1");
+		await supervisor.pollIdleOnce();
 
 		assert.equal(runtime.tab.status, "idle");
 		assert.deepEqual(settled, ["a1"]);
@@ -421,37 +428,44 @@ test("静默兜底强制收口时记 warn 日志（保留陈旧标志证据）�
 });
 
 test("静默兜底：自动重试窗口与等待回答的 UI 请求期间不收口", async () => {
-	const manager = makeManager();
-	const settled: string[] = [];
-	manager.eventSink.onEvent((event) => {
-		if (event.kind === "settled") settled.push(event.agentId);
-	});
-	const inner = internals(manager);
-	const runtime = makeRuntime(makeTab("a1", "running"), {
-		request: async () => ({ success: true, data: { isStreaming: true } }),
-	});
-	inner.agents.set("a1", runtime);
-	// 模拟 upsertRetryStatusMessage 写下的"正在自动重试"状态消息
-	runtime.transcript.messages.push({
-		id: "retry-1",
-		agentId: "a1",
-		role: "system",
-		text: "正在自动重试 1/3",
-		timestamp: Date.now(),
-		meta: { status: "running" },
-	});
-	runtime.transcript.retryStatusMessageId = "retry-1";
-	runtime.lastPiEventAt = Date.now() - RUN_SILENCE_FORCE_IDLE_MS - 1_000;
+	vi.useFakeTimers();
+	try {
+		const manager = makeManager();
+		const settled: string[] = [];
+		manager.eventSink.onEvent((event) => {
+			if (event.kind === "settled") settled.push(event.agentId);
+		});
+		const inner = internals(manager);
+		const runtime = makeRuntime(makeTab("a1", "running"), {
+			request: async () => ({ success: true, data: { isStreaming: true } }),
+		});
+		inner.agents.set("a1", runtime);
+		// 模拟 upsertRetryStatusMessage 写下的"正在自动重试"状态消息
+		runtime.transcript.messages.push({
+			id: "retry-1",
+			agentId: "a1",
+			role: "system",
+			text: "正在自动重试 1/3",
+			timestamp: Date.now(),
+			meta: { status: "running" },
+		});
+		runtime.transcript.retryStatusMessageId = "retry-1";
+		const supervisor = inner.runSupervisor(runtime);
+		supervisor.noteEvent("pi");
+		vi.setSystemTime(Date.now() + RUN_SILENCE_FORCE_IDLE_MS + 1_000);
 
-	await inner.markIdleIfPiReportsNoWork("a1");
-	assert.deepEqual(settled, []);
-	assert.equal(runtime.tab.status, "running");
+		await supervisor.pollIdleOnce();
+		assert.deepEqual(settled, []);
+		assert.equal(runtime.tab.status, "running");
 
-	// 重试结束（meta.status 由 auto_retry_end 改写）：兜底重新生效
-	(runtime.transcript.messages[0].meta as Record<string, unknown>).status = "success";
-	await inner.markIdleIfPiReportsNoWork("a1");
-	assert.deepEqual(settled, ["a1"]);
-	assert.equal(runtime.tab.status, "idle");
+		// 重试结束（meta.status 由 auto_retry_end 改写）：兜底重新生效
+		(runtime.transcript.messages[0].meta as Record<string, unknown>).status = "success";
+		await supervisor.pollIdleOnce();
+		assert.deepEqual(settled, ["a1"]);
+		assert.equal(runtime.tab.status, "idle");
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 test("轮询往返期间已被事件路径收口：不重复发 settled", async () => {
@@ -471,7 +485,7 @@ test("轮询往返期间已被事件路径收口：不重复发 settled", async 
 	});
 	inner.agents.set("a1", created);
 
-	await inner.markIdleIfPiReportsNoWork("a1");
+	await inner.runSupervisor(created).pollIdleOnce();
 
 	assert.deepEqual(settled, []);
 });
@@ -859,7 +873,7 @@ test("会话结束通知的静默窗口不被标题等元数据事件刷新", ()
 
 	inner.handlePiEvent("a1", { type: "session_settled" });
 	vi.advanceTimersByTime(2_000);
-	// 标题更新只刷新 lastPiEventAt，不应把通知再推迟 2.5s。
+	// 标题更新只刷新监督器的"pi 事件"活性戳，不应把通知再推迟 2.5s。
 	inner.handlePiEvent("a1", { type: "session_info_update", name: "新标题" });
 	vi.advanceTimersByTime(499);
 	assert.equal(notify.mock.calls.length, 0);
@@ -896,6 +910,40 @@ test("窗口结束时仍在执行工具则不弹通知，等收尾后重新计�
 	runtime.activeToolCalls.clear();
 	vi.advanceTimersByTime(2_500);
 	assert.equal(notify.mock.calls.length, 1);
+	vi.useRealTimers();
+});
+
+/**
+ * 工具边沿会把整个字段换成新 Map（applyActiveToolCallState -> updateActiveToolCalls 返回全新 Map），
+ * 不是就地修改。监督器视图若捕获旧引用，就永远看不到新一批工具，会在工具仍在跑时弹出
+ * "已完成"通知。上一条测试用就地 set 覆盖不到这条路径。
+ */
+test("窗口结束时工具刚被整批换入（新 Map 引用）同样不弹通知", () => {
+	vi.useFakeTimers();
+	const manager = new AgentManager(
+		() => undefined,
+		() => null,
+		{ get: () => ({ enableNotifications: true }) } as unknown as SettingsStore,
+		{} as unknown as AgentConfigDeps,
+		createAgentEventSink({ snapshot: async () => ({ tabs: [], agents: {} }) }),
+		undefined,
+	);
+	const inner = internals(manager);
+	const runtime = makeRuntime(makeTab("a1", "running"), {
+		request: async () => ({ success: true, data: {} }),
+		sendRaw: () => undefined,
+	});
+	inner.agents.set("a1", runtime);
+	inner.addMessage(runtime, "assistant", "已完成");
+	// 先建好监督器（视图在首次访问时构造），再按生产路径换掉整个 Map。
+	inner.runSupervisor(runtime);
+	const notify = vi.mocked(showAppNotification);
+	notify.mockClear();
+
+	inner.handlePiEvent("a1", { type: "session_settled" });
+	runtime.activeToolCalls = new Map([["tool-2", "bash"]]);
+	vi.advanceTimersByTime(2_500);
+	assert.equal(notify.mock.calls.length, 0, "整批换入的工具仍在执行，不应提示已完成");
 	vi.useRealTimers();
 });
 

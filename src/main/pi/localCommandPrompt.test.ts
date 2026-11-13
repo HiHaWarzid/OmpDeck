@@ -98,8 +98,6 @@ function makeManager(): AgentManager {
 
 type Internals = {
 	agents: Map<string, TestRuntime>;
-	emptyResponseTimers: Map<string, NodeJS.Timeout>;
-	getRuntimeState(agentId: string): Promise<unknown>;
 };
 
 function internals(m: AgentManager): Internals {
@@ -121,7 +119,6 @@ test("本地斜线命令(agentInvoked:false)立即收口到 idle，不再挂空�
 
 		assert.deepEqual(result, { accepted: true });
 		assert.equal(runtime.tab.status, "idle");
-		assert.equal(inner.emptyResponseTimers.has("a1"), false);
 		// 不能把本地命令误报成 provider 故障：只有用户自己那条消息。
 		assert.deepEqual(
 			runtime.transcript.messages.map((message) => message.role),
@@ -129,9 +126,13 @@ test("本地斜线命令(agentInvoked:false)立即收口到 idle，不再挂空�
 		);
 		assert.equal(runtime.lastLocalCommand, undefined);
 
-		// 兜底即使被别处重启，也不能再写错误消息。
+		// 没有任何空响应窗口：推进时钟不会追加错误卡片。
 		vi.advanceTimersByTime(200);
 		assert.equal(runtime.tab.status, "idle");
+		assert.deepEqual(
+			runtime.transcript.messages.map((message) => message.role),
+			["user"],
+		);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -152,7 +153,13 @@ test("缺少 agentInvoked 时仍走空响应兜底", async () => {
 
 		assert.deepEqual(result, { accepted: true });
 		assert.equal(runtime.tab.status, "running");
-		assert.equal(inner.emptyResponseTimers.has("a1"), true);
+
+		// 窗口未到不误报；到点后按 provider 空响应落 error 卡片。
+		vi.advanceTimersByTime(59);
+		assert.equal(runtime.tab.status, "running");
+		vi.advanceTimersByTime(1);
+		assert.equal(runtime.tab.status, "error");
+		assert.equal(runtime.transcript.messages.at(-1)?.role, "error");
 	} finally {
 		vi.useRealTimers();
 	}
@@ -171,13 +178,21 @@ test("斜线命令不干扰在途 prompt 的空响应兜底", async () => {
 		inner.agents.set("a1", runtime);
 
 		await manager.sendPrompt({ agentId: "a1", message: "看下 README" });
-		assert.equal(inner.emptyResponseTimers.has("a1"), true);
+		assert.equal(runtime.tab.status, "running");
 
 		await manager.sendPrompt({ agentId: "a1", message: "/context" });
 
 		// 前一条 prompt 仍在等 provider 流：兜底必须保留，状态保持 running。
-		assert.equal(inner.emptyResponseTimers.has("a1"), true);
 		assert.equal(runtime.tab.status, "running");
+		assert.deepEqual(
+			runtime.transcript.messages.map((message) => message.role),
+			["user", "user"],
+		);
+
+		// 保留的证据：推进到窗口仍会为在途 prompt 落错误卡片（没有被本地命令撤销）。
+		vi.advanceTimersByTime(60);
+		assert.equal(runtime.tab.status, "error");
+		assert.equal(runtime.transcript.messages.at(-1)?.role, "error");
 	} finally {
 		vi.useRealTimers();
 	}

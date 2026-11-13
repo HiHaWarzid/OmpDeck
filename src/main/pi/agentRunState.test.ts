@@ -18,7 +18,7 @@ const idleSignals = {
 	hasPendingUiRequest: false,
 	compacting: false,
 	hasActiveAssistant: false,
-	toolExecuting: null,
+	hasActiveTool: false,
 };
 
 describe("agent run state", () => {
@@ -27,7 +27,7 @@ describe("agent run state", () => {
 		expect(hasLocalWork({ ...idleSignals, hasPendingUiRequest: true })).toBe(true);
 		expect(hasLocalWork({ ...idleSignals, compacting: true })).toBe(true);
 		expect(hasLocalWork({ ...idleSignals, hasActiveAssistant: true })).toBe(true);
-		expect(hasLocalWork({ ...idleSignals, toolExecuting: "bash" })).toBe(true);
+		expect(hasLocalWork({ ...idleSignals, hasActiveTool: true })).toBe(true);
 	});
 
 	it("abort seals the generation and schedules a fallback deadline", () => {

@@ -183,6 +183,15 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：任何新的客户端门只允许调这 8 个方法，不得直接对 `AgentManager` 的变更方法再拼一遍「校验 → 关终端 → 停进程」。读路径、运行控制（归 `AgentControl`）与 AFK 编排不经过本 module——AFK 创建的 agent 没有桌面终端，且它在域内把 AgentManager 当 spawn 工具用。
 
+### AgentRunSupervisor（运行静默监督器）
+单 agent 的 per-run 定时器与「事件流是否还活着」判定的**唯一属主**（`main/pi/agentRunSupervisor.ts`）。settle 轮询、abort 兜底、空响应窗口、会话结束通知四个窗口以前是四份 `Map<agentId, Timeout>` + 15 个 AgentManager 私有方法，且与转录/事件/通知副作用写在同一层。
+
+接口形状按**领域事件**收口：`noteRunStarted` / `noteRunEnded` / `noteEvent(kind)` / `noteAbortSealed` / `noteAbortSettled` 进，`scheduleSettleCheck` / `scheduleIdleCheck(delayMs)` / `scheduleEmptyResponse` / `scheduleSessionEndNotification` 由外部按需排期（配套 `clearEmptyResponse` / `cancelSessionEndNotification`），`dispose()` 一次收尾。判定与计时留在模块内，副作用经 `effects` 交回 AgentManager：写状态只走视图的 `status`（唯一可写字段），清转录 / 发 `settled` / 弹通知 / 落日志都在 effects（`requestState` / `finishAsIdle` / `abortSettled` / `emptyResponse` / `notifyFinished` / `notificationsEnabled` / `log`）里。`get_state` RPC 本身不在本模块。
+
+不变量：**settle 观察与扩展命令复查各占一个定时器槽位**——共用槽位时，扩展命令的 100ms 复查会顶掉已排队的 1200ms settle 链，而复查若因「事件流刚有活动」不重排，这次 run 就再无观察者，永久停在 `running`。落定 idle 只由内部 `finishAsIdle` 施加一次；`dispose` 清掉全部五个定时器。
+
+规则：新增任何「等 pi 自己安静下来」的窗口都加进本模块，不在 AgentManager 里新开 `setTimeout`。模块不认识转录内容，需要转录信息的判定必须经由视图字段传入。
+
 ### RouteDescriptor / webRoutes（Web 路由唯一事实源）
 `src/shared/ipc.ts` 里的 `WebRestRoute`（`method` + `path` 模板 + `result` 拆包方式）与 `webRoutes` 表，是 **LAN-web 三端唯一的路径真值**：`WebServiceManager` 用 `matchWebRoute` 分发，`browserApi` 用 `webRouteUrl` 反向拼 URL，`mobile.js` 对齐同一批路径。
 
@@ -203,6 +212,15 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 **Mutation 也归它**：`runMutation` 是改写工作区的唯一入口（stage/unstage/discard/commit/push/pull），一次调用内独占「占门 → 捕获项目世代 → 执行 → 作废旧项目结果 → 按策略刷新 → 解锁」，返回 `ok | skipped | stale | failed`。面板只表达「做什么」与「哪个 spinner」，不得自己调 `beginMutation/endMutation` 拼骨架——那等于把同一套陈旧守卫切成两半，新增一条 mutation 就得再抄一遍。
 
 规则：面板组件不得自己 `setInterval` 拉 git，也不得自己判「这次响应过期了没」。
+
+### ProcessReplacement（进程替换编排）
+替换 pi child 之后「会话该恢复成什么样」的唯一实现（`main/pi/agentProcessReplacement.ts`）。四类入口共用它：压缩/干净退出后的**单次自动重连**、配置版本落后时的重连、上游拒绝 developer 角色后的**自愈**、以及替换过程中再次退出的**二次重连**。
+
+**会话路径前置条件也归它**：缺失时由编排层抛「会话尚未落盘，无法重连」，并把校验过的路径作为参数交给 `replaceProcess`，调用方不再各自判空（否则同一前置条件会出现两份措辞不同的报错）。
+
+它拥有的顺序是硬约束，分散复制时最容易走偏：**先 `starting`**（替换窗口内新 prompt 不得投给即将退役的 child）→ **替换先于恢复选择**（在旧 child 上 `set_model` 会被随后的替换丢弃）→ **成功后清 `lastError`**、**失败写 `lastError` 并落非 idle**（`statusOnFailure` 区分：进程已退出的自动重连落 `closed`，其余落 `error`）→ **finally 无条件广播终态**。
+
+规则：新增任何「换掉 child 再继续」的路径都调 `runProcessReplacement`，不要自己拼 `starting` → 替换 → 恢复 → `idle`。调用方的选择与锁（`configApplyPromise` / `healingDeveloperRole`）由调用方自己 try/finally 收尾，不进本 module——那是各入口不同的领域判断。
 
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。

@@ -29,8 +29,8 @@ import { resetTranscriptRun, type AgentTranscriptState } from "./agentTranscript
  *   - 本模块把「输入从哪来、什么算忙碌、何时可判空闲、结束时要清什么」收进一处；
  *     副作用（置 idle、发事件、IPC）仍由 AgentManager 施加，模块只做判定与状态迁移。
  *
- * 边界：定时器由调用方持有（scheduleAbortFallback / scheduleSettleCheck 仍在
- * AgentManager，因为它们的回调要触发副作用），模块只维护 deadline 与闸门语义。
+ * 边界：定时器与活性戳归 `AgentRunSupervisor` 所有；本模块只维护 deadline 与闸门语义，
+ * 不持有任何 setTimeout，也不决定副作用何时施加。
  */
 
 /** pi get_state 返回的忙碌相关字段（新旧字段名并存；形态不可信，读取时逐个归一化）。 */
@@ -55,8 +55,11 @@ export type LocalWorkSignals = {
 	compacting: boolean;
 	/** 有正在流式更新的 assistant 消息。 */
 	hasActiveAssistant: boolean;
-	/** 正在执行的工具名（null = 无）。 */
-	toolExecuting: string | null;
+	/**
+	 * 有在跑的工具批次。`activeToolCalls` 与 `toolExecuting` 在生产代码里恒成对
+	 * 写入/清理，这里合并成一个信号：两个字段各自再算一遍「忙」就是两份口径。
+	 */
+	hasActiveTool: boolean;
 };
 
 export type AgentRunState = {
@@ -87,8 +90,37 @@ export function hasLocalWork(signals: LocalWorkSignals): boolean {
 		signals.hasPendingUiRequest ||
 		signals.compacting ||
 		signals.hasActiveAssistant ||
-		signals.toolExecuting !== null
+		signals.hasActiveTool
 	);
+}
+
+/**
+ * 从运行态视图组装本地忙碌信号——全仓库唯一的「本地是否还在忙」取数口径。
+ *
+ * 原实现在 AgentManager 里有一份 `localWorkSignals(runtime)`，settle 轮询、静默兜底、
+ * 编辑/删除前的复核各自取数；抽出运行监督器后若两处各写一份，字段一漂移就会出现
+ * 「兜底认为空闲、编辑守卫认为忙」的双口径。因此把取数收在这里，监督器与 AgentManager
+ * 都从同一视图取。
+ *
+ * 视图只要求字段形态，不要求 AgentRuntime / AgentRunSupervisorView 本体：这样
+ * 「运行时对象」与「监督器持有的只读视图」都能直接传入，不需要额外适配层。
+ */
+export function localWorkSignalsOf(view: {
+	pendingUIRequests: { readonly size: number };
+	compacting: boolean;
+	rpcCompacting: boolean;
+	transcript: { readonly activeAssistantMessageId?: string };
+	activeToolCalls: { readonly size: number };
+	toolExecuting: string | null;
+}): LocalWorkSignals {
+	return {
+		hasPendingUiRequest: view.pendingUIRequests.size > 0,
+		compacting: view.rpcCompacting || view.compacting,
+		hasActiveAssistant: view.transcript.activeAssistantMessageId !== undefined,
+		// activeToolCalls 与 toolExecuting 在生产代码里成对写入，但清场分支有 5 处：
+		// 任一残留都按忙处理——宁可多等一次轮询，也不要把仍在跑工具的会话判成空闲。
+		hasActiveTool: view.activeToolCalls.size > 0 || view.toolExecuting !== null,
+	};
 }
 
 /**

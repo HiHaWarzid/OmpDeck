@@ -208,6 +208,15 @@ function loadAgentManager() {
 	registry["./agentHistory"] = loadModule("src/main/pi/agentHistory.ts", "agentHistory.ts");
 	// 交互请求代理（ctx.ui.* / 信任询问）；依赖已注入的 askQuestionCard。
 	registry["./agentInteractions"] = loadModule("src/main/pi/agentInteractions.ts", "agentInteractions.ts");
+	// 运行静默监督器（settle 轮询 / 静默兜底 / abort 兜底 / 空响应窗口 / 结束通知的唯一属主）；
+	// 值导入 settleReducer 与 agentRunState，两者已在上方注入。
+	registry["./agentRunSupervisor"] = loadModule("src/main/pi/agentRunSupervisor.ts", "agentRunSupervisor.ts");
+	// 进程替换编排（starting → 替换 → 恢复选择 → 终态广播的唯一实现）；
+	// 依赖 agentRunState（已注入），无其它 src 内运行时依赖。
+	registry["./agentProcessReplacement"] = loadModule(
+		"src/main/pi/agentProcessReplacement.ts",
+		"agentProcessReplacement.ts",
+	);
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {

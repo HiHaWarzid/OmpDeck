@@ -33,6 +33,7 @@ type TestRuntime = {
 	rpcCompacting: boolean;
 	modelRefreshing: boolean;
 	autoRestartAttempted: boolean;
+	supervisor?: unknown;
 };
 
 function makeRuntime(tab: AgentTab): TestRuntime {
@@ -79,20 +80,22 @@ function makeManager(timeoutMs = 60): AgentManager {
 	);
 }
 
+/**
+ * 只暴露监督器的公开接口：窗口布防走 `scheduleEmptyResponse`（prompt accepted 用的入口），
+ * 撤销走真实的 `handlePiEvent` 事件路径。断言全部落在可观察行为（status/错误卡片）上，
+ * 不再读取定时器容器——那是实现细节，收进 agentRunSupervisor 后就不该被测试穿透。
+ */
 type Internals = {
 	agents: Map<string, TestRuntime>;
-	scheduleEmptyResponseFallback(runtime: TestRuntime): void;
-	clearEmptyResponseTimer(runtime: TestRuntime): void;
+	runSupervisor(runtime: TestRuntime): { scheduleEmptyResponse(): void };
 	handlePiEvent(agentId: string, event: unknown): void;
-	emitStateNow(): void;
-	emptyResponseTimers: Map<string, NodeJS.Timeout>;
 };
 
 function internals(m: AgentManager): Internals {
 	return m as unknown as Internals;
 }
 
-test("agent_start 后清空兜底，timer 不再触发", () => {
+test("agent_start 后清空兜底窗口，到点不再报空响应", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -100,20 +103,18 @@ test("agent_start 后清空兜底，timer 不再触发", () => {
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
-		assert.equal(inner.emptyResponseTimers.has("a1"), true);
-
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
 		inner.handlePiEvent("a1", { type: "agent_start" });
-		assert.equal(inner.emptyResponseTimers.has("a1"), false);
 
 		vi.advanceTimersByTime(200);
 		assert.notEqual(runtime.tab.status, "error");
+		assert.equal(runtime.tab.lastError, undefined);
 	} finally {
 		vi.useRealTimers();
 	}
 });
 
-test("message_start(assistant) 后清空兜底", () => {
+test("message_start(assistant) 后清空兜底窗口", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -121,21 +122,21 @@ test("message_start(assistant) 后清空兜底", () => {
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
 		inner.handlePiEvent("a1", {
 			type: "message_start",
 			message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
 		});
-		assert.equal(inner.emptyResponseTimers.has("a1"), false);
 
 		vi.advanceTimersByTime(200);
 		assert.notEqual(runtime.tab.status, "error");
+		assert.equal(runtime.tab.lastError, undefined);
 	} finally {
 		vi.useRealTimers();
 	}
 });
 
-test("auto_retry_start 也清空兜底（视为上游在重试）", () => {
+test("auto_retry_start 也清空兜底窗口（视为上游在重试）", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -143,7 +144,7 @@ test("auto_retry_start 也清空兜底（视为上游在重试）", () => {
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
 		inner.handlePiEvent("a1", {
 			type: "auto_retry_start",
 			attempt: 1,
@@ -151,16 +152,16 @@ test("auto_retry_start 也清空兜底（视为上游在重试）", () => {
 			delayMs: 1000,
 			errorMessage: "",
 		});
-		assert.equal(inner.emptyResponseTimers.has("a1"), false);
 
 		vi.advanceTimersByTime(200);
 		assert.notEqual(runtime.tab.status, "error");
+		assert.equal(runtime.tab.lastError, undefined);
 	} finally {
 		vi.useRealTimers();
 	}
 });
 
-test("窗口内无流式信号 → 兜底触发，落 error + lastError", () => {
+test("窗口内无流式信号 → 兜底触发，落 error + lastError + 错误卡片", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -168,16 +169,34 @@ test("窗口内无流式信号 → 兜底触发，落 error + lastError", () => 
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
-		vi.advanceTimersByTime(80);
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
+		vi.advanceTimersByTime(59);
+
+		assert.equal(runtime.tab.status, "running", "窗口未到不得提前落 error");
+		// 先取值再断言：assert 的 asserts 签名会收窄「传入的那个变量」的类型，
+		// 直接传 runtime.tab.lastError 会让后续读取退化成 never。
+		const errorBeforeWindow = runtime.tab.lastError;
+		assert.equal(errorBeforeWindow, undefined, "窗口未到不得写入 lastError");
+
+		vi.advanceTimersByTime(1);
 		assert.equal(runtime.tab.status, "error", "超时后 status 必须为 error");
-		assert.ok(runtime.tab.lastError?.includes("Provider"));
+		// 上方 assert.equal 的 asserts 签名把 lastError 收窄为 undefined，
+		// 因此这里用显式标注的局部变量重新取值，避免拿到 never 类型。
+		const errorText: string | undefined = runtime.tab.lastError;
+		assert.ok(errorText?.includes("Provider"));
+		const last = runtime.transcript.messages.at(-1);
+		assert.equal(last?.role, "error");
+		assert.equal(last?.text, errorText);
+
+		// 只触发一次：再推进时钟不会追加第二张卡片
+		vi.advanceTimersByTime(500);
+		assert.equal(runtime.transcript.messages.length, 1);
 	} finally {
 		vi.useRealTimers();
 	}
 });
 
-test("agent_end 也清空兜底（run 结束后 timer 立即释放）", () => {
+test("agent_end 也清空兜底窗口（run 结束后窗口立即释放）", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -185,18 +204,18 @@ test("agent_end 也清空兜底（run 结束后 timer 立即释放）", () => {
 		const runtime = makeRuntime(makeTab("a1", "running"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
 		inner.handlePiEvent("a1", { type: "agent_end", messages: [] });
-		assert.equal(inner.emptyResponseTimers.has("a1"), false);
 
 		vi.advanceTimersByTime(200);
 		assert.notEqual(runtime.tab.status, "error");
+		assert.equal(runtime.tab.lastError, undefined);
 	} finally {
 		vi.useRealTimers();
 	}
 });
 
-test("status 已非 running 时 timer 触发也不报错（防御）", () => {
+test("status 已非 running 时窗口到点不落 error（防御）", () => {
 	vi.useFakeTimers();
 	try {
 		const manager = makeManager(60);
@@ -204,9 +223,10 @@ test("status 已非 running 时 timer 触发也不报错（防御）", () => {
 		const runtime = makeRuntime(makeTab("a1", "idle"));
 		inner.agents.set("a1", runtime);
 
-		inner.scheduleEmptyResponseFallback(runtime);
+		inner.runSupervisor(runtime).scheduleEmptyResponse();
 		vi.advanceTimersByTime(80);
 		assert.equal(runtime.tab.status, "idle", "status 非 running 时兜底不应当场落 error");
+		assert.equal(runtime.transcript.messages.length, 0);
 	} finally {
 		vi.useRealTimers();
 	}
