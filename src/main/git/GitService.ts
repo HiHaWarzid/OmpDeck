@@ -801,6 +801,10 @@ export class GitService {
 	/** 创建提交 */
 	async commit(cwd: string, message: string): Promise<void> {
 		this.invalidateStatusCache(cwd);
+		// 提交本身不改分支引用，但面板在提交后会 force 刷分支栏（合并提交可能顺带
+		// 删掉已合并分支、detached HEAD 也会变）。10s 冷却缓存若不清，那次强制刷新
+		// 照样拿回提交前的列表——和 checkout/createBranch 一样在这里失效。
+		this.invalidateBranchesCache(cwd);
 		await this.mutate(cwd, () => this.runGit(cwd, ["commit", "-m", message]));
 	}
 

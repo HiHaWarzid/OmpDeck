@@ -195,6 +195,15 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 **载入不得吞掉未提交编辑**：同一个应用内切换 tab 会重新载入该 tab 的数据，但「载入」只在草稿干净（value 与 base 相等）时才覆盖 value/base；有未提交编辑时保留草稿，切换回来看到的仍是用户输入。保存后的回读是例外，用显式 `force` 无条件覆盖（读的正是刚落盘的真值）。「重新载入 = 丢弃草稿」只保留给用户显式动作：换文件、导入后重载。
 
+### GitStatusResource（Git 状态资源）
+Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gitStatusResource.ts`）：状态 + 拉取 + 陈旧守卫 + 变更门 + 轮询调度收在一处，外部只订阅快照、发意图。
+
+四条隐式规则由它独占：**陈旧守卫**（世代号 + 请求号，项目切换后迟到的响应一律丢弃）、**单飞**（静默拉取在 mutation 或在途请求期间合并到在途 promise，否则慢于 30s 的 status 会彼此作废、列表永久停在旧值）、**变更门**（同一时刻只允许一个 mutation，旧项目的 mutation 收尾不得解锁新项目）、**轮询**（一份调度同时覆盖 status 与 branches；可见性 = IntersectionObserver + `visibilitychange` + `checkVisibility`，焦点/重新可见/操作后即刻补一次，30s 只兜底外部改动）。
+
+**Mutation 也归它**：`runMutation` 是改写工作区的唯一入口（stage/unstage/discard/commit/push/pull），一次调用内独占「占门 → 捕获项目世代 → 执行 → 作废旧项目结果 → 按策略刷新 → 解锁」，返回 `ok | skipped | stale | failed`。面板只表达「做什么」与「哪个 spinner」，不得自己调 `beginMutation/endMutation` 拼骨架——那等于把同一套陈旧守卫切成两半，新增一条 mutation 就得再抄一遍。
+
+规则：面板组件不得自己 `setInterval` 拉 git，也不得自己判「这次响应过期了没」。
+
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。
 

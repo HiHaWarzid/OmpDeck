@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -29,7 +30,7 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { showNotice } from "../../utils/notice";
-import { sameResourceGroups } from "../../utils/gitResourceGroups";
+import { createGitStatusResource } from "../../utils/gitStatusResource";
 import {
 	FILE_TREE_PAGE_SIZE,
 	buildFileTreeView,
@@ -45,7 +46,6 @@ import type {
   GitFileStatus,
   GitResource,
   GitResourceGroupType,
-  GitResourceGroups,
 } from "../../../../shared/types";
 import { GitStatus } from "../../../../shared/types";
 import { getFileIconColor, getFileIconSeti } from "../../fileIcons";
@@ -108,17 +108,6 @@ type SmartCommitPreference = {
   suggestSmartCommit: boolean;
 };
 
-const EMPTY_GROUPS: GitResourceGroups = {
-  merge: [],
-  index: [],
-  workingTree: [],
-  untracked: [],
-};
-/** 共享空分支信息：state 默认值/错误回退必须是稳定引用，否则每次落存都换新对象。 */
-const EMPTY_BRANCH_INFO: GitBranchInfo = Object.freeze({
-  current: null,
-  branches: Object.freeze([]) as unknown as string[],
-}) as GitBranchInfo;
 const GRAPH_COLORS = [
   "var(--git-graph-lane-1)",
   "var(--git-graph-lane-2)",
@@ -134,25 +123,6 @@ const PANE_HEADER_HEIGHT = 26;
 const BRANCH_BAR_HEIGHT = 36;
 const PANE_RESIZE_STEP = 20;
 const PANE_RESIZE_LARGE_STEP = 60;
-/**
- * 可见状态下的兜底轮询间隔：窗口聚焦、面板重新可见、git 操作后都会立即刷新，
- * 30s 只兜底在外部编辑器/终端里发生的改动，避免面板可见时高频 spawn git。
- */
-const GIT_POLL_INTERVAL_MS = 30_000;
-
-/**
- * 面板在 DOM 中是否真的可见。
- * 抽屉的 diff 视图用 `visibility: hidden` 覆盖源码面板：布局盒还在，IntersectionObserver
- * 仍会报告相交，只有 checkVisibility 能看到这层 CSS 可见性。用于轮询触发前的最后一道判断，
- * 避免用户看不到面板时仍然 spawn git。
- */
-function panelActuallyVisible(element: HTMLElement | null): boolean {
-  if (!element) return false;
-  if (typeof element.checkVisibility === "function") {
-    return element.checkVisibility({ checkVisibilityCSS: true });
-  }
-  return getComputedStyle(element).visibility !== "hidden";
-}
 
 function visiblePaneIds(open: PaneOpenState): PaneId[] {
   return PANE_IDS.filter((id) => open[id]);
@@ -910,32 +880,31 @@ export const GitPanel = memo(GitPanelImpl, sameGitPanelProps);
 
 function GitPanelImpl(props: GitPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
-  const projectIdRef = useRef(props.projectId);
-  projectIdRef.current = props.projectId;
+  /** git 门面引用可能被 App 替换：资源 module 每次发请求时读最新值，无需重建。 */
+  const gitRef = useRef(props.git);
+  gitRef.current = props.git;
   /**
-   * 面板是否出现在视口内。抽屉切到 Files/Browser tab、折叠或窄屏被遮挡时，
-   * GitPanel 仍挂在 DOM 里但用户看不到，此时轮询纯属浪费（每次都要 spawn git）。
-   * 默认 true：挂载初期 IntersectionObserver 还没回调，先让首次刷新照常发生。
+   * status/branches 的生命周期（拉取、陈旧守卫、变更门、轮询调度）全在 module 里，
+   * 面板只订阅快照并发意图：「不可见即停 / 30s 兜底 / 焦点即刻刷新」因此只有一处实现。
    */
-  const [panelVisible, setPanelVisible] = useState(true);
-  const statusRequestRef = useRef(0);
-  const statusRunningRequestRef = useRef<{
-    projectId: string;
-    request: number;
-  } | null>(null);
-  const mutationRequestRef = useRef(0);
-  const mutationRunningRef = useRef(false);
+  const [gitStatus] = useState(() =>
+    createGitStatusResource({
+      git: () => gitRef.current,
+      projectId: props.projectId,
+      initialBranchInfo: props.initialBranchInfo,
+    }),
+  );
+  const status = useSyncExternalStore(
+    gitStatus.subscribe,
+    gitStatus.getSnapshot,
+  );
+  const { groups, branchInfo, loading, error, mutating, notAGitRepo, gitNotInstalled } =
+    status;
   const [availableHeight, setAvailableHeight] = useState(720);
-  const [groups, setGroups] = useState<GitResourceGroups>(EMPTY_GROUPS);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
   const [committing, setCommitting] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [pulling, setPulling] = useState(false);
-  const [mutating, setMutating] = useState(false);
-  const [notAGitRepo, setNotAGitRepo] = useState(false);
-  const [gitNotInstalled, setGitNotInstalled] = useState(false);
   const [initializing, setInitializing] = useState(false);
   const [smartCommitPreference, setSmartCommitPreference] =
     useState<SmartCommitPreference>(() =>
@@ -956,90 +925,6 @@ function GitPanelImpl(props: GitPanelProps) {
   const [paneState, setPaneState] = useState<PaneState>(() =>
     readPaneState(props.projectId),
   );
-  /** 分支列表自持状态：面板打开时以 initialBranchInfo 作首帧，随后自拉取/自刷新，
-   *  不再依赖 App 逐帧透传 branches/currentBranch props。 */
-  const [branchInfo, setBranchInfo] = useState<GitBranchInfo>(
-    props.initialBranchInfo ?? EMPTY_BRANCH_INFO,
-  );
-
-  /**
-   * 拉取最新分支信息。与 refresh() 的 status 拉取解耦：checkout/create/commit 后
-   * 单独刷新分支列表，避免重跑整棵文件 status。
-   */
-  const refreshBranches = useCallback(async () => {
-    const projectId = props.projectId;
-    try {
-      const next = await props.git.branches(projectId);
-      if (projectId !== projectIdRef.current) return;
-      // 分支可能在外部终端/IDE 中切换，只在状态真的变化时更新，避免不必要重渲染。
-      setBranchInfo((current) =>
-        current.current === next.current &&
-        current.branches.join("\n") === next.branches.join("\n")
-          ? current
-          : next,
-      );
-    } catch {
-      if (projectId === projectIdRef.current) {
-        setBranchInfo(EMPTY_BRANCH_INFO);
-      }
-    }
-  }, [props.git, props.projectId]);
-
-  // 项目切换/面板挂载：以 App 统一 store 的最新值作首帧并立即拉取一次权威数据。
-  useEffect(() => {
-    setBranchInfo(props.initialBranchInfo ?? EMPTY_BRANCH_INFO);
-    void refreshBranches();
-    // initialBranchInfo 只在项目切换时作为种子使用，后续同步由 refreshBranches 自持，
-    // 故不列入依赖，避免 App store 每次变化都重复拉取。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.projectId, refreshBranches]);
-
-  // 面板可见性信号：GitPanel 根节点进入/离开视口时更新，供下面的轮询共用。
-  // 抽屉切 tab 用 CSS 保留 DOM，因此不能只依赖 document.hidden。
-  useEffect(() => {
-    const element = panelRef.current;
-    if (!element || typeof IntersectionObserver === "undefined") return;
-    const observer = new IntersectionObserver((entries) => {
-      const entry = entries[entries.length - 1];
-      if (entry) setPanelVisible(entry.isIntersecting);
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-
-  // 分支轮询：只在「面板在视口内 + 窗口可见」时跑；30s 兜底，
-  // 面板重新可见、窗口重新聚焦时立即补一次，保证外部终端/IDE 切换分支能及时反映。
-  useEffect(() => {
-    if (!props.projectId) return;
-    let timer: number | undefined;
-    const stop = () => {
-      if (timer !== undefined) {
-        window.clearInterval(timer);
-        timer = undefined;
-      }
-    };
-    const sync = () => {
-      const shouldPoll = panelVisible && document.visibilityState === "visible";
-      if (!shouldPoll) {
-        stop();
-        return;
-      }
-      void refreshBranches();
-      if (timer === undefined) {
-        timer = window.setInterval(() => {
-          if (panelActuallyVisible(panelRef.current)) void refreshBranches();
-        }, GIT_POLL_INTERVAL_MS);
-      }
-    };
-    sync();
-    document.addEventListener("visibilitychange", sync);
-    window.addEventListener("focus", sync);
-    return () => {
-      stop();
-      document.removeEventListener("visibilitychange", sync);
-      window.removeEventListener("focus", sync);
-    };
-  }, [props.projectId, refreshBranches, panelVisible]);
 
   useEffect(() => {
     const element = panelRef.current;
@@ -1059,26 +944,26 @@ function GitPanelImpl(props: GitPanelProps) {
   }, []);
 
   useEffect(() => {
-    // 项目切换会复用同一个 GitPanel 实例；递增序号让旧项目进行中的 status/mutation 结果失效。
-    statusRequestRef.current += 1;
-    mutationRequestRef.current += 1;
+    // 项目切换会复用同一个 GitPanel 实例：module 侧自增世代号让旧项目的 status/mutation
+    // 结果整体失效并清空资源状态；这里只重置面板自己的展示态。
+    gitStatus.setProject(props.projectId, props.initialBranchInfo);
     const next = readPaneState(props.projectId);
     setPaneState({ ...next, heights: fitPaneHeights(next, availableHeight) });
-    setGroups(EMPTY_GROUPS);
-    setError(null);
     setCommitMessage("");
     setCommitting(false);
-    mutationRunningRef.current = false;
-    setMutating(false);
     setResourceOpen({ merge: true, staged: true, changes: true });
     setCollapsedChangeDirs(new Set());
     setSmartCommitPreference(readSmartCommitPreference(props.projectId));
     setShowSmartCommitPrompt(false);
     setDiscardTarget(null);
-    setNotAGitRepo(false);
-    // 切项目时两个提示位一起清：它们是「当前项目此刻」的判断，不能跨项目沿用。
-    setGitNotInstalled(false);
-  }, [props.projectId]);
+    // initialBranchInfo 只作为项目切换时的种子；后续由资源 module 自拉取维护，
+    // 故不入依赖，避免 App store 每次变化都重复拉取。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gitStatus, props.projectId]);
+
+  // 轮询安装：面板在视口内 + 文档可见 + CSS 可见，焦点即刻补一次，30s 兜底——
+  // 全部由 module 绑定；面板不再自己写 setInterval/visibilitychange。
+  useEffect(() => gitStatus.install(panelRef.current), [gitStatus]);
 
   useEffect(() => {
     setPaneState((current) => ({
@@ -1097,124 +982,6 @@ function GitPanelImpl(props: GitPanelProps) {
       // Storage can be blocked in preview/web mode; pane interaction must still work for this session.
     }
   }, [paneState, props.projectId]);
-
-  /**
-   * 拉取最新 Git 工作区状态。
-   *
-   * @param silent - 静默模式：不显示 loading 动画、不清除已有错误和分组数据；
-   *                 用于后台轮询，避免闪烁和打断用户正在查看的 Diff 内容。
-   */
-  const refresh = useCallback(
-    async (silent = false) => {
-      // 静默轮询不打断 mutation，也不与前一个 status 请求重叠；否则慢于轮询间隔的请求会彼此作废，列表永久不更新。
-      if (
-        silent &&
-        (mutationRunningRef.current ||
-          statusRunningRequestRef.current?.projectId === props.projectId)
-      )
-        return;
-      const request = ++statusRequestRef.current;
-      const projectId = props.projectId;
-      const runningRequest = { projectId, request };
-      statusRunningRequestRef.current = runningRequest;
-      if (!silent) {
-        setLoading(true);
-        setError(null);
-      }
-      try {
-        const next = await props.git.status(projectId);
-        if (
-          request === statusRequestRef.current &&
-          projectId === projectIdRef.current
-        ) {
-          // 静默轮询是兜底通道；工作区没变时必须保留旧引用，否则整棵资源树
-          // （大仓库数千行）会跟着无意义地重渲染一次，白占主线程。
-          setGroups((current) =>
-            sameResourceGroups(current, next) ? current : next,
-          );
-          // 状态成功即证明 git 可用且目录是仓库：两个提示位必须随之清零。
-          // 此前只有 notAGitRepo 会在切项目/init 后被重置，gitNotInstalled 一旦置位
-          // 就永久停留，用户重装 git 或切到正常项目后仍看到「未安装」引导。
-          setGitNotInstalled(false);
-          setNotAGitRepo(false);
-        }
-      } catch (caught) {
-        if (
-          request === statusRequestRef.current &&
-          projectId === projectIdRef.current
-        ) {
-          if (!silent) {
-            setGroups(EMPTY_GROUPS);
-            // 失败分类不在渲染层猜：状态失败的两种可恢复原因（没装 git / 不是仓库）
-            // 由主进程的 probe 直接回答。此前靠正则匹配命令失败的英文文案，
-            // 文案一变（本地化、版本措辞）安装指引就会静默消失。
-            try {
-              const probe = await props.git.probe(projectId);
-              if (request !== statusRequestRef.current || projectId !== projectIdRef.current) {
-                return;
-              }
-              setGitNotInstalled(!probe.gitAvailable);
-              setNotAGitRepo(probe.gitAvailable && !probe.isRepo);
-              setError(probe.gitAvailable && probe.isRepo ? errorMessage(caught) : "");
-            } catch {
-              // probe 自身失败（项目被移除等）：退回显示干净的错误信息。
-              setError(errorMessage(caught));
-            }
-          }
-          // 静默失败不影响已展示的旧分组数据；不做任何 UI 状态变更。
-        }
-      } finally {
-        if (statusRunningRequestRef.current === runningRequest)
-          statusRunningRequestRef.current = null;
-        if (
-          request === statusRequestRef.current &&
-          projectId === projectIdRef.current &&
-          !silent
-        )
-          setLoading(false);
-      }
-    },
-    [props.git.status, props.git.probe, props.projectId],
-  );
-
-  // 打开 Git drawer 时首次加载；依赖 refresh 引用稳定。
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  // 静默轮询：只在「面板在视口内 + 窗口可见」时跑，30s 兜底拉取一次最新工作区状态，
-  // 不显示 loading 动画、不覆盖错误。每次轮询都会 spawn git，抽屉切走/最小化时必须停；
-  // 面板重新可见、窗口重新聚焦时立即补一次再重启定时器。
-  useEffect(() => {
-    let timer: number | undefined;
-    const stop = () => {
-      if (timer !== undefined) {
-        window.clearInterval(timer);
-        timer = undefined;
-      }
-    };
-    const sync = () => {
-      const shouldPoll = panelVisible && document.visibilityState === "visible";
-      if (!shouldPoll) {
-        stop();
-        return;
-      }
-      void refresh(true);
-      if (timer === undefined) {
-        timer = window.setInterval(() => {
-          if (panelActuallyVisible(panelRef.current)) void refresh(true);
-        }, GIT_POLL_INTERVAL_MS);
-      }
-    };
-    sync();
-    document.addEventListener("visibilitychange", sync);
-    window.addEventListener("focus", sync);
-    return () => {
-      stop();
-      document.removeEventListener("visibilitychange", sync);
-      window.removeEventListener("focus", sync);
-    };
-  }, [refresh, panelVisible]);
 
   const toggleResource = (key: keyof typeof resourceOpen) => {
     setResourceOpen((current) => ({ ...current, [key]: !current[key] }));
@@ -1294,60 +1061,36 @@ function GitPanelImpl(props: GitPanelProps) {
     setCollapsedChangeDirs(new Set());
   }, []);
 
-  const act = async (operation: () => Promise<void>) => {
-    if (mutationRunningRef.current || committing) return;
-    const mutationRequest = ++mutationRequestRef.current;
-    mutationRunningRef.current = true;
-    setMutating(true);
-    const projectId = props.projectId;
-    try {
-      await operation();
-      if (projectId === projectIdRef.current) await refresh();
-    } catch (caught) {
-      // Do not let refresh clear the mutation error before the user can read it.
-      if (projectId === projectIdRef.current) setError(errorMessage(caught));
-    } finally {
-      if (mutationRequest === mutationRequestRef.current) {
-        mutationRunningRef.current = false;
-        if (projectId === projectIdRef.current) setMutating(false);
-      }
-    }
+  /**
+   * 单条变更操作（stage/unstage/discard）的统一入口。
+   * 门、世代校验、错误落地、刷新都在 module 的 runMutation 里，这里只表达意图。
+   */
+  const act = async (operation: (projectId: string) => Promise<void>) => {
+    if (committing) return;
+    await gitStatus.runMutation({ run: operation });
   };
 
   const runCommit = async (stageAll: boolean) => {
     const message = commitMessage.trim();
-    if (
-      !message ||
-      committing ||
-      mutating ||
-      hasUnresolvedConflicts ||
-      mutationRunningRef.current
-    )
-      return;
-    const projectId = props.projectId;
-    const mutationRequest = ++mutationRequestRef.current;
-    mutationRunningRef.current = true;
-    setCommitting(true);
-    setError(null);
-    try {
-      if (stageAll) {
-        const paths = workingChanges.map((resource) => resource.path);
-        if (paths.length > 0) await props.git.stage(projectId, paths);
-      }
-      await props.git.commit(projectId, message);
-      if (projectId !== projectIdRef.current) return;
-      setCommitMessage("");
-      await refresh();
-      // 提交可能伴随分支状态变化（如合入删除分支），面板自持分支数据同步拉取。
-      void refreshBranches();
-    } catch (caught) {
-      if (projectId === projectIdRef.current) setError(errorMessage(caught));
-    } finally {
-      if (mutationRequest === mutationRequestRef.current) {
-        mutationRunningRef.current = false;
-        if (projectId === projectIdRef.current) setCommitting(false);
-      }
-    }
+    if (!message || committing || mutating || hasUnresolvedConflicts) return;
+    const outcome = await gitStatus.runMutation({
+      // setCommitting 放在 run 里：门被占时 run 根本不会执行，spinner 不该亮。
+      run: async (projectId) => {
+        setCommitting(true);
+        if (stageAll) {
+          const paths = workingChanges.map((resource) => resource.path);
+          if (paths.length > 0) await props.git.stage(projectId, paths);
+        }
+        await props.git.commit(projectId, message);
+      },
+      // 提交可能伴随分支状态变化（如合入删除分支）：刷新策略里带 force 分支拉取，
+      // 不能合并进提交前发出的在途读取，否则拿回的仍是提交前的分支列表。
+      refresh: "status+branches",
+    });
+    if (outcome.kind === "ok") setCommitMessage("");
+    // stale 表示跑到一半项目已切走：spinner 由项目切换的 effect 复位，
+    // 这里再清一次会误清新项目刚亮起的那个。
+    if (outcome.kind === "ok" || outcome.kind === "failed") setCommitting(false);
   };
 
   const doCommit = async () => {
@@ -1385,60 +1128,32 @@ function GitPanelImpl(props: GitPanelProps) {
     const target = discardTarget;
     if (!target) return;
     setDiscardTarget(null);
-    void act(() =>
-      props.git.discard(props.projectId, target.group, target.path),
+    void act((projectId) =>
+      props.git.discard(projectId, target.group, target.path),
     );
   };
 
-  const doPush = async () => {
-    if (!props.git.push || mutationRunningRef.current) return;
-    const projectId = props.projectId;
-    const mutationRequest = ++mutationRequestRef.current;
-    mutationRunningRef.current = true;
-    setPushing(true);
-    setError(null);
-    try {
-      await props.git.push(projectId);
-      if (projectId !== projectIdRef.current) return;
-      await refresh();
-    } catch (caught) {
-      if (projectId === projectIdRef.current) {
-        const msg = errorMessage(caught);
-        setError(msg);
-        showNotice(msg, 10000, "error");
-      }
-    } finally {
-      if (mutationRequest === mutationRequestRef.current) {
-        mutationRunningRef.current = false;
-        if (projectId === projectIdRef.current) setPushing(false);
-      }
-    }
+  /**
+   * push/pull 只有「调哪个 git 方法 + 哪个 spinner」不同：
+   * 门、世代校验、错误提示、刷新、解锁都交给 module，避免两条路径各写一遍陈旧守卫。
+   */
+  const runRemoteMutation = async (
+    action: (projectId: string) => Promise<void>,
+    setBusy: (busy: boolean) => void,
+  ) => {
+    const outcome = await gitStatus.runMutation({
+      run: async (projectId) => {
+        setBusy(true);
+        await action(projectId);
+      },
+      onNotice: (message) => showNotice(message, 10000, "error"),
+    });
+    if (outcome.kind === "ok" || outcome.kind === "failed") setBusy(false);
   };
 
-  const doPull = async () => {
-    if (!props.git.pull || mutationRunningRef.current) return;
-    const projectId = props.projectId;
-    const mutationRequest = ++mutationRequestRef.current;
-    mutationRunningRef.current = true;
-    setPulling(true);
-    setError(null);
-    try {
-      await props.git.pull(projectId);
-      if (projectId !== projectIdRef.current) return;
-      await refresh();
-    } catch (caught) {
-      if (projectId === projectIdRef.current) {
-        const msg = errorMessage(caught);
-        setError(msg);
-        showNotice(msg, 10000, "error");
-      }
-    } finally {
-      if (mutationRequest === mutationRequestRef.current) {
-        mutationRunningRef.current = false;
-        if (projectId === projectIdRef.current) setPulling(false);
-      }
-    }
-  };
+  const doPush = () => runRemoteMutation(props.git.push, setPushing);
+
+  const doPull = () => runRemoteMutation(props.git.pull, setPulling);
 
   const visibleSashAfterChanges = adjacentVisiblePane(
     paneState.open,
@@ -1530,10 +1245,11 @@ function GitPanelImpl(props: GitPanelProps) {
               setInitializing(true);
               try {
                 await props.git.init(props.projectId);
-                setNotAGitRepo(false);
-                void refresh();
+                // 初始化成功即不再是「无仓库」：先清引导位，再非静默拉一次权威状态。
+                gitStatus.clearRepoFlags();
+                void gitStatus.refresh();
               } catch (caught) {
-                setError(errorMessage(caught));
+                gitStatus.setError(errorMessage(caught));
               }
               setInitializing(false);
             }}
@@ -1556,8 +1272,8 @@ function GitPanelImpl(props: GitPanelProps) {
                     // 切换后采纳 App 返回的最新分支信息；无返回（异常路径）时自拉取一次。
                     void Promise.resolve(props.onSwitchBranch?.(branch)).then(
                       (next) => {
-                        if (next) setBranchInfo(next);
-                        else void refreshBranches();
+                        if (next) gitStatus.setBranchInfo(next);
+                        else void gitStatus.refreshBranches();
                       },
                     );
                   }
@@ -1586,8 +1302,8 @@ function GitPanelImpl(props: GitPanelProps) {
                       void Promise.resolve(
                         props.onCreateBranch?.(newBranchName.trim()),
                       ).then((next) => {
-                        if (next) setBranchInfo(next);
-                        else void refreshBranches();
+                        if (next) gitStatus.setBranchInfo(next);
+                        else void gitStatus.refreshBranches();
                       });
                       setBranchCreating(false);
                       setNewBranchName("");
@@ -1607,8 +1323,8 @@ function GitPanelImpl(props: GitPanelProps) {
                     void Promise.resolve(
                       props.onCreateBranch?.(newBranchName.trim()),
                     ).then((next) => {
-                      if (next) setBranchInfo(next);
-                      else void refreshBranches();
+                      if (next) gitStatus.setBranchInfo(next);
+                      else void gitStatus.refreshBranches();
                     });
                     setBranchCreating(false);
                     setNewBranchName("");
@@ -1675,7 +1391,7 @@ function GitPanelImpl(props: GitPanelProps) {
             className="git-action-btn"
             title={t("common.refresh")}
             aria-label={t("common.refresh")}
-            onClick={() => void refresh()}
+            onClick={() => void gitStatus.refresh()}
           >
             <RefreshCw size={14} />
           </button>
@@ -1685,7 +1401,7 @@ function GitPanelImpl(props: GitPanelProps) {
             className="git-action-btn"
             title={t("git.push")}
             aria-label={t("git.push")}
-            disabled={pushing || mutationRunningRef.current}
+            disabled={pushing || mutating}
             onClick={() => void doPush()}
           >
             {pushing ? (
@@ -1699,7 +1415,7 @@ function GitPanelImpl(props: GitPanelProps) {
             className="git-action-btn"
             title={t("git.pull")}
             aria-label={t("git.pull")}
-            disabled={pulling || mutationRunningRef.current}
+            disabled={pulling || mutating}
             onClick={() => void doPull()}
           >
             {pulling ? (
@@ -1729,11 +1445,11 @@ function GitPanelImpl(props: GitPanelProps) {
                     setInitializing(true);
                     try {
                       await props.git.init(props.projectId);
-                      setNotAGitRepo(false);
+                      gitStatus.clearRepoFlags();
                       // 初始化完成后刷新状态
-                      void refresh();
+                      void gitStatus.refresh();
                     } catch (caught) {
-                      setError(errorMessage(caught));
+                      gitStatus.setError(errorMessage(caught));
                     }
                     setInitializing(false);
                   }}
@@ -1842,9 +1558,9 @@ function GitPanelImpl(props: GitPanelProps) {
                   open={resourceOpen.staged}
                   onToggle={() => toggleResource("staged")}
                   allAction={() =>
-                    act(() =>
+                    act((projectId) =>
                       props.git.unstage(
-                        props.projectId,
+                        projectId,
                         groups.index.map((resource) => resource.path),
                       ),
                     )
@@ -1857,7 +1573,7 @@ function GitPanelImpl(props: GitPanelProps) {
                     groupType="index"
                     onOpenWorkspaceFileDiff={props.onOpenWorkspaceFileDiff}
                     mutating={mutating || committing}
-                    unstageFile={(path) => act(() => props.git.unstage(props.projectId, [path]))}
+                    unstageFile={(path) => act((projectId) => props.git.unstage(projectId, [path]))}
                     projectRoot={props.projectRoot}
                     collapsedDirs={collapsedChangeDirs}
                     onToggleDir={toggleChangeDir}
@@ -1871,9 +1587,9 @@ function GitPanelImpl(props: GitPanelProps) {
                   open={resourceOpen.changes}
                   onToggle={() => toggleResource("changes")}
                   allAction={() =>
-                    act(() =>
+                    act((projectId) =>
                       props.git.stage(
-                        props.projectId,
+                        projectId,
                         workingChanges.map((resource) => resource.path),
                       ),
                     )
@@ -1886,7 +1602,7 @@ function GitPanelImpl(props: GitPanelProps) {
                     groupType="workingTree"
                     onOpenWorkspaceFileDiff={props.onOpenWorkspaceFileDiff}
                     mutating={mutating || committing}
-                    stageFile={(path) => act(() => props.git.stage(props.projectId, [path]))}
+                    stageFile={(path) => act((projectId) => props.git.stage(projectId, [path]))}
                     discardFile={(path, group) => setDiscardTarget({ group, path })}
                     projectRoot={props.projectRoot}
                     collapsedDirs={collapsedChangeDirs}
