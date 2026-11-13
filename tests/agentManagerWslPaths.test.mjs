@@ -166,7 +166,15 @@ function loadAgentManager() {
 	registry["./boundedLruCache"] = loadModule("src/main/pi/boundedLruCache.ts", "boundedLruCache.ts");
 	// sessionJsonl 的读取管线收敛到 ../sessions/sessionEntries（唯一实现：编码守卫/逐行解析/
 	// 指纹/预算，仅依赖 node:fs/promises）；测试文件自身的 require 会把它解析到 tests/ 而失败。
-	registry["../sessions/sessionEntries"] = loadModule("src/main/sessions/sessionEntries.ts", "sessionEntries.ts");
+	const sessionEntries = loadModule("src/main/sessions/sessionEntries.ts", "sessionEntries.ts");
+	registry["../sessions/sessionEntries"] = sessionEntries;
+	// sessionTranscript（消息行谓词 + 分支回溯）从 sessions/ 目录内以 "./sessionEntries" 引用
+	// 同一份解析结果；两个 id 必须指向同一实例，否则「哪一行是消息」的规则会分裂成两套。
+	registry["./sessionEntries"] = sessionEntries;
+	registry["../sessions/sessionTranscript"] = loadModule(
+		"src/main/sessions/sessionTranscript.ts",
+		"sessionTranscript.ts",
+	);
 	registry["./sessionArchives"] = loadModule("src/main/pi/sessionArchives.ts", "sessionArchives.ts");
 	registry["./sessionJsonl"] = loadModule("src/main/pi/sessionJsonl.ts", "sessionJsonl.ts");
 	// W4：AgentManager 的 settle 判定收敛到纯函数模块 settleReducer（无运行时依赖）。
