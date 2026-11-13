@@ -2,8 +2,6 @@
  * Agent IPC handler：Agent 生命周期（创建/停止/重启/克隆）、消息收发、模型/思考级别切换。
  *
  * 从 index.ts 的 registerIpc() 迁移而来。
- * agentsPrompt / agentsAbort 只读访问 feishuBridge（通过 getFeishuBridge dep），
- * 用于飞书会话镜像、文件转发和流式卡片控制。
  * agentsStop / agentsRestart 调用 terminalManager.closeAgent 清理终端会话。
  */
 import type { BrowserWindow, NativeImage } from "electron";
@@ -14,16 +12,12 @@ import { normalizePiCommands } from "../../shared/piCommands";
 import type { AgentManager } from "../pi/AgentManager";
 import type { TerminalSessionManager } from "../terminal/TerminalSessionManager";
 import type { AppLogger } from "../logging/AppLogger";
-import type { FeishuBridge } from "../feishu/FeishuBridge";
-import { wantsFeishuDoc, wrapHostInstruction } from "../feishu/docActions";
-import { resolveFeishuFileSendIntent } from "../feishu/fileIntent";
 import { showAppNotification } from "../notifications";
 
 interface AgentHandlerDeps {
 	agentManager: AgentManager;
 	terminalManager: TerminalSessionManager;
 	appLogger: AppLogger;
-	getFeishuBridge: () => FeishuBridge | null;
 	getMainWindow: () => BrowserWindow | null;
 	/** 非 Windows 平台的 Toast 正文图像；Windows 左上角应用图标来自品牌化 exe/AUMID 快捷方式。 */
 	notificationIcon?: NativeImage;
@@ -44,7 +38,7 @@ type AgentHandlerMaps = {
 };
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps {
-	const { agentManager, terminalManager, appLogger, getFeishuBridge, getMainWindow, notificationIcon } = deps;
+	const { agentManager, terminalManager, appLogger, getMainWindow, notificationIcon } = deps;
 
 	return {
 		agents: {
@@ -97,7 +91,6 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 						title: tab.title,
 						sessionPath: tab.sessionPath,
 					});
-					// 不再自动为新会话创建飞书群；必须由用户在会话输入框的飞书菜单中手动连接后才同步。
 					return tab;
 				} catch (error) {
 					// createUnlocked 内部已尽量吞掉 pi 启动失败；这里兜底信任/项目查找等前置异常，
@@ -128,90 +121,21 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): AgentHandlerMaps 
 				void appLogger.info("agent", "Agent stopped", { agentId });
 			},
 			prompt: async (_event, input: SendPromptInput) => {
-				const bridge = getFeishuBridge();
-				const bridgeConnected = bridge?.getStatus().status === "connected";
-				const hasFeishuBinding = bridgeConnected && bridge.hasSessionBinding(input.agentId);
-				const docTitle = bridgeConnected ? wantsFeishuDoc(input.message) : undefined;
-				const sessionChatId = bridgeConnected ? bridge.getSessionChatId(input.agentId) : undefined;
-				let agentInstruction: string | undefined;
-				const buildFeishuActionInstruction = (chatId?: string) => [
-					"当前会话已连接飞书聊天。严禁调用 lark-cli、飞书 IM API 或搜索群聊来发送文件；不要询问 chat_id。需要把本地文件发到当前飞书聊天时，最终回答末尾独立一行写 [SEND_FILE:本地文件路径]，OmpDeck 会按当前会话绑定自动上传。",
-					chatId ? `当前绑定的飞书 chat_id: ${chatId}。这是只读上下文，用于确认当前会话绑定；发送文件仍必须用 [SEND_FILE:本地文件路径]。` : undefined,
-				].filter(Boolean).join("\n");
-
-				if (bridgeConnected && hasFeishuBinding) {
-					const filePath = resolveFeishuFileSendIntent(input.message, agentManager.getCwd(input.agentId));
-					if (filePath) {
-						const result = await bridge.sendFileForSession(input.agentId, filePath);
-						agentManager.recordHostExchange(input.agentId, input.message, result);
-						void appLogger.info("feishu", "File sent through current session binding", {
-							agentId: input.agentId,
-							filePath,
-							success: result.startsWith("✅"),
-						});
-						// 消息已由主进程直接处理；历史行为返回 undefined（桌面契约声明 SendPromptResult）
-						return undefined as unknown as SendPromptResult;
-					}
-				}
-
-				// 用户说了要做飞书文档但当前会话未绑定 → 自动绑定并告知 Agent 可用 lark-cli
-				if (bridgeConnected && docTitle && !hasFeishuBinding) {
-					const tab = agentManager.list().find((item) => item.id === input.agentId);
-					if (tab) {
-						await bridge.ensureSessionMirror(tab.id, tab.title, tab.sessionPath).catch((e) => {
-							console.error("[Feishu] auto-bind session mirror failed:", e);
-						});
-						bridge.trackDocRequest(tab.id, docTitle);
-						void bridge.forwardUserMessageToFeishu(tab.id, input.message).catch((e) => {
-							console.error("[Feishu] forward OmpDeck message failed:", e);
-						});
-						agentInstruction = `${buildFeishuActionInstruction(bridge.getSessionChatId(tab.id))}\n创建飞书文档时，先输出完整正文，最后独立一行写 [CREATE_DOC:文档标题]。`;
-					}
-				} else if (hasFeishuBinding) {
-					agentInstruction = buildFeishuActionInstruction(sessionChatId);
-					const tab = agentManager.list().find((item) => item.id === input.agentId);
-					if (tab) {
-						void bridge.startSessionMirrorRun(tab.id, tab.title, tab.sessionPath).catch((e) => {
-							console.error("[Feishu] session mirror card init failed:", e);
-						});
-						if (input.message.trim()) {
-							void bridge.forwardUserMessageToFeishu(tab.id, input.message).catch((e) => {
-								console.error("[Feishu] forward OmpDeck message failed:", e);
-							});
-						}
-					}
-				}
-				// agentMessage 用隐藏标记包裹宿主指令，UI/历史展示只显示用户原文。
-				const result = await agentManager.sendPrompt(
-					agentInstruction
-						? {
-								...input,
-								agentMessage: wrapHostInstruction(agentInstruction, input.message),
-							}
-						: input,
-				);
+				const result = await agentManager.sendPrompt(input);
 				void appLogger.info("agent", "Prompt sent", {
 					agentId: input.agentId,
 					messageLength: input.message.length,
 					imageCount: input.images?.length ?? 0,
 					streamingBehavior: input.streamingBehavior,
 				});
-				// 飞书文件直发分支会 return undefined（历史行为）；桌面契约声明 SendPromptResult
-				return result as SendPromptResult;
+				return result;
 			},
 			abort: async (_event, agentId: string) => {
-				// Session Mirror: 停止飞书流式卡片
-				const bridge = getFeishuBridge();
-				if (bridge) {
-					bridge.stopSessionMirrorRun(agentId);
-				}
 				const result = await agentManager.abort(agentId);
 				void appLogger.info("agent", "Agent aborted", { agentId });
 				return result;
 			},
 			abortAndRestoreQueue: async (_event, agentId: string) => {
-				const bridge = getFeishuBridge();
-				bridge?.stopSessionMirrorRun(agentId);
 				const result = await agentManager.abortAndRestoreQueue(agentId);
 				void appLogger.info("agent", "Agent aborted and queue restored", {
 					agentId,

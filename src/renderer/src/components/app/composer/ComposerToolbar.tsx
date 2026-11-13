@@ -292,9 +292,7 @@ export function ComposerToolbar(props: {
 	onOpenComposerModePicker?: () => void;
 	/** 取消计划模式：直接切回普通发送模式，不经过模式选择器 */
 	onCancelPlan?: () => void;
-	/** 在思考按钮后插入的额外指示器（如飞书链接状态） */
-	feishuIndicator?: ReactNode;
-	/** 会话文件路径卡片,渲染在思考按钮之后、feishuIndicator 之后 */
+	/** 会话文件路径卡片,渲染在思考按钮之后 */
 	pathIndicator?: ReactNode;
 	/** 文件引用按钮回调 */
 	onAttachFile?: () => void;
@@ -358,7 +356,6 @@ export function ComposerToolbar(props: {
 					{t("app.attachFile")}
 				</button>
 			)}
-			{props.feishuIndicator}
 			{props.pathIndicator}
 
 			{showCompact && (

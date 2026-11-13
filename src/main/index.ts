@@ -250,7 +250,6 @@ import { registerSessionHandlers } from "./ipc/sessionHandlers";
 import { registerGitHandlers } from "./ipc/gitHandlers";
 import { registerConfigHandlers } from "./ipc/configHandlers";
 import { registerClipboardHandlers } from "./ipc/clipboardHandlers";
-import { registerFeishuHandlers } from "./ipc/feishuHandlers";
 import { AfkOrchestrator } from "./afk/AfkOrchestrator";
 import { registerAfkHandlers } from "./afk/afkHandlers";
 import { registerPiHandlers } from "./ipc/piHandlers";
@@ -270,8 +269,6 @@ import {
 	openProjectInEditor,
 	validateExternalEditorCommand,
 } from "./editors/EditorDetector";
-import type { FeishuBridge } from "./feishu/FeishuBridge";
-import { listBots } from "./feishu/FeishuConfig";
 import { perfDump } from "./perf";
 import { startSoakRecorder } from "./perf/soak";
 
@@ -362,7 +359,6 @@ let rpcLogger: RpcLogger;
 let updateManager: UpdateManager;
 let linkOpener: LinkOpener;
 let trayManager: TrayManager;
-let feishuBridge: FeishuBridge | null = null;
 let activeWslEnvironment: WslEnvironment | null = null;
 let quickGen: QuickGenProcess | null = null;
 
@@ -1131,19 +1127,6 @@ function shouldShowMainWindowImmediately() {
 	return isUsingLinuxXWaylandWorkaround(petEnabledAtLaunch);
 }
 
-// ===== 飞书桥接 IPC =====
-
-/** 自动连接：启动时检查已保存的 Bot 配置，自动连接 */
-async function autoConnectFeishu() {
-	const bots = listBots();
-	if (bots.length === 0) return;
-	const bot = bots.find((b) => b.enabled);
-	if (!bot) return;
-	// 不再自动连接，由用户手动在配置页点击连接
-	// 避免应用重启后静默恢复连接导致用户困惑
-	console.log("[飞书] 检测到已保存的 Bot 配置:", bot.name, "(跳过自动连接，需手动连接)");
-}
-
 function registerIpc() {
 	// 全部 HandlerMap 模块统一走表驱动注册（通道名/协议取自通道表，命名空间跨模块自动合并）
 	registerIpcHandlers(
@@ -1186,7 +1169,6 @@ function registerIpc() {
 			agentManager,
 			terminalManager,
 			appLogger,
-			getFeishuBridge: () => feishuBridge,
 			getMainWindow: () => mainWindow,
 			notificationIcon,
 		}),
@@ -1449,16 +1431,6 @@ app.whenReady().then(async () => {
 	// 扩展部署、WSL 同步、代理/Web 服务/宠物等后置，避免打包后点击启动要先等一长串磁盘/网络 IO。
 	await settingsStore.load();
 	registerIpc();
-	registerIpcHandlers(registerFeishuHandlers({
-		agentManager,
-		projectStore,
-		appLogger,
-		getMainWindow: () => mainWindow,
-		getFeishuBridge: () => feishuBridge,
-		setFeishuBridge: (bridge) => {
-			feishuBridge = bridge;
-		},
-	}));
 	// 任务栏/Toast 的图标解析发生在窗口创建时，必须先把开始菜单快捷方式补好。
 	const windowsAppIdentity = await windowsAppIdentityReady;
 	if (windowsAppIdentity.status === "registered") {
@@ -1570,8 +1542,6 @@ async function runPostWindowStartupTasks(): Promise<void> {
 		}
 	})();
 
-	// 自动连接：如果已有 Bot 配置，自动启动飞书连接
-	autoConnectFeishu();
 	sendTelemetryHeartbeat();
 
 	// 启动后预热扩展列表缓存，打开配置页时优先命中内存结果。

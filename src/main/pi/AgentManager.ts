@@ -204,7 +204,7 @@ export type { ProjectTrustChoice } from "./agentInteractions";
 
 /**
  * 「IPC 基线截断」告警的最小间隔（每 agent）：getMessages 被渲染层状态拉取、
- * Web 轮询、飞书同步高频调用（≤600ms 一次）。超过 transcript 预算的会话若每次
+ * Web 轮询高频调用（≤600ms 一次）。超过 transcript 预算的会话若每次
  * 调用都 warn，日志会在几秒内被同一条记录刷爆，反而掩盖真正的问题。
  */
 const TRANSCRIPT_TRUNCATION_WARN_INTERVAL_MS = 60_000;
@@ -491,7 +491,7 @@ export class AgentManager {
 	/**
 	 * 返回某 agent 当前内存中的完整消息数组（只读快照）。
 	 * 供渲染层增量失同步自愈（渲染层重载后 agent 仍在流式，期间只有尾部增量、缺会话头）、
-	 * FeishuBridge/WebService 同步时间线使用。不存在该 agent 时返回空数组，
+	 * WebService 同步时间线使用。不存在该 agent 时返回空数组，
 	 * 不抛错——这些调用方只读展示，缺失时降级为空比中断流程更合理。
 	 */
 	getMessages(agentId: string): ChatMessage[] {
@@ -539,12 +539,6 @@ export class AgentManager {
 		preloadedEntries?: readonly unknown[],
 	): Promise<ChatMessage[]> {
 		return this.sessionJsonl.readDisplayMessages(sessionPath, agentId, preloadedEntries);
-	}
-
-	recordHostExchange(agentId: string, userText: string, assistantText: string) {
-		const runtime = this.requireRuntime(agentId);
-		this.addMessage(runtime, "user", userText);
-		this.addMessage(runtime, "assistant", assistantText);
 	}
 
 	getCwd(agentId: string) {
@@ -3670,15 +3664,6 @@ export class AgentManager {
 		}
 	}
 
-	/** 注册本地事件监听器（供 FeishuBridge 等主进程内部模块使用） */
-	addLocalEventListener(listener: (agentId: string, event: unknown) => void): () => void {
-		this.localEventListeners.add(listener);
-		return () => { this.localEventListeners.delete(listener); };
-	}
-
-	/** 本地事件监听器（供 FeishuBridge 等主进程内部模块消费原始 pi 事件） */
-	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
-
 	/**
 	 * 对外语义出口。桌面适配器、AFK 编排器、宠物桥共用同一个 sink；
 	 * 谁订阅谁退订，`hasUiResponders()` 因此只对「能作答交互请求」的消费者为真。
@@ -4065,10 +4050,6 @@ export class AgentManager {
 	}
 
 	private handlePiEvent(agentId: string, event: unknown) {
-		// 通知本地监听器（FeishuBridge 等主进程内部订阅）
-		for (const listener of this.localEventListeners) {
-			try { listener(agentId, event); } catch {}
-		}
 		// 不向渲染进程广播原始事件：agents:event 通道无任何订阅者（preload 未暴露），
 		// 每条 text_delta 都携带全量 partialMessage，跨进程结构化克隆纯属浪费；
 		// 渲染层所需信息已由 agents:message / agents:thinking / agents:runtime-state 覆盖。

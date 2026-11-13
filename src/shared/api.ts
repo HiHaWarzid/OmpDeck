@@ -50,12 +50,6 @@ import type {
 	ExternalEditor,
 	ExternalEditorId,
 	ExternalEditorSetting,
-	FeishuBotConfig,
-	FeishuBridgeStatus,
-	FeishuChatBinding,
-	FeishuChatMessage,
-	FeishuConnectInput,
-	FeishuTestResult,
 	FileTreeNode,
 	ForkMessage,
 	GitBranchInfo,
@@ -694,31 +688,6 @@ export interface TerminalApi {
 	onExit: (callback: (payload: TerminalExitEvent) => void) => () => void;
 }
 
-/** 飞书桥接 */
-export interface FeishuApi {
-	connect: (input: FeishuConnectInput) => Promise<{ success: boolean; message: string }>;
-	connectTemp: (input: FeishuConnectInput) => Promise<{ success: boolean; message: string; botInfo?: { id: string; name: string } }>;
-	disconnect: () => Promise<{ success: boolean }>;
-	connectByBot: (botId: string) => Promise<{ success: boolean; message: string }>;
-	statusRequest: () => Promise<FeishuBridgeStatus>;
-	onStatus: (callback: (status: FeishuBridgeStatus) => void) => () => void;
-	botsList: () => Promise<FeishuBotConfig[]>;
-	botAdd: (input: FeishuConnectInput) => Promise<{ success: boolean; bot?: FeishuBotConfig; error?: string }>;
-	botRemove: (botId: string) => Promise<boolean>;
-	botConfig: (botId: string, patch: Partial<FeishuBotConfig>) => Promise<FeishuBotConfig | undefined>;
-	botSecret: (botId: string) => Promise<string>;
-	testConnection: (appId: string, appSecret: string) => Promise<FeishuTestResult>;
-	bindingsList: () => Promise<FeishuChatBinding[]>;
-	bindingRemove: (chatId: string) => Promise<boolean>;
-	bindingUpdate: (chatId: string, patch: Partial<FeishuChatBinding>) => Promise<FeishuChatBinding | undefined>;
-	onMessages: (callback: (message: FeishuChatMessage) => void) => () => void;
-	onBindingsChanged: (callback: (bindings: FeishuChatBinding[]) => void) => () => void;
-	onWhoamiResult: (callback: (openId: string) => void) => () => void;
-	onBotsChanged: (callback: (bots: FeishuBotConfig[]) => void) => () => void;
-	sessionBotGet: (agentId: string) => Promise<string | null>;
-	sessionBotSet: (agentId: string, botId: string | null) => Promise<{ success: boolean; message?: string; chatId?: string }>;
-}
-
 /** 系统文件选择器 */
 export interface DialogApi {
 	pickFiles: (options?: { title?: string; includeDirectories?: boolean }) => Promise<string[]>;
@@ -790,7 +759,6 @@ export interface PiDesktopApi {
 	remoteAccess: RemoteAccessApi;
 	pet: PetApi;
 	terminal: TerminalApi;
-	feishu: FeishuApi;
 	dialog: DialogApi;
 	clipboard: ClipboardApi;
 	perf: PerfApi;

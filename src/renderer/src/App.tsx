@@ -76,8 +76,6 @@ const LazyMarkdownText = lazyWithReload(() =>
 const ScratchPadPanel = lazyWithReload(() =>
   import("./components/scratchPad/ScratchPadPanel").then((m) => ({ default: m.ScratchPadPanel })),
 );
-import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
-import { useFeishuBridge } from "./hooks/useFeishuBridge";
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
 import { Button } from "./components/ui/Button";
@@ -629,9 +627,6 @@ export function App() {
   // 菜单外层容器：用于「点击外部关闭」判定；chevron 引用用于 Escape 关闭后还焦。
   const sendBehaviorMenuWrapRef = useRef<HTMLDivElement | null>(null);
   const sendBehaviorChevronRef = useRef<HTMLButtonElement | null>(null);
-  const [sessionFeishuBotId, setSessionFeishuBotId] = useState<
-    string | undefined
-  >(undefined);
   const [sessionActionsOpen, setSessionActionsOpen] = useState(false);
   const [switchingBranch, setSwitchingBranch] = useState<string | null>(null);
   // 仅跟踪输入框中是否有非空白文本（驱动发送按钮状态），避免每键触发全量 App 重渲染。
@@ -1495,9 +1490,6 @@ export function App() {
   const arrowDownHeldRef = useRef(false);
   const projectDragPreventClickRef = useRef(false);
 
-  // ===== 飞书桥接 =====
-
-  const feishu = useFeishuBridge();
   const scratchPad = useScratchPad();
 
   // 当活跃项目切换时，从 localStorage 恢复该项目的抽屉面板状态和展开目录。
@@ -1579,26 +1571,6 @@ export function App() {
     // refreshSessions 每次渲染都是新函数；只需在面板/项目切换时触发。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawer, drawerCollapsed, sessionsProjectId]);
-
-  // 当活跃 Agent 切换或绑定列表变更时，加载该 Agent 指定的飞书 Bot
-  // 绑定变更后同步刷新，确保配置页断开关联后已连接状态正确反映。
-  useEffect(() => {
-    if (!activeAgentId) {
-      setSessionFeishuBotId(undefined);
-      return;
-    }
-    feishu.getSessionBot(activeAgentId).then((botId) => {
-      setSessionFeishuBotId(botId);
-    });
-  }, [activeAgentId, feishu.bindings]);
-
-  // Bot 列表变更后，若当前会话固定的 Bot 已被删除，则清除本地缓存避免指示器展示已失效的固定状态。
-  useEffect(() => {
-    if (!sessionFeishuBotId) return;
-    if (!feishu.bots.some((bot) => bot.id === sessionFeishuBotId)) {
-      setSessionFeishuBotId(undefined);
-    }
-  }, [feishu.bots, sessionFeishuBotId]);
 
   const activeProject = projects.find(
     (project) => project.id === activeProjectId,
@@ -6802,19 +6774,6 @@ export function App() {
                 >
                   <Paperclip size={15} strokeWidth={1.8} />
                 </button>
-                {/* 飞书状态入口：有配置 Bot 时显示，可按会话绑定/切换机器人 */}
-                <FeishuLinkIndicator
-                  status={feishu.status}
-                  bots={feishu.bots}
-                  activeAgentId={activeAgentId}
-                  activeBotId={feishu.activeBotId}
-                  sessionBotId={sessionFeishuBotId}
-                  isConnected={feishu.isConnected}
-                  connecting={feishu.connecting}
-                  onConnectByBot={feishu.connectByBot}
-                  onDisconnect={feishu.disconnect}
-                  onSetSessionBot={feishu.setSessionBot}
-                />
               </div>
               <div className="composer-bottom-center">
                 {/* 模型/思考级别/上下文压缩 chips：抽为 memo 组件，流式期间

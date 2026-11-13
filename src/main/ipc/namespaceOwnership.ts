@@ -52,7 +52,6 @@ export const NAMESPACE_OWNERS: Record<Namespace, readonly string[]> = {
 	// PetSystem.handlerMaps（src/main/pet/index.ts），非独立 handler 模块文件。
 	pet: ["pet"],
 	terminal: ["terminalHandlers"],
-	feishu: ["feishuHandlers"],
 	dialog: ["projectHandlers"],
 	clipboard: ["clipboardHandlers"],
 	// local/override 条目，实现走 preload 覆盖层（PIDECK_PERF=1），无 handler 注册。

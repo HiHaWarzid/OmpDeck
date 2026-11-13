@@ -41,7 +41,6 @@ Electron（当前）                                       Tauri（目标）
 │   child_process（子进程）  │                  │   portable-pty crate     │
 │   node:fs（文件系统）      │                  │   tauri-plugin-fs        │
 │   node:path / crypto     │                  │   Rust std / serde       │
-│   @larksuiteoapi（飞书）   │                  │   自有飞书 HTTP 封装      │
 └──────────────────────────┘                  └──────────────────────────┘
 ```
 
@@ -105,7 +104,6 @@ Electron（当前）                                       Tauri（目标）
 | 模块 | 位置 | 挑战 |
 |---|---|---|
 | **TerminalSessionManager** | `src/main/terminal/TerminalSessionManager.ts` | **`node-pty` 是最大依赖**。Tauri 侧有 `tauri-plugin-pty`（社区）但功能完整性不如 node-pty。可能需要基于 `portable-pty`/`tokio-pty` crate 自写 PTY wrapper，并暴露 xterm 数据通道作为 Tauri event。这是全迁移的最高风险点。 |
-| **FeishuBridge** | `src/main/feishu/FeishuBridge.ts` | **`@larksuiteoapi/node-sdk` 是 Node.js 专有包**。需要：<br>1. 自封装飞书 REST API（OAuth 认证 + 事件订阅 + 消息收发）<br>2. 管理 WebSocket/Webhook 长连接<br>3. 流式 Card 渲染（SSE 转发到 WebView）<br>4. 加密存储 appSecret |
 | **Claude/Codex/OpenCode Session Importer** | `src/main/sessions/*.ts` | 解析其他工具的 session 格式（JSON / TOML / 目录结构），逻辑上不复杂但细节多 |
 
 ---
@@ -142,8 +140,6 @@ fn list_projects(state: State<AppState>) -> Vec<Project> {
 | `agents:prompt` | `send_prompt` | 自定义 RPC |
 | `terminal:input` | `terminal_input` | tauri-plugin-pty |
 | `terminal:data` | event `terminal-data` | tauri-plugin-pty |
-| `feishu:connect` | `feishu_connect` | 自封装 HTTP |
-| `feishu:statusRequest` | `feishu_status` | — |
 
 ---
 
@@ -152,7 +148,6 @@ fn list_projects(state: State<AppState>) -> Vec<Project> {
 | 风险 | 等级 | 缓解措施 |
 |---|---|---|
 | `node-pty` 替代方案功能不完整 | 🔴 高 | 先用 `tauri-plugin-pty` 做 POC，验证 `pty.spawn()` + xterm 双向数据流能否达到当前效果 |
-| 飞书 SDK 无 Rust 版导致 Feishu 功能退化 | 🔴 高 | 分步迁移：第一阶段只保留「消息接收+转发」，第二阶段再实现完整 Card 镜像、SSE 流式渲染 |
 | 80 个 IPC handler 改写工作量大 | 🟡 中 | 按模块分批迁移，每次交付一个功能集群；可先搭 Rust 骨架再逐个填充 command |
 | WebView 跨平台渲染差异 | 🟡 中 | 建立跨平台截图测试（CI 中跑 Win/macOS/Linux），发现差异后加 polyfill |
 | 打包/签名/自动更新流程变更 | 🟡 中 | Tauri 的 CI 配置与 electron-builder 不同，需在 `tauri.conf.json` 中重新配置 |
@@ -192,7 +187,6 @@ fn list_projects(state: State<AppState>) -> Vec<Project> {
 - [ ] 前端 xterm 适配 Tauri event 通道
 
 ### Phase 4：复杂模块迁移（2–3 周）
-- [ ] Feishu Bridge（HTTP 封装 + 事件订阅 + 流式 Card）
 - [ ] Desktop Pet 系统（多窗口 + 透明背景 + 精灵动画）
 - [ ] Config Manager（模型/认证/信任配置）
 - [ ] Telemetry → PostHog API
@@ -223,7 +217,6 @@ fn list_projects(state: State<AppState>) -> Vec<Project> {
 - [ ] 核心痛点是否来自 Electron 的体积/内存/启动速度？
 - [ ] 团队是否愿意投入 Rust 学习成本？
 - [ ] 是否已用 `tauri-plugin-pty` 做终端 POC 并确认可行？
-- [ ] 飞书连接是否能接受功能退化的分期迁移方案？
 - [ ] 用户基数是否足够小，可以在迁移期间进行 Beta 测试？
 - [ ] 是否准备好了双线维护（旧版 Electron 维护 + 新版 Tauri 开发）的时间？
 

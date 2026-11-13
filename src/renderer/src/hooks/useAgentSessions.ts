@@ -2,7 +2,7 @@
  * useAgentSessions — Agent/会话状态 Hook
  *
  * 从 App.tsx 提取的 agent/session 相关状态、refs、计算值和纯动作。
- * 与 useFeishuBridge 不同，agent/session 状态与项目、UI、settings 深度耦合，
+ * agent/session 状态与项目、UI、settings 深度耦合，
  * 因此 RPC 流式 effect、createAgent 等带 UI 副作用的逻辑留在 App.tsx，
  * 通过本 hook 暴露的 setters/refs 更新状态。
  *

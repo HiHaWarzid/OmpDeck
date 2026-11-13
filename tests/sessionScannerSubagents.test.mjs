@@ -55,7 +55,7 @@ function loadSessionScanner(homePath, fsOverrides = {}, fsPromisesOverrides = {}
 	const codexMeta = loadCodexMetaModule();
 	const messageContent = loadTranspiledModule(
 		"src/main/pi/messageContent.ts",
-		new Map([["../feishu/docActions", { stripFeishuDocActionHint: (text) => text }]]),
+		new Map(),
 	);
 	const sessionSummaryCache = loadTranspiledModule(
 		"src/main/sessions/sessionSummaryCache.ts",

@@ -31,8 +31,6 @@ export type IpcOpKind = "invoke" | "subscribe" | "send" | "sendSync" | "local";
 export type IpcPushSource =
 	| "agent-manager"
 	| "agent-event-bridge"
-	| "feishu-bridge"
-	| "feishu-handlers"
 	| "pet-index"
 	| "pet-patrol"
 	| "pet-state-bridge"
@@ -572,32 +570,6 @@ export const ipcTable = {
 		shells: { channel: "terminal:shells", kind: "invoke" },
 		onData: { channel: "terminal:data", kind: "subscribe", pushFrom: "terminal-manager" },
 		onExit: { channel: "terminal:exit", kind: "subscribe", pushFrom: "terminal-manager" },
-	},
-	feishu: {
-		connect: { channel: "feishu:connect", kind: "invoke" },
-		/** 临时连接（不保存 bot 配置），用于首次添加 Bot 时先验证后保存 */
-		connectTemp: { channel: "feishu:connect-temp", kind: "invoke" },
-		disconnect: { channel: "feishu:disconnect", kind: "invoke" },
-		connectByBot: { channel: "feishu:connect-by-bot", kind: "invoke" },
-		statusRequest: { channel: "feishu:status-request", kind: "invoke" },
-		onStatus: { channel: "feishu:status", kind: "subscribe", pushFrom: "feishu-bridge" },
-		botsList: { channel: "feishu:bots-list", kind: "invoke" },
-		botAdd: { channel: "feishu:bot-add", kind: "invoke" },
-		botRemove: { channel: "feishu:bot-remove", kind: "invoke" },
-		botConfig: { channel: "feishu:bot-config", kind: "invoke" },
-		botSecret: { channel: "feishu:bot-secret", kind: "invoke" },
-		testConnection: { channel: "feishu:test-connection", kind: "invoke" },
-		bindingsList: { channel: "feishu:bindings-list", kind: "invoke" },
-		bindingRemove: { channel: "feishu:binding-remove", kind: "invoke" },
-		bindingUpdate: { channel: "feishu:binding-update", kind: "invoke" },
-		onMessages: { channel: "feishu:messages", kind: "subscribe", pushFrom: "feishu-bridge" },
-		onBindingsChanged: { channel: "feishu:bindings-changed", kind: "subscribe", pushFrom: "feishu-bridge" },
-		onWhoamiResult: { channel: "feishu:whoami-result", kind: "subscribe", pushFrom: "feishu-bridge" },
-		onBotsChanged: { channel: "feishu:bots-changed", kind: "subscribe", pushFrom: "feishu-handlers" },
-		/** 获取指定 Agent 绑定的飞书 Bot ID */
-		sessionBotGet: { channel: "feishu:session-bot-get", kind: "invoke" },
-		/** 设置指定 Agent 使用的飞书 Bot ID */
-		sessionBotSet: { channel: "feishu:session-bot-set", kind: "invoke" },
 	},
 	// AFK 挂机编排（Orchestrator 主进程组件；subscribe 通道 = renderer 语义事件订阅）
 	afk: {

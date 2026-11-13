@@ -173,7 +173,6 @@ function loadAgentManager() {
 	registry["./settleReducer"] = loadModule("src/main/pi/settleReducer.ts", "settleReducer.ts");
 	// 转录与运行态已抽为纯状态模块（agentTranscript / agentRunState），
 	// AgentManager 只做编排；测试用它们的工厂构造 runtime，不再手写字段清单。
-	registry["../feishu/docActions"] = loadModule("src/main/feishu/docActions.ts", "docActions.ts");
 	const messageContent = loadModule("src/main/pi/messageContent.ts", "messageContent.ts");
 	registry["./messageContent"] = messageContent;
 	const agentTranscript = loadModule("src/main/pi/agentTranscript.ts", "agentTranscript.ts");

@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 
-// feishuHandlers 模块级 import FeishuBridge（构造时读 userData），vitest node 环境无 electron；
+// 部分 handler 模块在模块级 import electron（读 app 路径等），vitest node 环境无 electron；
 // 用最小 mock 让模块可加载（注册函数只建闭包，不触达这些 API）
 vi.mock("electron", () => ({
 	app: {
@@ -29,7 +29,6 @@ import { registerClipboardHandlers } from "./clipboardHandlers";
 import { registerConfigHandlers } from "./configHandlers";
 import { registerEditorHandlers } from "./editorHandlers";
 import { registerExtensionHandlers } from "./extensionHandlers";
-import { registerFeishuHandlers } from "./feishuHandlers";
 import { registerFileHandlers } from "./fileHandlers";
 import { registerGitHandlers } from "./gitHandlers";
 import { registerLogHandlers } from "./logHandlers";
@@ -120,7 +119,6 @@ const moduleRegistrations = [
 			agentManager: stubs,
 			terminalManager: stubs,
 			appLogger: stubs,
-			getFeishuBridge: () => null,
 			getMainWindow: () => null,
 		}),
 	},
@@ -146,17 +144,9 @@ const moduleRegistrations = [
 		}),
 	},
 	{
-		module: "feishuHandlers",
-		map: registerFeishuHandlers({
-			agentManager: stubs,
-			projectStore: stubs,
-			appLogger: stubs,
-			getMainWindow: () => null,
-			getFeishuBridge: () => null,
-			setFeishuBridge: stubs,
-		}),
+		module: "pet",
+		map: petHandlerMaps,
 	},
-	{ module: "pet", map: petHandlerMaps },
 ];
 
 // 各注册模块的 map 已全部带 module 标签进 moduleRegistrations（含 pet），与 registerIpcHandlers 合并循环同源

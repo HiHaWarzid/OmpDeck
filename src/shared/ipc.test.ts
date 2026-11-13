@@ -85,7 +85,7 @@ describe("IPC 通道表契约", () => {
 		}
 	});
 
-	test("总通道数 = 304（298 + 6 新增 web:status / web:rotate-token / remote-access:status / start / stop / agents:history-page）", () => {
-		expect(Object.keys(ipcChannels).length).toBe(304);
+	test("总通道数 = 283（飞书桥接 21 条通道已随功能移除）", () => {
+		expect(Object.keys(ipcChannels).length).toBe(283);
 	});
 });

@@ -2,7 +2,7 @@
  * AFK IPC handler（afk:status / afk:terminate）。
  * subscribe 成员（onStatusChanged）不在此注册——它是主进程主动推送
  * （ipcChannels.afkStatusChanged，由 AfkOrchestrator 经 getMainWindow
- * 推给 renderer），与 feishuHandlers.broadcastBotsChanged 的推送模式一致。
+ * 推给 renderer），与其他主进程 handler 的广播模式一致。
  * 启停走设置（applySettings 热更新），不再暴露 afk:start/afk:stop。
  */
 import { ipcTable, type IpcHandlerMap } from "../../shared/ipc";

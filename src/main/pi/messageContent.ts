@@ -1,4 +1,15 @@
-import { stripFeishuDocActionHint, stripHostInstruction } from "../feishu/docActions";
+/**
+ * 宿主注入的内部指令只给模型看，展示前剥离。
+ * 飞书桥接已移除，但历史会话文件中仍可能残留这些标记与动作标记，
+ * 因此保留只读清洗逻辑，避免旧会话在时间线里露出内部提示。
+ */
+function stripHostInjections(text: string): string {
+	return text
+		.replace(/\[PIDECK_HOST_INSTRUCTION\][\s\S]*?\[\/PIDECK_HOST_INSTRUCTION\]\s*/g, "")
+		.replace(/\n{0,2}\[OmpDeck 飞书能力\][\s\S]*$/, "")
+		.replace(/\[(SEND_FILE|CREATE_DOC):[^\]]*\]/g, "")
+		.trim();
+}
 
 function stripCpaCompletionMarker(text: string): string {
 	// CPA uses this final-line sentinel for transport completion; it is not user-visible content.
@@ -13,10 +24,8 @@ function stripCpaCompletionMarker(text: string): string {
  */
 export function extractMessageText(content: unknown): string {
 	if (typeof content === "string") {
-		// 宿主指令 / 飞书能力提示只给模型看，UI 与历史展示前剥离。
-		return stripCpaCompletionMarker(
-			stripHostInstruction(stripFeishuDocActionHint(content)),
-		);
+		// 宿主指令 / 能力提示只给模型看，UI 与历史展示前剥离。
+		return stripCpaCompletionMarker(stripHostInjections(content));
 	}
 	if (!Array.isArray(content)) return "";
 
@@ -44,9 +53,7 @@ export function extractMessageText(content: unknown): string {
 		text += String(typed.text ?? "");
 	}
 
-	return stripCpaCompletionMarker(
-		stripHostInstruction(stripFeishuDocActionHint(text)),
-	);
+	return stripCpaCompletionMarker(stripHostInjections(text));
 }
 
 /**

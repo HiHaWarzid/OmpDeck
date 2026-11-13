@@ -2,8 +2,7 @@
  * afterPack 钩子：打包后执行多项清理，缩减安装包体积。
  *
  * 1. Locale 精简 —— 只保留中英文，删除 Electron 其余 52 个语言包（节省 ~42MB）
- * 2. larksuiteoapi 冗余清理 —— 删除未使用的 CJS 模块 lib/（节省 ~5MB）
- * 3. 通用 node_modules 清理 —— 删除文档、许可证、测试等无用文件
+ * 2. 通用 node_modules 清理 —— 删除文档、许可证、测试等无用文件
  *
  * 参考: https://www.electron.build/configuration/configuration#afterpack
  */
@@ -184,13 +183,7 @@ exports.default = async function (context) {
 
   let totalRemoved = 0;
 
-  // --- 3a. @larksuiteoapi 清理
-  // 注意：@larksuiteoapi/node-sdk 的 package.json 中 main 指向 ./lib/index.js（CJS），
-  // 没有 exports 字段。Node.js await import() 在无 exports 字段时仍使用 main 字段，
-  // 因此不能删除 lib/ 目录。如果希望减少体积，应把 main 改为 ./es/index.js 后再删除 lib/。
-  // 目前保留不动以避免 Cannot find package 运行时错误。
-
-  // --- 3b. 删除所有 node_modules 中的 source map、文档、测试文件 ---
+  // --- 3a. 删除所有 node_modules 中的 source map、文档、测试文件 ---
   const nmExtractDir = path.join(extractDir, "node_modules");
   if (fs.existsSync(nmExtractDir)) {
     async function cleanNodeModules(dir) {
@@ -247,7 +240,7 @@ exports.default = async function (context) {
     }
   }
 
-  // --- 3b2. 删除 asar 内 node-pty 非当前平台的 prebuild（.node 文件被 electron-builder 自动解包到 asar.unpacked，
+  // --- 3b. 删除 asar 内 node-pty 非当前平台的 prebuild（.node 文件被 electron-builder 自动解包到 asar.unpacked，
   //    但 asar 内仍保留了所有平台的副本，平台过滤只在 afterPack 上一步做了 asar.unpacked 的清理）---
   const nodePtyPrebuildDir = path.join(extractDir, "node_modules", "node-pty", "prebuilds");
   if (fs.existsSync(nodePtyPrebuildDir)) {

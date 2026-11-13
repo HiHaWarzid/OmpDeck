@@ -31,8 +31,6 @@ import { ipcChannels, ipcTable, type IpcOpEntry, type IpcPushSource } from "./ip
 const PUSH_SOURCE_FILES: Readonly<Record<IpcPushSource, string>> = {
 	"agent-manager": "pi/AgentManager.ts",
 	"agent-event-bridge": "ipc/agentEventBridge.ts",
-	"feishu-bridge": "feishu/FeishuBridge.ts",
-	"feishu-handlers": "ipc/feishuHandlers.ts",
 	"pet-index": "pet/index.ts",
 	"pet-patrol": "pet/PetPatrol.ts",
 	"pet-state-bridge": "pet/PetStateBridge.ts",
