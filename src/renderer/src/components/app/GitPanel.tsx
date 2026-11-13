@@ -951,6 +951,11 @@ function GitPanelImpl(props: GitPanelProps) {
     setPaneState({ ...next, heights: fitPaneHeights(next, availableHeight) });
     setCommitMessage("");
     setCommitting(false);
+    // push/pull 的 spinner 也必须在这里复位：mutation 跑到一半切项目时，runMutation
+    // 会因世代变化返回 stale，而 stale/skipped 都刻意不复位 spinner（可能已属于新项目）。
+    // 项目切换是它们唯一的复位点，漏掉就会让按钮永久处于 disabled + 转圈。
+    setPushing(false);
+    setPulling(false);
     setResourceOpen({ merge: true, staged: true, changes: true });
     setCollapsedChangeDirs(new Set());
     setSmartCommitPreference(readSmartCommitPreference(props.projectId));

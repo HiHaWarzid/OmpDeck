@@ -341,6 +341,8 @@ export function createGitStatusResource(
 		const ticket = beginMutation();
 		// 门被占：调用方连 spinner 都不该亮，所以这里不做任何状态改动。
 		if (!ticket) return { kind: "skipped" };
+		// 失败后要不要补一次静默刷新：必须在门释放后做（见 finally），故先记意图。
+		let failureRefreshNeeded = false;
 		// 项目 id 在开跑时捕获：跑完再读会拿到切换后的新项目。
 		const requestProjectId = projectId;
 		const requestGeneration = generation;
@@ -371,10 +373,18 @@ export function createGitStatusResource(
 			const message = caught instanceof Error ? caught.message : String(caught);
 			setError(message);
 			mutation.onNotice?.(message);
+			// mutation 期间被丢弃的静默轮询没人补偿：失败也可能是「一半已应用」
+			// （commit 失败但 stageAll 成功、pull 冲突等），不刷新就会让面板停在
+			// 改动前的分组上，最长 30s 或直到用户手动刷新。
+			// 这里只记意图：mutationTicket 到 finally 才释放，此刻调 refresh 会被单飞门
+			// 直接返回（见 refresh 的 silent 分支），是一句看起来有效、实际什么都不做的代码。
+			failureRefreshNeeded = true;
 			return { kind: "failed", errorMessage: message };
 		} finally {
 			// 项目已切换时 ticket 已被作废，这次收尾是 no-op（见 endMutation 的引用比较）。
 			endMutation(ticket);
+			// 静默模式不写 error/loading，不会冲掉刚落的错误文案。
+			if (failureRefreshNeeded) void refresh({ silent: true });
 		}
 	}
 

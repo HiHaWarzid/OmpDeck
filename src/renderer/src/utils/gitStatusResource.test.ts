@@ -256,7 +256,15 @@ describe("gitStatusResource 单飞与变更门", () => {
 		expect(failed).toEqual({ kind: "failed", errorMessage: "nothing to commit" });
 		expect(resource.getSnapshot().error).toBe("nothing to commit");
 		expect(notice).toHaveBeenCalledWith("nothing to commit");
-		// refresh: none —— 失败路径不许顺手刷新，否则会把错误提示冲掉。
+		// 失败可能「一半已应用」（stageAll 成功、commit 失败）：要在门释放后补一次静默刷新，
+		// 否则面板会停在改动前的分组上最多 30s。静默刷新不写 error/loading，
+		// 因此上面刚落的错误文案必须还在，且不能出现 loading 闪回。
+		expect(source.status).toHaveBeenCalledTimes(1);
+		expect(resource.getSnapshot().error).toBe("nothing to commit");
+		expect(resource.getSnapshot().loading).toBe(false);
+		// 失败补偿刷新不改变成功路径语义：refresh "none" 成功时仍然一次读取都不发。
+		source.status.mockClear();
+		await resource.runMutation({ run: async () => undefined, refresh: "none" });
 		expect(source.status).not.toHaveBeenCalled();
 	});
 

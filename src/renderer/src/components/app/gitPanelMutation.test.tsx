@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GitPanel } from "./GitPanel";
-import { setI18nLocale } from "../../i18n";
+import { setI18nLocale, t } from "../../i18n";
 import { GitStatus, type GitResource } from "../../../../shared/types";
 
 /**
@@ -119,6 +119,14 @@ function commitButton(): HTMLButtonElement {
 	return button;
 }
 
+function pushButton(): HTMLButtonElement {
+	const button = container.querySelector<HTMLButtonElement>(
+		`.git-action-btn[title="${t("git.push")}"]`,
+	);
+	if (!button) throw new Error("push button not rendered");
+	return button;
+}
+
 function typeCommitMessage(message: string): void {
 	const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
 	if (!textarea) throw new Error("commit textarea not rendered");
@@ -198,5 +206,43 @@ describe("GitPanel mutation 接线", () => {
 		// p1 的提交迟到落地：不得把 p2 的按钮留在 loading。
 		expect(commitButton().textContent).not.toContain("正在提交");
 		expect(container.querySelector(".git-commit-btn .git-spin")).toBeNull();
+	});
+
+	it("推送跑到一半切换项目：push spinner 不复活在旧状态上", async () => {
+		let releasePush!: () => void;
+		const pushGate = new Promise<void>((resolve) => {
+			releasePush = resolve;
+		});
+		const pushes: string[] = [];
+		const git = createGit({
+			push: (projectId) => {
+				pushes.push(projectId);
+				return projectId === "p1" ? pushGate : Promise.resolve();
+			},
+		});
+		await renderPanel(git);
+		await settle();
+
+		await act(async () => {
+			pushButton().click();
+			await Promise.resolve();
+		});
+		expect(pushButton().querySelector(".git-spin"), "推送中必须显示转圈").not.toBeNull();
+
+		// 跑到一半切项目：runMutation 因世代变化返回 stale，而 stale 刻意不复位 spinner
+		// （复位可能误清新项目刚亮的那个）。项目切换是它唯一的复位点。
+		await renderPanel(git, "p2");
+		await settle();
+		expect(pushButton().disabled, "切项目后旧 spinner 必须由切换重置").toBe(false);
+		expect(pushButton().querySelector(".git-spin")).toBeNull();
+
+		// 旧项目的迟到收尾也不得把 spinner 重新点亮。
+		await act(async () => {
+			releasePush();
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(pushButton().querySelector(".git-spin")).toBeNull();
+		expect(pushes).toEqual(["p1"]);
 	});
 });
