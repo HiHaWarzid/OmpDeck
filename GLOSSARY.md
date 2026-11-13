@@ -222,7 +222,11 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 **会话路径前置条件也归它**：缺失时由编排层抛「会话尚未落盘，无法重连」，并把校验过的路径作为参数交给 `replaceProcess`，调用方不再各自判空（否则同一前置条件会出现两份措辞不同的报错）。
 
-它拥有的顺序是硬约束，分散复制时最容易走偏：**先 `starting`**（替换窗口内新 prompt 不得投给即将退役的 child）→ **替换先于恢复选择**（在旧 child 上 `set_model` 会被随后的替换丢弃）→ **成功后清 `lastError`**、**失败写 `lastError` 并落非 idle**（`statusOnFailure` 区分：进程已退出的自动重连落 `closed`，其余落 `error`）→ **finally 无条件广播终态**。
+它拥有的顺序是硬约束，分散复制时最容易走偏：**先 `starting`**（替换窗口内新 prompt 不得投给即将退役的 child）→ **替换先于恢复选择**（在旧 child 上 `set_model` 会被随后的替换丢弃）→ **成功后清 `lastError`**、**失败写 `lastError` 并落非 idle** → **finally 无条件广播终态**。
+
+**失败状态按阶段判定**：只有 `replaceProcess` 失败（新 child 真的没起来）才用调用方给的 `statusOnReplaceFailure`（进程已退出的自动重连传 `closed`）；新 child 已起来、只是 `restoreSelection` 失败时**恒落 `error`**——会话是活的，下一句话就能发出去，标成 `closed` 等于骗用户去手动重启。这个阶段区分只有编排看得见（它知道 `replaceProcess` 的成功边界），不能交给调用方事后推断。
+
+**返回值必须被消费**：`runProcessReplacement` 返回 `ReplacementOutcome` 而不是抛错，调用方拿到 `{ ok:false }` 必须自己决定「这次失败对用户意味着什么」。压缩路径漏掉它就是真实缺陷——`compact()` 正常 resolve，渲染层弹「上下文压缩完成」，而会话其实不可用。
 
 规则：新增任何「换掉 child 再继续」的路径都调 `runProcessReplacement`，不要自己拼 `starting` → 替换 → 恢复 → `idle`。调用方的选择与锁（`configApplyPromise` / `healingDeveloperRole`）由调用方自己 try/finally 收尾，不进本 module——那是各入口不同的领域判断。
 
@@ -254,6 +258,11 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 **清盘只在项目记录真正消失时发生**（`projects-removed` 意图，host 方法 `forgetProjects(ids)`）：删项目、删 worktree 的子项目、关闭工作区模式（`ProjectStore.clearWorktreeChildren` 清空该父项目下全部子项目）。**不在可见项目列表缩小时清盘**——`projects` 是按 WSL/Windows 环境过滤后的列表，另一个环境的项目会临时「消失」，据此裁剪会误删它们的钉选记录。
 
 判定「真正消失」用**前后列表差集**，且差集计算只有一份实现（`App.syncVanishedProjects`）：`remove` 与 `toggleWorktreeEnabled` 都会连带删掉一批项目记录，曾被点的那一个 id 不足以描述结果。清盘接口按**集合**而非单个 id 表达，正是为了让新增删除路径不会漏掉其中一部分。
+
+### 子会话组键（SubagentGroupKey）
+侧栏子会话展开状态在 localStorage 里的键，由 `sidebarProjection` 的 `subagentGroupKey` / `nestedSubagentGroupKey` 构造、`subagentGroupProjectId` 反解归属——三者是唯一实现，组件与清盘逻辑都只调它们。
+
+键有两个维度：所属项目、以及是否为 worktree 子项目（`p:…` 与 `wt:p:…`），孙级再向后串联一层。**构造与反解必须成对演进**：构造散在多处、归属另拼一遍字符串时，清理侧只认顶层形状，`wt:` 形状的键永远匹配不上，删掉 worktree 后永久留在本地存储里并逐轮累积。项目 id 是 UUID（不含 `:`），按段落解析归属因此是安全的。
 
 ### ToolPanel 与退役的 sessions 面板
 `openPanel` 只接受 `ToolPanel`（`files` / `git` / `browser`），`DrawerPanel` 与之一致。历史会话面板（`sessions`）已整体退役：它的入口 `openProjectSessions` 无调用方，最终只剩一条「选择器 → 面板 → 抽屉组件」的不可达链路，与侧栏 `SessionManagerModal` 重复。会话历史的唯一入口是项目菜单的会话管理弹框。
