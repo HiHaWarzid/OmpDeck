@@ -188,6 +188,13 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：新增/修改任何 `/api` 端点只改 `webRoutes` 与 `ipcTable` 的 `route` 列，不在客户端手抄路径字符串。`route`（该成员确实有独立 REST 端点）与 `web`（该成员在 LAN-web 下也必须可用，是给守卫用的能力声明）**互不蕴含**：有 `route` 未必有 `web`（手机端专用端点），有 `web` 未必有 `route`（走 `/api/state` 轮询的能力）。两者的一致性由 `overrideParity.test.ts`（守卫探针）与 `webRouteParity.test.ts`（静态核对三端调用）各自把守。
 
+### ConfigDraft（配置草稿）
+设置弹框 / 配置弹框 / 模型角色 tab 三处编辑「已落盘配置」的**唯一草稿语义**（`renderer/src/utils/configDraft.ts`，零 React 依赖的纯函数）。`value` 是正在编辑的值，`base` 是它唯一的比较对象；脏不脏一律由**值 diff** 得出，而不是「改过哪些字段」——后者让「改回原值」仍然显示未保存，是此前三处共有的 bug。
+
+关键边界：`commitDraft` 只把**真正落盘的部分**从 value 搬到 base，并且用调用方传入的 `persisted`（刚提交的那份 patch）取值，而不是读 `draft.value`——保存是异步的，在途期间用户可能继续输入，读 value 会把从未发送出去的文本标成已保存。落盘失败时不得调用 `commitDraft`。
+
+**载入不得吞掉未提交编辑**：同一个应用内切换 tab 会重新载入该 tab 的数据，但「载入」只在草稿干净（value 与 base 相等）时才覆盖 value/base；有未提交编辑时保留草稿，切换回来看到的仍是用户输入。保存后的回读是例外，用显式 `force` 无条件覆盖（读的正是刚落盘的真值）。「重新载入 = 丢弃草稿」只保留给用户显式动作：换文件、导入后重载。
+
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。
 

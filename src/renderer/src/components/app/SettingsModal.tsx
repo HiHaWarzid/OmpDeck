@@ -24,9 +24,20 @@ import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { ModalSurface } from "../ui/ModalSurface";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
-import { ModelRolesTab } from "./ModelRolesTab";
+import { ModelRolesTab, type ModelRolesDraftState } from "./ModelRolesTab";
 import type { AppSettings, AppInfo, PiInstallStatus, PiUpdateCheckResult, PiCliUpdateResult, PetManifest, RemoteAccessStatus, WebServiceStatus } from "../../../shared/types";
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
+import {
+	adoptDraft,
+	commitDraft,
+	createDraft,
+	draftChanges,
+	hasDraftChanges,
+	isFieldDirty,
+	patchDraft,
+	resetDraft,
+	type Draft,
+} from "../../utils/configDraft";
 
 const ZOOM_FACTOR_MIN = 0.8;
 const ZOOM_FACTOR_MAX = 1.5;
@@ -251,55 +262,59 @@ function loadLastSettingsTab(): SettingsTabId {
 function SettingsModalContent(props: SettingsModalProps) {
 	const [activeTab, setActiveTab] = useState<SettingsTabId>(() => props.initialTab ?? loadLastSettingsTab());
 	// ── 全局设置草稿：进入弹框时快照 props.settings，所有修改在 draft 上操作，保存时统一提交 ──
-	const [draftSettings, setDraftSettings] = useState<AppSettings>(() => ({ ...props.settings }));
-	const [dirtyFields, setDirtyFields] = useState<Set<string>>(new Set());
+	// 脏判定交给 configDraft 的值 diff：把字段改回原值即自动恢复干净，不再需要
+	// 「改过哪些字段」的集合（那套在回退后仍留着脏标记）。
+	const [settingsDraft, setSettingsDraft] = useState<Draft<AppSettings>>(() =>
+		createDraft({ ...props.settings }),
+	);
+	const draftSettings = settingsDraft.value;
 	const [saving, setSaving] = useState(false);
 	/** 同步 ref 防止保存请求在 React 重渲染前被连点触发两次。 */
 	const savingRef = useRef(false);
-	/** 打开弹框时的原始设置快照，用于取消时回退 */
-	const baseSnapshotRef = useRef<AppSettings>({ ...props.settings });
+	/**
+	 * 模型角色 tab 的草稿状态（循环顺序 / 供应商顺序 / 角色存储）。
+	 * 这三项有自己的保存按钮与即时写盘 RPC，不在 AppSettings 草稿里，
+	 * 但仍必须并入未保存守卫，否则改完直接关弹层会静默丢弃。
+	 */
+	const [rolesDraft, setRolesDraft] = useState<ModelRolesDraftState | null>(null);
+	/**
+	 * 角色 tab 首次访问后保持挂载（用 hidden 隐藏）。
+	 * 草稿存在该 tab 的组件状态里：切走就卸载 = 静默丢弃草稿，
+	 * 关闭守卫会因此形同虚设（「改完 → 看别的 tab → 关闭」是最常见的失手路径）。
+	 */
+	const [rolesVisited, setRolesVisited] = useState(activeTab === "roles");
 
-	/** 更新草稿并标记对应字段为已修改。调用方传入的 patch 中的每个 key 都会追加到 dirtyFields。 */
+	/** 更新草稿（只改 value，base 保持为最后一次落盘的值）。 */
 	const updateDraft = (patch: Partial<AppSettings>) => {
-		setDraftSettings((prev) => ({ ...prev, ...patch }));
-		setDirtyFields((prev) => {
-			const next = new Set(prev);
-			for (const key of Object.keys(patch)) {
-				next.add(key);
-			}
-			return next;
-		});
+		setSettingsDraft((prev) => patchDraft(prev, patch));
 	};
 
-	/** 检查指定字段在草稿中是否已被修改（与初始快照比较） */
-	const isDirty = (field: keyof AppSettings): boolean => {
-		return dirtyFields.has(field);
-	};
+	/** 检查指定字段是否与基线不同（决定标签旁的未保存圆点）。 */
+	const isDirty = (field: keyof AppSettings): boolean => isFieldDirty(settingsDraft, field);
 
 	/**
 	 * 保存全部已修改的字段：计算差异后一次性提交。
-	 * 只有主进程确认落盘成功才更新快照/清除 dirty；失败时保留草稿和 dirty，
-	 * 否则用户会看到「已保存」而实际设置已回滚。保存期间的新编辑按字段保留。
+	 * 只有主进程确认落盘成功才推进草稿基线；失败时保留草稿和 dirty，
+	 * 否则用户会看到「已保存」而实际设置已回滚。保存期间的新编辑仍留在草稿里。
 	 */
 	const saveAll = async (): Promise<boolean> => {
-		if (dirtyFields.size === 0) return true;
+		const patch = draftChanges(settingsDraft);
+		const savedKeys = Object.keys(patch);
+		// 角色 tab 的附加项表面上是独立表单，但「保存并关闭」必须把它们一起落盘：
+		// 只保存 AppSettings 会让确认框承诺的保存变成半保存，用户仍会丢改动。
+		const rolesDirty = rolesDraft?.dirty === true;
+		if (savedKeys.length === 0 && !rolesDirty) return true;
 		if (savingRef.current) return false;
 		savingRef.current = true;
 		setSaving(true);
-		const savedKeys = new Set(dirtyFields);
-		const patch: Partial<AppSettings> = {};
-		for (const key of savedKeys) {
-			(patch as Record<string, unknown>)[key] = (draftSettings as Record<string, unknown>)[key];
-		}
 		try {
+			if (rolesDirty && !(await rolesDraft.save())) return false;
+			if (savedKeys.length === 0) return true;
 			const ok = await props.onChange(patch);
 			if (!ok) return false;
-			baseSnapshotRef.current = { ...baseSnapshotRef.current, ...patch };
-			setDirtyFields((prev) => {
-				const next = new Set(prev);
-				for (const key of savedKeys) next.delete(key);
-				return next;
-			});
+			// 只推进真正落盘的键，且用**刚提交的 patch** 作为落盘值：请求在途时
+			// 用户可能继续输入，从 value 取值会把没发出去的文本误判成已保存。
+			setSettingsDraft((prev) => commitDraft(prev, savedKeys, patch));
 			return true;
 		} finally {
 			savingRef.current = false;
@@ -307,19 +322,25 @@ function SettingsModalContent(props: SettingsModalProps) {
 		}
 	};
 
-	/** 取消全部修改：将草稿回退到初始快照，丢弃所有未保存变更 */
+	/**
+	 * 取消全部修改：将草稿回退到基线，丢弃所有未保存变更。
+	 *
+	 * 保存进行中一律不执行：保存请求仍在飞，回退只会让界面显示旧值、
+	 * 而随后落盘的值又和它不一致（用户以为「取消了」但改动照样写进去了）。
+	 */
 	const cancelAll = () => {
-		setDraftSettings({ ...baseSnapshotRef.current });
-		setDirtyFields(new Set());
+		if (savingRef.current) return;
+		const base = settingsDraft.base;
+		setSettingsDraft((prev) => resetDraft(prev));
+		// 角色 tab 的附加项有各自的草稿，全局取消必须一并回退，否则「取消」只撤回一半。
+		rolesDraft?.discard();
 		setPetPreviewMode("__auto");
 		setWslValidation(null);
-		setWslUserInput(baseSnapshotRef.current.wslUser);
+		setWslUserInput(base.wslUser);
 		setPerAreaFontSize(
-			baseSnapshotRef.current.uiFontSize !== null ||
-				baseSnapshotRef.current.chatFontSize !== null ||
-				baseSnapshotRef.current.inputFontSize !== null,
+			base.uiFontSize !== null || base.chatFontSize !== null || base.inputFontSize !== null,
 		);
-		setWebPortDraft(String(baseSnapshotRef.current.webServicePort));
+		setWebPortDraft(String(base.webServicePort));
 	};
 
 
@@ -453,7 +474,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 					: { remoteAccessEnabled: false },
 			);
 			await Promise.all([refreshWebStatus(), refreshRemoteStatus()]);
-			// 立即生效的开关不经过 dirtyFields；无论成功失败，都以主进程实际落盘值为准。
+			// 立即生效的开关不经过草稿保存；无论成功失败，都以主进程实际落盘值为准。
 			// 失败路径尤其重要：Serve 启动失败时主进程只回滚 remoteAccessEnabled，
 			// webServiceEnabled 可能已经开启，草稿不能继续显示“Web 服务已关闭”。
 			const persisted = await window.piDesktop.settings.get().catch(() => props.settings);
@@ -461,14 +482,8 @@ function SettingsModalContent(props: SettingsModalProps) {
 				webServiceEnabled: persisted.webServiceEnabled,
 				remoteAccessEnabled: persisted.remoteAccessEnabled,
 			};
-			setDraftSettings((prev) => ({ ...prev, ...nextDraft }));
-			baseSnapshotRef.current = { ...baseSnapshotRef.current, ...nextDraft };
-			setDirtyFields((prev) => {
-				const next = new Set(prev);
-				next.delete("webServiceEnabled");
-				next.delete("remoteAccessEnabled");
-				return next;
-			});
+			// 采信外部真值（base 与 value 同步更新），这两个键因此不再是 dirty
+			setSettingsDraft((prev) => adoptDraft(prev, nextDraft));
 		} finally {
 			setRemoteBusy(false);
 		}
@@ -694,9 +709,10 @@ function SettingsModalContent(props: SettingsModalProps) {
 	];
 	const lightBackgroundDisabled = draftSettings.theme === "dark";
 
-	const hasDirtyChanges = dirtyFields.size > 0;
+	// dirty 由值 diff 得出：全部字段改回原值后这里自动变 false，save bar 与关闭守卫随之消失
+	const hasDirtyChanges = hasDraftChanges(settingsDraft) || rolesDraft?.dirty === true;
 	// 代理 tab 仍展示未保存提示；实际保存/取消统一走全局草稿，避免旧 proxyDirty 局部状态残留。
-	const proxyDirty = PROXY_FIELDS.some((field) => dirtyFields.has(field));
+	const proxyDirty = PROXY_FIELDS.some((field) => isFieldDirty(settingsDraft, field));
 	const isWebRuntime = document.documentElement.dataset.runtime === "web";
 	// 回环地址的二维码手机扫了也连不上，应改为提示用户切换监听地址。
 	const webUrlIsLoopback = (() => {
@@ -734,7 +750,7 @@ function SettingsModalContent(props: SettingsModalProps) {
 						>
 							{t("common.save")}
 						</button>
-						<button className="config-btn" onClick={cancelAll}>
+						<button className="config-btn" disabled={saving} onClick={cancelAll}>
 							{t("common.cancel")}
 						</button>
 					</>
@@ -749,6 +765,8 @@ function SettingsModalContent(props: SettingsModalProps) {
 						className={activeTab === tab.id ? "active" : ""}
 						onClick={() => {
 							setActiveTab(tab.id);
+							// 角色 tab 一旦访问就保持挂载，草稿不因切换 tab 而蒸发。
+							if (tab.id === "roles") setRolesVisited(true);
 							try {
 								localStorage.setItem(SETTINGS_LAST_TAB_KEY, tab.id);
 							} catch {
@@ -1973,8 +1991,10 @@ function SettingsModalContent(props: SettingsModalProps) {
 					/>
 				)}
 				{/* ── 模型角色 tab ── */}
-				{activeTab === "roles" && (
-					<ModelRolesTab />
+				{rolesVisited && (
+					<div hidden={activeTab !== "roles"}>
+						<ModelRolesTab onDraftStateChange={setRolesDraft} />
+					</div>
 				)}
 				{/* ── AFK 编排 tab ── */}
 				{activeTab === "afk" && (

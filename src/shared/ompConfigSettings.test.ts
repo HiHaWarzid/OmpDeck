@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-	diffOmpSettings,
+	configValuesEqual,
+	diffOmpPathValues,
+	OMP_SETTINGS_PATHS,
 	ompSettingsPatchFromPackage,
 	pickOmpSettings,
 	readOmpPath,
@@ -62,7 +64,7 @@ describe("setEnabledModelSelected", () => {
 			false,
 		);
 		expect(removed).toEqual([scoped]);
-		expect(diffOmpSettings(baseline, { enabledModels: removed })).toEqual({
+		expect(diffOmpPathValues(baseline, { enabledModels: removed }, OMP_SETTINGS_PATHS)).toEqual({
 			set: [{ path: "enabledModels", value: [scoped] }],
 			unset: [],
 		});
@@ -72,7 +74,25 @@ describe("setEnabledModelSelected", () => {
 	});
 });
 
-describe("diffOmpSettings", () => {
+describe("configValuesEqual", () => {
+	it("is type-strict for scalars and null-vs-undefined", () => {
+		// 1 与 true 序列化后看起来都像「真」，但设置键的类型不能因此被改写。
+		expect(configValuesEqual(true, 1)).toBe(false);
+		expect(configValuesEqual(0, false)).toBe(false);
+		expect(configValuesEqual("1", 1)).toBe(false);
+		expect(configValuesEqual(null, undefined)).toBe(false);
+		expect(configValuesEqual(undefined, undefined)).toBe(true);
+		expect(configValuesEqual(null, null)).toBe(true);
+	});
+
+	it("ignores key order but compares array order", () => {
+		expect(configValuesEqual({ a: 1, b: 2 }, { b: 2, a: 1 })).toBe(true);
+		expect(configValuesEqual({ a: 1 }, { a: 1, b: undefined })).toBe(false);
+		expect(configValuesEqual(["a", "b"], ["b", "a"])).toBe(false);
+	});
+});
+
+describe("diffOmpPathValues on OMP_SETTINGS_PATHS", () => {
 	it("returns an empty patch when nothing changed", () => {
 		const baseline = {
 			enabledModels: ["a/b"],
@@ -80,11 +100,13 @@ describe("diffOmpSettings", () => {
 			compaction: { enabled: true },
 			modelRoles: { default: "x/y" },
 		};
-		expect(diffOmpSettings(baseline, structuredClone(baseline))).toEqual({ set: [], unset: [] });
+		expect(
+			diffOmpPathValues(baseline, structuredClone(baseline), OMP_SETTINGS_PATHS),
+		).toEqual({ set: [], unset: [] });
 	});
 
 	it("only reports editable keys that changed", () => {
-		const patch = diffOmpSettings(
+		const patch = diffOmpPathValues(
 			{
 				enabledModels: ["a/b"],
 				retry: { maxRetries: 3, baseDelayMs: 500 },
@@ -96,6 +118,7 @@ describe("diffOmpSettings", () => {
 				// 非可编辑键即使变了也不提交
 				modelRoles: { default: "z/w" },
 			},
+			OMP_SETTINGS_PATHS,
 		);
 		expect(patch.set).toEqual([
 			{ path: "enabledModels", value: ["a/b", "c/d"] },
@@ -105,11 +128,12 @@ describe("diffOmpSettings", () => {
 	});
 
 	it("treats a removed key as unset and a removed sub-tree as per-key unsets", () => {
-		const patch = diffOmpSettings(
+		const patch = diffOmpPathValues(
 			{
 				compaction: { enabled: false, reserveTokens: 8192, keepRecentTokens: 25000 },
 			},
 			{},
+			OMP_SETTINGS_PATHS,
 		);
 		expect(patch.set).toEqual([]);
 		expect(patch.unset).toEqual([
@@ -120,9 +144,10 @@ describe("diffOmpSettings", () => {
 	});
 
 	it("does not equate distinct types or numbers", () => {
-		const patch = diffOmpSettings(
+		const patch = diffOmpPathValues(
 			{ compaction: { enabled: true }, retry: { maxRetries: 3 } },
 			{ compaction: { enabled: 1 }, retry: { maxRetries: 4 } },
+			OMP_SETTINGS_PATHS,
 		);
 		expect(patch.set).toEqual([
 			{ path: "retry.maxRetries", value: 4 },

@@ -1,6 +1,6 @@
 import { showNotice } from "./utils/notice";
 import { isAgentActiveOrIdle } from "./utils/agentRuntimeState";
-import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
+import { Component, useState, useEffect, useCallback, useRef, type ReactNode } from "react";
 import type { PiDesktopApi } from "../../shared/api";
 import type { ConfigSaveWarning } from "../../shared/types";
 import { AuthTab } from "./config/AuthTab";
@@ -27,7 +27,16 @@ import type {
 import type { ConfigFileDiagnostic, CreatePiPromptTemplateInput, PiExtensionListResult, PiExtensionSummary, PiPromptTemplateListResult, PiPromptTemplateSummary, PiSkillListResult, PiSkillLocation, PiSkillSummary } from "../../shared/types";
 import { getProviderHeaders, KNOWN_PROVIDER_ENDPOINTS } from "./config/providerHeaders";
 import { lookupBuiltinApiRoute } from "../../shared/providerApiRoutes";
-import { diffOmpSettings } from "../../shared/ompConfigSettings";
+import { OMP_SETTINGS_PATHS, configValuesEqual, writeOmpPath } from "../../shared/ompConfigSettings";
+import {
+	commitDraft,
+	createDraft,
+	draftPatch,
+	hasDraftChanges,
+	rebaseDraft,
+	setDraftValue,
+	type Draft,
+} from "./utils/configDraft";
 
 const api: PiDesktopApi = (window as unknown as { piDesktop: PiDesktopApi })
 	.piDesktop;
@@ -187,10 +196,21 @@ function ConfigModalContent(props: ConfigModalProps) {
 
 	// 各 tab 的数据
 	const [modelsData, setModelsData] = useState<ModelsFile>({ providers: {} });
+	/**
+	 * models.json 的磁盘基线。
+	 *
+	 * 关闭守卫的判据是「value 与基线是否相等」而不是「有没有点过保存」：只有基线在
+	 * **每次真正回读磁盘**时一起更新，未保存改动才不会被后续 tab 切换洗成「干净」。
+	 * 同理适用于 auth。
+	 */
+	const [modelsBaseline, setModelsBaseline] = useState<ModelsFile>({ providers: {} });
 	const [authData, setAuthData] = useState<AuthFile>({});
-	/** omp 全局设置权威源 config.yml 的草稿与载入基线（保存时据此生成补丁） */
-	const [settingsData, setSettingsData] = useState<Record<string, unknown>>({});
-	const [settingsBaseline, setSettingsBaseline] = useState<Record<string, unknown>>({});
+	const [authBaseline, setAuthBaseline] = useState<AuthFile>({});
+	/** omp 全局设置权威源 config.yml 的草稿（base = 载入/最后落盘值，value = 编辑中） */
+	const [settingsDraft, setSettingsDraft] = useState<Draft<Record<string, unknown>>>(() =>
+		createDraft({}),
+	);
+	const settingsData = settingsDraft.value;
 	/**
 	 * 当前 omp config.yml 的默认模型配置（modelRoles.default + defaultThinkingLevel），
 	 * 供 ModelsTab 提供商卡片标记与快速设定默认。
@@ -204,7 +224,6 @@ function ConfigModalContent(props: ConfigModalProps) {
 	const [discoveredModels, setDiscoveredModels] = useState<
 		Record<string, Array<{ id: string; name?: string }>>
 	>({});
-	const [trustData, setTrustData] = useState<Record<string, boolean>>({});
 	const [skillsData, setSkillsData] = useState<PiSkillListResult>({
 		locations: [],
 		skills: [],
@@ -239,8 +258,41 @@ function ConfigModalContent(props: ConfigModalProps) {
 	/** 用户已删除的内置模板名称（仅当前会话有效） */
 	const [deletedBuiltinNames, setDeletedBuiltinNames] = useState<Set<string>>(new Set());
 	const [uninstallExtensionConfirm, setUninstallExtensionConfirm] = useState<PiExtensionSummary | null>(null);
+	/**
+	 * 源文件 tab 的编辑草稿与基线。
+	 *
+	 * 只有 `raw` tab 的载入路径会写它们：settings/models/trust 分支以前也顺手写
+	 * `setRawContent`，结果「编辑源文件 → 切到别的 tab」会被那次载入静默覆盖。
+	 * 现在这四个状态只属于 raw tab，切换 tab 不再互相踩。
+	 */
 	const [rawContent, setRawContent] = useState("");
-	const [rawFileName, setRawFileName] = useState("models.json");
+	const [rawBaseline, setRawBaseline] = useState("");
+	const [rawFileName, setRawFileName] = useState("config.yml");
+	/** trust tab 的草稿与基线（同样只由 trust 载入路径写）。 */
+	const [trustData, setTrustData] = useState<Record<string, boolean>>({});
+	const [trustBaseline, setTrustBaseline] = useState<Record<string, boolean>>({});
+
+	/**
+	 * 各 tab「当前值 vs 基线」的最新快照。
+	 *
+	 * loadConfig 是 useCallback：把草稿塞进依赖数组会让「数据变化」反过来触发载入，形成回读
+	 * 循环；不塞又只能看到挂载那一刻的旧值。载入路径需要判断「这个 tab 是否还有未保存编辑
+	 * （有就不能覆盖）」，所以用 ref 读取最新值，依赖表仍只保留回调。
+	 */
+	const draftsRef = useRef({
+		models: { value: modelsData, baseline: modelsBaseline },
+		auth: { value: authData, baseline: authBaseline },
+		trust: { value: trustData, baseline: trustBaseline },
+		raw: { value: rawContent, baseline: rawBaseline, fileName: rawFileName },
+		settings: { value: settingsDraft },
+	});
+	draftsRef.current = {
+		models: { value: modelsData, baseline: modelsBaseline },
+		auth: { value: authData, baseline: authBaseline },
+		trust: { value: trustData, baseline: trustBaseline },
+		raw: { value: rawContent, baseline: rawBaseline, fileName: rawFileName },
+		settings: { value: settingsDraft },
+	};
 
 	// 展开的 provider / auth 项
 	const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
@@ -312,8 +364,45 @@ function ConfigModalContent(props: ConfigModalProps) {
 		onConfirm: () => void;
 	} | null>(null);
 
+	/**
+	 * 源文件 tab 的载入：内容与基线一起换。
+	 *
+	 * 「重新载入 = 丢弃该文件草稿」是本 tab 的唯一语义；只换内容不换基线会让刚读到的
+	 * 磁盘文本立刻被算成未保存改动，关闭弹层时凭空弹出保存确认。
+	 */
+	const loadRawFile = useCallback(async (fileName: string, options: { force?: boolean } = {}) => {
+		// 同一文件已有未保存编辑时不回读：切到别的 tab 再切回来不该把草稿洗成磁盘值。
+		// 换文件（下拉切换）与保存后回读是明确意图，走 force 直接重置草稿。
+		const liveRaw = draftsRef.current.raw;
+		if (!options.force && fileName === liveRaw.fileName && liveRaw.value !== liveRaw.baseline) {
+			return;
+		}
+		const res =
+			fileName === "models.json"
+				? await api.config.getModels()
+				: fileName === "trust.json"
+					? await api.config.getTrust()
+					: await api.config.getOmpConfig();
+		setRawFileName(fileName);
+		setRawContent(res.raw);
+		setRawBaseline(res.raw);
+		setConfigDiagnostic(res.diagnostic ?? null);
+	}, []);
+
 	const loadConfig = useCallback(
-		async (target: ConfigTab) => {
+		async (
+			target: ConfigTab,
+			/**
+			 * 设置 tab 的回读选项。
+			 * `rebasePaths`：只把这些已落盘的路径对齐到磁盘真值，其余未提交编辑原样保留。
+			 * 不传则整份重建（打开弹层、切换 tab、点「重新载入」语义都是丢弃草稿）。
+			 *
+			 * `force`：保存后的回读。该 tab 刚落盘，内存里的 value 与 base 在本次渲染前
+			 * 还是旧的（setState 尚未提交），dirty 判据会把这次回读误拦；而回读要读的正是
+			 * 磁盘规范化后的真值，必须无条件覆盖。
+			 */
+			options: { rebasePaths?: readonly string[]; force?: boolean } = {},
+		) => {
 			setLoading(true);
 			setError(null);
 			setConfigDiagnostic(null);
@@ -325,14 +414,23 @@ function ConfigModalContent(props: ConfigModalProps) {
 						api.config.getModels(),
 						api.config.getOmpDefault(),
 					]);
-					setModelsData(normalizeModelsFile(res.parsed));
-					setRawContent(res.raw);
-					setRawFileName("models.json");
+					// 该 tab 还有未保存编辑时不回读：切走再切回来不该把草稿洗成磁盘值。
+					const live = draftsRef.current;
+					if (options.force || configValuesEqual(live.models.value, live.models.baseline)) {
+						const parsed = normalizeModelsFile(res.parsed);
+						setModelsData(parsed);
+						setModelsBaseline(parsed);
+					}
 					setConfigDiagnostic(res.diagnostic ?? null);
 					setOmpDefault(ompDefaultRes);
 				} else if (target === "auth") {
 					const res = await api.config.getAuth();
-					setAuthData(res.parsed as AuthFile);
+					const live = draftsRef.current;
+					if (options.force || configValuesEqual(live.auth.value, live.auth.baseline)) {
+						const parsed = res.parsed as AuthFile;
+						setAuthData(parsed);
+						setAuthBaseline(parsed);
+					}
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "settings") {
 					// 设置页数据源 = omp 权威设置 config.yml；auth/models 仅用于 enabledModels 候选
@@ -341,12 +439,33 @@ function ConfigModalContent(props: ConfigModalProps) {
 						api.config.getAuth(),
 						api.config.getModels(),
 					]);
-					setSettingsData(settingsRes.parsed);
-					setSettingsBaseline(settingsRes.parsed);
-					setAuthData(authRes.parsed as AuthFile);
-					setModelsData(normalizeModelsFile(modelsRes.parsed));
-					setRawContent(settingsRes.raw);
-					setRawFileName("config.yml");
+					// 保存后的回读只校准刚落盘的路径：同一时间用户可能还在改别的字段，
+					// 整份重建会把那些尚未提交的编辑静默清空。其余情况（打开弹层、
+					// 切换 tab、重新载入）仍是「重新载入 = 丢弃草稿」。
+					const rebasePaths = options.rebasePaths;
+					if (rebasePaths && rebasePaths.length > 0) {
+						setSettingsDraft((prev) => rebaseDraft(prev, settingsRes.parsed, rebasePaths));
+					} else if (
+						// 该 tab 还有未提交的编辑：切走再切回来不该把草稿洗成磁盘值
+						options.force ||
+						!hasDraftChanges(draftsRef.current.settings.value, OMP_SETTINGS_PATHS)
+					) {
+						setSettingsDraft(createDraft(settingsRes.parsed));
+					}
+					// auth/models 在这里只是 enabledModels 候选来源，同样来自磁盘。
+					// 已有未保存编辑时不覆盖：切到设置页不该吞掉另一个 tab 的草稿，
+					// 内存里的值本身仍是可用于候选列表的比较新的那一份。
+					const live = draftsRef.current;
+					if (configValuesEqual(live.auth.value, live.auth.baseline)) {
+						const authParsed = authRes.parsed as AuthFile;
+						setAuthData(authParsed);
+						setAuthBaseline(authParsed);
+					}
+					if (configValuesEqual(live.models.value, live.models.baseline)) {
+						const modelsParsed = normalizeModelsFile(modelsRes.parsed);
+						setModelsData(modelsParsed);
+						setModelsBaseline(modelsParsed);
+					}
 					setConfigDiagnostic(settingsRes.diagnostic ?? null);
 					// 默认模型权威源同样是 config.yml（modelRoles.default）
 					setOmpDefault(await api.config.getOmpDefault());
@@ -405,17 +524,18 @@ function ConfigModalContent(props: ConfigModalProps) {
 					}
 				} else if (target === "trust") {
 					const res = await api.config.getTrust();
-					setTrustData(res.parsed as Record<string, boolean>);
-					setRawContent(res.raw);
-					setRawFileName("trust.json");
+					const live = draftsRef.current;
+					if (options.force || configValuesEqual(live.trust.value, live.trust.baseline)) {
+						const parsed = res.parsed as Record<string, boolean>;
+						setTrustData(parsed);
+						setTrustBaseline(parsed);
+					}
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "raw") {
-					// 源文件 tab 默认打开 omp 设置权威源 config.yml；其它文件由下拉切换
-					const fileName = "config.yml";
-					setRawFileName(fileName);
-					const res = await api.config.getOmpConfig();
-					setRawContent(res.raw);
-					setConfigDiagnostic(res.diagnostic ?? null);
+					// 保持当前选中的文件（首次进入是 omp 设置权威源 config.yml），
+					// 切走再切回来不该把下拉选择重置成默认文件。
+					await loadRawFile(draftsRef.current.raw.fileName);
+					return;
 				}
 			} catch (e) {
 				setError(e instanceof Error ? e.message : String(e));
@@ -423,7 +543,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 				setLoading(false);
 			}
 		},
-		[tab],
+		[loadRawFile],
 	);
 
 	useEffect(() => {
@@ -497,6 +617,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 	/**
 	 * 保存并提示。返回是否真正落盘：调用方必须据此决定是否 reload，
 	 * 否则失败时随后的 loadConfig 会 setError(null) 并覆盖用户草稿。
+	 *
+	 * `quiet`：批量保存（关闭守卫「保存并关闭」）里每个 tab 各调一次，成功提示由调用方
+	 * 合并成一条，否则一次关闭会连弹 5 个 toast。失败提示与降级告警不受影响。
 	 */
 	const saveAndReload = async (
 		saveFn: () => Promise<{
@@ -505,6 +628,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 			warnings?: ConfigSaveWarning[];
 		}>,
 		successMessage?: string,
+		options: { quiet?: boolean } = {},
 	): Promise<boolean> => {
 		setSaving(true);
 		setError(null);
@@ -530,6 +654,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 				);
 				return true;
 			}
+			if (options.quiet) return true;
 			showToast(successMessage ?? t("config.saved"));
 			return true;
 		} catch (e) {
@@ -936,7 +1061,13 @@ function ConfigModalContent(props: ConfigModalProps) {
 		});
 	};
 
-	const handleSaveModels = async () => {
+	/**
+	 * 落盘 models.json（含 compat 归一化），成功后把基线与界面值一起推进到写入值。
+	 *
+	 * 拆出「只落盘、不回读」的版本，是因为关闭守卫可能在别的 tab 上触发保存：
+	 * 那边不能顺手 reload，否则会把当前 tab 闪成 loading 并重建无关草稿。
+	 */
+	const persistModels = async (quiet = false): Promise<boolean> => {
 		// 保存前规范化所有供应商的 compat 字段，确保布尔值显式写入而不依赖后端默认值
 		const normalizedData = {
 			...modelsData,
@@ -957,9 +1088,19 @@ function ConfigModalContent(props: ConfigModalProps) {
 		const saved = await saveAndReload(
 			() => api.config.saveModels(normalizedData),
 			t("config.modelsSaved"),
+			{ quiet },
 		);
-		if (!saved) return;
-		await loadConfig("models");
+		if (!saved) return false;
+		// 基线取自「刚写出去的那份值」而不是界面旧值：compat 默认字段是保存时才补的，
+		// 拿旧值当基线会让同一份内容保存后仍显示为未保存改动。
+		setModelsData(normalizedData);
+		setModelsBaseline(normalizedData);
+		return true;
+	};
+
+	const handleSaveModels = async () => {
+		if (!(await persistModels())) return;
+		await loadConfig("models", { force: true });
 
 		// 保存后自动刷新所有运行中的 Agent，使模型配置实时生效
 		// pi 官方尚未支持，先注释
@@ -1040,37 +1181,75 @@ function ConfigModalContent(props: ConfigModalProps) {
 		});
 	};
 
+	const persistAuth = async (quiet = false): Promise<boolean> => {
+		const saved = await saveAndReload(() => api.config.saveAuth(authData), undefined, { quiet });
+		if (!saved) return false;
+		setAuthBaseline(authData);
+		return true;
+	};
+
 	const handleSaveAuth = async () => {
-		if (!(await saveAndReload(() => api.config.saveAuth(authData)))) return;
-		await loadConfig("auth");
+		if (!(await persistAuth())) return;
+		await loadConfig("auth", { force: true });
 	};
 
 	// ── Settings 操作 ────────────────────────────────────
 
-	const handleSaveSettings = async () => {
-		const patch = diffOmpSettings(settingsBaseline, settingsData);
+	/**
+	 * 保存设置草稿：只提交真正改动过的点路径。
+	 * 返回是否「已干净」（空补丁或落盘成功）——ModalSurface 的未保存守卫用它决定是否放行关闭。
+	 */
+	const handleSaveSettings = async (quiet = false): Promise<boolean> => {
+		const patch = draftPatch(settingsDraft, OMP_SETTINGS_PATHS);
+		// 本次真正要落盘的路径：commit 只推进这些，保存期间新动的键继续留在草稿里
+		const landedPaths = [
+			...(patch.set ?? []).map((entry) => entry.path),
+			...(patch.unset ?? []),
+		];
+		// 基线只能推进「刚提交出去的那份值」：patch 在这里定型，而 commit 发生在 await 之后，
+		// 此间用户可能继续输入。若让 commit 从当时的 draft.value 取值，那些从未发送的文本
+		// 会被标成已保存，关闭弹层时静默丢失。
+		let persisted: Record<string, unknown> = {};
+		for (const entry of patch.set ?? []) persisted = writeOmpPath(persisted, entry.path, entry.value);
+		for (const path of patch.unset ?? []) persisted = writeOmpPath(persisted, path, undefined);
 		// 没有改动就不落盘（避免把空补丁写成一次无意义写入）
 		if ((patch.set?.length ?? 0) === 0 && (patch.unset?.length ?? 0) === 0) {
-			await loadConfig("settings");
-			return;
+			if (tab === "settings" && !quiet) await loadConfig("settings");
+			return true;
 		}
-		if (!(await saveAndReload(() => api.config.patchOmpConfig(patch)))) return;
-		await loadConfig("settings");
+		if (!(await saveAndReload(() => api.config.patchOmpConfig(patch), undefined, { quiet })))
+			return false;
+		// 落盘成功才推进基线；失败时草稿与 dirty 原样保留
+		setSettingsDraft((prev) => commitDraft(prev, landedPaths, persisted));
+		// 回读一次磁盘真值（omp 可能规范化写入值）。带上 landedPaths，让回读只校准
+		// 刚提交的字段——保存期间用户可能已经改了别的字段，整份重建会吞掉那些编辑。
+		// 不在设置 tab 时不重载：关闭守卫可能在别的 tab 上触发保存，
+		// 重载会把 loading 态闪到当前 tab 上。
+		if (tab === "settings" && !quiet) await loadConfig("settings", { rebasePaths: landedPaths });
+		return true;
 	};
 
 	// ── Trust 操作 ────────────────────────────────────────
 
-	const handleSaveTrust = async () => {
-		const saved = await saveAndReload(() =>
-			api.config.saveRaw("trust.json", JSON.stringify(trustData, null, 2)),
+	const persistTrust = async (quiet = false): Promise<boolean> => {
+		const saved = await saveAndReload(
+			() => api.config.saveRaw("trust.json", JSON.stringify(trustData, null, 2)),
+			undefined,
+			{ quiet },
 		);
-		if (!saved) return;
-		await loadConfig("trust");
+		if (!saved) return false;
+		setTrustBaseline(trustData);
+		return true;
+	};
+
+	const handleSaveTrust = async () => {
+		if (!(await persistTrust())) return;
+		await loadConfig("trust", { force: true });
 	};
 
 	// ── Raw 操作 ─────────────────────────────────────────
 
-	const handleSaveRaw = async () => {
+	const persistRaw = async (quiet = false): Promise<boolean> => {
 		const isModelsFile = rawFileName === "models.json";
 		const saved = await saveAndReload(
 			() =>
@@ -1078,29 +1257,31 @@ function ConfigModalContent(props: ConfigModalProps) {
 					? api.config.saveOmpConfigRaw(rawContent)
 					: api.config.saveRaw(rawFileName, rawContent),
 			isModelsFile ? t("config.modelsSaved") : undefined,
+			{ quiet },
 		);
-		if (!saved) return;
+		if (!saved) return false;
+		setRawBaseline(rawContent);
+		return true;
+	};
+
+	const handleSaveRaw = async () => {
+		const isModelsFile = rawFileName === "models.json";
+		if (!(await persistRaw())) return;
 		if (isModelsFile) {
-			await loadConfig("models");
+			await loadConfig("models", { force: true });
 			// Raw 保存也触发模型刷新，确保运行中的 Agent 实时生效
 			// pi 官方尚未支持，先注释
 			// void refreshRunningAgents();
-		} else if (rawFileName === "trust.json") await loadConfig("trust");
-		else await loadConfig("settings");
+		} else if (rawFileName === "trust.json") await loadConfig("trust", { force: true });
+		else await loadConfig("settings", { force: true });
 	};
 
 	// 切换源文件时重新加载对应文件内容
 	const handleRawFileChange = async (fileName: string) => {
-		setRawFileName(fileName);
 		setLoading(true);
+		setError(null);
 		try {
-			const res =
-				fileName === "models.json"
-					? await api.config.getModels()
-					: fileName === "trust.json"
-						? await api.config.getTrust()
-						: await api.config.getOmpConfig();
-			setRawContent(res.raw);
+			await loadRawFile(fileName, { force: true });
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
 		} finally {
@@ -1449,7 +1630,11 @@ function ConfigModalContent(props: ConfigModalProps) {
 					return;
 				}
 				onSaved();
-				await loadConfig(tab);
+				// 导入已整体重写三份配置：必须当场丢弃全部草稿。否则旧 base 与旧 value
+				// 会让 dirty 继续为真，关闭时「保存并关闭」把导入前的值写回去，
+				// 恰好覆盖刚导入的内容 —— 而提示语还写着「保存」，用户看不出丢数据。
+				discardAllDrafts();
+				await loadConfig(tab, { force: true });
 				showToast(t("config.imported"));
 			} catch (e) {
 				setError(e instanceof Error ? e.message : String(e));
@@ -1466,6 +1651,66 @@ function ConfigModalContent(props: ConfigModalProps) {
 		{ id: "raw", label: t("config.nav.raw") },
 	];
 
+	/**
+	 * 关闭守卫的 dirty 判据：每个 tab 都用「当前值与磁盘基线是否相等」，
+	 * 而不是「有没有点过保存」。基线只在载入与真正落盘成功时推进（见各 persist*），
+	 * 所以切 tab、Esc、点关闭的行为在所有 tab 上一致：有未保存内容就拦一次。
+	 *
+	 * 源文件 tab 是全文编辑：内容逐字比较即可，不需要结构化相等。
+	 */
+	const modelsDirty = !configValuesEqual(modelsData, modelsBaseline);
+	const authDirty = !configValuesEqual(authData, authBaseline);
+	const trustDirty = !configValuesEqual(trustData, trustBaseline);
+	const rawDirty = rawContent !== rawBaseline;
+	const settingsDirty = hasDraftChanges(settingsDraft, OMP_SETTINGS_PATHS);
+	const configDirty = settingsDirty || modelsDirty || authDirty || trustDirty || rawDirty;
+
+	/**
+	 * 「保存并关闭」：逐个 tab 落盘，任一失败即停在弹层里。
+	 *
+	 * 顺序是**先全文、后结构化**：源文件 tab 写的是整个文件，先落它，结构化保存再叠在上面
+	 * 才不会被全文覆盖。结构化写盘分两种：config.yml 走路径补丁（只动自己的键，全文里其它
+	 * 编辑原样保留），models.json / trust.json 是整文件写（同一文件的全文编辑因此以结构化
+	 * tab 为准 —— 那个 tab 上显示的就是用户最后设定的值）。
+	 *
+	 * 这里不调用 loadConfig：关闭后弹层就重载，回读只会把 loading 闪到当前 tab 上。
+	 */
+	const handleSaveAll = async (): Promise<boolean> => {
+		// 每份都静默，成功提示在全部落盘后合并成一条
+		if (rawDirty && !(await persistRaw(true))) return false;
+		if (trustDirty && !(await persistTrust(true))) return false;
+		if (authDirty && !(await persistAuth(true))) return false;
+		if (modelsDirty && !(await persistModels(true))) return false;
+		if (settingsDirty && !(await handleSaveSettings(true))) return false;
+		showToast(t("config.saved"));
+		return true;
+	};
+
+	/**
+	 * 丢弃全部 tab 的未保存草稿：把各基线对齐到当前值（不改显示），设置草稿重建。
+	 *
+	 * 只在两个地方用：弹层关闭（草稿不该活过本次会话）、导入成功（磁盘三份文件已被
+	 * 整体重写，旧草稿再落盘就会覆盖刚导入的内容）。其它 tab 的数据不必在这里清空——
+	 * 切过去时 loadConfig 会重新回读并把基线一起换掉。
+	 */
+	const discardAllDrafts = () => {
+		setSettingsDraft(createDraft({}));
+		setModelsBaseline(modelsData);
+		setAuthBaseline(authData);
+		setTrustBaseline(trustData);
+		setRawBaseline(rawContent);
+	};
+
+	// 弹层关闭时组件并不卸载（App 常驻渲染 <ConfigModal open=…>），草稿会活过本次会话。
+	// 不主动丢弃的话：「放弃更改」只是关窗，遗留 dirty 草稿下次打开就变成幽灵拦截，
+	// 并被「保存并关闭」重新写回磁盘。
+	useEffect(() => {
+		if (open) return;
+		discardAllDrafts();
+		// 只在关闭那一刻对齐，不随数据变化重跑
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [open]);
+
 	if (!open) return null;
 
 	return (
@@ -1474,6 +1719,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 			onRequestClose={onClose}
 			title={t("config.title")}
 			className="config-modal"
+			dirty={configDirty}
+			onSaveBeforeClose={handleSaveAll}
+			saving={saving}
 			headerActions={
 			section === "config" ? (
 				<>
@@ -1654,7 +1902,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 						saving={saving}
 						modelsData={modelsData}
 						discoveredModels={discoveredModels}
-						onChange={setSettingsData}
+						// SettingsTab 用 writeOmpPath 返回新的根对象，这里整体换掉草稿 value
+						onChange={(next) => setSettingsDraft((prev) => setDraftValue(prev, next))}
 						onSave={handleSaveSettings}
 					/>
 				)}

@@ -121,23 +121,56 @@ export function ompSettingsPatchFromPackage(root: Record<string, unknown>): OmpC
 }
 
 /**
- * 设置页草稿 vs 载入基线的差异 → 只包含改动键的补丁（空补丁不落盘）。
- * 值用 JSON 序列化比较：true / 1 / "1" 不会互相等价，数组顺序变化算改动。
+ * 配置值的结构化相等：嵌套对象按内容比较（键顺序无关），数组按顺序逐项比较。
+ *
+ * 为什么不用 JSON.stringify：同一份映射换个插入顺序就会字符串不同，
+ * 于是「把值改回原样」仍被判成改动 —— 草稿回退因此看起来没生效。
+ * 类型必须严格一致（true / 1 / "1" 互不相等），所以先比 typeof 再比内容。
  */
-export function diffOmpSettings(
+export function configValuesEqual(a: unknown, b: unknown): boolean {
+	if (Object.is(a, b)) return true;
+	if (typeof a !== typeof b || a === null || b === null) return false;
+	if (Array.isArray(a) || Array.isArray(b)) {
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+		return a.every((item, index) => configValuesEqual(item, b[index]));
+	}
+	if (typeof a !== "object") return false;
+	// 到这里 a / b 都是同类型的普通映射（YAML 解析结果没有 Date/Map 等 exotic 值）
+	const left = a as Record<string, unknown>;
+	const right = b as Record<string, unknown>;
+	const keys = Object.keys(left);
+	if (keys.length !== Object.keys(right).length) return false;
+	return keys.every(
+		(key) =>
+			Object.prototype.hasOwnProperty.call(right, key) &&
+			configValuesEqual(left[key], right[key]),
+	);
+}
+
+/**
+ * 基线 vs 草稿在给定点路径上的差异 → 只包含改动路径的补丁（空补丁不落盘）。
+ * 路径集合由调用方给出：设置页只提交可编辑键，配置页同理，非可编辑键一律不碰。
+ *
+ * 这是「设置页怎么算 dirty」的唯一实现。渲染层草稿引擎
+ * （renderer/src/utils/configDraft.ts 的 draftPatch / hasDraftChanges）包在本函数上，
+ * 因此不要再在这里加 `diffOmpSettings(baseline, draft)` 之类的便捷包装——
+ * 多一个同语义导出，就多一份可以悄悄漂移的口径。
+ */
+export function diffOmpPathValues(
 	baseline: Record<string, unknown>,
 	draft: Record<string, unknown>,
+	paths: readonly string[],
 ): OmpConfigPatch {
 	const set: NonNullable<OmpConfigPatch["set"]> = [];
 	const unset: string[] = [];
-	for (const path of OMP_SETTINGS_PATHS) {
+	for (const path of paths) {
 		const before = readOmpPath(baseline, path);
 		const after = readOmpPath(draft, path);
 		if (after === undefined) {
 			if (before !== undefined) unset.push(path);
 			continue;
 		}
-		if (JSON.stringify(before) !== JSON.stringify(after)) {
+		if (!configValuesEqual(before, after)) {
 			set.push({ path, value: after });
 		}
 	}
