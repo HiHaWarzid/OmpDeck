@@ -89,6 +89,16 @@ All notable changes to PiDeck are documented here.
 - **Log details keep the real error** — Nested `Error` objects inside log details
   are serialized with name/message/stack, so failures such as "Failed to list
   sessions" no longer land in the log as `{"error":{}}`.
+- **Git panel spinner no longer sticks after a project switch** — Switching
+  projects while a push/pull was in flight left the push button disabled and
+  spinning forever: the stale mutation intentionally skips its own spinner
+  cleanup, and nothing else reset it. Project switches now reset both, and the
+  regression is pinned by a panel test.
+- **Git panel refreshes after a half-applied mutation** — A failed commit still
+  stages files and a conflicting pull still moves the tree, but the panel kept
+  the pre-mutation grouping until the next 30 s poll; the fallback refresh ran
+  while the mutation lock was still held and was merged away. It now runs after
+  the lock is released, silently, so the error message stays on screen.
 
 ## v0.6.7 - 2026-07-29
 
