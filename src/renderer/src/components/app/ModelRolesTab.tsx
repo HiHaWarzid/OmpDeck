@@ -272,12 +272,37 @@ export function ModelRolesTab(props: {
 	};
 
 	/**
+	 * 只重读预设列表。
+	 *
+	 * 保存/删除预设写的是 `modelPresets`，不碰循环顺序、回退链、provider 顺序和
+	 * roleStorage。以前这些操作走 `loadExtras()`（无 rebase），会把用户在这四个
+	 * 输入框里正在编辑、尚未提交的文本整份重建掉——保存一个预设就静默丢失另一处编辑。
+	 */
+	const refreshPresets = async () => {
+		try {
+			setPresets((await window.piDesktop.config.getOmpModelPresets()) ?? {});
+		} catch {
+			// 旧版 omp 可能没有该 RPC；保持既有预设不变，不影响角色编辑。
+		}
+	};
+
+	/** 只重读回退链。同样避免重建另外三个 draft 字段。 */
+	const refreshFallbackChains = async () => {
+		try {
+			setFallbackChains((await window.piDesktop.config.getOmpFallbackChains()) ?? {});
+		} catch {
+			/* 同上 */
+		}
+	};
+
+	/**
 	 * 读取预设/循环/回退链；与角色读取相互独立，失败时保持空值。
 	 *
 	 * `rebase` 指定刚落盘（或刚被外部改写）的字段：只有这些字段的草稿与基线
 	 * 对齐到磁盘真值，其余未提交编辑原样保留。逐字段保存时若整份重建，
 	 * 保存 A 字段的回读会把同时编辑中的 B 字段静默清空。
-	 * 不传 rebase 即「重新载入 = 丢弃草稿」（首次载入、应用预设等场景）。
+	 * 不传 rebase 即「重新载入 = 丢弃草稿」，只用于首次载入这类用户没有在编辑的时机；
+	 * 一次操作没有改动这四个字段时，用 `refreshPresets` / `refreshFallbackChains`。
 	 */
 	const loadExtras = async (rebase?: readonly (keyof ExtrasDraft)[]) => {
 		try {
@@ -429,7 +454,8 @@ export function ModelRolesTab(props: {
 			reportResult(result, "settings.modelPresets.saved");
 			if (result.valid) {
 				setPresetName("");
-				await loadExtras();
+				// 只重读预设：另外四个输入框里的未提交编辑不归这次写入管。
+				await refreshPresets();
 			}
 			return result.valid;
 		} catch (err) {
@@ -447,8 +473,9 @@ export function ModelRolesTab(props: {
 			const result = await window.piDesktop.config.applyOmpModelPreset(name);
 			reportResult(result, "settings.modelPresets.applied");
 			if (result.valid) {
+				// 应用预设整体替换 modelRoles，但同样不碰循环/回退链/provider/存储字段。
 				await loadRoles();
-				await loadExtras();
+				await refreshPresets();
 			}
 		} catch (err) {
 			setNotice(err instanceof Error ? err.message : String(err));
@@ -463,7 +490,7 @@ export function ModelRolesTab(props: {
 		try {
 			const result = await window.piDesktop.config.deleteOmpModelPreset(name);
 			reportResult(result, "settings.modelPresets.deleted");
-			if (result.valid) await loadExtras();
+			if (result.valid) await refreshPresets();
 		} catch (err) {
 			setNotice(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -588,7 +615,9 @@ export function ModelRolesTab(props: {
 			if (result.valid) {
 				setFallbackChains(next);
 				setFallbackDraft("");
-				await loadExtras();
+				// 只重读回退链（omp 会规范化写入值）。不能走 loadExtras()：
+				// 那会把循环顺序/provider 顺序/roleStorage 三个输入框里正在编辑的文本重建掉。
+				await refreshFallbackChains();
 			}
 			return result.valid;
 		} catch (err) {
@@ -601,6 +630,7 @@ export function ModelRolesTab(props: {
 
 	/** 把「角色 + 逗号分隔链」追加成一条回退链；返回是否落盘。 */
 	const addFallback = async (): Promise<boolean> => {
+		const text = fallbackDraft.trim();
 		const chain = fallbackDraft
 			.split(",")
 			.map((item) => item.trim())
@@ -608,13 +638,21 @@ export function ModelRolesTab(props: {
 		if (!fallbackRole) {
 			// 有文本却没有键：不能返回 true —— 那会让「保存并关闭」一边声称保存成功
 			// 一边把这段文本丢掉。返回 false 让调用方留在弹层里，并把原因说清楚。
-			if (chain.length > 0) {
+			if (text.length > 0) {
 				setNotice(t("settings.modelFallback.missingKey"));
 				return false;
 			}
 			return true;
 		}
-		if (chain.length === 0) return true;
+		// 有文本却解析不出任何条目（例如只剩一个逗号）：与「有文本没键」同理，
+		// 返回 true 会让保存并关闭把这段文本静默丢掉。只有真正空输入才算无事可做。
+		if (chain.length === 0) {
+			if (text.length > 0) {
+				setNotice(t("settings.modelFallback.invalidChain"));
+				return false;
+			}
+			return true;
+		}
 		return commitFallback({ ...fallbackChains, [fallbackRole]: chain }, "fallback-add");
 	};
 

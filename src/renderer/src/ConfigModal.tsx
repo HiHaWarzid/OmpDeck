@@ -396,12 +396,18 @@ function ConfigModalContent(props: ConfigModalProps) {
 			 * 设置 tab 的回读选项。
 			 * `rebasePaths`：只把这些已落盘的路径对齐到磁盘真值，其余未提交编辑原样保留。
 			 * 不传则整份重建（打开弹层、切换 tab、点「重新载入」语义都是丢弃草稿）。
+			 * `rebaseSubmitted`：本次真正提交出去的值。用于识别「请求在途期间用户又改了
+			 * 同一个字段」——回读拿到的磁盘真值属于更早的输入，不能盖掉新编辑。
 			 *
 			 * `force`：保存后的回读。该 tab 刚落盘，内存里的 value 与 base 在本次渲染前
 			 * 还是旧的（setState 尚未提交），dirty 判据会把这次回读误拦；而回读要读的正是
 			 * 磁盘规范化后的真值，必须无条件覆盖。
 			 */
-			options: { rebasePaths?: readonly string[]; force?: boolean } = {},
+			options: {
+				rebasePaths?: readonly string[];
+				rebaseSubmitted?: Record<string, unknown>;
+				force?: boolean;
+			} = {},
 		) => {
 			setLoading(true);
 			setError(null);
@@ -444,7 +450,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 					// 切换 tab、重新载入）仍是「重新载入 = 丢弃草稿」。
 					const rebasePaths = options.rebasePaths;
 					if (rebasePaths && rebasePaths.length > 0) {
-						setSettingsDraft((prev) => rebaseDraft(prev, settingsRes.parsed, rebasePaths));
+						setSettingsDraft((prev) =>
+							rebaseDraft(prev, settingsRes.parsed, rebasePaths, options.rebaseSubmitted),
+						);
 					} else if (
 						// 该 tab 还有未提交的编辑：切走再切回来不该把草稿洗成磁盘值
 						options.force ||
@@ -1198,8 +1206,15 @@ function ConfigModalContent(props: ConfigModalProps) {
 	/**
 	 * 保存设置草稿：只提交真正改动过的点路径。
 	 * 返回是否「已干净」（空补丁或落盘成功）——ModalSurface 的未保存守卫用它决定是否放行关闭。
+	 *
+	 * `quiet` 必须走选项对象而不是位置布尔：本函数会被直接挂在 `<button onClick={...}>` 上，
+	 * React 会把 MouseEvent 作为第一个实参传进来，位置布尔会被事件对象顶成 truthy——
+	 * 表现是设置页每次点保存都静默（无成功提示、也不回读磁盘真值）。
 	 */
-	const handleSaveSettings = async (quiet = false): Promise<boolean> => {
+	const handleSaveSettings = async (
+		options: { quiet?: boolean } = {},
+	): Promise<boolean> => {
+		const quiet = options.quiet === true;
 		const patch = draftPatch(settingsDraft, OMP_SETTINGS_PATHS);
 		// 本次真正要落盘的路径：commit 只推进这些，保存期间新动的键继续留在草稿里
 		const landedPaths = [
@@ -1223,9 +1238,12 @@ function ConfigModalContent(props: ConfigModalProps) {
 		setSettingsDraft((prev) => commitDraft(prev, landedPaths, persisted));
 		// 回读一次磁盘真值（omp 可能规范化写入值）。带上 landedPaths，让回读只校准
 		// 刚提交的字段——保存期间用户可能已经改了别的字段，整份重建会吞掉那些编辑。
+		// 同时带上 persisted：若在途期间用户又改了**同一个**字段，回读拿到的磁盘值
+		// 是更早那次输入的结果，不能盖掉新编辑。
 		// 不在设置 tab 时不重载：关闭守卫可能在别的 tab 上触发保存，
 		// 重载会把 loading 态闪到当前 tab 上。
-		if (tab === "settings" && !quiet) await loadConfig("settings", { rebasePaths: landedPaths });
+		if (tab === "settings" && !quiet)
+			await loadConfig("settings", { rebasePaths: landedPaths, rebaseSubmitted: persisted });
 		return true;
 	};
 
@@ -1681,7 +1699,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 		if (trustDirty && !(await persistTrust(true))) return false;
 		if (authDirty && !(await persistAuth(true))) return false;
 		if (modelsDirty && !(await persistModels(true))) return false;
-		if (settingsDirty && !(await handleSaveSettings(true))) return false;
+		if (settingsDirty && !(await handleSaveSettings({ quiet: true }))) return false;
 		showToast(t("config.saved"));
 		return true;
 	};
@@ -1904,7 +1922,8 @@ function ConfigModalContent(props: ConfigModalProps) {
 						discoveredModels={discoveredModels}
 						// SettingsTab 用 writeOmpPath 返回新的根对象，这里整体换掉草稿 value
 						onChange={(next) => setSettingsDraft((prev) => setDraftValue(prev, next))}
-						onSave={handleSaveSettings}
+						// 显式包一层：直接把 async 处理器挂在 onClick 上会让 MouseEvent 变成第一个实参
+						onSave={() => void handleSaveSettings()}
 					/>
 				)}
 

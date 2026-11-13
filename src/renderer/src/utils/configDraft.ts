@@ -149,19 +149,30 @@ export function adoptDraft<T extends object>(draft: Draft<T>, values: Partial<T>
  * 会把同时编辑中的 B 字段静默清空。
  *
  * `paths` 里的键若在磁盘上不存在（unset），会把该路径写成 undefined。
+ *
+ * `submitted` 给出**本次提交出去的值**，用于处理「请求在途期间用户又改了同一字段」：
+ * 那时磁盘真值属于更早的一次输入，直接写回 `value` 会吞掉在途编辑并把草稿标成干净。
+ * 因此只有当 `value` 仍等于提交值（用户没再动过）时才对齐 `value`；`base` 一律对齐，
+ * 它描述的是磁盘事实。不传 `submitted` 则退化为无条件对齐（调用方确认没有在途编辑）。
  */
 export function rebaseDraft<T extends object>(
 	draft: Draft<T>,
 	fresh: T,
 	paths: readonly string[],
+	submitted?: Partial<T>,
 ): Draft<T> {
 	let base = draft.base as Record<string, unknown>;
 	let value = draft.value as Record<string, unknown>;
 	const source = fresh as Record<string, unknown>;
+	const submittedSource = submitted as Record<string, unknown> | undefined;
 	for (const path of paths) {
 		const next = readOmpPath(source, path);
 		base = writeOmpPath(base, path, next);
-		value = writeOmpPath(value, path, next);
+		// 没有提交值可比（调用方保证无在途编辑）时保持旧语义。
+		const untouched =
+			submittedSource === undefined ||
+			configValuesEqual(readOmpPath(value, path), readOmpPath(submittedSource, path));
+		if (untouched) value = writeOmpPath(value, path, next);
 	}
 	return { base: base as T, value: value as T };
 }
