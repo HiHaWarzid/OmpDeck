@@ -1927,7 +1927,7 @@ export class AgentManager {
 				});
 				// 进程已死读不到 get_state，只能退回本会话最近一次已知模型。
 				const selection = runtime.lastModelSelection ?? {};
-				await runProcessReplacement(
+				const outcome = await runProcessReplacement(
 					this.replacementTarget(runtime),
 					selection,
 					this.replacementEffects(agentId, runtime, {
@@ -1940,10 +1940,15 @@ export class AgentManager {
 						failure: (message) =>
 							`会话压缩完成，但 Agent 自动重连失败（${message}）。请手动重启 Agent。`,
 						// 旧 child 已退出且新 child 没起来：停在 error 会让 UI 以为还能发消息。
-						statusOnFailure: "closed",
+						// 新 child 起来了、只是模型恢复失败时编排会改判 error——会话是活的。
+						statusOnReplaceFailure: "closed",
 						logScope: "Compact reattach",
 					},
 				);
+				// 重连失败必须从这里抛出：compact() 正常 resolve 时渲染层会弹
+				// 「上下文压缩完成」的成功 toast（见 App 的 compactAgent），而此刻会话其实
+				// 已经不可用。错误卡已在编排里写好，这里只负责让调用链以失败收场。
+				if (!outcome.ok) throw new Error(outcome.errorMessage);
 			} else {
 				// 会话过小 / Already compacted / 鉴权失败等：把可读错误抛给渲染进程 toast。
 				throw error;
@@ -3976,8 +3981,8 @@ export class AgentManager {
 				{
 					success: "会话压缩完成，Agent 已自动重连",
 					failure: () => "Agent 进程意外退出，自动重连失败",
-					// 进程已退出：失败后必须落 closed，停在 error 会让 UI 以为还能发消息。
-					statusOnFailure: "closed",
+					// 进程已退出且新 child 起不来：必须落 closed，停在 error 会让 UI 以为还能发消息。
+					statusOnReplaceFailure: "closed",
 					logScope: origin === "create" ? "Auto reattach after clean exit" : "Reattach auto-restart",
 				},
 			);

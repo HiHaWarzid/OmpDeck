@@ -264,4 +264,49 @@ describe("compact 触发的重连", () => {
 		expect(runtime.rpcCompacting).toBe(false);
 		expect(state).toBeTruthy();
 	});
+
+	/**
+	 * 重连失败时 compact() 必须 reject：渲染层只要拿到 resolved promise 就弹
+	 * 「上下文压缩完成」的成功 toast（App.compactAgent），而此刻会话其实不可用。
+	 * 旧实现直接 `await this.reattachProcess(...)`，异常会自然冒出去；收进编排模块后
+	 * 返回的是 ReplacementOutcome，丢掉它就会静默变成「成功」。
+	 */
+	it("重连失败时 compact() 抛错，且新 child 没起来落 closed", async () => {
+		const manager = makeManager();
+		const { runtime } = seedRuntime(manager, {
+			processAlive: false,
+			compactThrows: true,
+			failStart: true,
+		});
+		runtime.lastModelSelection = { provider: "anthropic", modelId: "claude-sonnet-4" };
+
+		await expect(manager.compact("a1")).rejects.toThrow("spawn ENOENT");
+
+		// 没有活着的 child 可交互：停在 error 会让 UI 以为还能发消息。
+		expect(runtime.tab.status).toBe("closed");
+		expect(runtime.tab.lastError).toContain("spawn ENOENT");
+		expect(runtime.compacting).toBe(false);
+	});
+
+	/**
+	 * 新 child 起来了、只是 set_model 被拒：会话是活的，下一句话就能发出去。
+	 * 这种失败必须落 error 而不是 closed，否则 UI 显示「已关闭」并让用户手动重启，
+	 * 白白丢掉一段完全可以继续的上下文。
+	 */
+	it("只有模型恢复失败时落 error（会话仍可用），同样让 compact() 抛错", async () => {
+		const manager = makeManager();
+		const { runtime, sent } = seedRuntime(manager, {
+			processAlive: false,
+			compactThrows: true,
+			failRestore: true,
+		});
+		runtime.lastModelSelection = { provider: "anthropic", modelId: "claude-sonnet-4" };
+
+		await expect(manager.compact("a1")).rejects.toThrow("model not available");
+
+		expect(runtime.tab.status).toBe("error");
+		expect(runtime.tab.lastError).toContain("model not available");
+		// 新 child 确实被拉起并尝试恢复过选择。
+		expect(sent.some((req) => req.type === "set_model")).toBe(true);
+	});
 });

@@ -31,7 +31,7 @@ type Harness = {
 function createHarness(overrides: {
 	replaceFails?: boolean;
 	restoreFails?: boolean;
-	statusOnFailure?: "error" | "closed";
+	statusOnReplaceFailure?: "error" | "closed";
 } = {}): Harness {
 	const statusAtReplace: string[] = [];
 	const replacePaths: string[] = [];
@@ -144,11 +144,11 @@ describe("runProcessReplacement", () => {
 		expect(harness.restore).not.toHaveBeenCalled();
 	});
 
-	it("statusOnFailure=closed 时把失败收敛成 closed（进程已退出的场景）", async () => {
+	it("statusOnReplaceFailure=closed 只在新 child 没起来时生效（进程已退出的场景）", async () => {
 		const harness = createHarness({ replaceFails: true });
 		await runProcessReplacement(harness.target, {}, harness.effects, {
 			...copy,
-			statusOnFailure: "closed",
+			statusOnReplaceFailure: "closed",
 		});
 
 		expect(harness.target.status).toBe("closed");
@@ -162,6 +162,23 @@ describe("runProcessReplacement", () => {
 		expect(outcome.ok).toBe(false);
 		expect(harness.target.status).toBe("error");
 		expect(harness.target.lastError).toBe("set_model rejected");
+	});
+
+	/**
+	 * 新 child 已起来、只是模型/思考档恢复失败：会话是活的，下一句话就能发出去。
+	 * 这里若沿用 statusOnReplaceFailure 的 closed，UI 会显示「已关闭」并提示用户手动重启，
+	 * 而那个会话其实完全可用——用户会白白丢掉一段能继续的上下文。
+	 */
+	it("新 child 已起来时的恢复失败恒落 error，即使调用方要求 closed", async () => {
+		const harness = createHarness({ restoreFails: true });
+		const outcome = await runProcessReplacement(harness.target, {}, harness.effects, {
+			...copy,
+			statusOnReplaceFailure: "closed",
+		});
+
+		expect(outcome).toEqual({ ok: false, errorMessage: "set_model rejected" });
+		expect(harness.target.status).toBe("error");
+		expect(harness.restore).toHaveBeenCalledTimes(1);
 	});
 
 	it("无论成败都把终态广播出去，不把 starting 留在 UI 上", async () => {

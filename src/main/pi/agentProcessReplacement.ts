@@ -84,11 +84,14 @@ export type ReplacementCopy = {
 	/** 失败提示；收到的是不含包装的错误信息。 */
 	failure(errorMessage: string): string;
 	/**
-	 * 失败时落哪个状态。默认 `error`（进程仍可重启、会话文件还在，值得让用户重试）；
-	 * 进程已经退出的自动重连必须传 `closed`——此时没有活着的 child 可交互，
-	 * 停在 error 会让 UI 以为还能发消息。
+	 * **替换失败、新 child 没起来**时落哪个状态：默认 `error`；进程已退出的自动重连传
+	 * `closed`——没有活着的 child 可交互，停在 error 会让 UI 以为还能发消息。
+	 *
+	 * 只管「child 起不来」这一段。新 child 已经起来、只是 restoreSelection 失败时**恒为
+	 * error**：会话是活的，下一句话就能发出去，标成 closed 等于骗用户去手动重启。
+	 * 这个区分只有本模块知道（它看得见 replaceProcess 是否成功），不能交给调用方猜。
 	 */
-	statusOnFailure?: Extract<AgentStatus, "error" | "closed">;
+	statusOnReplaceFailure?: Extract<AgentStatus, "error" | "closed">;
 	/** 日志用的事件名（成功/失败共用前缀，便于过滤）。 */
 	logScope: string;
 };
@@ -108,6 +111,9 @@ export async function runProcessReplacement<T extends ReplacementTarget>(
 	effects: ReplacementEffects<T>,
 	copy: ReplacementCopy,
 ): Promise<ReplacementOutcome> {
+	// 新 child 是否真的起来了：决定失败时落 closed 还是 error（见 statusOnReplaceFailure）。
+	// 只有本模块能看到 replaceProcess 的成功边界，调用方无法事后推断。
+	let replaced = false;
 	// 先进入 starting：替换窗口内 UI 显示重连中，且新 prompt 不会投给即将退役的 child。
 	// 同时清掉上一次进程留下的 lastError：重连进行中还挂着旧错误，UI 会同时显示
 	// 「正在重连」和早已过时的崩溃原因；失败分支会写入本次的真实原因。
@@ -121,6 +127,7 @@ export async function runProcessReplacement<T extends ReplacementTarget>(
 		const sessionPath = target.sessionPath;
 		if (!sessionPath) throw new Error("会话尚未落盘，无法重连");
 		await effects.replaceProcess(target, sessionPath);
+		replaced = true;
 		// 恢复选择必须在替换之后：旧 child 上的 set_model 会被随后的替换丢弃。
 		await effects.restoreSelection(target, selection);
 		target.status = "idle";
@@ -132,7 +139,7 @@ export async function runProcessReplacement<T extends ReplacementTarget>(
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
 		// 失败必须落非 idle 状态且写 lastError：否则用户面对的是一个没有线索的会话。
-		target.status = copy.statusOnFailure ?? "error";
+		target.status = replaced ? "error" : (copy.statusOnReplaceFailure ?? "error");
 		target.lastError = errorMessage;
 		effects.addMessage(target, "error", copy.failure(errorMessage));
 		effects.logError?.(`${copy.logScope} failed`, {
