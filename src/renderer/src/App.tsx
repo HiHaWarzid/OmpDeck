@@ -2157,7 +2157,8 @@ export function App() {
     );
     // 面板钉选不在这里按可见项目裁剪：projects 只是当前环境过滤后的可见列表，
     // 切到 WSL/Windows 模式会让另一半项目临时“消失”，据此裁剪会误删它们的钉选与持久化记录。
-    // 真正的删除走 updateAfterProjectRemoved → panelHost.forgetProject。
+    // 真正的删除走 syncVanishedProjects → panelHost.forgetProjects（删项目 / 删 worktree /
+    // 关闭工作区模式三条路径共用）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectIdsKey]);
 
@@ -2993,18 +2994,25 @@ export function App() {
   }
 
   /**
-   * 项目记录消失后的统一收尾：**必须**在 `setProjects(next)` 之后、下一次渲染之前同步调用，
-   * 因为这里要读 `projectsRef.current`（仍是删除前的列表）做差集。
+   * 项目记录消失后的统一收尾。
    *
    * 三条路径都会让主进程连带删掉一批项目记录——删项目（父项目连带 worktree 子项目）、
    * 删 worktree、关闭工作区模式（清空该父项目下全部子项目）。只有「删除前列表 −
    * 删除后列表」这个差集知道到底少了谁，所以差集计算只放这里：新增删除路径时不会再漏掉
    * 面板钉选清理，被删项目的 `pid:project-drawer:*` / `pid:project-expanded-dirs:*`
    * 也不会永久留在 localStorage 里。
+   *
+   * `prev` 由调用方在删除前显式取好（唯一合法前值来源是 `projectsRef.current`），
+   * 不在函数里读 ref：这样调用方即使将来在 `setProjects` 与调用之间插入 `await`，
+   * 差集也不会静默退化成空集。
+   *
+   * **不可用于** `refreshProjects` / `projects:changed` 这类「整体重载列表」的路径：
+   * 那里 `next` 可能是启动瞬间还没 load 完的空列表，也可能按 WSL/Windows 环境过滤过，
+   * 据此清盘会删掉存活项目（含另一环境全部项目）的持久化键。
    */
-  function syncVanishedProjects(next: Project[]): string[] {
+  function syncVanishedProjects(prev: readonly Project[], next: Project[]): string[] {
     const alive = new Set(next.map((project) => project.id));
-    const vanished = projectsRef.current
+    const vanished = prev
       .filter((project) => !alive.has(project.id))
       .map((project) => project.id);
     if (vanished.length > 0) panelHost.forgetProjects(vanished);
@@ -3019,6 +3027,7 @@ export function App() {
 
   function updateAfterProjectRemoved(
     removedProjectId: string,
+    prev: readonly Project[],
     next: Project[],
   ) {
     setSessionsByProject((current) => {
@@ -3029,7 +3038,7 @@ export function App() {
     forgetProject(removedProjectId);
     // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
     // 所以「调了 remove」不等于「记录真没了」——按前后列表差集清理，而不是只清被点的那一个。
-    syncVanishedProjects(next);
+    syncVanishedProjects(prev, next);
   }
 
   async function createAgent(
@@ -4380,6 +4389,8 @@ export function App() {
   /** 删除 worktree 工作区 */
   async function removeWorktree(parentProjectId: string, worktreePath: string) {
     try {
+      // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
+      const prev = projectsRef.current;
       const removed = await api.git.worktreeRemove(parentProjectId, worktreePath);
       if (!removed) {
         throw new Error(t("app.worktreeRemoveNotFound"));
@@ -4388,7 +4399,7 @@ export function App() {
       setProjects(next);
       // 主进程连带删掉了该 worktree 的子项目记录；统一差集收尾会清它的面板钉选与
       // 持久化记录，否则同一路径再次注册成项目时会带着旧面板回来。
-      syncVanishedProjects(next);
+      syncVanishedProjects(prev, next);
       await refreshWorktrees(parentProjectId);
       showToast(t("app.worktreeRemoved"));
     } catch (e) {
@@ -6465,6 +6476,8 @@ export function App() {
             const project = projectMenu.project;
             setProjectMenu(null);
             try {
+              // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
+              const prev = projectsRef.current;
               const updated = await api.projects.toggleWorktreeEnabled(project.id);
               if (updated) {
                 const next = await api.projects.list();
@@ -6472,7 +6485,7 @@ export function App() {
                 // 关闭工作区模式时主进程会清空该父项目下全部 worktree 子项目记录
                 // （ProjectStore.clearWorktreeChildren），那些子项目的面板钉选、
                 // 持久化记录和「活动项目」指向都要一起收尾，否则会留下无主状态。
-                syncVanishedProjects(next);
+                syncVanishedProjects(prev, next);
                 // 开启后立即扫描并注册已有 worktree
                 if (updated.worktreeEnabled) {
                   void refreshWorktrees(updated.id);
@@ -6496,9 +6509,11 @@ export function App() {
             const project = projectMenu.project;
             setProjectMenu(null);
             try {
+              // 删除前的列表必须在 await 之前取：await 期间可能有渲染，ref 会指向新列表。
+              const prev = projectsRef.current;
               const next = await api.projects.remove(project.id);
               setProjects(next);
-              updateAfterProjectRemoved(project.id, next);
+              updateAfterProjectRemoved(project.id, prev, next);
             } catch (e) {
               if (String((e as Error)?.message ?? e).includes("PROJECT_HAS_RUNNING_AGENT")) {
                 setConfirmDialog({
