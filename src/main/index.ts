@@ -26,6 +26,7 @@ import {
 import { acquireVersionSingleInstance } from "./singleInstance";
 import { resolveNativeThemeSource } from "./nativeThemeSource";
 import { readLastWindowBounds, saveLastWindowBounds } from "./windowState";
+import { MainWindowLifecycle } from "./mainWindow";
 import { cleanupStaleTempFiles } from "./storage/staleTempFileCleanup";
 import {
 	RENDERER_RECOVERY_MAX_ATTEMPTS,
@@ -281,16 +282,11 @@ import { startSoakRecorder } from "./perf/soak";
 let mainWindow: BrowserWindow | null = null;
 /** 语义事件 → 主窗通道的适配器（AgentManager 构造时创建，窗口创建后 attach）。 */
 let desktopAgentEvents: ElectronAgentEventBridge | null = null;
-/** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
-let isQuitting = false;
-// 主窗口主 frame 加载健康状态（自愈判断用，见 handleVersionFocusRequest）。
-// mainFrameLoadFailed：最近一次主 frame 导航失败（含 dev server 失联导致的错误页）。
-// pendingErrorPageFinish：did-fail-load 之后紧跟的那次 did-finish-load 属于错误页本身，
-// 不能据此清除失败标记——只有真实页面加载成功才清除。
-let mainFrameLoadFailed = false;
-let pendingErrorPageFinish = false;
-// dev URL 首次加载失败后回退到已构建的 renderer 产物，只回退一次，避免无产物时反复重试。
-let mainWindowDevFallbackTried = false;
+/**
+ * 主窗口生命周期判定与状态（加载健康、dev 回退、退出标记、自愈次数账本）。
+ * 窗口句柄经注入的访问器读取（不能快照：窗口会销毁重建），此处不再另存健康/退出态。
+ */
+const mainWindowLifecycle = new MainWindowLifecycle(() => mainWindow);
 /**
  * renderer console 已知噪音（仅 dev 模式过滤）：CSP 开发警告、vite HMR 中间态
  * （[vite] reload 失败、保存代码瞬间的 ReferenceError not defined、hooks 顺序告警）
@@ -436,17 +432,6 @@ function focusMainWindow() {
 }
 
 /**
- * 主窗口是否处于不可用状态（空白页/崩溃），需要重建而非仅聚焦。
- * 除渲染进程崩溃外，主 frame 加载失败（如 dev server 失联）也会让窗口停留在
- * 错误页——此时二次启动只聚焦无济于事，必须重建窗口走一遍加载/回退逻辑。
- */
-function mainWindowNeedsRecovery(window: BrowserWindow): boolean {
-	if (window.isDestroyed()) return true;
-	if (window.webContents.isCrashed()) return true;
-	return mainFrameLoadFailed;
-}
-
-/**
  * 卡死现场的主进程侧证据：渲染进程的驻留内存与 CPU。
  * 只在主进程能看到（渲染层此时已经不响应 IPC，拿不到它的自述），
  * 用于区分「内存压力/GC 抖动」和「纯 CPU 长任务」。
@@ -467,9 +452,6 @@ function describeRendererProcessMetrics(window: BrowserWindow): Record<string, u
 	}
 }
 
-/** 最近窗口内的自动恢复时间戳：只在主进程内存里，重启应用即清零。 */
-let rendererRecoveryAttempts: number[] = [];
-
 /**
  * 渲染进程持续无响应多久后按「软崩溃」处理。
  * 取 60s：既要避开「忙但还能用」的瞬时卡顿（那种情况下 Electron 不会报 unresponsive），
@@ -482,8 +464,7 @@ const RENDERER_UNRESPONSIVE_RECOVERY_MS = 60_000;
  * 这里只负责副作用（日志、重载、超限时弹窗）。
  */
 function handleRendererProcessGone(window: BrowserWindow, details: Electron.RenderProcessGoneDetails): void {
-	const decision = decideRendererRecovery(rendererRecoveryAttempts, Date.now());
-	rendererRecoveryAttempts = decision.attempts;
+	const decision = mainWindowLifecycle.decideRecovery(Date.now(), decideRendererRecovery);
 	if (decision.action === "prompt") {
 		void appLogger.error("app", "Renderer recovery attempts exhausted", {
 			attempts: decision.attempts.length,
@@ -543,7 +524,7 @@ async function promptRendererRecoveryExhausted(window: BrowserWindow): Promise<v
 	if (window.isDestroyed()) return;
 	if (response === 0) {
 		// 用户显式要求再试：清空计数，让下一次崩溃重新走自动恢复而不是立刻弹窗。
-		rendererRecoveryAttempts = [];
+		mainWindowLifecycle.resetRecoveryAttempts();
 		void appLogger.warn("app", "Renderer recovery retried by user");
 		window.webContents.reload();
 		return;
@@ -558,27 +539,23 @@ async function promptRendererRecoveryExhausted(window: BrowserWindow): Promise<v
  * 挂到顶层 focusExistingWindow，供版本单实例锁的 .focus 信号调用。
  */
 function handleVersionFocusRequest() {
-	if (
-		mainWindow &&
-		!mainWindow.isDestroyed() &&
-		!mainWindowNeedsRecovery(mainWindow)
-	) {
+	if (mainWindowLifecycle.planVersionFocus() === "focus") {
 		focusMainWindow();
 		return;
 	}
 	void app.whenReady().then(() => {
-		if (mainWindow && !mainWindow.isDestroyed()) {
-			if (!mainWindowNeedsRecovery(mainWindow)) {
-				focusMainWindow();
-				return;
-			}
+		const plan = mainWindowLifecycle.planVersionFocus();
+		if (plan === "focus") {
+			focusMainWindow();
+			return;
+		}
+		if (plan === "recreate") {
 			// 窗口还在但渲染已坏：重建而非聚焦，避免用户反复启动都看到空白页
 			void appLogger?.warn("app", "Recreating unhealthy main window on version focus request", {
-				crashed: mainWindow.webContents.isCrashed(),
-				loadFailed: mainFrameLoadFailed,
-				url: mainWindow.webContents.getURL(),
+				crashed: mainWindow?.webContents.isCrashed(),
+				url: mainWindow?.webContents.getURL(),
 			});
-			mainWindow.destroy();
+			mainWindow?.destroy();
 		}
 		if (settingsStore) {
 			void createWindow().catch((error) => {
@@ -605,12 +582,12 @@ function shutdownServices(opts: { awaitFlush: boolean }): Promise<void> | void {
 
 /**
  * 重启应用：统一清理后 relaunch + quit。
- * 必须先置 isQuitting，否则 closeToTray 会把退出流程吞成「隐藏到托盘」，relaunch 不生效；
+ * 必须先置 quitting，否则 closeToTray 会把退出流程吞成「隐藏到托盘」，relaunch 不生效；
  * 清理失败不能拦住重启，否则应用会卡死在"点了没反应"。
  * 托盘菜单与设置页「重启」IPC（registerAppHandlers → appRestart）共用此流程。
  */
 async function restartApp() {
-	isQuitting = true;
+	mainWindowLifecycle.setQuitting(true);
 	// await 刷盘完成再 relaunch：before-quit 的刷盘在 app.quit() 后才跑，
 	// 不等就 relaunch 会丢掉重启前最后一次 update（新实例已在读旧文件）。
 	await shutdownServices({ awaitFlush: true });
@@ -725,9 +702,7 @@ function printStartupInfo() {
 
 async function createWindow() {
 	// 重建窗口时重置加载健康状态，让新窗口重新尝试 dev URL（若仍失联则再次回退构建产物）
-	mainFrameLoadFailed = false;
-	pendingErrorPageFinish = false;
-	mainWindowDevFallbackTried = false;
+	mainWindowLifecycle.resetLoadHealth();
 	applyNativeThemeSource(settingsStore.get());
 	const windowOptions = settingsStore.createWindowOptions();
 	const showMainWindowImmediately = shouldShowMainWindowImmediately();
@@ -839,11 +814,7 @@ async function createWindow() {
 		});
 		// 紧跟 did-fail-load 的这次 finish 是 Chromium 错误页本身，不视为加载成功；
 		// 其余 finish 说明真实页面已加载，清除失败标记。
-		if (pendingErrorPageFinish) {
-			pendingErrorPageFinish = false;
-		} else {
-			mainFrameLoadFailed = false;
-		}
+		mainWindowLifecycle.onMainFrameLoadFinished();
 		// 恢复用户设置的窗口缩放；在 did-finish-load 后应用，避免早期设置被覆盖。
 		mainWindow?.webContents.setZoomFactor(settingsStore.get().zoomFactor);
 	});
@@ -857,12 +828,12 @@ async function createWindow() {
 				isMainFrame,
 			});
 			if (!isMainFrame) return;
-			mainFrameLoadFailed = true;
-			pendingErrorPageFinish = true;
+			const { fallbackToBuiltRenderer } = mainWindowLifecycle.onMainFrameLoadFailed(
+				shouldUseDevRendererUrl(),
+			);
 			// dev server 失联（承载它的终端/父进程被关）时，窗口会永远停在错误页。
 			// 回退到已构建的 renderer 产物，保证至少能看到界面而不是空白；只回退一次。
-			if (shouldUseDevRendererUrl() && !mainWindowDevFallbackTried) {
-				mainWindowDevFallbackTried = true;
+			if (fallbackToBuiltRenderer) {
 				void appLogger.warn("app", "Dev server unreachable, falling back to built renderer", {
 					errorCode,
 					errorDescription,
@@ -895,7 +866,7 @@ async function createWindow() {
 		rendererUnresponsiveTimer = setTimeout(() => {
 			rendererUnresponsiveTimer = null;
 			// 计时期间用户关窗/渲染进程已崩溃：交给既有路径，不重复处理。
-			if (createdWindow.isDestroyed() || createdWindow.webContents.isCrashed()) return;
+			if (mainWindowLifecycle.planUnresponsiveRecovery(createdWindow) === "ignore") return;
 			void appLogger.error("app", "Renderer unresponsive, forcing recovery", {
 				blockedMs: Date.now() - rendererUnresponsiveSince,
 				...describeRendererProcessMetrics(createdWindow),
@@ -922,7 +893,7 @@ async function createWindow() {
 		rendererUnresponsiveSince = 0;
 		clearRendererUnresponsiveWatch();
 		// clean-exit 是正常离开（关窗/退出），窗口已销毁时也无处可恢复。
-		if (details.reason === "clean-exit" || createdWindow.isDestroyed()) return;
+		if (!mainWindowLifecycle.shouldRecoverRenderer(createdWindow, details.reason === "clean-exit")) return;
 		handleRendererProcessGone(createdWindow, details);
 	});
 	mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
@@ -1005,12 +976,13 @@ async function createWindow() {
 	});
 
 	mainWindow.on("close", (event) => {
-		if (!isQuitting && settingsStore.get().closeToTray) {
+		const plan = mainWindowLifecycle.planClose(settingsStore.get().closeToTray);
+		if (plan === "hide") {
 			event.preventDefault();
 			mainWindow?.hide();
-		} else if (!isQuitting) {
+		} else if (plan === "quit") {
 			// 如果没有启用托盘，关闭窗口时直接退出应用
-			isQuitting = true;
+			mainWindowLifecycle.setQuitting(true);
 			app.quit();
 		}
 	});
@@ -1173,7 +1145,7 @@ function registerIpc() {
 			updateManager,
 			getMainWindow: () => mainWindow,
 			setIsQuitting: (value: boolean) => {
-				isQuitting = value;
+				mainWindowLifecycle.setQuitting(value);
 			},
 			// 重启前主动让出单实例锁，保证 relaunch 的新实例能拿到主实例身份
 			releaseSingleInstanceLock: () => versionSingleInstance.dispose(),
@@ -1274,7 +1246,7 @@ app.whenReady().then(async () => {
 	rpcLogger = new RpcLogger();
 	updateManager = new UpdateManager({ appLogger, getMainWindow: () => mainWindow });
 	linkOpener = new LinkOpener({ getMainWindow: () => mainWindow, getSettings: () => settingsStore.get() });
-	trayManager = new TrayManager({ getMainWindow: () => mainWindow, setIsQuitting: (v) => { isQuitting = v; }, onQuit: () => { app.quit(); }, onRestart: restartApp });
+	trayManager = new TrayManager({ getMainWindow: () => mainWindow, setIsQuitting: (v) => { mainWindowLifecycle.setQuitting(v); }, onQuit: () => { app.quit(); }, onRestart: restartApp });
 	gitService = new GitService();
 	worktreeService = new WorktreeService();
 	piLocator = new PiLocator("omp");
@@ -1604,7 +1576,7 @@ app.on("child-process-gone", (_event, details) => {
 });
 
 app.on("before-quit", () => {
-	isQuitting = true;
+	mainWindowLifecycle.setQuitting(true);
 	trayManager?.destroy();
 	// 与 restartApp 同一套停机顺序（shutdownServices）：正常退出是同步 handler，
 	// 只能 fire-and-forget，刷盘完成靠进程退出前的时间窗口。
@@ -1614,6 +1586,6 @@ app.on("before-quit", () => {
 app.on("window-all-closed", () => {
 	// macOS 关闭所有窗口不退出；其他平台如果启用 closeToTray 也不退出
 	if (process.platform === "darwin") return;
-	if (!isQuitting) return;
+	if (!mainWindowLifecycle.isQuitting()) return;
 	app.quit();
 });
