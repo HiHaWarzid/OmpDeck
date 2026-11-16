@@ -1,11 +1,7 @@
 /** 工具调用卡片：ToolCard 与按轮聚合的 ToolGroupCard，以及工具名/参数的展示推导。 */
 import { memo, useMemo, useState, type ReactNode } from "react";
-import {
-	type ToolGroupItem,
-	parseToolArgs,
-	countTextLines,
-	getToolEditDiff,
-} from "../AppUtils";
+import { type ToolGroupItem } from "../timeline/timelineProjection";
+import { countTextLines, getToolEditDiff, parseToolArgs } from "../../../utils/toolArgs";
 import {
 	Check,
 	ChevronDown,

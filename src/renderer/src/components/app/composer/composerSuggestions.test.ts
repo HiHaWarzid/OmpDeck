@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildSuggestionItems, detectTrigger, filterVisibleCommands } from "./AppUtils";
-import type { PiCommand } from "../../../../shared/types";
+import { buildSuggestionItems, detectTrigger, filterVisibleCommands } from "./composerSuggestions";
+import type { PiCommand } from "../../../../../shared/types";
 
 const fast: PiCommand = {
 	name: "fast",

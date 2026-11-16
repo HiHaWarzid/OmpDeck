@@ -22,13 +22,13 @@ type ThinkingTimingMessage = Partial<
 
 /**
  * 计算一段思考的显示时机，收敛 TurnRow 两条分支（timeline/TurnRow.tsx 已完成/流式）
- * 与 AppUtils 分组的重复推导。
+ * 与 timelineProjection 分组的重复推导。
  *
  * startedAt 优先级（与 TurnRow 双来源修复 2046f757 一致）：
  *   message.thinkingStartedAt（消息落库，最精确）→ streamingStartedAt（agent 级
  *   流式开始，首次 thinking_delta 到达时记录）→ runStartedAt（整轮起点）。
  *   仅当 options.timestampTier 时在 streaming 之前插入 message.timestamp 回退
- *   （AppUtils 分组路径原链 thinkingStartedAt ?? timestamp ?? runStartedAt 的形态；
+ *   （timelineProjection 分组路径原链 thinkingStartedAt ?? timestamp ?? runStartedAt 的形态；
  *   分组路径无 streaming 上下文，timestamp 是它仅有的次优起点）。
  *
  * endedAt 优先级：message.thinkingEndedAt → message.timestamp。

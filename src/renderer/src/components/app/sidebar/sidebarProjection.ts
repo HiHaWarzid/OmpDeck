@@ -8,7 +8,7 @@ import {
 	getProjectAgentSessionDisplay,
 	type ProjectAgentSessionDisplay,
 } from "../../../agentListDisplay";
-import { matches } from "../AppUtils";
+import { matches } from "../../../utils/keywordMatch";
 
 /**
  * 侧栏行投影（批次 5c）：搜索/来源过滤、会话分组排序、worktree 行解析全部收敛到这里，

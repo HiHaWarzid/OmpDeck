@@ -5,6 +5,7 @@
  * 本文件只是渲染层的薄转发入口，禁止在这里再写第二套算法。
  */
 import removeMarkdown from "remove-markdown";
+import { stripAnsi } from "../../../../shared/sessionDisplayContract";
 
 export {
 	formatTimestamp as formatTime,
@@ -31,6 +32,21 @@ export function formatDuration(ms: number): string {
 	const remaining = seconds % 60;
 	return remaining > 0 ? `${minutes}m${remaining}s` : `${minutes}m`;
 }
+/**
+ * 单行摘要：去 ANSI、去围栏代码块后取首个非空行，超长截断。
+ * 会话大纲、多选弹窗、会话引用弹窗共用同一截断策略，避免三处各写一遍。
+ */
+export function summarizeMessage(text: string) {
+	const cleaned = stripAnsi(text);
+	const firstLine =
+		cleaned
+			.replace(/```[\s\S]*?```/g, " ")
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.find(Boolean) ?? "";
+	return firstLine.length > 48 ? `${firstLine.slice(0, 48)}...` : firstLine;
+}
+
 /** 去除文本中的 <thinking> 标签 */
 export function stripThinkingTags(text: string): string {
 	return text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();

@@ -7,7 +7,7 @@
  *  （追加 remark-math / rehype-katex / katex.min.css）。
  */
 import { memo, Suspense, useMemo } from "react";
-import { sameImageListForRender } from "../AppUtils";
+import { sameImageListForRender } from "./timelineProjection";
 import type { ImageContent } from "../../../../../shared/types";
 import { stripAnsi, stripThinkingTags } from "../format";
 import { MessageImages } from "./MessageImages";

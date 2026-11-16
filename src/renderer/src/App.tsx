@@ -209,15 +209,10 @@ import {
   buildSidebarProjectDisplay,
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
-import {
-  buildModifiedFiles,
-  displayPath,
-  flattenFiles,
-  matches,
-  filterVisibleCommands,
-  countTextLines,
-  type MessageItem,
-} from "./components/app/AppUtils";
+import { buildModifiedFiles } from "./utils/toolArgs";
+import { flattenFiles } from "./utils/fileTree";
+import { matches } from "./utils/keywordMatch";
+import { filterVisibleCommands } from "./components/app/composer/composerSuggestions";
 import {
   formatFilePathRef,
   getCaretOffset,

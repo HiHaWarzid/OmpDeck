@@ -5,7 +5,7 @@ import { t } from "../../i18n";
 import {
 	sameRenderMessageListForRender,
 	type RenderMessage,
-} from "./AppUtils";
+} from "./timeline/timelineProjection";
 import {
 	areStreamStatesEqual,
 	type MessageStreamState,

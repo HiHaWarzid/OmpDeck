@@ -16,7 +16,7 @@ import {
 	type AgentRunItem,
 	sameAgentRunForRender,
 	sameChatMessageForRender,
-} from "../AppUtils";
+} from "./timelineProjection";
 import { computeThinkingTiming } from "../../../utils/thinkingTiming";
 import {
 	Check,

@@ -1,9 +1,9 @@
 /** 消息多选弹窗：批量选择消息用于复制/导出。 */
 import { useCallback, useMemo, useState } from "react";
-import { summarizeMessage, type MessageItem, type AgentRunItem, type RenderMessage } from "../AppUtils";
+import { type AgentRunItem, type MessageItem, type RenderMessage } from "../timeline/timelineProjection";
 import { Check, Brain, FileText, MessageCircle, X } from "lucide-react";
 import { t } from "../../../i18n";
-import { formatTime, stripAnsi } from "../format";
+import { formatTime, stripAnsi, summarizeMessage } from "../format";
 
 /** 收集所有可勾选的消息 ID（user + assistant） */
 function getSelectableMessageIds(

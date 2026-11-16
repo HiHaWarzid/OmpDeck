@@ -228,7 +228,7 @@ const TOOL_ARG_KEYS = [
 
 /**
  * diff / 修改清单只认路径类键。前四项与摘要优先级同源，其余是写入类工具的别名；
- * 合并进同一张表，避免 AppUtils 再维护一份自己的键序。
+ * 合并进同一张表，避免 timelineProjection 再维护一份自己的键序。
  */
 const TOOL_PATH_KEYS = [
 	...TOOL_ARG_PATH_KEYS,

@@ -33,7 +33,7 @@ import {
 	buildSuggestionItems,
 	detectTrigger,
 	type SuggestionItem,
-} from "../components/app/AppUtils";
+} from "../components/app/composer/composerSuggestions";
 import {
 	formatFilePathRef,
 	getCaretOffset,

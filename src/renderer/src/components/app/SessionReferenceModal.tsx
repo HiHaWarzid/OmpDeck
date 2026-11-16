@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { X, MessageCircle, Brain, FileText } from "lucide-react";
 import { t } from "../../i18n";
 import type { SessionSummary } from "../../../../shared/types";
-import { summarizeMessage, stripAnsi, formatTime } from "./AppUtils";
+import { formatTime, stripAnsi, summarizeMessage } from "./format";
 
 type SessionMessage = { role: string; content: string; timestamp: number };
 

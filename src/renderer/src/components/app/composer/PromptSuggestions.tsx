@@ -1,6 +1,6 @@
 /** 输入建议浮层：按 composer trigger 渲染命令与模板建议。 */
 import { useEffect, useRef } from "react";
-import { type SuggestionItem } from "../AppUtils";
+import { type SuggestionItem } from "./composerSuggestions";
 import { Folder, X } from "lucide-react";
 import { t } from "../../../i18n";
 import { IconButton } from "../../ui/IconButton";

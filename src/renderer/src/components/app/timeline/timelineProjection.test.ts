@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { sameChatMessageForRender, sameImageListForRender } from "./AppUtils";
-import type { ChatMessage, ImageContent } from "../../../../shared/types";
+import { sameChatMessageForRender, sameImageListForRender } from "./timelineProjection";
+import type { ChatMessage, ImageContent } from "../../../../../shared/types";
 
 /**
  * 渲染 memo 比较器的契约。

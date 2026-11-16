@@ -17,7 +17,7 @@ import {
 } from "../../../../shared/types";
 import { t, type TranslationKey } from "../../i18n";
 import { showNotice } from "../../utils/notice";
-import { formatTime } from "./AppUtils";
+import { formatTime } from "./format";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";

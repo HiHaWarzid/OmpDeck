@@ -39,7 +39,7 @@ import { rpcLogActions } from "../../../workspace/slices/rpcLogSlice";
 import { Badge } from "../../ui/Badge";
 import { IconButton } from "../../ui/IconButton";
 import { AgentStatusIndicator, BrandLockup, ProjectAvatar } from "../brand/Brand";
-import { formatTime } from "../AppUtils";
+import { formatTime } from "../format";
 import {
 	displayProjectDirectoryName,
 	formatCodexSubagentName,
