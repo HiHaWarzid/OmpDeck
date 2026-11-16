@@ -209,6 +209,37 @@ describe("落盘后按路径回读", () => {
 		expect(dirtyPaths(rebased)).toEqual(["theme"]);
 	});
 
+	it("回读期间又改了同一个字段时保留新编辑，不拿更早的磁盘值盖掉", () => {
+		// 提交的是 retry.maxRetries=5；请求在途时用户又把它改成 9。
+		const draft = createDraft(seed());
+		const submitted = { retry: { maxRetries: 5 } } as Partial<Sample>;
+		const edited = {
+			base: draft.base,
+			value: { ...draft.value, retry: { maxRetries: 9, baseDelayMs: 500 } },
+		};
+
+		// 磁盘回读到的是「那次已发出的 5」（omp 可能规范化，这里取 5 本身）。
+		const fresh: Sample = { ...seed(), retry: { maxRetries: 5, baseDelayMs: 500 } };
+		const rebased = rebaseDraft(edited, fresh, ["retry.maxRetries"], submitted);
+
+		// 基线推进到落盘值，但值仍是用户最后输入的 9，且继续显示为未保存。
+		expect(rebased.base.retry.maxRetries).toBe(5);
+		expect(rebased.value.retry.maxRetries).toBe(9);
+		expect(dirtyPaths(rebased, ["retry.maxRetries"])).toEqual(["retry.maxRetries"]);
+	});
+
+	it("回读期间没再动那个字段时对齐到磁盘真值并变干净", () => {
+		const draft = patchDraft(createDraft(seed()), { retry: { maxRetries: 5, baseDelayMs: 500 } });
+		const submitted = { retry: { maxRetries: 5 } } as Partial<Sample>;
+		// omp 把 5 规范成了 4：没在途编辑时应当采信磁盘值。
+		const fresh: Sample = { ...seed(), retry: { maxRetries: 4, baseDelayMs: 500 } };
+		const rebased = rebaseDraft(draft, fresh, ["retry.maxRetries"], submitted);
+
+		expect(rebased.base.retry.maxRetries).toBe(4);
+		expect(rebased.value.retry.maxRetries).toBe(4);
+		expect(dirtyPaths(rebased)).toEqual([]);
+	});
+
 	it("磁盘上键已不存在时，把该路径写成 undefined", () => {
 		const draft = patchDraft(createDraft(seed()), { afk: { enabled: true, targetProjectIds: [] } });
 		const rebased = rebaseDraft(draft, { ...seed(), afk: undefined } as unknown as Sample, [
