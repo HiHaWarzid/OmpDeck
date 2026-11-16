@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { PiRpcClient, RpcResponse } from "./PiRpcClient";
-import { classifyPiFailure, requestPiCommand } from "./piRpcCompat";
+import { requestPiCommand } from "./piRpcCompat";
+import { classifyPiFailure } from "./piProtocol";
 
 /** 只实现 request 的假客户端：按命令名返回预设响应，并记录调用顺序。 */
 function fakeClient(responses: Record<string, RpcResponse>) {
@@ -19,14 +20,6 @@ function fakeClient(responses: Record<string, RpcResponse>) {
 
 const ok = (command: string, data?: unknown): RpcResponse => ({ type: "response", command, success: true, data });
 
-describe("classifyPiFailure", () => {
-	it("separates unknown command from transport limit and other errors", () => {
-		expect(classifyPiFailure({ type: "response", command: "x", success: false, error: "Unknown command: get_commands" })).toBe("unknown-command");
-		expect(classifyPiFailure({ type: "response", command: "x", success: false, error: "Response exceeded transport limit" })).toBe("transport-limit");
-		expect(classifyPiFailure({ type: "response", command: "x", success: false, error: "session busy" })).toBe("other");
-		expect(classifyPiFailure(undefined)).toBe("other");
-	});
-});
 
 describe("requestPiCommand", () => {
 	it("uses the new command name and never touches the legacy alias", async () => {

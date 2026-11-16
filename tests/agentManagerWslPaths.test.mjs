@@ -196,14 +196,18 @@ function loadAgentManager() {
 	// AgentManager 引入 ../perf（src/main/perf.ts，纯诊断模块，无内部依赖）；
 	// 测试文件自身的 require 会把 "../perf" 解析到仓库根目录，必须显式注入。
 	registry["../perf"] = loadModule("src/main/perf.ts", "perf.ts");
-	// 跨 pi 版本的 RPC 命令名兼容层（新名优先 / 旧名兜底，仅类型导入无运行时依赖）。
+	// 运行控制模块（模型/思考档/服务档/自动压缩/todo）；同样只值导入共享类型，
+	// 无 src 内运行时依赖，注入后 AgentManager 才能解析 `./agentControl`。
+	registry["./agentControl"] = loadModule("src/main/pi/agentControl.ts", "agentControl.ts");
+	// pi 线格式唯一属主（帧解读 / get_state 擦洗 / 失败类别）；值导入 settleReducer 与
+	// agentControl，两者已在上面注入，因此 AgentManager 与 piRpcCompat 都能解析到同一实例。
+	registry["./piProtocol"] = loadModule("src/main/pi/piProtocol.ts", "piProtocol.ts");
+	// 跨 pi 版本的 RPC 命令名兼容层（新名优先 / 旧名兜底）；失败类别判定已在 ./piProtocol，
+	// 换名重试时值导入它，因此必须在 piProtocol 之后注入。
 	registry["./piRpcCompat"] = loadModule("src/main/pi/piRpcCompat.ts", "piRpcCompat.ts");
 	// follow-up 队列账本（纯状态 + 判断，仅类型导入 shared）；测试文件自身的 require
 	// 同样解析不到 src 目录，必须显式注入。
 	registry["./followUpQueue"] = loadModule("src/main/pi/followUpQueue.ts", "followUpQueue.ts");
-	// 运行控制模块（模型/思考档/服务档/自动压缩/todo）；同样只值导入共享类型，
-	// 无 src 内运行时依赖，注入后 AgentManager 才能解析 `./agentControl`。
-	registry["./agentControl"] = loadModule("src/main/pi/agentControl.ts", "agentControl.ts");
 	// 历史读取模块（翻页/全文）；依赖 agentTranscript 与 messageTimeline，两者已在上方注入。
 	registry["./agentHistory"] = loadModule("src/main/pi/agentHistory.ts", "agentHistory.ts");
 	// 交互请求代理（ctx.ui.* / 信任询问）；依赖已注入的 askQuestionCard。

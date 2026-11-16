@@ -183,6 +183,15 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：任何新的客户端门只允许调这 8 个方法，不得直接对 `AgentManager` 的变更方法再拼一遍「校验 → 关终端 → 停进程」。读路径、运行控制（归 `AgentControl`）与 AFK 编排不经过本 module——AFK 创建的 agent 没有桌面终端，且它在域内把 AgentManager 当 spawn 工具用。
 
+### PiProtocol（pi 线格式解码器）
+「pi 说了什么」这件事的**唯一属主**（`main/pi/piProtocol.ts`）。RPC 事件帧与 `get_state` / `get_session_stats` 响应体都是未校验的线上数据，读法以前散在三处：`AgentManager.handlePiEvent` 的 30 种帧名 if 阶梯、`getRuntimeState` 的逐字段擦洗、`QuickGenProcess` 对 `message_update`/`agent_end` 的第二份解读。谁都得自己认一遍帧名，于是「pi 的措辞变了」会一次性打穿三处。
+
+接口是纯函数：`decodePiFrame(event, now)` → `PiFrame`（`work` 活性标记 + 可选 `PiEffect`），另有按需读的 `readAgentEndReport` / `decodeAssistantEvent` / `normalizeRuntimeSnapshot` / `normalizePiQueue` / `classifyPiFailure`。**只读，无副作用**——碰进程、转录、IPC 的副作用全留在 `AgentManager`，所以帧解读可以直接对着原始 JSON 单测，不必起 pi 进程。
+
+两条语义边界必须保留：`undefined` 表示「连帧都不是」，此时调用方连活性戳都不该刷；`{ work: false }` 表示「是帧但不算用户可感知的工作」，只有元数据帧（`session_info_update` / `available_commands_update` 等）走这条。混在一处时 `session_info_update` 会顶住「已完成」通知不发。
+
+规则：新增帧种、字段改名、跨版本命令名探测的判定都进本 module；调用方只按 `effect.kind` 分派副作用，不得再读 `event.type`。`piRpcCompat` 只保留「新名优先、旧名兜底」的发送策略，失败类别仍由本 module 判定。
+
 ### AgentRunSupervisor（运行静默监督器）
 单 agent 的 per-run 定时器与「事件流是否还活着」判定的**唯一属主**（`main/pi/agentRunSupervisor.ts`）。settle 轮询、abort 兜底、空响应窗口、会话结束通知四个窗口以前是四份 `Map<agentId, Timeout>` + 15 个 AgentManager 私有方法，且与转录/事件/通知副作用写在同一层。
 

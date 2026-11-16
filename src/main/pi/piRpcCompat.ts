@@ -16,6 +16,7 @@
  * 旧命令，实测一天日志里 300+ 条 "Unknown command"）。
  */
 import type { PiRpcClient, RpcResponse } from "./PiRpcClient";
+import { classifyPiFailure } from "./piProtocol";
 
 /** 新命令名 → 旧 pi 只认的名字（按新名优先探测）。 */
 const LEGACY_COMMAND_NAMES: Record<string, string> = {
@@ -27,21 +28,6 @@ const LEGACY_COMMAND_NAMES: Record<string, string> = {
 /** 每个 pi 进程已探测出的「主命令名」缓存。 */
 const resolvedCommandNames = new WeakMap<PiRpcClient, Map<string, string>>();
 
-/**
- * 失败响应的类别。调用方需要按类别分支：
- *   - unknown-command：命令名与此 pi 版本不兼容（本模块负责换名重试）；
- *   - transport-limit：响应体超过 RPC 传输上限（大会话的 get_messages/get_entries 会命中），
- *     必须走会话文件直读兜底，绝不能把 `data === undefined` 当「会话为空」；
- *   - other：其余真实错误（参数错误、会话忙、provider 报错等），照原样上报。
- */
-export type PiFailureKind = "unknown-command" | "transport-limit" | "other";
-
-export function classifyPiFailure(response: RpcResponse | undefined): PiFailureKind {
-	const error = response?.error ?? "";
-	if (/unknown command/i.test(error)) return "unknown-command";
-	if (/transport limit/i.test(error)) return "transport-limit";
-	return "other";
-}
 
 /**
  * 按「新名优先、旧名兜底」发一条命令，返回真正生效的命令名与响应。

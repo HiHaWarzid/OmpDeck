@@ -13,6 +13,7 @@ import type { AppSettings } from "../../shared/types";
 import type { AppLogger } from "../logging/AppLogger";
 import type { PiLocator } from "./PiLocator";
 import { PiRpcClient } from "./PiRpcClient";
+import { decodePiFrame } from "./piProtocol";
 
 /** QuickGen 依赖：通过依赖注入避免直接耦合全局单例。 */
 export interface QuickGenProcessDeps {
@@ -61,17 +62,17 @@ export class QuickGenProcess {
 				}
 			}, 60_000);
 
+			// 帧解读统一走 piProtocol：这里不再自己认帧名，只挑「增量文本」与「收终态」两种效果。
 			const onEvent = (event: Record<string, unknown>) => {
-				const eventType = event.type as string;
-				if (eventType === "message_update") {
-					const ae = (event as Record<string, unknown>).assistantMessageEvent as
-						| Record<string, unknown>
-						| undefined;
-					if (ae?.type === "text_delta" && typeof ae.delta === "string") {
-						collected.push(ae.delta);
+				const effect = decodePiFrame(event, Date.now())?.effect;
+				if (!effect) return;
+				if (effect.kind === "assistant-event") {
+					if (effect.event.phase === "text-delta" && effect.event.delta) {
+						collected.push(effect.event.delta);
 					}
+					return;
 				}
-				if (eventType === "agent_settled" || eventType === "agent_end") {
+				if (effect.kind === "settled" || effect.kind === "agent-end") {
 					settled = true;
 					clearTimeout(timeout);
 					rpc.off("event", onEvent);
