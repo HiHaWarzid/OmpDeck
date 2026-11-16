@@ -332,6 +332,15 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 规则：不要在调用点复制 markup 来换样式——样式差异用 class 名参数表达；需要不同的装饰就用 `renderOptionTrailing`。AGENTS.md 里旧的「自定义下拉例外配方」已随本 module 退役。
 
+### PickerPalette（居中浮层外壳）
+「backdrop + 居中 palette」的**唯一结构实现**（`components/ui/PickerPalette.tsx`）。composer 的模型 / 模式 / 思考档位 / 提示模板四个选择器都只是它的内容，外壳（结构、外部点击、Esc、焦点归还）由它独占。
+
+它是关闭层的**一类使用者**，不重复关闭逻辑：四个调用点各写一份 `picker-backdrop onClick` 时，「关闭」被实现成只有鼠标能走的一条路径——Esc 完全无效、焦点留在被卸载的选项上，下一次 Tab 从文档头开始。这就是「界面被复制了四份、而不变式只有一份」的典型症状。
+
+焦点归还取**打开瞬间的 `activeElement`**，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的 memo 组件里，为一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取——模型选择器的搜索框带 `autoFocus`，等副作用阶段读到的已是浮层内部的输入框。
+
+规则：新增居中浮层用 `PickerPalette`，只传 `className` 和内容；不要在调用点重写 backdrop / `stopPropagation` 这对组合。
+
 # 时间线投影与输入建议（Renderer 领域术语）
 
 > 第六领域：transcript 怎么变成时间线、时间线条目怎么被判为「没变」、输入框怎么识别引用。

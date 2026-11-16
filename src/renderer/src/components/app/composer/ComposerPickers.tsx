@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { t } from "../../../i18n";
 import { IconButton } from "../../ui/IconButton";
+import { PickerPalette } from "../../ui/PickerPalette";
 import type { ComposerAgentMode, AvailableModel } from "../../../../../shared/types";
 import { sortProvidersByOrder } from "../../../../../shared/types/ompRoles";
 import { THINKING_LEVELS } from "./thinkingLevels";
@@ -178,204 +179,199 @@ export function ModelPicker(props: {
 	}, [currentModelKey, normalizedSearch]);
 
 	return (
-		<div className="picker-backdrop" onClick={props.onClose}>
-			<div
-				className="picker-palette model-picker"
-				onClick={(event) => event.stopPropagation()}
-			>
-				<div className="picker-palette-header">
-					<span>{t("app.modelPickerTitle")}</span>
-					<IconButton
-						className="picker-palette-close"
-						label={t("common.close")}
-						onClick={props.onClose}
-					>
-						<X size={16} strokeWidth={2.2} aria-hidden="true" />
-					</IconButton>
-				</div>
-				<div className="picker-palette-search">
-					<div className="picker-palette-search-row">
-						<input
-							autoFocus
-							value={modelPickerSearch}
-							onChange={(event) => setModelPickerSearch(event.target.value)}
-							placeholder={t("app.modelPickerSearch")}
-							className={providerGroupKeys.length > 0 ? "has-actions" : undefined}
-						/>
-						{providerGroupKeys.length > 0 && (
-							<div className="picker-palette-actions">
-								<IconButton
-									className="picker-palette-action-icon"
-									label={t("app.modelCollapseAllProviders")}
-									title={t("app.modelCollapseAllProviders")}
-									onClick={() => {
-										// 一键折叠当前结果里的所有 provider 分组，适合像 IDE 一样快速收拢长列表。
-										setCollapsedGroups((prev) => {
-											const next = new Set(prev);
-											for (const groupKey of providerGroupKeys) next.add(groupKey);
-											return next;
-										});
-									}}
-									disabled={allProviderGroupsCollapsed}
-								>
-									<ChevronsDownUp size={13} strokeWidth={2} aria-hidden="true" />
-								</IconButton>
-								<IconButton
-									className="picker-palette-action-icon"
-									label={t("app.modelExpandAllProviders")}
-									title={t("app.modelExpandAllProviders")}
-									onClick={() => {
-										// 展开当前结果里的所有 provider 分组，避免用户折叠后还要逐个恢复。
-										setCollapsedGroups((prev) => {
-											const next = new Set(prev);
-											for (const groupKey of providerGroupKeys) next.delete(groupKey);
-											return next;
-										});
-									}}
-									disabled={!allProviderGroupsCollapsed}
-								>
-									<ChevronsUpDown size={13} strokeWidth={2} aria-hidden="true" />
-								</IconButton>
-							</div>
-						)}
-					</div>
-				</div>
-				<div className="picker-palette-list" ref={modelPickerListRef}>
-					<button
-						type="button"
-						className="picker-palette-scroll-btn picker-palette-scroll-top"
-						title={t("app.modelScrollToTop")}
-						onClick={() => modelPickerListRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
-					>
-						<MoveUp size={14} strokeWidth={1.8} aria-hidden="true" />
-					</button>
-					{/* 收藏分区：置于最顶部，可折叠 */}
-					{favorites.length > 0 && (
-						<div className="model-group model-favorites-group">
-							<div
-								className={`model-group-header${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}
-								onClick={() => {
-									setCollapsedGroups(prev => {
-										const next = new Set(prev);
-										if (next.has('__favorites__')) next.delete('__favorites__');
-										else next.add('__favorites__');
-										return next;
-									});
-								}}
-							>
-								<span className={`model-favorites-arrow${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}>
-									<Star size={14} strokeWidth={1.8} fill='currentColor' />
-								</span>
-								{t("app.modelFavorites")}
-								<span className="model-group-count">{favorites.length}</span>
-							</div>
-							{!collapsedGroups.has('__favorites__') && favorites.map(renderModelRow)}
-						</div>
-					)}
-					{/* 其余模型按供应商分组 */}
-					{sortedProviders.map((provider) => (
-						<div key={provider} className="model-group">
-							<div
-								className={`model-group-header${collapsedGroups.has(provider) ? ' collapsed' : ''}`}
-								onClick={() => {
-									setCollapsedGroups(prev => {
-										const next = new Set(prev);
-										if (next.has(provider)) next.delete(provider);
-										else next.add(provider);
-										return next;
-									});
-								}}
-							>
-								{provider}
-								<span className="model-group-count">{groupedModels[provider].length}</span>
-							</div>
-							{!collapsedGroups.has(provider) && groupedModels[provider].map(renderModelRow)}
-						</div>
-					))}
-					{favorites.length === 0 && sortedProviders.length === 0 && (
-						<div className="picker-palette-empty">{t("app.modelPickerEmpty")}</div>
-					)}
-					<button
-						type="button"
-						className="picker-palette-scroll-btn picker-palette-scroll-bottom"
-						title={t("app.modelScrollToBottom")}
-						onClick={() => {
-							const el = modelPickerListRef.current;
-							if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-						}}
-					>
-						<MoveDown size={14} strokeWidth={1.8} aria-hidden="true" />
-					</button>
-				</div>
-				{props.serviceTiers && props.onToggleServiceTier && (
-					<div className="model-picker-tier-footer">
-						<span className="model-picker-tier-label">{t("app.serviceTierSection")}</span>
-						<button
-							type="button"
-							className={`model-picker-tier-btn${props.serviceTiers.fastEnabled ? " on" : ""}`}
-							aria-pressed={props.serviceTiers.fastEnabled}
-							disabled={props.serviceTierBusy}
-							onClick={() =>
-								props.onToggleServiceTier?.("fast", !props.serviceTiers?.fastEnabled)
-							}
-							title={
-								props.serviceTiers.fastActive
-									? t("app.serviceFastActive")
-									: t("app.serviceFastIdle")
-							}
-						>
-							{t("app.serviceFastChip")}
-						</button>
-						<button
-							type="button"
-							className={`model-picker-tier-btn${props.serviceTiers.slowEnabled ? " on" : ""}`}
-							aria-pressed={props.serviceTiers.slowEnabled}
-							disabled={props.serviceTierBusy || !props.serviceTiers.slowSupported}
-							onClick={() =>
-								props.onToggleServiceTier?.("slow", !props.serviceTiers?.slowEnabled)
-							}
-							title={
-								props.serviceTiers.slowSupported
-									? t("app.serviceSlowTitle", {
-											scope:
-												props.serviceTiers.slowScope === "session"
-													? t("app.serviceSlowScopeSession")
-													: t("app.serviceSlowScopeGlobal"),
-										})
-									: t("app.serviceSlowUnsupported")
-							}
-						>
-							{t("app.serviceSlowChip")}
-						</button>
-					</div>
-				)}
-				{props.sessionControls && props.onToggleAutoCompaction && (
-					<div className="model-picker-tier-footer">
-						<span className="model-picker-tier-label">
-							{t("app.autoCompactionSection")}
-						</span>
-						<button
-							type="button"
-							className={`model-picker-tier-btn${props.sessionControls.autoCompactionEnabled ? " on" : ""}`}
-							aria-pressed={!!props.sessionControls.autoCompactionEnabled}
-							disabled={props.sessionControlBusy}
-							onClick={() =>
-								props.onToggleAutoCompaction?.(
-									!props.sessionControls?.autoCompactionEnabled,
-								)
-							}
-							title={
-								props.sessionControls.autoCompactionEnabled
-									? t("app.autoCompactionOn")
-									: t("app.autoCompactionOff")
-							}
-						>
-							{t("app.autoCompactionChip")}
-						</button>
-					</div>
-				)}
+		<PickerPalette className="model-picker" onClose={props.onClose}>
+			<div className="picker-palette-header">
+				<span>{t("app.modelPickerTitle")}</span>
+				<IconButton
+					className="picker-palette-close"
+					label={t("common.close")}
+					onClick={props.onClose}
+				>
+					<X size={16} strokeWidth={2.2} aria-hidden="true" />
+				</IconButton>
 			</div>
-		</div>
+			<div className="picker-palette-search">
+				<div className="picker-palette-search-row">
+					<input
+						autoFocus
+						value={modelPickerSearch}
+						onChange={(event) => setModelPickerSearch(event.target.value)}
+						placeholder={t("app.modelPickerSearch")}
+						className={providerGroupKeys.length > 0 ? "has-actions" : undefined}
+					/>
+					{providerGroupKeys.length > 0 && (
+						<div className="picker-palette-actions">
+							<IconButton
+								className="picker-palette-action-icon"
+								label={t("app.modelCollapseAllProviders")}
+								title={t("app.modelCollapseAllProviders")}
+								onClick={() => {
+									// 一键折叠当前结果里的所有 provider 分组，适合像 IDE 一样快速收拢长列表。
+									setCollapsedGroups((prev) => {
+										const next = new Set(prev);
+										for (const groupKey of providerGroupKeys) next.add(groupKey);
+										return next;
+									});
+								}}
+								disabled={allProviderGroupsCollapsed}
+							>
+								<ChevronsDownUp size={13} strokeWidth={2} aria-hidden="true" />
+							</IconButton>
+							<IconButton
+								className="picker-palette-action-icon"
+								label={t("app.modelExpandAllProviders")}
+								title={t("app.modelExpandAllProviders")}
+								onClick={() => {
+									// 展开当前结果里的所有 provider 分组，避免用户折叠后还要逐个恢复。
+									setCollapsedGroups((prev) => {
+										const next = new Set(prev);
+										for (const groupKey of providerGroupKeys) next.delete(groupKey);
+										return next;
+									});
+								}}
+								disabled={!allProviderGroupsCollapsed}
+							>
+								<ChevronsUpDown size={13} strokeWidth={2} aria-hidden="true" />
+							</IconButton>
+						</div>
+					)}
+				</div>
+			</div>
+			<div className="picker-palette-list" ref={modelPickerListRef}>
+				<button
+					type="button"
+					className="picker-palette-scroll-btn picker-palette-scroll-top"
+					title={t("app.modelScrollToTop")}
+					onClick={() => modelPickerListRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+				>
+					<MoveUp size={14} strokeWidth={1.8} aria-hidden="true" />
+				</button>
+				{/* 收藏分区：置于最顶部，可折叠 */}
+				{favorites.length > 0 && (
+					<div className="model-group model-favorites-group">
+						<div
+							className={`model-group-header${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}
+							onClick={() => {
+								setCollapsedGroups(prev => {
+									const next = new Set(prev);
+									if (next.has('__favorites__')) next.delete('__favorites__');
+									else next.add('__favorites__');
+									return next;
+								});
+							}}
+						>
+							<span className={`model-favorites-arrow${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}>
+								<Star size={14} strokeWidth={1.8} fill='currentColor' />
+							</span>
+							{t("app.modelFavorites")}
+							<span className="model-group-count">{favorites.length}</span>
+						</div>
+						{!collapsedGroups.has('__favorites__') && favorites.map(renderModelRow)}
+					</div>
+				)}
+				{/* 其余模型按供应商分组 */}
+				{sortedProviders.map((provider) => (
+					<div key={provider} className="model-group">
+						<div
+							className={`model-group-header${collapsedGroups.has(provider) ? ' collapsed' : ''}`}
+							onClick={() => {
+								setCollapsedGroups(prev => {
+									const next = new Set(prev);
+									if (next.has(provider)) next.delete(provider);
+									else next.add(provider);
+									return next;
+								});
+							}}
+						>
+							{provider}
+							<span className="model-group-count">{groupedModels[provider].length}</span>
+						</div>
+						{!collapsedGroups.has(provider) && groupedModels[provider].map(renderModelRow)}
+					</div>
+				))}
+				{favorites.length === 0 && sortedProviders.length === 0 && (
+					<div className="picker-palette-empty">{t("app.modelPickerEmpty")}</div>
+				)}
+				<button
+					type="button"
+					className="picker-palette-scroll-btn picker-palette-scroll-bottom"
+					title={t("app.modelScrollToBottom")}
+					onClick={() => {
+						const el = modelPickerListRef.current;
+						if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+					}}
+				>
+					<MoveDown size={14} strokeWidth={1.8} aria-hidden="true" />
+				</button>
+			</div>
+			{props.serviceTiers && props.onToggleServiceTier && (
+				<div className="model-picker-tier-footer">
+					<span className="model-picker-tier-label">{t("app.serviceTierSection")}</span>
+					<button
+						type="button"
+						className={`model-picker-tier-btn${props.serviceTiers.fastEnabled ? " on" : ""}`}
+						aria-pressed={props.serviceTiers.fastEnabled}
+						disabled={props.serviceTierBusy}
+						onClick={() =>
+							props.onToggleServiceTier?.("fast", !props.serviceTiers?.fastEnabled)
+						}
+						title={
+							props.serviceTiers.fastActive
+								? t("app.serviceFastActive")
+								: t("app.serviceFastIdle")
+						}
+					>
+						{t("app.serviceFastChip")}
+					</button>
+					<button
+						type="button"
+						className={`model-picker-tier-btn${props.serviceTiers.slowEnabled ? " on" : ""}`}
+						aria-pressed={props.serviceTiers.slowEnabled}
+						disabled={props.serviceTierBusy || !props.serviceTiers.slowSupported}
+						onClick={() =>
+							props.onToggleServiceTier?.("slow", !props.serviceTiers?.slowEnabled)
+						}
+						title={
+							props.serviceTiers.slowSupported
+								? t("app.serviceSlowTitle", {
+										scope:
+											props.serviceTiers.slowScope === "session"
+												? t("app.serviceSlowScopeSession")
+												: t("app.serviceSlowScopeGlobal"),
+									})
+								: t("app.serviceSlowUnsupported")
+						}
+					>
+						{t("app.serviceSlowChip")}
+					</button>
+				</div>
+			)}
+			{props.sessionControls && props.onToggleAutoCompaction && (
+				<div className="model-picker-tier-footer">
+					<span className="model-picker-tier-label">
+						{t("app.autoCompactionSection")}
+					</span>
+					<button
+						type="button"
+						className={`model-picker-tier-btn${props.sessionControls.autoCompactionEnabled ? " on" : ""}`}
+						aria-pressed={!!props.sessionControls.autoCompactionEnabled}
+						disabled={props.sessionControlBusy}
+						onClick={() =>
+							props.onToggleAutoCompaction?.(
+								!props.sessionControls?.autoCompactionEnabled,
+							)
+						}
+						title={
+							props.sessionControls.autoCompactionEnabled
+								? t("app.autoCompactionOn")
+								: t("app.autoCompactionOff")
+						}
+					>
+						{t("app.autoCompactionChip")}
+					</button>
+				</div>
+			)}
+		</PickerPalette>
 	);
 }
 export function ComposerModePicker(props: {
@@ -397,41 +393,36 @@ export function ComposerModePicker(props: {
 	];
 
 	return (
-		<div className="picker-backdrop" onClick={props.onClose}>
-			<div
-				className="picker-palette composer-mode-picker"
-				onClick={(event) => event.stopPropagation()}
-			>
-				<div className="picker-palette-header">
-					<div className="thinking-picker-header-content">
-						<span>{t("app.composerModeTitle")}</span>
-					</div>
-					<IconButton
-						className="picker-palette-close"
-						label={t("common.close")}
-						onClick={props.onClose}
-					>
-						<X size={16} strokeWidth={2.2} aria-hidden="true" />
-					</IconButton>
+		<PickerPalette className="composer-mode-picker" onClose={props.onClose}>
+			<div className="picker-palette-header">
+				<div className="thinking-picker-header-content">
+					<span>{t("app.composerModeTitle")}</span>
 				</div>
-				<div className="picker-palette-list">
-					{items.map((item) => {
-						const selected = item.value === props.currentMode;
-						return (
-							<button
-								key={item.value}
-								className={`picker-palette-item${selected ? " selected" : ""}`}
-								onClick={() => props.onPick(item.value)}
-							>
-								<span className="picker-palette-label">{t(item.labelKey)}</span>
-								<span className="picker-palette-desc">{t(item.descriptionKey)}</span>
-								{selected && <span className="picker-palette-check">✓</span>}
-							</button>
-						);
-					})}
-				</div>
+				<IconButton
+					className="picker-palette-close"
+					label={t("common.close")}
+					onClick={props.onClose}
+				>
+					<X size={16} strokeWidth={2.2} aria-hidden="true" />
+				</IconButton>
 			</div>
-		</div>
+			<div className="picker-palette-list">
+				{items.map((item) => {
+					const selected = item.value === props.currentMode;
+					return (
+						<button
+							key={item.value}
+							className={`picker-palette-item${selected ? " selected" : ""}`}
+							onClick={() => props.onPick(item.value)}
+						>
+							<span className="picker-palette-label">{t(item.labelKey)}</span>
+							<span className="picker-palette-desc">{t(item.descriptionKey)}</span>
+							{selected && <span className="picker-palette-check">✓</span>}
+						</button>
+					);
+				})}
+			</div>
+		</PickerPalette>
 	);
 }
 export function ThinkingPicker(props: {
@@ -459,46 +450,41 @@ export function ThinkingPicker(props: {
 					description: t(entry.descriptionKey),
 				}));
 	return (
-		<div className="picker-backdrop" onClick={props.onClose}>
-			<div
-				className="picker-palette thinking-picker"
-				onClick={(event) => event.stopPropagation()}
-			>
-				<div className="picker-palette-header">
-					<div className="thinking-picker-header-content">
-						<span>{t("app.thinkingPickerTitle")}</span>
-						<small className="thinking-picker-hint">
-							{t("app.thinkingPickerHint")}
-						</small>
-					</div>
-					<IconButton
-						className="picker-palette-close"
-						label={t("common.close")}
-						onClick={props.onClose}
-					>
-						<X size={16} strokeWidth={2.2} aria-hidden="true" />
-					</IconButton>
+		<PickerPalette className="thinking-picker" onClose={props.onClose}>
+			<div className="picker-palette-header">
+				<div className="thinking-picker-header-content">
+					<span>{t("app.thinkingPickerTitle")}</span>
+					<small className="thinking-picker-hint">
+						{t("app.thinkingPickerHint")}
+					</small>
 				</div>
-				<div className="picker-palette-list">
-					{levelItems.map((level) => {
-						const selected = level.value === props.current;
-						return (
-							<button
-								key={level.value}
-								className={`picker-palette-item${selected ? " selected" : ""}`}
-								onClick={() => props.onPick(level.value)}
-							>
-								<span className="picker-palette-label">{level.label}</span>
-								{level.description && (
-									<span className="picker-palette-desc">{level.description}</span>
-								)}
-								{selected && <span className="picker-palette-check">✓</span>}
-							</button>
-						);
-					})}
-				</div>
+				<IconButton
+					className="picker-palette-close"
+					label={t("common.close")}
+					onClick={props.onClose}
+				>
+					<X size={16} strokeWidth={2.2} aria-hidden="true" />
+				</IconButton>
 			</div>
-		</div>
+			<div className="picker-palette-list">
+				{levelItems.map((level) => {
+					const selected = level.value === props.current;
+					return (
+						<button
+							key={level.value}
+							className={`picker-palette-item${selected ? " selected" : ""}`}
+							onClick={() => props.onPick(level.value)}
+						>
+							<span className="picker-palette-label">{level.label}</span>
+							{level.description && (
+								<span className="picker-palette-desc">{level.description}</span>
+							)}
+							{selected && <span className="picker-palette-check">✓</span>}
+						</button>
+					);
+				})}
+			</div>
+		</PickerPalette>
 	);
 }
 /**
@@ -576,56 +562,51 @@ export function PromptTemplatePicker(props: {
 	);
 
 	return (
-		<div className="picker-backdrop" onClick={props.onClose}>
-			<div
-				className="picker-palette prompt-template-picker"
-				onClick={(event) => event.stopPropagation()}
-			>
-				<div className="picker-palette-header">
-					{previewTemplate ? (
-						<>
-							<button
-								className="picker-preview-back-btn"
-								onClick={() => setPreviewTemplate(null)}
-								title={t("app.promptTemplateBackToPicker")}
-							>
-								<ChevronLeft size={16} strokeWidth={2.2} />
-							</button>
-							<span>{t("app.promptTemplatePreviewTitle", { name: "/" + previewTemplate.name })}</span>
-						</>
-					) : (
-						<span>{t("app.promptTemplatePickerTitle")}</span>
-					)}
-					<IconButton
-						className="picker-palette-close"
-						label={t("common.close")}
-						onClick={props.onClose}
-					>
-						<X size={16} strokeWidth={2.2} aria-hidden="true" />
-					</IconButton>
-				</div>
-				{!previewTemplate && (
-					<div className="picker-palette-search">
-						<input
-							autoFocus
-							value={search}
-							onChange={(e) => setSearch(e.target.value)}
-							placeholder={t("app.promptTemplateSearchPlaceholder")}
-						/>
-					</div>
-				)}
+		<PickerPalette className="prompt-template-picker" onClose={props.onClose}>
+			<div className="picker-palette-header">
 				{previewTemplate ? (
-					<div className="picker-preview-inline">
-						<pre className="picker-preview-content">{previewTemplate.content}</pre>
-					</div>
+					<>
+						<button
+							className="picker-preview-back-btn"
+							onClick={() => setPreviewTemplate(null)}
+							title={t("app.promptTemplateBackToPicker")}
+						>
+							<ChevronLeft size={16} strokeWidth={2.2} />
+						</button>
+						<span>{t("app.promptTemplatePreviewTitle", { name: "/" + previewTemplate.name })}</span>
+					</>
 				) : (
-					<div className="picker-palette-list">
-						{templateList}
-						{emptyState}
-					</div>
+					<span>{t("app.promptTemplatePickerTitle")}</span>
 				)}
-				{/* 旧的弹框预览已移除，改为内联显示 */}
+				<IconButton
+					className="picker-palette-close"
+					label={t("common.close")}
+					onClick={props.onClose}
+				>
+					<X size={16} strokeWidth={2.2} aria-hidden="true" />
+				</IconButton>
 			</div>
-		</div>
+			{!previewTemplate && (
+				<div className="picker-palette-search">
+					<input
+						autoFocus
+						value={search}
+						onChange={(e) => setSearch(e.target.value)}
+						placeholder={t("app.promptTemplateSearchPlaceholder")}
+					/>
+				</div>
+			)}
+			{previewTemplate ? (
+				<div className="picker-preview-inline">
+					<pre className="picker-preview-content">{previewTemplate.content}</pre>
+				</div>
+			) : (
+				<div className="picker-palette-list">
+					{templateList}
+					{emptyState}
+				</div>
+			)}
+			{/* 旧的弹框预览已移除，改为内联显示 */}
+		</PickerPalette>
 	);
 }

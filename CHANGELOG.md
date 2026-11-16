@@ -53,7 +53,9 @@ All notable changes to PiDeck are documented here.
   returns to the trigger. Previously nine separate document listeners used two
   event names and two phases; the browser device menu and the settings model
   picker could not be closed with the keyboard at all, and one Escape closed both
-  an open select and its settings dialog.
+  an open select and its settings dialog. The composer's four centred palettes
+  (model / mode / thinking level / prompt template) now share a `PickerPalette`
+  shell too; each used to carry its own backdrop that only a mouse could dismiss.
 - **All dropdowns share one listbox primitive** — `SelectField` and the Git panel
   filter no longer carry duplicated markup, ARIA wiring, and keyboard handling.
 - **Timeline projection is one module** — Message grouping (agent runs, thinking
