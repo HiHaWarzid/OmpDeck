@@ -217,6 +217,15 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 **载入不得吞掉未提交编辑**：同一个应用内切换 tab 会重新载入该 tab 的数据，但「载入」只在草稿干净（value 与 base 相等）时才覆盖 value/base；有未提交编辑时保留草稿，切换回来看到的仍是用户输入。保存后的回读是例外，用显式 `force` 无条件覆盖（读的正是刚落盘的真值）。「重新载入 = 丢弃草稿」只保留给用户显式动作：换文件、导入后重载。
 
+### SessionHistoryPaging（更早历史页账本）
+渲染层「更早历史」（`-N` 页、向前翻）的**唯一状态归属**（`renderer/src/utils/sessionHistoryPaging.ts`，零 React 依赖）。此前是 App 里 3 个 `useState` + 2 个 `useRef` + 一个 40 行 loader + 一个重置 effect，另加 `ConversationPane` 里第二份 id 去重；五条互相依赖的不变式只写在注释里，接口是七千行的 `App()`，一条测试都写不了。
+
+它独占的不变式：**单飞**（同一 key 在途时重复点击合并到在途 promise，点击瞬间 state 尚未刷新，不能用 state 挡）、**作用域绑定**（cursor 只从同一 key 复用，换了会话文件绝不复用上一个文件的字节偏移）、**陈旧响应丢弃**（请求代号 + 作用域失配，二者都要，切换后代号才能识别「切走再切回同一会话」的旧响应）、**基线失效**（重连/压缩替换尾窗基线后清页并推进代号，否则新基线之前会拼出空洞）、**id 去重**（页间与「页 vs 实时尾窗」两处，后者在渲染时做，见 `mergeOlderHistory`）。
+
+**两个身份必须分开**：翻页 key = `agentId ∥ sessionPath ∥ 基线代号`，决定「这一页属于哪个会话的哪段基线」；会话身份 = `agentId ∥ sessionPath`，决定「用户是否已经切走」（`abandonInFlight(scope)` 用它）。混用时任何一次尾窗刷新都会让在途页被误判过期而丢弃——`historyHasOlder` 与基线代号都会随刷新翻转，但它们不改变「用户还在看这个文件」。
+
+规则：新增任何「向前翻历史」的入口都走本账本，不在组件里新开 `useState` 记 cursor；展示拼接由 `read(scope)` / `mergeOlderHistory` 派生，账本不持有实时转录。
+
 ### GitStatusResource（Git 状态资源）
 Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gitStatusResource.ts`）：状态 + 拉取 + 陈旧守卫 + 变更门 + 轮询调度收在一处，外部只订阅快照、发意图。
 
@@ -242,11 +251,18 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 ### ShutdownSequence（停机顺序）
 退出与重启共用的停机顺序唯一实现（`main/lifecycle/shutdownSequence.ts`）：**顺序**（刷盘 → 停对外服务 → 关终端/agent → 本地收尾）、**同步性**（before-quit 路径的 stop 必须在本函数返回前同步执行，`markCleanExit` 不能推到 microtask）、**幂等**（restartApp await 过一次后，app.quit 触发的 before-quit 不再重复停机）。刷盘失败只告警、不阻塞停机。启动侧的**构造顺序**不在此 module：它是 index.ts 里对模块级单例的直线构造，抽出来只移动代码不移动复杂度。
 
-# 右侧面板（Renderer 领域术语）
+### MainWindowLifecycle（主窗口生命周期）
+主窗口「这一条生命周期事件该做什么」的**状态与判定唯一实现**（`main/mainWindow.ts`）：加载健康三标记（`loadFailed` / `pendingErrorPageFinish` / `devFallbackTried`）、退出标记、自愈次数账本，以及由它们派生的五个判定——`planVersionFocus`（同版本二次启动：聚焦 / 重建 / 加载）、`onMainFrameLoadFailed`（是否回退已构建产物，只回退一次）、`planClose`（隐藏到托盘 / 退出 / 忽略）、`shouldRecoverRenderer`（渲染进程崩溃后是否自愈）、`planUnresponsiveRecovery`（强杀 / 交给既有路径）。
 
-> 第四领域：右侧面板（文件 / Git / 浏览器）的状态机，源自架构评审候选 1「Collapse the right-panel FSM into one module」。维护规则同上。
+此前它们是 `index.ts` 模块级作用域里的五个自由函数 + 四个可空 `let`，只在「按特定顺序调用」时才成立，dev 回退、错误页重试、托盘退出都没有测试面——而这几条正是反复出问题的地方（窗口停在错误页、托盘「退出」被吞成隐藏）。
 
-## 术语
+分工：`rendererRecovery` 只回答「这块界面还值得自动 reload 吗」（次数预算），本 module 回答「该做什么」并持有那份账本。二者都不碰 Electron 副作用：`reload` / `loadFile` / `destroy` / `hide` / `quit` 由 `index.ts` 执行，因此判定能对假窗口单测。
+
+**窗口句柄不属于本 module**：它经注入的访问器读取，不能构造时快照（窗口会销毁重建，快照会把重建后的新窗口判成「没有窗口」）。窗口与 IPC handler 的共享仍由 `index.ts` 承担，登记窗口不是本 module 的职责。
+
+**事件判定用事件自己的窗口句柄**：`shouldRecoverRenderer` / `planUnresponsiveRecovery` 接受的 `MainWindowHandle` 由 `index.ts` 从事件回调里传入，不取「当前主窗口」——窗口重建后旧窗口的迟到事件若按新窗口状态判定，会误判成「值得自愈」而强杀健康窗口。
+
+规则：新增任何「窗口出事了怎么办」的分支，加一个判定方法并写进单测，不要在 `index.ts` 的事件回调里加条件。
 
 ### 无产物降级页（fallbackPage.html）
 `main/web/fallbackPage.html`：`index.html` 缺失时 Web 服务返回的兜底页面（也是路由奇偶守卫的扫描对象之一）。以 `?raw` 内联进主进程产物，页面内容零插值。
@@ -291,3 +307,58 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 ### 已知历史值（`editor` / `sessions`）
 旧版把 `editor`、`sessions` 当成独立面板值。现在编辑器是 files 的子视图，历史会话面板已删除：`DrawerPanel` 类型不含这两者，只有 localStorage 读入时接受并折叠——`editor` → `files`，`sessions` → `null`（`normalizePanel`，不带这个折叠会让恢复出的抽屉指向一个没有渲染分支的面板）。
+
+# 弹层关闭与选项选择（Renderer 领域术语）
+
+> 第五领域：所有弹层的「怎么关」与所有下拉的「怎么选」。源自架构评审候选 3「Collapse popover dismissal into a dismissable layer」。维护规则同上。
+
+## 术语
+
+### DismissableLayer（关闭层）
+「点外部关闭 / Esc 关闭 / 关闭后归还焦点」的**唯一实现**（`components/ui/dismissableLayer.ts` 纯注册表 + `components/ui/useDismissableLayer.ts` React 绑定）。
+
+此前渲染层有 9 处各自 `document.addEventListener`，分成两套事件名（`mousedown` / `pointerdown`）、两种相位（发送方式菜单用捕获阶段抢在输入框之前），焦点归还只有 1 处，Esc 只有 6 处实现——浏览器设备菜单与设置页模型选择器**根本关不掉**。接口是「注册一层，告诉我它什么时候该关」，不是「每个组件自己组装监听」。
+
+四条不变式只写一次：**外部点击关闭所有不含点击目标的层**（点进去父层内部时只有内层关闭）、**Esc 只关栈顶一层并消费按键**（捕获阶段 `preventDefault + stopPropagation`，输入框的历史导航与 Radix Dialog 不会被顺带触发）、**Esc 关闭前先归还焦点再通知关闭**（触发器 `onFocus` 可能重新打开菜单，同批次内以关闭收尾；鼠标点外部时不抢焦点）、**一份 document 监听按引用计数装卸**（没有打开的层就不占监听器）。
+
+两个身份必须分开：`getElement` 表达「这一层的边界在哪」，`getReturnFocus` 表达「关闭后焦点去哪」。**二者都按需读取、不做快照**——层内的容器节点会随状态重建（模型角色选择器在角色之间切换），快照会指向已卸载的旧节点，于是每一次点击都被判成「外部」。
+
+规则：新增任何弹层都调 `useDismissableLayer`，不自己 `addEventListener`；需要禁用某条关闭路径时传 `dismissOnOutsidePointer: false` / `dismissOnEscape: false`，不要复制一份监听再删掉两行。
+
+### Listbox（选项选择原语）
+「触发器 + 弹出选项」的**唯一实现**（`components/ui/Listbox.tsx`）。`SelectField` 是它的表单外壳（标签 + 说明），Git 面板的 `GitCompactFilter` 是它的紧凑外壳（对勾装饰、更小的 chevron），两者共用同一套 ARIA 结构与键盘行为。
+
+它独占的不变式：`aria-haspopup/aria-expanded/aria-controls` 与 `role="listbox"/role="option"/aria-selected` 的配对、**方向键打开并移动焦点**（键盘打开才把焦点移进选项，鼠标打开留在触发器）、`Home`/`End`、`Esc` 关闭（交给关闭层）、**选中后焦点回触发器**（否则焦点随卸载的选项消失，下一次 Tab 从文档头开始）、`Tab` 显式收回到触发器。
+
+规则：不要在调用点复制 markup 来换样式——样式差异用 class 名参数表达；需要不同的装饰就用 `renderOptionTrailing`。AGENTS.md 里旧的「自定义下拉例外配方」已随本 module 退役。
+
+# 时间线投影与输入建议（Renderer 领域术语）
+
+> 第六领域：transcript 怎么变成时间线、时间线条目怎么被判为「没变」、输入框怎么识别引用。
+> 源自架构评审候选 4「时间线投影独立成模块」。维护规则同上。
+
+## 术语
+
+### TimelineProjection（时间线投影）
+「消息 → 渲染条目」以及「两条条目内容是否相同」的**唯一实现**（`components/app/timeline/timelineProjection.ts`）。
+
+接口是纯函数：`groupToolMessages(messages) → RenderMessage[]` 产出 `agent-run` / `message` / `thinking-group` / `tool-group` 四种条目，`sameRenderMessageForRender` 家族回答两条条目能否跳过重渲染，`getMultiSelectImageCaptureIds` 把选中的子消息投影成条目级捕获集合。
+
+必须同住一处的理由：分组产物每次渲染都整体重建，所以比较器的字段集必须与分组产出的字段集严格对齐。**两者分居时，改一处必漏另一处**——历史缺陷就是这么产生的：`images` 按引用比较 → memo 恒定失效，流式期间每个 delta 都让整轮历史重跑 markdown 解析；`meta` 漏比较 → 工具卡永远停在 `running`。
+
+规则：新增渲染条目种类或给条目加字段，都在本模块内同时改分组与比较器，不允许调用方自己写 `memo` 比较函数。
+
+### ComposerSuggestions（输入建议投影）
+`/` 命令、`@` 文件引用、`&` 会话引用的**触发识别与候选构造唯一实现**（`components/app/composer/composerSuggestions.ts`）：`detectTrigger` 判定「光标处正在输入哪类引用」，`buildSuggestionItems` 按该判定产出候选，`applySuggestion` 负责插入文本与光标落点，`filterVisibleCommands` 是命令目录的可见性规则（桌面已有等价入口的内置命令不重复暴露，且先隐藏再去重）。
+
+触发规则与候选构造必须成对演进：`/fast on` 子命令提示、`@src/ 说明…` 不得把浮层钉死、URL 查询参数里的 `&` 不算会话引用，这些规则都跨越「识别」与「构造」两侧，分开就会重新长出第二条路径解析。
+
+### SessionOutline（会话大纲）
+时间线导航行的投影（`components/app/sessionOutline.ts`）：`buildOutline` 把 user 消息投影成 `{ id, role, title, time }`。
+
+缓存住在模块内（`WeakMap` 以消息对象为键，并再核对 text/timestamp 以覆盖原地改写）：流式期间 transcript 每 50ms 更新，但历史消息对象引用不变，未变化的消息必须返回**同一个 item 对象**，宿主才能保持数组引用稳定、不重建大纲。
+
+### ToolArgs（工具参数推导）
+工具调用参数 → diff / 改动行数 / 会话修改文件清单的**唯一实现**（`utils/toolArgs.ts`）。
+
+它独占 `write|edit|create|patch` 的工具名规则、`oldText`/`old_text` 多写法兼容、「同一路径再次修改移到末尾」的顺序语义。这些共同定义右侧 Files 抽屉与会话结束摘要的数据源，因此不能挂在 App 根 `useMemo` 上（transcript 每 50ms 增量都会唤醒根组件）；改为只在需要时按快照调用一次，进而是可独立单测的深模块。

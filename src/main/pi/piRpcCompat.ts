@@ -28,7 +28,6 @@ const LEGACY_COMMAND_NAMES: Record<string, string> = {
 /** 每个 pi 进程已探测出的「主命令名」缓存。 */
 const resolvedCommandNames = new WeakMap<PiRpcClient, Map<string, string>>();
 
-
 /**
  * 按「新名优先、旧名兜底」发一条命令，返回真正生效的命令名与响应。
  * 所有候选名都被判定为 Unknown command 时返回最后一次失败响应（由调用方决定兜底）。

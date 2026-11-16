@@ -48,6 +48,50 @@ All notable changes to PiDeck are documented here.
 - **Config export/import no longer carries credentials** — Exports contain no
   `apiKey`; imports keep the target machine's existing keys and only take an
   explicitly non-empty key from the package.
+- **Popovers share one dismissal layer** — Every popover now closes on outside
+  click and on Escape, one Escape closes only the innermost layer, and focus
+  returns to the trigger. Previously nine separate document listeners used two
+  event names and two phases; the browser device menu and the settings model
+  picker could not be closed with the keyboard at all, and one Escape closed both
+  an open select and its settings dialog.
+- **All dropdowns share one listbox primitive** — `SelectField` and the Git panel
+  filter no longer carry duplicated markup, ARIA wiring, and keyboard handling.
+- **Timeline projection is one module** — Message grouping (agent runs, thinking
+  groups, tool groups), the render-equality comparators those groups are compared
+  with, and the multi-select capture rule now live together in
+  `timeline/timelineProjection.ts` instead of a 921-line `AppUtils.ts` grab bag.
+  Composer suggestions, the session outline, and tool-argument derivation moved
+  to their own modules; the comparators can no longer drift from the fields the
+  grouping produces.
+- **Main window lifecycle is one module** — Load health (failed load / error-page
+  retry / one-shot dev fallback), the quit flag and the renderer recovery budget
+  now live in `main/mainWindow.ts` as decisions (`planVersionFocus`,
+  `onMainFrameLoadFailed`, `planClose`, `planUnresponsiveRecovery`) instead of
+  four module-scope `let`s and five free functions in `index.ts`. The window
+  itself stays in `index.ts`; only the decisions moved, so they are unit-tested
+  against a fake window without booting Electron.
+- **pi's wire format has one decoder** — Frame names are now read in
+  `main/pi/piProtocol.ts` instead of three places. `handlePiEvent` was a 498-line
+  frame-name ladder, `getRuntimeState` had its own 126-line field scrub, and
+  `QuickGenProcess` read `message_update` / `agent_end` a third time; a change in
+  pi's wording could break all three at once, and none of it could be tested
+  without launching pi. The decoder is pure, so frames, snapshots, queues, and
+  failure classification are now unit-tested against raw JSON.
+- **Earlier history paging has one ledger** — The five invariants behind "load
+  older messages" (single flight, scope binding, stale-response discard,
+  baseline invalidation, id dedupe) used to live in three `useState`s, two
+  `useRef`s, and comments inside `App.tsx`, with a second dedupe pass in the
+  conversation pane; editing any one of them silently produced flashing pages
+  instead of a test failure. They now live in
+  `utils/sessionHistoryPaging.ts`, and the two identities it needs (which page
+  belongs to which session file, versus whether the user has navigated away) are
+  separate keys.
+- **The web fallback page is a real file** — The 214-line "no renderer bundle"
+  page moved out of a template literal into `main/web/fallbackPage.html`,
+  inlined at build time. The route parity guard now scans it with the same
+  extractor it already runs against `mobile.js`, so the hand-written
+  find-the-backtick-and-walk-escapes scraper is gone.
+
 
 ### 🔒 Security
 

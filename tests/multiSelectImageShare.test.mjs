@@ -4,28 +4,25 @@ import test from "node:test";
 import ts from "typescript";
 import vm from "node:vm";
 
-function loadAppUtils() {
-  const source = readFileSync("src/renderer/src/components/app/AppUtils.ts", "utf8");
+function loadTimelineProjection() {
+  const source = readFileSync("src/renderer/src/components/app/timeline/timelineProjection.ts", "utf8");
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2022,
     },
   });
-  // AppUtils 的运行时导入只有 ./RichInput 与 ../../utils/thinkingTiming（其余为
-  // type-only，转译后消除）；被测的 getMultiSelectImageCaptureIds 不依赖两者，
-  // 用最小 stub 即可。thinkingTiming 由 W5 引入（getMultiSelectImageCaptureIds 之外
-  // 的思考计时工具函数使用）。
+  // 运行时导入只有 thinkingTiming 与 ../format（其余为 type-only，转译后消除）。
+  // 被测的 getMultiSelectImageCaptureIds 不经过两者，但同一模块里的分组函数会用到，
+  // 因此仍给最小 stub 保证模块可求值。
   const require = (id) => {
-    if (id === "./RichInput") return { formatFilePathRef: () => "" };
-    if (id === "../../utils/thinkingTiming") return { computeThinkingTiming: () => 0 };
-    // 展示规则转发层；被测函数不依赖这些实现，只需形状正确。
-    if (id === "../../../../shared/sessionDisplayContract")
-      return { displayPath: (p) => p, formatTimestamp: () => "", stripAnsi: (v) => String(v ?? ""), toolArgPath: () => null };
-    throw new Error(`unexpected import in AppUtils: ${id}`);
+    if (id === "../../../utils/thinkingTiming") return { computeThinkingTiming: () => 0 };
+    if (id === "../format")
+      return { stripAnsi: (v) => String(v ?? ""), stripThinkingTags: (v) => String(v ?? "") };
+    throw new Error(`unexpected import in timelineProjection: ${id}`);
   };
   const sandbox = { exports: {}, require, location: { href: "file:///Users/test/app" } };
-  vm.runInNewContext(outputText, sandbox, { filename: "AppUtils.ts" });
+  vm.runInNewContext(outputText, sandbox, { filename: "timelineProjection.ts" });
   return sandbox.exports;
 }
 
@@ -38,7 +35,7 @@ test("multi-select image export stays renderable for html-to-image", () => {
 });
 
 test("multi-select image export maps selected assistant messages to their visible run rows", () => {
-  const { getMultiSelectImageCaptureIds } = loadAppUtils();
+  const { getMultiSelectImageCaptureIds } = loadTimelineProjection();
   const user = { kind: "message", message: { id: "u1", role: "user", text: "hi", timestamp: 1 } };
   const run = {
     kind: "agent-run",
