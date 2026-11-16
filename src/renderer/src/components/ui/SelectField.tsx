@@ -1,12 +1,12 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { ChevronDown } from "lucide-react";
+import { useRef, type ReactNode } from "react";
+import { Listbox, type ListboxOption } from "./Listbox";
 
-export type SelectFieldOption = {
-	value: string;
-	label: ReactNode;
-	disabled?: boolean;
-};
+export type SelectFieldOption = ListboxOption;
 
+/**
+ * 带标签的下拉选择器。ARIA 结构、键盘行为与关闭逻辑全在 `Listbox`（详见该模块注释），
+ * 本组件只负责「标签 + 说明文字」这层表单外壳，不再自己挂 document 监听。
+ */
 export function SelectField(props: {
 	label: ReactNode;
 	value: string;
@@ -16,86 +16,31 @@ export function SelectField(props: {
 	description?: ReactNode;
 	disabled?: boolean;
 }) {
-	const [open, setOpen] = useState(false);
-	const fieldRef = useRef<HTMLDivElement>(null);
-	const listboxId = useId();
-	const selectedOption =
-		props.options.find((option) => option.value === props.value) ??
-		props.options[0];
-
-	useEffect(() => {
-		if (!open) return;
-		const handlePointerDown = (event: PointerEvent) => {
-			if (!fieldRef.current?.contains(event.target as Node)) {
-				setOpen(false);
-			}
-		};
-		const handleKeyDown = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setOpen(false);
-		};
-		document.addEventListener("pointerdown", handlePointerDown);
-		document.addEventListener("keydown", handleKeyDown);
-		return () => {
-			document.removeEventListener("pointerdown", handlePointerDown);
-			document.removeEventListener("keydown", handleKeyDown);
-		};
-	}, [open]);
-
-	function selectOption(option: SelectFieldOption) {
-		if (props.disabled || option.disabled) return;
-		props.onChange(option.value);
-		setOpen(false);
-	}
+	const containerRef = useRef<HTMLDivElement>(null);
 
 	return (
 		<div
-			ref={fieldRef}
+			ref={containerRef}
 			className={["ui-field ui-select-field", props.className]
 				.filter(Boolean)
 				.join(" ")}
 		>
 			<span className="ui-field-label">{props.label}</span>
-			<button
-				type="button"
-				className="ui-select-control"
+			<Listbox
+				containerRef={containerRef}
+				value={props.value}
+				options={props.options}
+				onSelect={props.onChange}
 				disabled={props.disabled}
-				aria-haspopup="listbox"
-				aria-expanded={open}
-				aria-controls={listboxId}
-				onClick={() => setOpen((current) => !current)}
-				onKeyDown={(event) => {
-					if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-						event.preventDefault();
-						setOpen(true);
-					}
-				}}
-			>
-				<span className="ui-select-value">
-					{selectedOption?.label ?? props.value}
-				</span>
-				<ChevronDown size={15} strokeWidth={2.2} aria-hidden="true" />
-			</button>
-			{open && !props.disabled && (
-				<div id={listboxId} className="ui-select-menu" role="listbox">
-					{props.options.map((option) => (
-						<button
-							key={option.value}
-							type="button"
-							className={
-								option.value === props.value
-									? "ui-select-option active"
-									: "ui-select-option"
-							}
-							role="option"
-							aria-selected={option.value === props.value}
-							disabled={option.disabled}
-							onClick={() => selectOption(option)}
-						>
-							{option.label}
-						</button>
-					))}
-				</div>
-			)}
+				triggerClassName="ui-select-control"
+				valueClassName="ui-select-value"
+				menuClassName="ui-select-menu"
+				optionClassName="ui-select-option"
+				chevronSize={15}
+				// 与旧实现一致：值不在选项里时回退到第一个选项的标签，
+				// 而不是显示原始 value（20 个调用点的空值显示保持原样）。
+				fallbackLabel={props.options[0]?.label}
+			/>
 			{props.description && (
 				<small className="ui-field-description">{props.description}</small>
 			)}

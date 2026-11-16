@@ -28,6 +28,8 @@ import {
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
+import { Listbox } from "../ui/Listbox";
+import { useDismissableLayer } from "../ui/useDismissableLayer";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { showNotice } from "../../utils/notice";
 import { createGitStatusResource } from "../../utils/gitStatusResource";
@@ -670,90 +672,49 @@ function PaneHeader(props: {
 }
 
 /**
- * 紧凑型下拉筛选器，替换原生 <select> 用于 Git pane header 中的过滤/选择场景。
- * 使用统一的按钮+弹出菜单，避免 Windows 原生 <select> 样式不一致的问题。
+ * 紧凑型下拉筛选器，用于 Git pane header 中的过滤/选择场景（替代原生 `<select>`）。
+ * ARIA 结构、键盘导航与关闭行为全在共享 `Listbox` 原语里，这里只提供紧凑尺寸与对勾装饰。
  */
 function GitCompactFilter(props: {
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (value: string) => void;
-  ariaLabel: string;
-  className?: string;
+	value: string;
+	options: { value: string; label: string }[];
+	onChange: (value: string) => void;
+	ariaLabel: string;
+	className?: string;
 }) {
-  const [open, setOpen] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
+	const containerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
-
-  const selected = props.options.find((o) => o.value === props.value);
-
-  return (
-    <div
-      ref={containerRef}
-      className={`git-compact-filter${props.className ? ` ${props.className}` : ""}`}
-    >
-      <button
-        type="button"
-        className="git-compact-filter-btn"
-        aria-label={props.ariaLabel}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-            event.preventDefault();
-            setOpen(true);
-          }
-        }}
-      >
-        <span className="git-compact-filter-label">
-          {selected?.label ?? props.value}
-        </span>
-        <ChevronDown
-          size={12}
-          className={`git-compact-filter-chevron${open ? " open" : ""}`}
-        />
-      </button>
-      {open && (
-        <div className="git-compact-filter-menu" role="listbox">
-          {props.options.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              className={`git-compact-filter-opt${opt.value === props.value ? " active" : ""}`}
-              role="option"
-              aria-selected={opt.value === props.value}
-              onClick={() => {
-                props.onChange(opt.value);
-                setOpen(false);
-              }}
-            >
-              <span className="git-compact-filter-opt-label">{opt.label}</span>
-              {opt.value === props.value && (
-                <Check size={12} className="git-compact-filter-check" />
-              )}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+	return (
+		<div
+			ref={containerRef}
+			className={`git-compact-filter${props.className ? ` ${props.className}` : ""}`}
+		>
+			<Listbox
+				containerRef={containerRef}
+				value={props.value}
+				// 选项文本单独包一层 span：CSS 靠 .git-compact-filter-opt-label 做省略，
+				// 不包的话对勾会被长文本挤出容器。
+				options={props.options.map((option) => ({
+					value: option.value,
+					label: <span className="git-compact-filter-opt-label">{option.label}</span>,
+				}))}
+				onSelect={props.onChange}
+				ariaLabel={props.ariaLabel}
+				triggerClassName="git-compact-filter-btn"
+				valueClassName="git-compact-filter-label"
+				menuClassName="git-compact-filter-menu"
+				optionClassName="git-compact-filter-opt"
+				activeOptionClassName="active"
+				chevronSize={12}
+				chevronClassName={(open) =>
+					`git-compact-filter-chevron${open ? " open" : ""}`
+				}
+				renderOptionTrailing={(_option, isSelected) =>
+					isSelected ? <Check size={12} className="git-compact-filter-check" /> : null
+				}
+			/>
+		</div>
+	);
 }
 
 function PaneSash(props: {
@@ -1190,22 +1151,17 @@ function GitPanelImpl(props: GitPanelProps) {
   const [newBranchName, setNewBranchName] = useState("");
   const branchBarRef = useRef<HTMLDivElement>(null);
 
-  // 点击外部关闭分支下拉
-  useEffect(() => {
-    if (!branchOpen) return;
-    const handler = (event: MouseEvent) => {
-      if (
-        branchBarRef.current &&
-        !branchBarRef.current.contains(event.target as Node)
-      ) {
-        setBranchOpen(false);
-        setBranchCreating(false);
-        setNewBranchName("");
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [branchOpen]);
+  // 点击外部 / Esc 关闭分支下拉：清理在途的新建分支草稿（此前无 Esc 分支）。
+  const closeBranchDropdown = useCallback(() => {
+    setBranchOpen(false);
+    setBranchCreating(false);
+    setNewBranchName("");
+  }, []);
+  useDismissableLayer({
+    open: branchOpen,
+    elementRef: branchBarRef,
+    onDismiss: closeBranchDropdown,
+  });
 
   return (
     <div

@@ -52,6 +52,7 @@ import {
 	resetDraft,
 	type Draft,
 } from "../../utils/configDraft";
+import { useDismissableLayer } from "../ui/useDismissableLayer";
 
 /** 角色元数据：本地化由 i18n 键提供（settings.role.<key>.name/.desc）。 */
 const ROLE_META: Array<{ role: OmpModelRole }> = OMP_MODEL_ROLES.map((role) => ({ role }));
@@ -376,22 +377,12 @@ export function ModelRolesTab(props: {
 		void ensureModels();
 	};
 
-	// 点击外部关闭弹层
-	useEffect(() => {
-		if (!activeRole) return;
-		const onPointerDown = (e: PointerEvent) => {
-			if (!popupRef.current?.contains(e.target as Node)) setActiveRole(null);
-		};
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") setActiveRole(null);
-		};
-		document.addEventListener("pointerdown", onPointerDown);
-		document.addEventListener("keydown", onKeyDown);
-		return () => {
-			document.removeEventListener("pointerdown", onPointerDown);
-			document.removeEventListener("keydown", onKeyDown);
-		};
-	}, [activeRole]);
+	// 点击外部 / Esc 关闭弹层（行为细节在共享关闭层：Esc 只关最上面一层并归还焦点）。
+	useDismissableLayer({
+		open: activeRole !== null,
+		elementRef: popupRef,
+		onDismiss: () => setActiveRole(null),
+	});
 
 	const saveRoleSelector = async (role: OmpModelRole, selector: string) => {
 		setSavingRole(role);

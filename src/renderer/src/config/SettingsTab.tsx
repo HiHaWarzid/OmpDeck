@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef } from "react";
 import { X, Check } from "lucide-react";
+import { useDismissableLayer } from "../components/ui/useDismissableLayer";
 import type { ModelsFile } from "./configTypes";
 import {
 	readOmpPath,
@@ -211,17 +212,12 @@ function EnabledModelsInput(props: {
 		entries.filter((entry): entry is string => typeof entry === "string"),
 	);
 
-	// 点击外部关闭下拉
-	useEffect(() => {
-		if (!open) return;
-		const handlePointerDown = (event: PointerEvent) => {
-			if (!containerRef.current?.contains(event.target as Node)) {
-				setOpen(false);
-			}
-		};
-		document.addEventListener("pointerdown", handlePointerDown);
-		return () => document.removeEventListener("pointerdown", handlePointerDown);
-	}, [open]);
+	// 点击外部 / Esc 关闭下拉：行为细节在共享关闭层，此前这里没有 Esc 分支。
+	useDismissableLayer({
+		open,
+		elementRef: containerRef,
+		onDismiss: () => setOpen(false),
+	});
 
 	const toggleModel = (id: string) => {
 		props.onChange(setEnabledModelSelected(entries, id, !selected.has(id)));

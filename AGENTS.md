@@ -78,6 +78,8 @@ src/
 | `IconButton` | `components/ui/IconButton.tsx` | 纯图标按钮，带 `aria-label` | 工具栏图标按钮、行内操作按钮 |
 | `CloseIconButton` | `components/ui/IconButton.tsx` | 统一的关闭按钮（X 图标） | 弹框/抽屉的关闭按钮 |
 | `SelectField` | `components/ui/SelectField.tsx` | 自定义下拉选择器（按钮 + 弹出 listbox） | **替代所有原生 `<select>`** |
+| `Listbox` | `components/ui/Listbox.tsx` | 选项选择原语：ARIA + 键盘 + 关闭；`SelectField` / `GitCompactFilter` 都是它的外壳 | 需要非表单外壳的下拉 |
+| `useDismissableLayer` | `components/ui/useDismissableLayer.ts` | 弹层关闭层：点外部关闭、Esc 关闭、焦点归还 | **任何自建弹层的关闭行为** |
 | `TextField` | `components/ui/TextField.tsx` | 带标签的文本输入 | 表单输入、配置项编辑 |
 | `Modal` | `components/ui/Modal.tsx` | 基于 Radix Dialog 的弹框，支持 full/medium/small 三档尺寸 | 全屏弹框、中/小弹框 |
 | `LazyMonacoEditor` | `components/ui/LazyMonacoEditor.tsx` | Monaco 编辑器懒加载封装 | 代码编辑、SKILL.md 编辑 |
@@ -91,14 +93,15 @@ src/
 | `<button className="随便写">` | `<Button variant="primary">...</Button>` 或 `<IconButton label="...">{icon}</IconButton>` |
 | 手写 `div + onClick` 弹框 | `<Modal open=... onClose=...>...</Modal>` |
 | 自己实现 `✕` 关闭按钮 | `<CloseIconButton label={t("common.close")} onClick=... />` |
+| 弹层里自己 `document.addEventListener` 判外部点击/Esc | `useDismissableLayer({ open, elementRef, onDismiss })` |
 
 ### 自定义下拉的例外
 
-如果 `SelectField` 无法满足需求（例如选项里需要显示图标、两行文字、分组等），可以参考 `GitPanel.tsx` 的 `GitCompactFilter` 自定义实现，但必须：
-- 使用 `button + role="listbox"` + `role="option"` 的 ARIA 结构
-- 用 `ChevronDown` 图标（来自 lucide-react）
-- 支持 `Escape` 关闭、点击外部关闭、键盘 `ArrowDown/ArrowUp` 打开
-- 样式走 `--color-*` 语义 token，不要写死颜色
+`SelectField` 与 Git 面板的 `GitCompactFilter` 现在是同一个原语 `Listbox`（`components/ui/Listbox.tsx`）的两个外壳，ARIA 结构、键盘导航、关闭行为都在里面，不要再各写一份。
+
+需要新外观时给 `Listbox` 传不同的 class 名，需要额外装饰时用 `renderOptionTrailing` / `triggerExtra`。**不要复制 markup 自建下拉**：那样 Esc、方向键、焦点归还这些行为会各写一遍，实际已经出现过「两个下拉根本关不掉」的缺陷。
+
+如果需要完全不同的交互（多选、分组、搜索），仍走 `useDismissableLayer` + 自己的 listbox 结构，但不要把关闭监听重新装到组件里——细节见 `GLOSSARY.md` 的 DismissableLayer / Listbox 两条。
 
 ## 图标系统
 

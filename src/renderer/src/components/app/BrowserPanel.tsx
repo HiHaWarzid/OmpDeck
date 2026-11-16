@@ -12,6 +12,7 @@ import {
 	X,
 } from "lucide-react";
 import { t } from "../../i18n";
+import { useDismissableLayer } from "../ui/useDismissableLayer";
 
 type DeviceType = "pc" | "mobile" | "tablet";
 
@@ -352,16 +353,12 @@ export function BrowserPanel(props: {
 		[loadUrl, url],
 	);
 
-	useEffect(() => {
-		if (!deviceMenuOpen) return;
-		const handleMouseDown = (event: MouseEvent) => {
-			if (!deviceMenuRef.current?.contains(event.target as Node)) {
-				setDeviceMenuOpen(false);
-			}
-		};
-		document.addEventListener("mousedown", handleMouseDown);
-		return () => document.removeEventListener("mousedown", handleMouseDown);
-	}, [deviceMenuOpen]);
+	// 点击外部 / Esc 关闭设备菜单（此前只能靠点外部关闭）。
+	useDismissableLayer({
+		open: deviceMenuOpen,
+		elementRef: deviceMenuRef,
+		onDismiss: () => setDeviceMenuOpen(false),
+	});
 
 	const handleKeyDown = useCallback(
 		(event: React.KeyboardEvent) => {

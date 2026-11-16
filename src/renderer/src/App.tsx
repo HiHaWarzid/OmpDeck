@@ -80,6 +80,7 @@ const ScratchPadPanel = lazyWithReload(() =>
 import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { Badge } from "./components/ui/Badge";
 import { Button } from "./components/ui/Button";
+import { useDismissableLayer } from "./components/ui/useDismissableLayer";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { ComposerStatusChips } from "./components/app/composer/ComposerToolbar";
@@ -652,19 +653,17 @@ export function App() {
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
   const editorsRef = useRef<HTMLDivElement>(null);
 
-  // 点击编辑器气泡外部时关闭
-  useEffect(() => {
-    if (!editorsOpen) return;
-    const handler = (event: MouseEvent) => {
-      if (editorsRef.current && !editorsRef.current.contains(event.target as Node)) {
-        setEditorsOpen(false);
-        setEditorsAnchor(null);
-        setEditorsTargetPath(null);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [editorsOpen]);
+  // 点击编辑器气泡外部时关闭（Esc 同样可关，见共享关闭层）。
+  const closeEditorsBubble = useCallback(() => {
+    setEditorsOpen(false);
+    setEditorsAnchor(null);
+    setEditorsTargetPath(null);
+  }, []);
+  useDismissableLayer({
+    open: editorsOpen,
+    elementRef: editorsRef,
+    onDismiss: closeEditorsBubble,
+  });
 
   /** 活跃的 Extension UI 请求 map（requestId → UiRequest），用于实时显示 ask_question 卡片 */
   // 待答 UI 请求属于条目状态：键 = 条目键，agent 关闭即回收（原根级 record 不裁剪）。
@@ -2386,17 +2385,12 @@ export function App() {
   // 与 runtime 重复，也无法跟随 /reload-plugins 更新。
 
   // 追踪 agent 会话开始/结束时间,计算会话时长
-  // 点击外部区域自动关闭会话组合下拉
-  useEffect(() => {
-    if (!sessionActionsOpen) return;
-    const handler = (event: MouseEvent) => {
-      if (sessionComboRef.current && !sessionComboRef.current.contains(event.target as Node)) {
-        setSessionActionsOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [sessionActionsOpen]);
+  // 点击外部区域 / Esc 自动关闭会话组合下拉（关闭行为统一在共享关闭层里）。
+  useDismissableLayer({
+    open: sessionActionsOpen,
+    elementRef: sessionComboRef,
+    onDismiss: () => setSessionActionsOpen(false),
+  });
 
   const triggerBrandLogoReplay = useCallback(() => {
     setBrandLogoReplayToken((token) => token + 1);
@@ -3872,30 +3866,15 @@ export function App() {
     }, 160);
   }
 
-  // hover 打开不会移动焦点，焦点仍可能留在输入框：补上全局「点击外部关闭」
-  // 和 Escape，否则菜单只能靠鼠标移出时的 160ms 延迟关闭。
-  useEffect(() => {
-    if (!sendBehaviorMenuOpen) return;
-    const handlePointerDown = (event: globalThis.PointerEvent) => {
-      if (sendBehaviorMenuWrapRef.current?.contains(event.target as Node)) return;
-      setSendBehaviorMenuOpen(false);
-    };
-    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      // 捕获阶段拦下，避免同时触发输入框的 Esc（历史导航/关闭建议）分支。
-      event.preventDefault();
-      event.stopPropagation();
-      // 先还焦再关闭：chevron 的 onFocus 会重新打开菜单，同批次内以关闭收尾。
-      sendBehaviorChevronRef.current?.focus();
-      setSendBehaviorMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    document.addEventListener("keydown", handleKeyDown, true);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("keydown", handleKeyDown, true);
-    };
-  }, [sendBehaviorMenuOpen]);
+  // hover 打开不会移动焦点，焦点仍可能留在输入框：补上「点击外部关闭」和 Escape，
+  // 否则菜单只能靠鼠标移出时的 160ms 延迟关闭。行为细节（捕获阶段、先还焦再关闭）在
+  // 共享关闭层里——chevron 的 onFocus 会重新打开菜单，同批次内以关闭收尾。
+  useDismissableLayer({
+    open: sendBehaviorMenuOpen,
+    elementRef: sendBehaviorMenuWrapRef,
+    returnFocusRef: sendBehaviorChevronRef,
+    onDismiss: () => setSendBehaviorMenuOpen(false),
+  });
 
   /** 菜单内上下键循环移动焦点；菜单项本身不参与 Tab 序列。 */
   function handleSendBehaviorMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
