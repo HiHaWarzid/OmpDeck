@@ -24,6 +24,7 @@ import { t } from "../../i18n";
 import { showNotice } from "../../utils/notice";
 import { writeClipboard } from "../../utils/clipboard";
 import { pickTimelineAnchorIndex } from "../../utils/timelineAnchor";
+import { mergeOlderHistory } from "../../utils/sessionHistoryPaging";
 import { isAgentExactlyRunning, isAgentIdle, isAgentStarting, isAgentStreaming } from "../../utils/agentRuntimeState";
 import { isPendingAgentId } from "../../hooks/useAgentSessions";
 import { useMessagePagination } from "../../hooks/useMessagePagination";
@@ -33,7 +34,8 @@ import { EmptyState } from "./brand/Brand";
 import { MultiSelectModal } from "./modals/MultiSelectModal";
 import { MessageListContent } from "./MessageListContent";
 import { buildStreamState } from "./streamStateSelector";
-import { buildOutline, getMultiSelectImageCaptureIds, groupToolMessages, type OutlineItem } from "./AppUtils";
+import { getMultiSelectImageCaptureIds, groupToolMessages } from "./timeline/timelineProjection";
+import { buildOutline, type OutlineItem } from "./sessionOutline";
 import { stripMarkdown } from "./format";
 
 type AskResponse = {
@@ -70,7 +72,7 @@ export type ConversationPaneProps = {
 	terminalRowHeight: number;
 	composerOffsetHeight: number;
 	/** 从会话文件向前加载的旧页（App 持有，跨滚动/流式稳定）。 */
-	olderHistoryMessages?: ChatMessage[];
+	olderHistoryMessages?: readonly ChatMessage[];
 	hasOlderHistory?: boolean;
 	loadingOlderHistory?: boolean;
 	onLoadOlderHistory?: () => void | Promise<void>;
@@ -124,14 +126,12 @@ function ConversationPaneImpl(
 	// 当前会话消息：订阅留在本组件，根不再跟进 50ms 流式增量。
 	const transcript = useWorkspaceSlice(activeAgentId, "transcript");
 	const transcriptMessages = transcript?.messages ?? EMPTY_MESSAGES;
-	// 旧页来自 App（不在 transcript 分片里）。首屏旧页可能与基线最后 30 轮重叠，
-	// 这里按稳定消息 id 去重后再拼到最前面，避免重复渲染同一条消息。
-	const activeMessages = useMemo(() => {
-		if (!olderHistoryMessages?.length) return transcriptMessages;
-		const known = new Set(transcriptMessages.map((message) => message.id));
-		const older = olderHistoryMessages.filter((message) => !known.has(message.id));
-		return older.length > 0 ? [...older, ...transcriptMessages] : transcriptMessages;
-	}, [olderHistoryMessages, transcriptMessages]);
+	// 旧页来自 App 的页账本（不在 transcript 分片里）。首屏基线（尾窗）与文件页重叠的
+	// 部分按稳定消息 id 过滤——去重规则与产生页的账本同处一个 module。
+	const activeMessages = useMemo(
+		() => mergeOlderHistory(olderHistoryMessages, transcriptMessages),
+		[olderHistoryMessages, transcriptMessages],
+	);
 
 	const [multiSelectOpen, setMultiSelectOpen] = useState(false);
 	const [autoScroll, setAutoScroll] = useState(true);

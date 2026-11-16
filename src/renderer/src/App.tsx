@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   useCallback,
+  useSyncExternalStore,
   useTransition,
   useDeferredValue,
   type PointerEvent,
@@ -106,6 +107,10 @@ import {
 import { startFrameSampling, stopFrameSampling } from "./utils/perfStats";
 import { translateAgentErrorMessage } from "./utils/agentErrors";
 import { withTimeout } from "./utils/withTimeout";
+import {
+  createSessionHistoryPaging,
+  type SessionHistoryScope,
+} from "./utils/sessionHistoryPaging";
 import {
   buildQueueRows,
   historyKeyForAgent,
@@ -607,30 +612,22 @@ export function App() {
   const [todoBusy, setTodoBusy] = useState(false);
   const [sendBehaviorMenuOpen, setSendBehaviorMenuOpen] = useState(false);
   const sendBehaviorMenuCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 大会话历史分页：App 持有旧页，切换会话/文件时按 key 自动失效。
-  // 不用 transcript 承载旧页，否则流式基线重推会把它们覆盖掉。
-  type OlderHistoryState = {
-    key: string;
-    messages: ChatMessage[];
-    cursor: number;
-    hasMore: boolean;
-  };
-  const [olderHistory, setOlderHistory] = useState<OlderHistoryState>({
-    key: "",
-    messages: [],
-    cursor: 0,
-    hasMore: true,
-  });
-  const [olderHistoryLoadingKey, setOlderHistoryLoadingKey] = useState<string | null>(null);
   /**
-   * 基线代号：进程重连/压缩重载会替换 transcript 基线，此前的旧页可能与新基线
-   * 之间出现缺口。代号进入 key 后，旧页连同在途响应一起失效。
+   * 大会话「更早历史」的页账本：单飞、作用域绑定、陈旧响应丢弃、基线失效、id 去重
+   * 五条不变式收在 utils/sessionHistoryPaging，App 只订阅视图并发意图。
+   * 不用 transcript 承载旧页，否则流式基线重推会把它们覆盖掉。
    */
-  const [olderHistoryEpoch, setOlderHistoryEpoch] = useState(0);
-  // 点击瞬间 state 还没刷新，必须用 ref 挡住同一会话的重复请求，否则两次翻页会并发。
-  const olderHistoryLoadingRef = useRef<string | null>(null);
-  // 请求代号：切会话/基线重建后，晚到的旧响应必须丢弃，不能覆盖新会话的页。
-  const olderHistoryRequestRef = useRef(0);
+  const [olderHistoryPaging] = useState(() =>
+    createSessionHistoryPaging({
+      loadPage: (agentId, beforeOffset) => api.agents.getHistoryPage(agentId, beforeOffset),
+      onError: (error) =>
+        showToast(
+          t("app.loadOlderHistoryFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        ),
+    }),
+  );
   // 菜单外层容器：用于「点击外部关闭」判定；chevron 引用用于 Escape 关闭后还焦。
   const sendBehaviorMenuWrapRef = useRef<HTMLDivElement | null>(null);
   const sendBehaviorChevronRef = useRef<HTMLButtonElement | null>(null);
@@ -3748,84 +3745,42 @@ export function App() {
     activeAgentId && hasComposerContent && activeBusyDraft,
   );
   const showBusySendControls = isAgentBusy || keepBusyDraftControls;
-  // 旧页 key 绑定「agent + sessionPath + 基线代号」：切会话文件或重连重建基线后，
+  // 作用域绑定「agent + sessionPath + 基线代号」：切会话文件或重连重建基线后，
   // 旧页自动失配，不再显示错文件内容或跨基线拼接出缺口。
-  const olderHistoryKey = activeAgentId
-    ? `${activeAgentId}\u0000${activeAgent?.sessionPath ?? ""}\u0000${olderHistoryEpoch}`
-    : "";
-  const olderHistoryMatches = olderHistory.key === olderHistoryKey;
-  const olderHistoryForActive = olderHistoryMatches ? olderHistory.messages : undefined;
-  const hasOlderHistory = Boolean(
-    activeAgentId
-    && activeAgent?.sessionPath
-    && activeAgent.historyHasOlder === true
-    && (!olderHistoryMatches || olderHistory.hasMore),
+  const olderHistoryScope = useMemo<SessionHistoryScope>(
+    () => ({
+      agentId: activeAgentId,
+      sessionPath: activeAgent?.sessionPath,
+      historyHasOlder: activeAgent?.historyHasOlder === true,
+    }),
+    [activeAgentId, activeAgent?.sessionPath, activeAgent?.historyHasOlder],
   );
-  const olderHistoryLoading = olderHistoryLoadingKey === olderHistoryKey;
-
-  const loadOlderHistory = useCallback(async () => {
-    if (!activeAgentId || !activeAgent?.sessionPath) return;
-    const key = olderHistoryKey;
-    if (olderHistoryLoadingRef.current === key) return;
-    olderHistoryLoadingRef.current = key;
-    const requestId = ++olderHistoryRequestRef.current;
-    setOlderHistoryLoadingKey(key);
-    // cursor 必须来自同一 key；切会话后的旧 cursor 属于另一个文件，绝不复用。
-    const cursor = olderHistoryMatches ? olderHistory.cursor : undefined;
-    try {
-      const page = await api.agents.getHistoryPage(activeAgentId, cursor);
-      // 切会话/重连后旧请求才返回：直接丢弃，否则会覆盖新会话的旧页状态。
-      if (olderHistoryRequestRef.current !== requestId) return;
-      setOlderHistory((prev) => {
-        const base = prev.key === key ? prev.messages : [];
-        // 同一条消息可能同时出现在基线尾窗和文件页里（entryId/行边界历史遗留），
-        // 按稳定 message id 去重，避免重复气泡和 React key 冲突。
-        const seen = new Set(base.map((message) => message.id));
-        const incoming = page.messages.filter((message) => {
-          if (seen.has(message.id)) return false;
-          seen.add(message.id);
-          return true;
-        });
-        return {
-          key,
-          messages: [...incoming, ...base],
-          cursor: page.cursor,
-          hasMore: page.hasMore,
-        };
-      });
-    } catch (error) {
-      if (olderHistoryRequestRef.current !== requestId) return;
-      showToast(
-        t("app.loadOlderHistoryFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-      );
-    } finally {
-      if (olderHistoryLoadingRef.current === key) olderHistoryLoadingRef.current = null;
-      setOlderHistoryLoadingKey((prev) => (prev === key ? null : prev));
-    }
-  }, [
-    activeAgentId,
-    activeAgent?.sessionPath,
-    olderHistoryKey,
-    olderHistoryMatches,
-    olderHistory.cursor,
-    olderHistoryLoadingKey,
-  ]);
+  // 账本变更（翻到新页 / loading 翻转 / 基线失效）通过修订号触发重渲染；
+  // 作用域变化由上面的 useMemo 依赖自然驱动。
+  useSyncExternalStore(olderHistoryPaging.subscribe, olderHistoryPaging.getRevision);
+  // 把「用户当前在看哪个会话」登记给账本：切走后迟到的页必须丢弃，
+  // 而不是写进上一个会话的账本里等切回来时突然出现。
+  // 判定「同一个会话」的规则在账本里（会话身份 = agent + sessionPath，不含基线代号与
+  // historyHasOlder），这里只管把当前作用域交过去。
+  useEffect(() => {
+    olderHistoryPaging.abandonInFlight(olderHistoryScope);
+  }, [olderHistoryPaging, olderHistoryScope]);
+  const olderHistory = olderHistoryPaging.read(olderHistoryScope);
+  const olderHistoryForActive = olderHistory.olderMessages.length > 0
+    ? olderHistory.olderMessages
+    : undefined;
+  const hasOlderHistory = olderHistory.hasMore;
+  const olderHistoryLoading = olderHistory.loading;
+  const loadOlderHistory = useCallback(
+    () => olderHistoryPaging.loadNextPage(olderHistoryScope),
+    [olderHistoryPaging, olderHistoryScope],
+  );
   // 重连/压缩会把 transcript 替换成新的尾窗基线；继续拼接旧页会在两者之间留下空洞。
-  // 清掉旧页并递增代号，避免在途请求返回后把已失效的页重新写回当前 key。
+  // 账本据此清页并推进代号，在途请求返回后会被判过期而丢弃。
   useEffect(() => {
     if (!agentStarting) return;
-    setOlderHistory((prev) => (
-      prev.key === "" && prev.messages.length === 0
-        ? prev
-        : { key: "", messages: [], cursor: 0, hasMore: true }
-    ));
-    setOlderHistoryEpoch((epoch) => epoch + 1);
-    olderHistoryRequestRef.current += 1;
-    olderHistoryLoadingRef.current = null;
-    setOlderHistoryLoadingKey(null);
-  }, [agentStarting]);
+    olderHistoryPaging.invalidateBaseline();
+  }, [agentStarting, olderHistoryPaging]);
 
   // 菜单里的 steer 快捷键跟随设置；↓ + Enter 是固定组合，不随设置变化。
   const sendShortcutKeys =
