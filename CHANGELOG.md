@@ -56,6 +56,13 @@ All notable changes to PiDeck are documented here.
   an open select and its settings dialog. The composer's four centred palettes
   (model / mode / thinking level / prompt template) now share a `PickerPalette`
   shell too; each used to carry its own backdrop that only a mouse could dismiss.
+- **Context menus share one shell** — The file, project, agent, session, git-commit,
+  and session-source-filter context menus all render through `ContextMenuSurface`:
+  cursor positioning, viewport flipping, backdrop, and Escape live in one place.
+  Each of the six used to carry its own backdrop plus `stopPropagation` pair, the
+  flip correction existed twice, and none of them closed on Escape. The worktree
+  creation dialog and the fullscreen browser overlay now register with the
+  dismissal layer as well, so Escape no longer depends on the input keeping focus.
 - **All dropdowns share one listbox primitive** — `SelectField` and the Git panel
   filter no longer carry duplicated markup, ARIA wiring, and keyboard handling.
 - **Timeline projection is one module** — Message grouping (agent runs, thinking

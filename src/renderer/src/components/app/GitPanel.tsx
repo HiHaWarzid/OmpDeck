@@ -30,6 +30,7 @@ import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { Listbox } from "../ui/Listbox";
 import { useDismissableLayer } from "../ui/useDismissableLayer";
+import { ContextMenuSurface } from "../ui/ContextMenuSurface";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { showNotice } from "../../utils/notice";
 import { createGitStatusResource } from "../../utils/gitStatusResource";
@@ -2035,7 +2036,18 @@ function CommitHoverCard(props: {
   state: CommitDetailState | undefined;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  onDismiss: () => void;
 }) {
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  // 悬停卡片也是一层弹层：Esc 由关闭层统一消费，自己再挂 window keydown 会让一次
+  // Esc 同时关掉卡片和它下面那层（输入框历史导航、Radix Dialog）。
+  // 指针进出不参与「点外部关闭」——开合由 hover 计时器驱动。
+  useDismissableLayer({
+    open: true,
+    elementRef: cardRef,
+    dismissOnOutsidePointer: false,
+    onDismiss: props.onDismiss,
+  });
   const commit = props.state?.detail?.commit ?? props.hover.commit;
   const shortStat = props.state?.detail?.commit.shortStat;
   const gap = 8;
@@ -2060,6 +2072,7 @@ function CommitHoverCard(props: {
 
   return createPortal(
     <div
+      ref={cardRef}
       id="git-commit-hover"
       className="git-commit-hover"
       role="tooltip"
@@ -2291,23 +2304,14 @@ function SourceControlGraph(props: {
   }, [clearHoverTimer, props.open]);
 
   useEffect(() => {
-    const dismissOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        clearHoverTimer();
-        clearHoverDismissTimer();
-        setHover(null);
-      }
-    };
     // Hover 使用打开时缓存的 DOMRect；窗口尺寸变化后旧坐标不再可靠，直接关闭等待重新触发。
     const dismissOnResize = () => {
       clearHoverTimer();
       clearHoverDismissTimer();
       setHover(null);
     };
-    window.addEventListener("keydown", dismissOnEscape);
     window.addEventListener("resize", dismissOnResize);
     return () => {
-      window.removeEventListener("keydown", dismissOnEscape);
       window.removeEventListener("resize", dismissOnResize);
       clearHoverTimer();
       clearHoverDismissTimer();
@@ -2434,9 +2438,15 @@ function SourceControlGraph(props: {
     [clearHoverTimer, loadCommitDetail],
   );
 
+  /**
+   * 立即收起悬停卡片：点击展开、列表滚动、Esc 都由这里收尾。
+   * 同时复位 hoverOverCard——否则卡片在指针下被关掉时，行离开的延迟关闭会被它挡住，
+   * 下一次悬停要等计时器超时才重新出现。
+   */
   const dismissHover = useCallback(() => {
     clearHoverTimer();
     clearHoverDismissTimer();
+    hoverOverCard.current = false;
     setHover(null);
   }, [clearHoverTimer, clearHoverDismissTimer]);
 
@@ -2632,16 +2642,16 @@ function SourceControlGraph(props: {
               state={detailStates[hover.commit.hash]}
               onMouseEnter={handleCardMouseEnter}
               onMouseLeave={handleCardMouseLeave}
+              onDismiss={dismissHover}
             />
           )}
           {/* 提交右键菜单 */}
           {contextMenu && (
-            <div className="context-backdrop" onClick={closeContextMenu}>
-              <div
-                className="context-menu"
-                style={{ left: contextMenu.x, top: contextMenu.y }}
-                onClick={(event) => event.stopPropagation()}
-              >
+            <ContextMenuSurface
+              x={contextMenu.x}
+              y={contextMenu.y}
+              onClose={closeContextMenu}
+            >
                 <button
                   disabled={contextMenuLoading !== null}
                   onClick={() =>
@@ -2779,8 +2789,7 @@ function SourceControlGraph(props: {
                   ) : null}
                   {t("git.dropCommit")}
                 </button>
-              </div>
-            </div>
+            </ContextMenuSurface>
           )}
           {/* 确认弹框 */}
           {confirmAction && (

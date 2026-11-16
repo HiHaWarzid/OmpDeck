@@ -1,6 +1,7 @@
 /** 创建 worktree 弹窗。 */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { t } from "../../../i18n";
+import { useDismissableLayer } from "../../ui/useDismissableLayer";
 
 /** 创建 git worktree 的对话框 */
 export function WorktreeCreateDialog(props: {
@@ -11,10 +12,21 @@ export function WorktreeCreateDialog(props: {
 }) {
 	const [name, setName] = useState("");
 	const inputRef = useRef<HTMLInputElement>(null);
+	const dialogRef = useRef<HTMLDivElement>(null);
 
 	useEffect(() => {
 		inputRef.current?.focus();
 	}, []);
+
+	// Esc 归关闭层所有，而不是输入框的 onKeyDown：输入框失焦（点按钮、Tab 出去）后
+	// 原先那条路径就失效了，弹层却还在。外部点击仍由 backdrop 负责——关闭层在
+	// pointerdown 阶段关闭后，紧接的 click 会落到弹层下面，取消按钮会被顺带激活。
+	useDismissableLayer({
+		open: true,
+		elementRef: dialogRef,
+		dismissOnOutsidePointer: false,
+		onDismiss: props.onClose,
+	});
 
 	// 预览最终创建的分支名，与后端 WorktreeService.slugify 保持一致：
 	// 保留 Unicode 字母数字，其余字符替换为 -。让用户在提交前看到中文/特殊字符的实际结果，
@@ -31,6 +43,7 @@ export function WorktreeCreateDialog(props: {
 	return (
 		<div className="context-backdrop worktree-create-backdrop" onClick={props.onClose}>
 			<div
+				ref={dialogRef}
 				className="worktree-create-dialog"
 				onClick={(e) => e.stopPropagation()}
 			>
@@ -46,7 +59,6 @@ export function WorktreeCreateDialog(props: {
 						if (e.key === "Enter" && name.trim()) {
 							props.onCreate(name.trim());
 						}
-						if (e.key === "Escape") props.onClose();
 					}}
 					disabled={props.creating}
 				/>

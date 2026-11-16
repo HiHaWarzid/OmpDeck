@@ -45,6 +45,10 @@
   浏览器设备菜单与设置页模型选择器根本无法用键盘关闭，而一次 Esc 会同时关掉打开的下拉
   和它所在的设置弹框。composer 的模型 / 模式 / 思考档位 / 提示模板四个居中浮层同样收进
   `PickerPalette` 外壳：它们此前各写一份 backdrop，只有鼠标点空白处能关。
+- **右键菜单共用一套外壳** — 文件 / 项目 / Agent / 会话 / Git 提交 / 会话来源筛选六处右键
+  菜单收进 `ContextMenuSurface`：光标定位、视口翻转、backdrop 与 Esc 只写一次。此前六处
+  各写一份 backdrop 与 `stopPropagation`，坐标修正还有两份拷贝，且**没有一处能用 Esc 关闭**。
+  worktree 创建弹窗与浏览器全屏覆盖层也接上关闭层，Esc 不再依赖输入框是否聚焦。
 - **所有下拉共用 listbox 原语** — `SelectField` 与 Git 面板筛选器不再各存一份 markup、
   ARIA 结构与键盘行为。
 - **时间线投影收成一个模块** — 消息分组（agent 轮次、思考组、工具组）、比较这些分组所需的

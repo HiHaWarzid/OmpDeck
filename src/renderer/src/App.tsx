@@ -169,6 +169,7 @@ import {
   ProjectContextMenu,
   SessionContextMenu,
 } from "./components/app/menus/ContextMenus";
+import { ContextMenuSurface } from "./components/ui/ContextMenuSurface";
 import { ConfirmDialog } from "./components/ui/ConfirmDialog";
 import { ModalSurface } from "./components/ui/ModalSurface";
 import { TextField } from "./components/ui/TextField";
@@ -646,6 +647,7 @@ export function App() {
   const [editorsTargetPath, setEditorsTargetPath] = useState<string | null>(null);
   /** 浏览器全屏模式：在完整窗口覆盖层中渲染浏览器面板，不受右侧抽屉宽度限制。 */
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
+  const browserFullscreenRef = useRef<HTMLDivElement | null>(null);
   const editorsRef = useRef<HTMLDivElement>(null);
 
   // 点击编辑器气泡外部时关闭（Esc 同样可关，见共享关闭层）。
@@ -1375,6 +1377,7 @@ export function App() {
   const projectDragPreventClickRef = useRef(false);
 
   const scratchPad = useScratchPad();
+  const scratchPadOverlayRef = useRef<HTMLDivElement>(null);
 
   const activeProject = projects.find(
     (project) => project.id === activeProjectId,
@@ -2091,26 +2094,36 @@ export function App() {
     };
   }, []);
 
-  // 全局快捷键：Cmd/Ctrl+Shift+S 呼出/收起草稿本；Esc 关闭
+  // 全局快捷键：Cmd/Ctrl+Shift+S 呼出/收起草稿本；Esc 关闭走共享关闭层。
   const scratchPadToggle = scratchPad.toggle;
   const scratchPadClose = scratchPad.close;
   const scratchPadIsOpen = scratchPad.isOpen;
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const isSaveShortcut = (e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s";
-      if (isSaveShortcut) {
-        e.preventDefault();
-        scratchPadToggle();
-        return;
-      }
-      if (e.key === "Escape" && scratchPadIsOpen) {
-        e.stopPropagation();
-        scratchPadClose();
-      }
+      if (!isSaveShortcut) return;
+      e.preventDefault();
+      scratchPadToggle();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [scratchPadToggle, scratchPadClose, scratchPadIsOpen]);
+  }, [scratchPadToggle]);
+  // 草稿本是覆盖整个窗口的一层：Esc 由关闭层接管，弹框盖在它上面时只关弹框。
+  // 遮罩自身的 onClick 已经负责「点外部关闭」，这里不重复判指针，否则抬高层里的点击会误关它。
+  useDismissableLayer({
+    open: scratchPadIsOpen,
+    elementRef: scratchPadOverlayRef,
+    dismissOnOutsidePointer: false,
+    onDismiss: scratchPadClose,
+  });
+
+  // 浏览器全屏覆盖层同样是整窗一层：Esc 关闭，外部点击仍由它自己的 backdrop 处理。
+  useDismissableLayer({
+    open: browserFullscreen,
+    elementRef: browserFullscreenRef,
+    dismissOnOutsidePointer: false,
+    onDismiss: () => setBrowserFullscreen(false),
+  });
 
   // 桌面宠物点击跳转：主进程通知激活某 Agent，切到对应 project + agent tab
   useEffect(() => {
@@ -6208,15 +6221,12 @@ export function App() {
       {sessionFilterOpen && (() => {
         const currentFilter = sessionSourceFilter[sessionFilterOpen.projectId] ?? null;
         return (
-          <div className="context-backdrop" onClick={() => setSessionFilterOpen(null)}>
-            <div
-              className="context-menu filter-menu"
-              style={{
-                left: sessionFilterOpen.x,
-                top: sessionFilterOpen.y,
-              }}
-              onClick={(e) => e.stopPropagation()}
-            >
+          <ContextMenuSurface
+            x={sessionFilterOpen.x}
+            y={sessionFilterOpen.y}
+            className="filter-menu"
+            onClose={() => setSessionFilterOpen(null)}
+          >
               <div className="filter-menu-header">{t("menu.filterSessions")}</div>
               <label className="filter-menu-item">
                 <input
@@ -6245,8 +6255,7 @@ export function App() {
                   </span>
                 </label>
               ))}
-            </div>
-          </div>
+          </ContextMenuSurface>
         );
       })()}
       {projectMenu && (
@@ -6950,7 +6959,11 @@ filePath={gitDrawerDiff.filePath}
 
       {/* Scratch Pad（草稿本）：根级渲染，避免受 chat-pane grid 影响定位 */}
       {scratchPad.isOpen || scratchPad.isClosing ? (
-        <div className={`scratch-pad-overlay${scratchPad.isClosing ? " closing" : ""}`} onClick={() => scratchPad.close()}>
+        <div
+          ref={scratchPadOverlayRef}
+          className={`scratch-pad-overlay${scratchPad.isClosing ? " closing" : ""}`}
+          onClick={() => scratchPad.close()}
+        >
           <Suspense fallback={null}>
           <ScratchPadPanel
             drafts={scratchPad.drafts}
@@ -7024,7 +7037,7 @@ filePath={gitDrawerDiff.filePath}
 
       {/* 浏览器全屏覆盖层 */}
       {browserFullscreen && (
-        <div className="modal-backdrop" onClick={() => setBrowserFullscreen(false)}>
+        <div className="modal-backdrop" onClick={() => setBrowserFullscreen(false)} ref={browserFullscreenRef}>
           <div className="browser-modal" onClick={(e) => e.stopPropagation()}>
             <Suspense fallback={LazyPanelFallback}>
               <BrowserPanel

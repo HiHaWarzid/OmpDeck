@@ -2687,8 +2687,8 @@ export class AgentManager {
 			if (lines.length === 0 || !lines[0].trim()) {
 				throw new Error("Session file is empty");
 			}
-			// �ĵ�һ�� JSON ���󣬼��� _reloadMarker �ֶΣ����� pi ���·������Ļ��档
-			// ֻ�ĵ�һ�е����ݣ����ı��нṹ��ʹ marker ���������ļ���Ȼ�ǺϷỰ��
+			// 改第一行 JSON 对象，加入 _reloadMarker 字段，迫使 pi 重新发现并重载该会话。
+			// 只改第一行的内容，不改文件行结构，使 marker 即便残留，文件仍是合法会话。
 			const firstLine = JSON.parse(lines[0]) as Record<string, unknown>;
 			delete firstLine._reloadMarker; // 先清除旧的，确保值不同
 			firstLine._reloadMarker = markerId;
@@ -2717,7 +2717,7 @@ export class AgentManager {
 				elapsedMs: Date.now() - startTime,
 			});
 
-			// �ָ���һ�У��Ƴ� _reloadMarker �ֶΣ������ļ���ԭʼ״̬
+			// 恢复第一行：移除 _reloadMarker 字段，把文件还原到原始状态
 			try {
 				const afterRaw = await readFile(sessionHostPath, "utf8");
 				const afterLines = afterRaw.split(/\r?\n/);
@@ -2728,7 +2728,7 @@ export class AgentManager {
 					await writeFile(sessionHostPath, afterLines.join("\n"), "utf8");
 				}
 			} catch {
-				// _reloadMarker �ֶ����� residue ���ᵼ�� pi ���Է�����������Ӱ���Ựʹ��
+				// _reloadMarker 残留只会让 pi 多读一次会话，不影响使用
 			}
 
 			if (!response.success) {

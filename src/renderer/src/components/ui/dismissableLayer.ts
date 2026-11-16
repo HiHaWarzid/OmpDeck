@@ -1,13 +1,13 @@
 /**
  * 弹层关闭层（dismissable layer）：所有「点外部关闭 / Esc 关闭」行为的唯一属主。
  *
- * 为什么收成一个 module：此前渲染层有 9 处各自 `document.addEventListener`，分成两套事件名
+ * 为什么收成一个 module：此前渲染层有 9 处各自监听 window/document，分成两套事件名
  * （mousedown / pointerdown）、两种相位（发送方式菜单用捕获阶段抢在输入框之前），
  * 焦点归还在其中 1 处，Esc 只有 6 处实现——浏览器设备菜单与设置页模型选择器**根本关不掉**。
  * AGENTS.md 甚至为自定义下拉写了一条「必须支持 Esc / 点击外部 / ArrowUp/Down」的例外配方：
  * 那是一份「不存在的 module」的规格说明，于是每个新弹层都再实现一遍，漏掉两处。
  *
- * 现在只有一份 document 监听（用引用计数按需装卸），每条不变式只写一次：
+ * 现在只有一份 window 捕获监听（用引用计数按需装卸），每条不变式只写一次：
  *
  * - 外部点击：关闭**所有**不包含点击目标的层。点进父层内部时只有内层关闭。
  * - Esc：只有栈顶可关的那一层消费按键，并在捕获阶段 `preventDefault + stopPropagation`。
@@ -94,7 +94,7 @@ function stopListening(): void {
 
 /**
  * 注册一层打开的弹层。返回注销函数（幂等）。
- * 每次注册/注销都会按需装卸唯一的一份 document 监听：没有打开的层时不占监听器。
+ * 每次注册/注销都会按需装卸唯一的一份 window 捕获监听：没有打开的层时不占监听器。
  */
 export function registerDismissableLayer(spec: DismissableLayerSpec): () => void {
 	layers.push(spec);

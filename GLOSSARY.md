@@ -319,7 +319,7 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 此前渲染层有 9 处各自 `document.addEventListener`，分成两套事件名（`mousedown` / `pointerdown`）、两种相位（发送方式菜单用捕获阶段抢在输入框之前），焦点归还只有 1 处，Esc 只有 6 处实现——浏览器设备菜单与设置页模型选择器**根本关不掉**。接口是「注册一层，告诉我它什么时候该关」，不是「每个组件自己组装监听」。
 
-四条不变式只写一次：**外部点击关闭所有不含点击目标的层**（点进去父层内部时只有内层关闭）、**Esc 只关栈顶一层并消费按键**（捕获阶段 `preventDefault + stopPropagation`，输入框的历史导航与 Radix Dialog 不会被顺带触发）、**Esc 关闭前先归还焦点再通知关闭**（触发器 `onFocus` 可能重新打开菜单，同批次内以关闭收尾；鼠标点外部时不抢焦点）、**一份 document 监听按引用计数装卸**（没有打开的层就不占监听器）。
+四条不变式只写一次：**外部点击关闭所有不含点击目标的层**（点进去父层内部时只有内层关闭）、**Esc 只关栈顶一层并消费按键**（捕获阶段 `preventDefault + stopPropagation`，输入框的历史导航与 Radix Dialog 不会被顺带触发）、**Esc 关闭前先归还焦点再通知关闭**（触发器 `onFocus` 可能重新打开菜单，同批次内以关闭收尾；鼠标点外部时不抢焦点）、**一份 window 捕获监听按引用计数装卸**（没有打开的层就不占监听器）。
 
 两个身份必须分开：`getElement` 表达「这一层的边界在哪」，`getReturnFocus` 表达「关闭后焦点去哪」。**二者都按需读取、不做快照**——层内的容器节点会随状态重建（模型角色选择器在角色之间切换），快照会指向已卸载的旧节点，于是每一次点击都被判成「外部」。
 
@@ -340,6 +340,15 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 焦点归还取**打开瞬间的 `activeElement`**，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的 memo 组件里，为一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取——模型选择器的搜索框带 `autoFocus`，等副作用阶段读到的已是浮层内部的输入框。
 
 规则：新增居中浮层用 `PickerPalette`，只传 `className` 和内容；不要在调用点重写 backdrop / `stopPropagation` 这对组合。
+
+### ContextMenuSurface（右键菜单外壳）
+「光标定位 + backdrop + 视口翻转」的**唯一结构实现**（`components/ui/ContextMenuSurface.tsx`）。文件 / 项目 / Agent / 会话 / Git 提交 / 会话来源筛选六处右键菜单都只是它的内容。
+
+此前六处各写一份 `context-backdrop` + 内层 `stopPropagation` + 各自的坐标修正（`useMenuPosition` 与 FileContextMenu 的内联版本是同一段逻辑的两份拷贝），并且**没有一处能用 Esc 关闭**——关闭被实现成只有鼠标能走的路径。外壳独占坐标翻转、backdrop 与 Esc，调用方只提供 `x/y` 与按钮列表。
+
+外部点击**故意留给 backdrop**，而不是关闭层的 `pointerdown`：关闭层在 pointerdown 阶段同步关闭后，紧接的 `click` 会落到菜单下面那个元素上，一次「关菜单」会顺带激活下层按钮。backdrop 挡在中间吞掉这次 `click` 才是菜单语义；Esc 没有这个问题，所以它走关闭层（`dismissOnOutsidePointer: false`）。
+
+规则：新增右键菜单用 `ContextMenuSurface`，不要重写 backdrop / 定位 / `stopPropagation`。
 
 # 时间线投影与输入建议（Renderer 领域术语）
 
