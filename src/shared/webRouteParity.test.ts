@@ -10,7 +10,7 @@ import { matchWebRoute, webRoutePathParams, webRoutes, webRouteUrl, type WebRest
  * - 桌面 renderer 走 browserApi（从 webRoutes 派生路径）；
  * - 服务端分发走 matchWebRoute（同一张表）；
  * - `src/renderer/public/mobile.js` 是浏览器里直接跑的脚本集合，没有构建步骤，无法 import 共享表；
- * - `WebServiceManager.renderPage()` 是 index.html 缺失时返回的内联降级页，同样手写路径。
+ * - `src/main/web/fallbackPage.html` 是 index.html 缺失时返回的降级页，同样手写路径。
  *
  * 后两者只能**静态核对**：从源码里抽出所有 `/api/...` 字面量，归一成路径形状后与
  * webRoutes 比对。只要有一侧漂移（服务端改路径、客户端改字面量、新增端点只在一边），
@@ -23,6 +23,7 @@ import { matchWebRoute, webRoutePathParams, webRoutes, webRouteUrl, type WebRest
 
 const MOBILE_JS = join(process.cwd(), "src/renderer/public/mobile.js");
 const WEB_SERVICE_MANAGER = join(process.cwd(), "src/main/web/WebServiceManager.ts");
+const FALLBACK_PAGE = join(process.cwd(), "src/main/web/fallbackPage.html");
 
 /** 不属于 webRoutes 聚合/直连端点（改这里等于承认又加了一个手写路由）。 */
 const AGGLOMERATE_ROUTES = ["/api/state", "/api/health", "/api/web/status"];
@@ -131,37 +132,6 @@ function collectRouteLiterals(source: string): string[] {
 	return [...literals];
 }
 
-/**
- * 抽出 renderPage() 内联页面的可扫描源码。
- *
- * 降级页不是独立文件：它嵌在 TS 模板字符串里，内层模板的 ` 与 ${ 都被转义过
- * （`` \` `` / `\${`），必须先反转义，才能与 mobile.js 共用同一个抽取器。
- */
-function readFallbackPage(source: string): string {
-	const marker = "private renderPage()";
-	const start = source.indexOf(marker);
-	if (start < 0) {
-		throw new Error("WebServiceManager.renderPage() 找不到了：降级页抽取器需要更新");
-	}
-	const open = source.indexOf("`", start);
-	let index = open + 1;
-	let escaped = false;
-	for (; index < source.length; index++) {
-		const char = source[index];
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
-		if (char === "\\") {
-			escaped = true;
-			continue;
-		}
-		if (char === "`") break;
-	}
-	const body = source.slice(open + 1, index);
-	return body.replace(/\\`/g, "`").replace(/\\\$\{/g, "${");
-}
-
 /** 表内端点：键为路径形状，值为命名空间.成员（失败信息里可读）。 */
 function routePaths(): Map<string, string> {
 	const byPath = new Map<string, string>();
@@ -179,8 +149,8 @@ function routePaths(): Map<string, string> {
 const CLIENTS = [
 	{ name: "mobile.js", source: readFileSync(MOBILE_JS, "utf8") },
 	{
-		name: "WebServiceManager.renderPage()",
-		source: readFallbackPage(readFileSync(WEB_SERVICE_MANAGER, "utf8")),
+		name: "fallbackPage.html",
+		source: readFileSync(FALLBACK_PAGE, "utf8"),
 	},
 ];
 

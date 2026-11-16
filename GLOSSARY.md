@@ -248,6 +248,19 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 ## 术语
 
+### 无产物降级页（fallbackPage.html）
+`main/web/fallbackPage.html`：`index.html` 缺失时 Web 服务返回的兜底页面（也是路由奇偶守卫的扫描对象之一）。以 `?raw` 内联进主进程产物，页面内容零插值。
+
+它曾经是 `WebServiceManager.renderPage()` 里的一段 214 行模板字符串，代价全落在守卫上：页面里的 `/api/...` 字面量必须被扫描，而扫描器只能手写「找 `private renderPage()` → 定位反引号 → 逐字符走转义」的抽取器，方法一改名就抛错；页面本身也没有任何语言服务/格式化/渲染测试。搬成资源文件后，守卫用与 `mobile.js` 同一个抽取器，抽取器消失。
+
+规则：页面里需要注入运行时数据就经 `/api/state` 拉取，不要把插值塞回模板字符串——一旦有插值就不可能再当静态资源。
+
+# 右侧面板（Renderer 领域术语）
+
+> 第四领域：右侧面板（文件 / Git / 浏览器）的状态机，源自架构评审候选 1「Collapse the right-panel FSM into one module」。维护规则同上。
+
+## 术语
+
 ### SessionPanelHost（右侧面板宿主）
 右侧面板状态的**唯一所有者**：`hooks/useSessionPanelHost.ts`（React 适配器：收起动画 timer、项目切换恢复一次性触发、副作用落地）+ `components/app/panel/sessionPanelState.ts`（纯归约）。App 只消费派生视图与意图方法，拿不到 raw setter。
 
