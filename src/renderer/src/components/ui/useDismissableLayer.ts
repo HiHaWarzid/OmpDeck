@@ -16,6 +16,11 @@ export function useDismissableLayer(options: {
 	open: boolean;
 	elementRef: RefObject<HTMLElement | null>;
 	onDismiss: (reason: DismissReason) => void;
+	/**
+	 * 覆盖「打开它的元素」。缺省时自动取打开瞬间聚焦的元素——必须在**渲染期**记，
+	 * 不能等到注册：层内输入框的 `autoFocus` 在 commit 时就抢走了焦点，
+	 * 此时再读 activeElement 只会读到即将卸载的层内节点，焦点归还变成把焦点丢给弹框。
+	 */
 	returnFocusRef?: RefObject<HTMLElement | null>;
 	dismissOnOutsidePointer?: boolean;
 	dismissOnEscape?: boolean;
@@ -24,11 +29,28 @@ export function useDismissableLayer(options: {
 	const dismissRef = useRef(options.onDismiss);
 	dismissRef.current = options.onDismiss;
 
+	// 打开这一帧的 activeElement 就是触发器（点按钮 → 按钮聚焦 → 状态位翻真）。
+	const wasOpenRef = useRef(false);
+	const openerRef = useRef<HTMLElement | null>(null);
+	if (open && !wasOpenRef.current && typeof document !== "undefined") {
+		const active = document.activeElement;
+		openerRef.current = active instanceof HTMLElement ? active : null;
+	}
+	wasOpenRef.current = open;
+
 	useEffect(() => {
 		if (!open) return;
 		return registerDismissableLayer({
 			getElement: () => elementRef.current,
-			getReturnFocus: returnFocusRef ? () => returnFocusRef.current : undefined,
+			getReturnFocus: returnFocusRef
+				? () => returnFocusRef.current
+				: () => {
+						// body 表示打开时没有真实焦点（脚本打开、点空白处），归还给它没有意义；
+						// 触发器可能已经随渲染被卸载，那时也不该 focus 一个游离节点。
+						const opener = openerRef.current;
+						if (!opener || opener === document.body || !opener.isConnected) return null;
+						return opener;
+					},
 			dismissOnOutsidePointer: options.dismissOnOutsidePointer,
 			dismissOnEscape: options.dismissOnEscape,
 			onDismiss: (reason) => dismissRef.current(reason),

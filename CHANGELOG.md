@@ -49,13 +49,14 @@ All notable changes to PiDeck are documented here.
   `apiKey`; imports keep the target machine's existing keys and only take an
   explicitly non-empty key from the package.
 - **Popovers share one dismissal layer** — Every popover now closes on outside
-  click and on Escape, one Escape closes only the innermost layer, and focus
-  returns to the trigger. Previously nine separate document listeners used two
-  event names and two phases; the browser device menu and the settings model
-  picker could not be closed with the keyboard at all, and one Escape closed both
-  an open select and its settings dialog. The composer's four centred palettes
-  (model / mode / thinking level / prompt template) now share a `PickerPalette`
-  shell too; each used to carry its own backdrop that only a mouse could dismiss.
+  click and on Escape, one Escape closes only the innermost layer, and focus goes
+  back to whatever opened it (unless that was nothing). Previously nine separate
+  document listeners used two event names and two phases; the browser device menu
+  and the settings model picker could not be closed with the keyboard at all, and
+  one Escape closed both an open select and its settings dialog. The composer's
+  four centred palettes (model / mode / thinking level / prompt template) now
+  share a `PickerPalette` shell too; each used to carry its own backdrop that only
+  a mouse could dismiss.
 - **Context menus share one shell** — The file, project, agent, session, git-commit,
   and session-source-filter context menus all render through `ContextMenuSurface`:
   cursor positioning, viewport flipping, backdrop, and Escape live in one place.

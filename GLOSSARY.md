@@ -323,7 +323,9 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 四条不变式只写一次：**外部点击关闭所有不含点击目标的层**（点进去父层内部时只有内层关闭）、**Esc 只关栈顶一层并消费按键**（捕获阶段 `preventDefault + stopPropagation`，输入框的历史导航与 Radix Dialog 不会被顺带触发）、**Esc 关闭前先归还焦点再通知关闭**（触发器 `onFocus` 可能重新打开菜单，同批次内以关闭收尾；鼠标点外部时不抢焦点）、**一份 window 捕获监听按引用计数装卸**（没有打开的层就不占监听器）。
 
-两个身份必须分开：`getElement` 表达「这一层的边界在哪」，`getReturnFocus` 表达「关闭后焦点去哪」。**二者都按需读取、不做快照**——层内的容器节点会随状态重建（模型角色选择器在角色之间切换），快照会指向已卸载的旧节点，于是每一次点击都被判成「外部」。
+两个身份必须分开：`getElement` 表达「这一层的边界在哪」，`getReturnFocus` 表达「关闭后焦点去哪」。`getElement` **按需读取、不做快照**——层内的容器节点会随状态重建（模型角色选择器在角色之间切换），快照会指向已卸载的旧节点，于是每一次点击都被判成「外部」。`getReturnFocus` 相反**必须在渲染期快照**打开瞬间的 `activeElement`：层内输入框的 `autoFocus` 在 commit 阶段就把焦点抢走了，等到注册（副作用）再读只会拿到一个随即卸载的层内节点。
+
+自动快照让「焦点归还」成为关闭层的默认行为而不是逐点接线：此前只有发送方式菜单、`Listbox`、`PickerPalette` 显式传 `returnFocusRef`，设备菜单、分支下拉、模型角色选择器、会话操作菜单的 Esc 都把焦点丢给弹框或 `body`，文档却统一宣称「焦点回到触发器」。调用方仍可传 `returnFocusRef` 覆盖（触发器不是当时的 `activeElement`，例如右键菜单）。打开时 `activeElement` 就是 `body`、或触发器已卸载，则不抢焦点。
 
 规则：新增任何弹层都调 `useDismissableLayer`，不自己 `addEventListener`；需要禁用某条关闭路径时传 `dismissOnOutsidePointer: false` / `dismissOnEscape: false`，不要复制一份监听再删掉两行。
 
@@ -341,7 +343,7 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 两条关闭路径按各自的能力分工，不是重复：Esc 走关闭层；外部点击走 backdrop 自己的 `click`（`dismissOnOutsidePointer: false`）。关闭层在 pointerdown 阶段就同步关闭，浮层随即卸载，紧随其后的 `click` 会落到浮层下面那个元素上——composer 浮层下面就是发送按钮，一次「关浮层」会顺带把消息发出去。与 `ContextMenuSurface`、`WorktreeCreateDialog` 是同一套取舍。
 
-焦点归还取**打开瞬间的 `activeElement`**，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的 memo 组件里，为一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取——模型选择器的搜索框带 `autoFocus`，等副作用阶段读到的已是浮层内部的输入框。
+焦点归还取**打开瞬间的 `activeElement`**，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的 memo 组件里，为一次 `.focus()` 把 ref 穿过整条链得不偿失。快照由关闭层在**渲染期**取（见 `DismissableLayer`），不是本外壳自己的逻辑——`PickerPalette` 不传 `returnFocusRef`。
 
 规则：新增居中浮层用 `PickerPalette`，只传 `className` 和内容；不要在调用点重写 backdrop / `stopPropagation` 这对组合。
 

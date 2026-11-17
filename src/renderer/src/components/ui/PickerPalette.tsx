@@ -12,9 +12,9 @@ import { useDismissableLayer } from "./useDismissableLayer";
  * 那次点击不会继续穿透到下面的按钮（关闭层在 pointerdown 就卸载浮层，click 会落到下层）。
  *
  * 焦点归还取「打开瞬间的 activeElement」，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的
- * memo 组件里，为了一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取：
- * 模型选择器的搜索框带 `autoFocus`，等到副作用阶段读到的已是浮层内部的输入框，
- * 归还焦点会落到一个随即卸载的节点上。
+ * memo 组件里，为了一次 `.focus()` 把 ref 穿过整条链得不偿失。快照由关闭层在渲染期取
+ * （理由见 `useDismissableLayer`）：模型选择器的搜索框带 `autoFocus`，等到副作用阶段读到的
+ * 已是浮层内部的输入框，归还焦点会落到一个随即卸载的节点上。
  */
 
 export type PickerPaletteProps = {
@@ -27,14 +27,6 @@ export type PickerPaletteProps = {
 
 export function PickerPalette(props: PickerPaletteProps) {
 	const paletteRef = useRef<HTMLDivElement | null>(null);
-	const returnFocusRef = useRef<HTMLElement | null>(null);
-	if (returnFocusRef.current === null) {
-		const active = document.activeElement;
-		// body 表示没有真实焦点（点空白处或脚本打开），归还给它没有意义。
-		if (active instanceof HTMLElement && active !== document.body) {
-			returnFocusRef.current = active;
-		}
-	}
 
 	useDismissableLayer({
 		open: true,
@@ -42,7 +34,6 @@ export function PickerPalette(props: PickerPaletteProps) {
 		// 外部点击由 backdrop 的 click 承担，理由见文件头。
 		dismissOnOutsidePointer: false,
 		onDismiss: props.onClose,
-		returnFocusRef,
 	});
 
 	return (
