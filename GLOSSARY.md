@@ -271,7 +271,9 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 它曾经是 `WebServiceManager.renderPage()` 里的一段 214 行模板字符串，代价全落在守卫上：页面里的 `/api/...` 字面量必须被扫描，而扫描器只能手写「找 `private renderPage()` → 定位反引号 → 逐字符走转义」的抽取器，方法一改名就抛错；页面本身也没有任何语言服务/格式化/渲染测试。搬成资源文件后，守卫用与 `mobile.js` 同一个抽取器，抽取器消失。
 
-规则：页面里需要注入运行时数据就经 `/api/state` 拉取，不要把插值塞回模板字符串——一旦有插值就不可能再当静态资源。
+页面脚本把 `/api/state` 的字段拼进 `innerHTML`，所以**每一个插值都必须过 `escapeHtml`**，包括 `data-*` 属性值、`class` 里的角色名和状态文案。该页面与 `/api/*` 同源，一个能携带标签的字段就等于「打开了降级页的人可以驱动本机 agent」（回环豁免无需令牌）。今天 `project.id` / `agent.id` 是 `randomUUID()`、`status` 与 `role` 是闭集，没有可利用路径；`fallbackPageEscaping.test.ts` 用恶意字段跑真实脚本，守住下一次字段来源变化。
+
+规则：页面里需要注入运行时数据就经 `/api/state` 拉取，不要把插值塞回模板字符串——一旦有插值就不可能再当静态资源。新增任何拼进 `innerHTML` 的字段，先过 `escapeHtml` 并把字段加进 `fallbackPageEscaping.test.ts` 的 `HOSTILE` 样本。
 
 # 右侧面板（Renderer 领域术语）
 

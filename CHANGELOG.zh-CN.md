@@ -81,6 +81,7 @@
 
 - **默认仅监听回环地址** — `webServiceHost` 默认从 `0.0.0.0` 改为 `127.0.0.1`；局域网访问需要在设置中显式切换。
 - **非回环请求强制令牌** — 手机、其他设备和隧道域名访问 API 必须携带 `Authorization: Bearer`、`X-Omp-Token` 或 `?token=`；仅本机回环地址或实际绑定主机免令牌，任意 IP 字面量 Host 不再免令牌，本机反向代理改写 Host 也不会被误判成本机直连。带反向代理转发头（Tailscale Serve、Cloudflare Tunnel、`Forwarded`、`X-Real-IP` 等）的请求即使从 `127.0.0.1` 回源也不会被当作本机直连。
+- **Web 降级页的注入面收口** — 页面脚本把 `/api/state` 的 `project.id` / `agent.id` / `status` / `message.role` 直接拼进 `innerHTML`，漏掉 `escapeHtml` 就等于「同源脚本可控」；这些字段现已全部转义，新增 `fallbackPageEscaping.test.ts` 用恶意字段跑真实脚本守住下一次字段来源变化（此前这些字段是 `randomUUID()` 与闭集，无可利用路径）。
 - **写请求防护** — 校验 Origin 与 Host 一致、拒绝非 JSON Content-Type，按 IP 限制写操作频率（120 次/分钟），请求体上限 2MB。
 - 局域网裸 HTTP 不加密，跨网络请使用 Tailscale Serve / Cloudflare Tunnel 等 HTTPS 入口，不要把服务端口直接暴露到公网。
 

@@ -103,24 +103,24 @@
 		}
 		function render() {
 			el("projects").innerHTML = state.projects.map(project => `
-				<button class="item ${project.id === creatingProjectId ? "loading" : ""}" data-project="${project.id}" ${creatingProjectId ? "disabled" : ""}>
+				<button class="item ${project.id === creatingProjectId ? "loading" : ""}" data-project="${escapeHtml(project.id)}" ${creatingProjectId ? "disabled" : ""}>
 					<strong>${escapeHtml(project.name)}</strong>
 					<small>${project.id === creatingProjectId ? '<span class="pulse"></span>正在打开...' : escapeHtml(project.path)}</small>
 				</button>`).join("");
 			el("agents").innerHTML = state.agents.map(agent => `
 				<div class="agent-row">
-					<button class="item ${agent.id === activeAgentId ? "active" : ""}" data-agent="${agent.id}">
+					<button class="item ${agent.id === activeAgentId ? "active" : ""}" data-agent="${escapeHtml(agent.id)}">
 						<strong>${escapeHtml(agent.title)}</strong>
-						<small>${agent.status === "running" ? '<span class="pulse"></span>' : ""}${agent.status} · ${escapeHtml(agent.cwd)}</small>
+						<small>${agent.status === "running" ? '<span class="pulse"></span>' : ""}${escapeHtml(agent.status)} · ${escapeHtml(agent.cwd)}</small>
 					</button>
-					<button class="close-agent ghost" data-close-agent="${agent.id}" title="关闭 Agent">关闭</button>
+					<button class="close-agent ghost" data-close-agent="${escapeHtml(agent.id)}" title="关闭 Agent">关闭</button>
 				</div>`).join("");
 			const agent = state.agents.find(item => item.id === activeAgentId);
 			el("title").textContent = agent ? agent.title : "选择或创建 Agent";
-			el("status").innerHTML = agent?.status === "running" ? '<span class="pulse"></span>正在响应...' : (agent ? agent.status : "已连接");
+			el("status").innerHTML = agent?.status === "running" ? '<span class="pulse"></span>正在响应...' : escapeHtml(agent ? agent.status : "已连接");
 			const messages = activeAgentId ? state.messagesByAgent[activeAgentId] || [] : [];
 			el("messages").innerHTML = messages.length
-				? messages.map(message => `<div class="message ${message.role}"><span class="role">${message.role}</span>${escapeHtml(message.text || "")}</div>`).join("")
+				? messages.map(message => `<div class="message ${escapeHtml(message.role)}"><span class="role">${escapeHtml(message.role)}</span>${escapeHtml(message.text || "")}</div>`).join("")
 				: '<div class="empty">暂无消息</div>';
 			el("prompt").disabled = !agent;
 			el("composer").querySelector("button[type=submit]").disabled = !agent;
