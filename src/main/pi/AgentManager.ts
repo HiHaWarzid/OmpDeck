@@ -85,7 +85,7 @@ import {
 	mergeSubagentFrame,
 	normalizePiQueue,
 	normalizeRuntimeSnapshot,
-	readSubagentFrameIdentity,
+	readSubagentFrameId,
 	retryStatusText,
 	type PiAssistantEvent,
 	type PiSubagentFrame,
@@ -2401,16 +2401,14 @@ export class AgentManager {
 	 * 合并 subagent_lifecycle / subagent_progress 帧。
 	 *
 	 * 合并规则（身份/id 复用/终态粘滞/字段向后合并）在 `mergeSubagentFrame` 里，
-	 * 这里是唯一的副作用面：写 registry 并发事件。
+	 * 这里是唯一的副作用面：写 registry 并发事件。同一 id 的新一次运行不需要这里
+	 * 先删旧记录——`mergeSubagentFrame` 在 lifecycle(started) 上换用空基线，
+	 * 返回值本就不带上一轮的统计与终态。
 	 */
 	private applySubagentFrame(runtime: AgentRuntime, frame: PiSubagentFrame) {
-		const identity = readSubagentFrameIdentity(frame);
-		if (!identity) return;
-		// lifecycle(started) 是一次全新运行：先丢掉上一次的统计与终态，
-		// 否则终态粘滞会把同一 id 的新运行永久钉在 completed。
-		if (identity.restarted) runtime.subagents.delete(identity.id);
-		const previous = runtime.subagents.get(identity.id);
-		const next = mergeSubagentFrame(previous, frame);
+		const id = readSubagentFrameId(frame);
+		if (!id) return;
+		const next = mergeSubagentFrame(runtime.subagents.get(id), frame);
 		if (!next) return;
 		runtime.subagents.set(next.id, next);
 		this.emitSubagents(runtime);

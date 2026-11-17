@@ -176,7 +176,10 @@ describe("工具与压缩帧", () => {
 
 	it("两帧同时带 errorMessage 与 finalError 时各自取权威字段", () => {
 		// omp 线格式里 auto_retry_start 带 errorMessage、auto_retry_end 带 finalError；
-		// 若某版本两个都带，起帧信 errorMessage、终帧信 finalError，与原实现一致。
+		// 若某版本两个都带，起帧信 errorMessage、终帧信 finalError。
+		// 注意这与迁移前不同：旧实现的重试卡片统一取 errorMessage，而失败文案取
+		// finalError，两处文案可能各说各话；现在终帧统一取 finalError，卡片与
+		// 「请求失败：…」一致。
 		expect(effectOf({ type: "auto_retry_start", errorMessage: "429", finalError: "boom" }))
 			.toMatchObject({ kind: "retry-start", reason: "429" });
 		expect(effectOf({ type: "auto_retry_end", success: false, errorMessage: "429", finalError: "boom" }))

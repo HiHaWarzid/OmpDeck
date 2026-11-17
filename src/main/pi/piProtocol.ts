@@ -97,20 +97,20 @@ const NON_WORK_FRAME_TYPES = new Set([
 export type PiSubagentFrame = { frame: "lifecycle" | "progress"; payload: Raw };
 
 /**
- * 一帧子代理事件对应的 registry 键，以及它是否代表「同一 id 的新一次运行」。
+ * 一帧子代理事件对应的 registry 键。
  *
- * 返回 `undefined` 表示帧里没有可用 id（不能凭空造空记录）。`restarted` 由
- * lifecycle(started) 判定：omp 的 subagentId 在 session 内可复用，新的 started
- * 必须丢弃上一次的统计与终态，否则终态粘滞会把新运行永久钉在 completed。
+ * 返回 `undefined` 表示帧里没有可用 id（不能凭空造空记录）。id 来源是
+ * `payload.progress.id` 优先、`payload.id` 兜底——progress 帧把身份埋在 progress 里，
+ * lifecycle 帧放在顶层；这条规则收在这里，`mergeSubagentFrame` 与调用方共用。
+ *
+ * 「同一 id 的新一次运行」不是身份的一部分：它决定的是合并基线（见
+ * `mergeSubagentFrame`），放在这里会让调用方误以为要自己处理重置。
  */
-export function readSubagentFrameIdentity(
-	input: PiSubagentFrame,
-): { id: string; restarted: boolean } | undefined {
+export function readSubagentFrameId(input: PiSubagentFrame): string | undefined {
 	const progress = asRecord(input.payload.progress);
 	const source = progress ?? input.payload;
 	const id = readString(source.id) || readString(input.payload.id) || "";
-	if (!id) return undefined;
-	return { id, restarted: input.frame === "lifecycle" && source.status === "started" };
+	return id || undefined;
 }
 
 /** 子代理已收口状态：到达后不再被迟到的 progress("running") 覆盖。 */
@@ -507,15 +507,18 @@ export function decodePiFrame(event: unknown, now: number): PiFrame | undefined 
  * lifecycle 只保证身份与终态，progress 才有运行摘要；两者按字段向后合并，
  * 避免后到的 lifecycle(completed) 把 progress 的统计清空。返回 undefined 表示这一帧
  * 没有可用的 id，调用方据此跳过（不能凭空造一条空记录）。
+ *
+ * id 复用的重置也在这里：omp 的 subagentId 在 session 内可复用（同名 agent 再次派生），
+ * lifecycle(started) 换成空基线重新开始，因此调用方不必先删旧记录。
  */
 export function mergeSubagentFrame(
 	previous: AgentSubagent | undefined,
-	input: { frame: "lifecycle" | "progress"; payload: Raw },
+	input: PiSubagentFrame,
 ): AgentSubagent | undefined {
 	const { frame, payload } = input;
 	const progress = asRecord(payload.progress);
 	const source = progress ?? payload;
-	const id = readString(source.id) || readString(payload.id) || "";
+	const id = readSubagentFrameId(input);
 	if (!id) return undefined;
 
 	// omp 的 subagentId 在 session 内可能复用（同名 agent 再次派生）：新的

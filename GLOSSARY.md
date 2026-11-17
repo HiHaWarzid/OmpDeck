@@ -192,6 +192,8 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：新增帧种、字段改名、跨版本命令名探测的判定都进本 module；调用方只按 `effect.kind` 分派副作用，不得再读 `event.type`。`piRpcCompat` 只保留「新名优先、旧名兜底」的发送策略，失败类别仍由本 module 判定。
 
+子代理帧的**合并语义**同属本 module：`mergeSubagentFrame` 负责身份取值（`progress.id` 优先、`payload.id` 兜底）、id 复用重置（`lifecycle(started)` 换空基线）、终态粘滞与字段向后合并，调用方只写 registry。判定与写回分开后，「同一 `subagentId` 的新一次运行」不再需要调用方先删旧记录——两份实现曾在 `readSubagentFrameIdentity.restarted` 与合并基线里各写一遍。
+
 ### AgentRunSupervisor（运行静默监督器）
 单 agent 的 per-run 定时器与「事件流是否还活着」判定的**唯一属主**（`main/pi/agentRunSupervisor.ts`）。settle 轮询、abort 兜底、空响应窗口、会话结束通知四个窗口以前是四份 `Map<agentId, Timeout>` + 15 个 AgentManager 私有方法，且与转录/事件/通知副作用写在同一层。
 
