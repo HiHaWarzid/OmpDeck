@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { sameChatMessageForRender, sameImageListForRender } from "./timelineProjection";
+import {
+	groupToolMessages,
+	sameChatMessageForRender,
+	sameImageListForRender,
+} from "./timelineProjection";
 import type { ChatMessage, ImageContent } from "../../../../../shared/types";
 
 /**
@@ -77,5 +81,85 @@ describe("sameChatMessageForRender", () => {
 		const previous = message({ meta } as Partial<ChatMessage>);
 		const next = message({ meta } as Partial<ChatMessage>);
 		expect(sameChatMessageForRender(previous, next)).toBe(true);
+	});
+});
+
+describe("groupToolMessages", () => {
+	const user = (id: string, timestamp: number) =>
+		message({ id, role: "user", text: "ask", timestamp });
+	const assistant = (id: string, text: string, timestamp: number) =>
+		message({ id, role: "assistant", text, timestamp });
+	const tool = (id: string, timestamp: number) =>
+		message({ id, role: "tool", text: "", timestamp, meta: { toolName: "bash" } });
+	const system = (id: string, timestamp: number) =>
+		message({ id, role: "system", text: "question", timestamp });
+
+	it("buckets a user turn into one agent-run starting at the user timestamp", () => {
+		const runs = groupToolMessages([
+			user("u1", 100),
+			tool("t1", 110),
+			assistant("a1", "done", 120),
+		]);
+		expect(runs.map((item) => item.kind)).toEqual(["message", "agent-run"]);
+		const run = runs[1];
+		expect(run.kind === "agent-run" && [run.startedAt, run.endedAt]).toEqual([100, 120]);
+		expect(run.kind === "agent-run" && run.items.map((item) => item.kind)).toEqual([
+			"tool-group",
+			"message",
+		]);
+	});
+
+	it("merges consecutive assistant texts into one bubble", () => {
+		const runs = groupToolMessages([user("u1", 1), assistant("a1", "one", 2), assistant("a2", "two", 3)]);
+		const run = runs[1];
+		const items = run.kind === "agent-run" ? run.items : [];
+		expect(items).toHaveLength(1);
+		expect(items[0].kind === "message" && items[0].message.text).toBe("one\n\ntwo");
+		expect(items[0].kind === "message" && items[0].message.id).toBe("a1|a2");
+	});
+
+	it("does not carry tools into the next turn when the previous turn never answered", () => {
+		// 上一轮只有工具、用户又问新问题：必须切段，否则工具会混进下一轮回答块。
+		const runs = groupToolMessages([user("u1", 1), tool("t1", 2), user("u2", 3), assistant("a1", "hi", 4)]);
+		expect(runs.map((item) => item.kind)).toEqual(["message", "agent-run", "message", "agent-run"]);
+		const first = runs[1];
+		expect(first.kind === "agent-run" && first.items.map((item) => item.kind)).toEqual(["tool-group"]);
+	});
+
+	it("stages tools that precede an ask_question card into the run that follows the answer", () => {
+		// ask_question：system 卡片不中断 agent-run，卡片前的工具/思考要与随后的回答同属一轮，
+		// 否则会被拆成两个折叠区域。暂存只在本轮尚无 assistant 文本时生效（见「上一轮没有回答」
+		// 用例）：普通新提问必须切段，不能借这条路径把上一轮工具混进下一轮。
+		const runs = groupToolMessages([
+			user("u1", 1),
+			message({ id: "th1", role: "assistant", text: "", thinking: "hmm", timestamp: 2 }),
+			tool("t1", 3),
+			system("s1", 4),
+			user("u2", 5),
+			assistant("a1", "hi", 6),
+		]);
+		expect(runs.map((item) => item.kind)).toEqual(["message", "message", "message", "agent-run"]);
+		const run = runs[3];
+		expect(run.kind === "agent-run" && run.items.map((item) => item.kind)).toEqual([
+			"thinking-group",
+			"tool-group",
+			"message",
+		]);
+	});
+
+	it("folds thinking-only messages into a thinking-group with timing", () => {
+		const runs = groupToolMessages([
+			user("u1", 1),
+			message({ id: "th1", role: "assistant", text: "", thinking: "hmm", timestamp: 2 }),
+			assistant("a1", "done", 3),
+		]);
+		const run = runs[1];
+		const items = run.kind === "agent-run" ? run.items : [];
+		expect(items.map((item) => item.kind)).toEqual(["thinking-group", "message"]);
+		const group = items[0];
+		expect(group.kind === "thinking-group" && group.text).toBe("hmm");
+		expect(group.kind === "thinking-group" && group.startedAt).toBeLessThanOrEqual(
+			group.kind === "thinking-group" ? group.endedAt : 0,
+		);
 	});
 });
