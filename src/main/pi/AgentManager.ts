@@ -82,6 +82,8 @@ import { LatestByKeyEmitter } from "./LatestByKeyEmitter";
 import {
 	classifyPiFailure,
 	decodePiFrame,
+	describeRpcLog,
+	isRpcLogWorthy,
 	mergeSubagentFrame,
 	normalizePiQueue,
 	normalizeRuntimeSnapshot,
@@ -106,43 +108,6 @@ function readEventKey(
 	if (typeof value === "string") return value;
 	if (typeof value === "number" && Number.isFinite(value)) return String(value);
 	return undefined;
-}
-
-/**
- * 流式增量事件类型：每 token/每块一条，RPC 日志默认不落盘
- * （用户打开 RPC 控制台后记录全量）。其余 send/response/阶段事件低频且有诊断价值。
- *
- * toolcall_delta 与 text/thinking_delta 同性质——一次工具调用参数可能切成上万条增量
- * （写大文件时每条都带全量 partial arguments）。实测 10-16：单个 agent 单日 32MB 日志里
- * 83% 是 toolcall_delta；全 agent 当日 307MB 中 242MB（79%）属于此类。它既不是"低频阶段事件"，
- * 只是当初名单漏了一个类型。
- */
-const RPC_STREAMING_DELTA_TYPES: Record<string, true> = {
-	text_delta: true,
-	thinking_delta: true,
-	toolcall_delta: true,
-};
-
-/**
- * 工具输出分片事件：tool_execution_update/tool_stream_update 每收到一段输出就一条，
- * 与流式增量同样属于"过程噪音"（起止事件 tool_execution_start/end 仍照常落盘，
- * 足以还原调用顺序、耗时与成败；完整输出在 pi 自己的会话文件里）。
- * 实测 10-16：两类合计占当日 RPC 日志体积 10%（29.5MB/307MB）。
- */
-const RPC_CHUNK_EVENT_TYPES: Record<string, true> = {
-	tool_execution_update: true,
-	tool_stream_update: true,
-};
-
-/** RPC 日志默认落盘判定：send 与阶段/响应事件全记，流式增量与输出分片跳过。 */
-export function isRpcLogWorthy(entry: { direction: string; data: unknown }): boolean {
-	if (entry.direction === "send") return true;
-	const data = entry.data as Record<string, unknown> | null | undefined;
-	const type = data?.type;
-	if (typeof type === "string" && RPC_CHUNK_EVENT_TYPES[type] === true) return false;
-	if (type !== "message_update" || !data) return true;
-	const eventType = (data.assistantMessageEvent as Record<string, unknown> | undefined)?.type;
-	return typeof eventType !== "string" || RPC_STREAMING_DELTA_TYPES[eventType] !== true;
 }
 import {
 	createStreamGateState,
@@ -3643,42 +3608,19 @@ export class AgentManager {
 		});
 		child.on("rpc-log", (entry: { direction: string; data: unknown }) => {
 			if (!owns()) return;
-			// 渲染层的实时 RPC 控制台与文件日志共用同一个 per-agent 开关
-			//（renderer 的 onRpcLog 处理器在开关关闭时直接丢弃，见 App.tsx）。
-			// 默认（开关关闭）仍落盘低频事件（send/response/阶段事件），仅跳过
-			// 每 token/每块一条的流式增量（text/thinking/toolcall_delta）与工具输出分片
-			// ——全量记录会拖慢事件循环且文件快速膨胀（实测 toolcall_delta 一项就占
-			// 当日 307MB 日志的 79%）；用户打开 RPC 控制台后记录全量。
+			// 「哪些帧值得留痕、日志行长什么样」都在 piProtocol（isRpcLogWorthy /
+			// describeRpcLog）——与 decodePiFrame 同住一个模块，pi 改措辞时只改一处。
+			// 渲染层的实时 RPC 控制台与文件日志共用同一个 per-agent 开关（renderer 的
+			// onRpcLog 处理器在开关关闭时直接丢弃，见 App.tsx）。
 			const rt = this.agents.get(agentId);
 			if (!rt || (!rt.rpcLogging && !isRpcLogWorthy(entry))) return;
 			try {
 				const data = entry.data as Record<string, any>;
-				let summary: string;
-				if (entry.direction === "send") {
-					const type = data.type ?? "?";
-					if (type === "prompt")
-						summary = `→ prompt: ${(data.message ?? "").slice(0, 60)}`;
-					else if (type === "set_model")
-						summary = `→ set_model: ${data.provider}/${data.modelId}`;
-					else if (type === "set_thinking_level")
-						summary = `→ set_thinking: ${data.level}`;
-					else if (type === "bash")
-						summary = `→ bash: ${(data.command ?? "").slice(0, 60)}`;
-					else summary = `→ ${type}`;
-				} else {
-					const type = data.type ?? "?";
-					if (type === "response")
-						summary = `← ${data.command ?? "?"} ${data.success ? "✓" : "✗"}${data.error ? ` ${data.error}` : ""}`;
-					else if (type === "message_update") {
-						const evt = data.assistantMessageEvent?.type ?? "?";
-						summary = `← message_update.${evt}`;
-					} else summary = `← ${type}`;
-				}
 				const logEntry = {
 					id: randomUUID(),
 					agentId,
 					direction: entry.direction,
-					summary,
+					summary: describeRpcLog(entry),
 					data,
 					time: Date.now(),
 				};

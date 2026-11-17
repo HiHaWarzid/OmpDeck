@@ -86,7 +86,10 @@ All notable changes to PiDeck are documented here.
   `QuickGenProcess` read `message_update` / `agent_end` a third time; a change in
   pi's wording could break all three at once, and none of it could be tested
   without launching pi. The decoder is pure, so frames, snapshots, queues, and
-  failure classification are now unit-tested against raw JSON.
+  failure classification are now unit-tested against raw JSON. The RPC log
+  policy (which frames get persisted, and what a log line looks like) moved in
+  from `AgentManager`'s `rpc-log` handler too: that was the second-to-last place
+  reading frame names.
 - **Earlier history paging has one ledger** — The five invariants behind "load
   older messages" (single flight, scope binding, stale-response discard,
   baseline invalidation, id dedupe) used to live in three `useState`s, two

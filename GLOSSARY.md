@@ -192,6 +192,8 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：新增帧种、字段改名、跨版本命令名探测的判定都进本 module；调用方只按 `effect.kind` 分派副作用，不得再读 `event.type`。`piRpcCompat` 只保留「新名优先、旧名兜底」的发送策略，失败类别仍由本 module 判定。
 
+RPC 日志的**留痕政策**也在这里：`isRpcLogWorthy` 判定「哪些帧值得落盘」（send 与阶段/响应事件全记，`text|thinking|toolcall_delta` 与工具输出分片跳过——实测单 agent 单日 307MB 日志里 79% 是这类增量），`describeRpcLog` 产出日志行摘要。两者与 `decodePiFrame` 读同一批帧名，此前住在 `AgentManager` 的 `child.on("rpc-log")` 里：那是帧名的第二处读法，pi 改措辞时与解码器各自失效。现在调用方只做副作用（推送 / 落盘），格式可单测。
+
 子代理帧的**合并语义**同属本 module：`mergeSubagentFrame` 负责身份取值（`progress.id` 优先、`payload.id` 兜底）、id 复用重置（`lifecycle(started)` 换空基线）、终态粘滞与字段向后合并，调用方只写 registry。判定与写回分开后，「同一 `subagentId` 的新一次运行」不再需要调用方先删旧记录——两份实现曾在 `readSubagentFrameIdentity.restarted` 与合并基线里各写一遍。
 
 ### AgentRunSupervisor（运行静默监督器）

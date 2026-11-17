@@ -755,6 +755,79 @@ export function normalizeRuntimeSnapshot(input: PiSnapshotInput): PiRuntimeSnaps
 	};
 }
 
+/** 流式增量事件类型：每 token/每块一条，RPC 日志默认不落盘。 */
+const RPC_STREAMING_DELTA_TYPES: Record<string, true> = {
+	text_delta: true,
+	thinking_delta: true,
+	toolcall_delta: true,
+};
+
+/**
+ * 工具输出分片事件：`tool_execution_update`/`tool_stream_update` 每收到一段输出就一条，
+ * 与流式增量同样属于「过程噪音」（起止事件仍照常落盘，足以还原调用顺序与成败；
+ * 完整输出在 pi 自己的会话文件里）。
+ */
+const RPC_CHUNK_EVENT_TYPES: Record<string, true> = {
+	tool_execution_update: true,
+	tool_stream_update: true,
+};
+
+/**
+ * RPC 日志默认落盘判定：send 与阶段/响应事件全记，流式增量与输出分片跳过。
+ *
+ * 这里是帧名的第二处读法（`decodePiFrame` 之外唯一的），因此和它住在同一个模块：
+ * 两份名单都是「哪些帧值得留痕」的知识，散回调用方就会在 pi 改措辞时各自失效。
+ * 全量记录会拖慢事件循环且文件快速膨胀——实测单 agent 单日 307MB 日志里 79% 是
+ * `toolcall_delta` 一类增量；用户打开 RPC 控制台后调用方改记全量。
+ */
+export function isRpcLogWorthy(entry: { direction: string; data: unknown }): boolean {
+	if (entry.direction === "send") return true;
+	const data = asRecord(entry.data);
+	if (!data) return true;
+	const type = readString(data.type);
+	if (type && RPC_CHUNK_EVENT_TYPES[type] === true) return false;
+	if (type !== "message_update") return true;
+	const eventType = (asRecord(data.assistantMessageEvent) ?? {}).type;
+	return typeof eventType !== "string" || RPC_STREAMING_DELTA_TYPES[eventType] !== true;
+}
+
+/**
+ * RPC 日志行摘要：`→ prompt: …` / `← message_update.text_delta`。
+ *
+ * 纯投影，不含落盘与推送。调用方只负责把它塞进日志条目，因此摘要格式可以单测。
+ * 非对象的 `data`（线上数据未校验）渲染成 `← ?`：此前这种条目会在调用方
+ * 访问 `data.type` 时抛错、被 catch 吞掉并丢弃，等于静默丢失一条日志。
+ */
+export function describeRpcLog(entry: { direction: string; data: unknown }): string {
+	const data = asRecord(entry.data) ?? {};
+	const type = readString(data.type) ?? "?";
+	if (entry.direction === "send") {
+		if (type === "prompt") return `→ prompt: ${truncate(readString(data.message) ?? "", 60)}`;
+		if (type === "set_model") {
+			return `→ set_model: ${readString(data.provider) ?? ""}/${readString(data.modelId) ?? ""}`;
+		}
+		if (type === "set_thinking_level") {
+			return `→ set_thinking: ${readString(data.level) ?? ""}`;
+		}
+		if (type === "bash") return `→ bash: ${truncate(readString(data.command) ?? "", 60)}`;
+		return `→ ${type}`;
+	}
+	if (type === "response") {
+		const mark = data.success ? "✓" : "✗";
+		const error = readString(data.error);
+		return `← ${readString(data.command) ?? "?"} ${mark}${error ? ` ${error}` : ""}`;
+	}
+	if (type === "message_update") {
+		const evt = (asRecord(data.assistantMessageEvent) ?? {}).type;
+		return `← message_update.${typeof evt === "string" ? evt : "?"}`;
+	}
+	return `← ${type}`;
+}
+
+function truncate(text: string, max: number): string {
+	return text.length > max ? text.slice(0, max) : text;
+}
+
 /** `contextTokens/contextWindow/contextPercent` 允许 null（上下文尚未建立时 omp 回 null）。 */
 function nullableNumber(value: unknown): number | null | undefined {
 	if (value === null) return null;

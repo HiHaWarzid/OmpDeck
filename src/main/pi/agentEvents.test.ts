@@ -8,7 +8,7 @@ import type {
 	AgentTab,
 	ChatMessage,
 } from "../../shared/types";
-import { AgentManager, isRpcLogWorthy } from "./AgentManager";
+import { AgentManager } from "./AgentManager";
 import { createAgentEventSink, type AgentEvent } from "./agentEventSink";
 import { showAppNotification } from "../notifications";
 import { createStreamGateState, type StreamGateState } from "./streamGate";
@@ -640,63 +640,6 @@ test("cache_warming 事件投影：start 标记 warming，end 单独保留 outco
 	});
 	assert.equal(runtime.cacheWarming?.phase, "done");
 	assert.equal(runtime.cacheWarming?.outcome, "error");
-});
-
-// ── isRpcLogWorthy（RPC 日志默认落盘过滤）──────────────
-
-test("isRpcLogWorthy: send 方向与阶段/响应事件全记，流式增量跳过", () => {
-	// send：无论类型都记录
-	assert.equal(isRpcLogWorthy({ direction: "send", data: { type: "prompt" } }), true);
-	// recv 响应：记录
-	assert.equal(
-		isRpcLogWorthy({ direction: "recv", data: { type: "response", command: "get_state", success: true } }),
-		true,
-	);
-	// recv 阶段事件（toolcall_start / agent_start 等低频）：记录
-	assert.equal(
-		isRpcLogWorthy({
-			direction: "recv",
-			data: { type: "message_update", assistantMessageEvent: { type: "toolcall_start" } },
-		}),
-		true,
-	);
-	// recv 无 assistantMessageEvent 的 message_update：记录
-	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "message_update" } }), true);
-	// recv 非 message_update 类型：记录
-	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "agent_start" } }), true);
-	// 流式增量（每 token 一条）：默认不落盘
-	assert.equal(
-		isRpcLogWorthy({
-			direction: "recv",
-			data: { type: "message_update", assistantMessageEvent: { type: "text_delta" } },
-		}),
-		false,
-	);
-	assert.equal(
-		isRpcLogWorthy({
-			direction: "recv",
-			data: { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } },
-		}),
-		false,
-	);
-	// toolcall_delta：与文本增量同为每块一条（实测占单 agent 单日日志 83%），默认不落盘
-	assert.equal(
-		isRpcLogWorthy({
-			direction: "recv",
-			data: { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } },
-		}),
-		false,
-	);
-	// 工具输出分片：默认不落盘；调用起止事件仍照常记录（顺序/耗时/成败可还原）
-	assert.equal(
-		isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_update" } }),
-		false,
-	);
-	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_stream_update" } }), false);
-	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_start" } }), true);
-	assert.equal(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_end" } }), true);
-	// send 方向不受上述过滤影响（用户主动命令全记）
-	assert.equal(isRpcLogWorthy({ direction: "send", data: { type: "tool_execution_update" } }), true);
 });
 
 // ── omp 原生 ask（method: "ask"）协议适配 ──────────────────

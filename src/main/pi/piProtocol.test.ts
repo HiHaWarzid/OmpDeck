@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import {
 	classifyPiFailure,
 	decodePiFrame,
+	describeRpcLog,
+	isRpcLogWorthy,
 	readAgentEndReport,
 	retryStatusText,
 	normalizePiQueue,
@@ -250,5 +252,74 @@ describe("失败响应类别", () => {
 		expect(classifyPiFailure({ error: "session busy" })).toBe("other");
 		// 超时后 client 可能没有响应体：不能当成命令名不兼容去换名重试。
 		expect(classifyPiFailure(undefined)).toBe("other");
+	});
+});
+
+describe("RPC 日志落盘判定", () => {
+	it("send 与阶段/响应事件全记，流式增量与工具输出分片跳过", () => {
+		// send：无论类型都记录
+		expect(isRpcLogWorthy({ direction: "send", data: { type: "prompt" } })).toBe(true);
+		// recv 响应与低频阶段事件：记录
+		expect(
+			isRpcLogWorthy({ direction: "recv", data: { type: "response", command: "get_state", success: true } }),
+		).toBe(true);
+		expect(
+			isRpcLogWorthy({
+				direction: "recv",
+				data: { type: "message_update", assistantMessageEvent: { type: "toolcall_start" } },
+			}),
+		).toBe(true);
+		// 没有 assistantMessageEvent 的 message_update 无法判定为增量，按低频事件记录
+		expect(isRpcLogWorthy({ direction: "recv", data: { type: "message_update" } })).toBe(true);
+		expect(isRpcLogWorthy({ direction: "recv", data: { type: "agent_start" } })).toBe(true);
+		// 流式增量（每 token 一条）：默认不落盘
+		for (const eventType of ["text_delta", "thinking_delta", "toolcall_delta"]) {
+			expect(
+				isRpcLogWorthy({
+					direction: "recv",
+					data: { type: "message_update", assistantMessageEvent: { type: eventType } },
+				}),
+			).toBe(false);
+		}
+		// 工具输出分片：不落盘；调用起止事件仍记录，足以还原顺序/耗时/成败
+		expect(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_update" } })).toBe(false);
+		expect(isRpcLogWorthy({ direction: "recv", data: { type: "tool_stream_update" } })).toBe(false);
+		expect(isRpcLogWorthy({ direction: "recv", data: { type: "tool_execution_start" } })).toBe(true);
+		// send 方向不受过滤影响（用户主动命令全记）
+		expect(isRpcLogWorthy({ direction: "send", data: { type: "tool_execution_update" } })).toBe(true);
+	});
+});
+
+describe("RPC 日志行摘要", () => {
+	it("按帧名与方向投影出可读的一行", () => {
+		expect(describeRpcLog({ direction: "send", data: { type: "prompt", message: "hello" } })).toBe(
+			"→ prompt: hello",
+		);
+		// 长 prompt 截断到 60 字符：日志行不跟着正文长度膨胀
+		expect(
+			describeRpcLog({ direction: "send", data: { type: "prompt", message: "x".repeat(100) } }),
+		).toBe(`→ prompt: ${"x".repeat(60)}`);
+		expect(
+			describeRpcLog({ direction: "send", data: { type: "set_model", provider: "p", modelId: "m" } }),
+		).toBe("→ set_model: p/m");
+		expect(describeRpcLog({ direction: "send", data: { type: "set_thinking_level", level: "high" } })).toBe(
+			"→ set_thinking: high",
+		);
+		expect(describeRpcLog({ direction: "recv", data: { type: "response", command: "get_state", success: true } })).toBe(
+			"← get_state ✓",
+		);
+		expect(
+			describeRpcLog({ direction: "recv", data: { type: "response", command: "do", success: false, error: "boom" } }),
+		).toBe("← do ✗ boom");
+		expect(
+			describeRpcLog({
+				direction: "recv",
+				data: { type: "message_update", assistantMessageEvent: { type: "text_delta" } },
+			}),
+		).toBe("← message_update.text_delta");
+		// 未知帧名原样带出，别丢掉线索
+		expect(describeRpcLog({ direction: "recv", data: { type: "agent_start" } })).toBe("← agent_start");
+		// 非对象 data：旧实现会抛错并被调用方的 catch 静默丢弃，等于丢日志
+		expect(describeRpcLog({ direction: "recv", data: null })).toBe("← ?");
 	});
 });
