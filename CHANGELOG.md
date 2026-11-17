@@ -144,6 +144,12 @@ All notable changes to PiDeck are documented here.
 - **Log details keep the real error** — Nested `Error` objects inside log details
   are serialized with name/message/stack, so failures such as "Failed to list
   sessions" no longer land in the log as `{"error":{}}`.
+- **Extension errors reported as objects keep their message** — An
+  `extension_error` frame carries `error` either as a string or as an object with
+  a `message`; the old code stringified it unconditionally, so every object became
+  `[object Object]` and the extension's actual reason was lost. The string is
+  tried first, then the object's `message`, and the fallback text only when
+  neither exists.
 - **Git panel spinner no longer sticks after a project switch** — Switching
   projects while a push/pull was in flight left the push button disabled and
   spinning forever: the stale mutation intentionally skips its own spinner

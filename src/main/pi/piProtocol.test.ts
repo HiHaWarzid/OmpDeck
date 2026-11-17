@@ -109,6 +109,25 @@ describe("agent_end 错误阶梯", () => {
 	});
 });
 
+describe("扩展错误帧", () => {
+	// 扩展抛出的 error 可能是字符串，也可能是 { message } 对象。丢成
+	// "Extension error" 会让用户看不到扩展抛出的真实原因。
+	it("字符串与对象两种 error 都取到可读文本", () => {
+		expect(effectOf({ type: "extension_error", error: "boom" })).toEqual({
+			kind: "extension-error",
+			message: "boom",
+		});
+		expect(effectOf({ type: "extension_error", error: { message: "boom" } })).toEqual({
+			kind: "extension-error",
+			message: "boom",
+		});
+		expect(effectOf({ type: "extension_error" })).toEqual({
+			kind: "extension-error",
+			message: "Extension error",
+		});
+	});
+});
+
 describe("自动重试卡片", () => {
 	it("重试帧缺字段时保持 undefined，让调用方回退到卡片 meta", () => {
 		const effect = effectOf({ type: "auto_retry_start", attempt: 2, maxAttempts: 5 });

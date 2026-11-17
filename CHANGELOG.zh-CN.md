@@ -108,6 +108,10 @@
   （10 秒内只重载一次并写日志），真正的模块错误仍照常抛出。
 - **日志保留真实错误** — 日志 detail 里嵌套的 `Error` 会序列化为
   name/message/stack，`Failed to list sessions` 一类失败不再记录成 `{"error":{}}`。
+- **扩展抛出的对象错误不再显示成 `[object Object]`** — `extension_error` 帧的
+  `error` 可能是字符串，也可能是带 `message` 的对象；旧实现无条件 `String()`，
+  对象一律落成 `[object Object]`，扩展的真实报错信息随之丢失。现在先取字符串，
+  再取对象上的 `message`，两者都没有时才用兜底文案。
 - **切换项目后 Git 面板的推送/拉取按钮不再永久转圈** — 推送途中切项目时，
   `runMutation` 因世代变化返回 stale，而 stale 刻意不复位 spinner（可能已属于新项目），
   于是按钮永久 disabled + 转圈。现在项目切换会复位 push/pull 两个 spinner，并有面板测试钉住。

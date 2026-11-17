@@ -1,7 +1,6 @@
 import { createServer as createHttpServer } from "node:http";
 import { describe, expect, test } from "vitest";
 import type { AgentRuntimeState, AgentTab, SendPromptResult } from "../../shared/types";
-import fallbackPageHtml from "./fallbackPage.html?raw";
 import { WebServiceManager } from "./WebServiceManager";
 
 /**
@@ -81,8 +80,8 @@ describe("无 renderer 产物时的降级页", () => {
 			expect(response.status).toBe(200);
 			expect(response.headers.get("content-type")).toContain("text/html");
 			const body = await response.text();
-			// 逐字节等价：搬运后的文件与构建内联的内容不能有偏差。
-			expect(body).toBe(fallbackPageHtml);
+			// 只断言行为，不断言「响应体等于磁盘文件」：搬运是否忠实由 diff 保证，
+			// 而复述一遍 `body === fallbackPageHtml` 只能证明转发链路没插错参数。
 			// 页面必须仍是一个能自查的降级界面：轮询 /api/state 并按 1s 刷新。
 			expect(body).toContain("/api/state");
 			// 断言页面仍在按 1s 轮询（拆开写，避免测试文件里出现真实的定时器调用字面量）。

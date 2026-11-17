@@ -481,11 +481,14 @@ export function decodePiFrame(event: unknown, now: number): PiFrame | undefined 
 	}
 
 	if (type === "extension_error") {
+		// `error` 可能是字符串，也可能是对象：旧实现在对象上 `String()` 出 "[object Object]"，
+		// 等于丢掉了唯一有诊断价值的信息。这里先取字符串，再取对象上的 message。
+		const structured = asRecord(raw.error);
 		return {
 			work,
 			effect: {
 				kind: "extension-error",
-				message: readString(raw.error) ?? "Extension error",
+				message: readString(raw.error) ?? readString(structured?.message) ?? "Extension error",
 			},
 		};
 	}
