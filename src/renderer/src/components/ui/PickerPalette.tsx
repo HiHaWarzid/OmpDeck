@@ -8,6 +8,8 @@ import { useDismissableLayer } from "./useDismissableLayer";
  * 把「关闭」实现成只有鼠标能触发的一条路径——Esc 完全无效，焦点也留在被卸载的选项上，
  * 下一个 Tab 从文档头开始。`dismissableLayer` 已经是关闭行为的唯一属主，这四个浮层只是它的
  * 一类使用者：外壳负责结构、外部点击、Esc 与焦点归还，调用方只提供 palette 的类名与内容。
+ * 关闭分成两条路径不是重复：Esc 走关闭层；外部点击走 backdrop 的 click，这样「关浮层」的
+ * 那次点击不会继续穿透到下面的按钮（关闭层在 pointerdown 就卸载浮层，click 会落到下层）。
  *
  * 焦点归还取「打开瞬间的 activeElement」，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的
  * memo 组件里，为了一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取：
@@ -37,15 +39,18 @@ export function PickerPalette(props: PickerPaletteProps) {
 	useDismissableLayer({
 		open: true,
 		elementRef: paletteRef,
+		// 外部点击由 backdrop 的 click 承担，理由见文件头。
+		dismissOnOutsidePointer: false,
 		onDismiss: props.onClose,
 		returnFocusRef,
 	});
 
 	return (
-		<div className="picker-backdrop">
+		<div className="picker-backdrop" onClick={props.onClose}>
 			<div
 				ref={paletteRef}
 				className={["picker-palette", props.className].filter(Boolean).join(" ")}
+				onClick={(event) => event.stopPropagation()}
 			>
 				{props.children}
 			</div>

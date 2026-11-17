@@ -339,6 +339,8 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 它是关闭层的**一类使用者**，不重复关闭逻辑：四个调用点各写一份 `picker-backdrop onClick` 时，「关闭」被实现成只有鼠标能走的一条路径——Esc 完全无效、焦点留在被卸载的选项上，下一次 Tab 从文档头开始。这就是「界面被复制了四份、而不变式只有一份」的典型症状。
 
+两条关闭路径按各自的能力分工，不是重复：Esc 走关闭层；外部点击走 backdrop 自己的 `click`（`dismissOnOutsidePointer: false`）。关闭层在 pointerdown 阶段就同步关闭，浮层随即卸载，紧随其后的 `click` 会落到浮层下面那个元素上——composer 浮层下面就是发送按钮，一次「关浮层」会顺带把消息发出去。与 `ContextMenuSurface`、`WorktreeCreateDialog` 是同一套取舍。
+
 焦点归还取**打开瞬间的 `activeElement`**，不由 App 逐层透传 ref：触发按钮埋在 composer 底栏的 memo 组件里，为一次 `.focus()` 把 ref 穿过整条链得不偿失。快照必须在**渲染期**取——模型选择器的搜索框带 `autoFocus`，等副作用阶段读到的已是浮层内部的输入框。
 
 规则：新增居中浮层用 `PickerPalette`，只传 `className` 和内容；不要在调用点重写 backdrop / `stopPropagation` 这对组合。
