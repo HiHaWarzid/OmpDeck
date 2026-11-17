@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { t } from "../../../i18n";
-import type { DiffFileHandler, SessionModifiedFile } from "../types";
+import type { DiffFileHandler, DiffTarget } from "../types";
 
 const SESSION_FILE_SUMMARY_COLLAPSED_KEY_PREFIX =
 	"pid:session-file-summary-collapsed:";
@@ -24,7 +24,7 @@ function loadFileListExpanded(sessionKey: string | null): boolean {
 	return stored !== null ? stored === "true" : false;
 }
 export function SessionFileSummary(props: {
-	files: SessionModifiedFile[];
+	files: DiffTarget[];
 	onOpenFile?: (path: string) => void;
 	onDiffFile?: DiffFileHandler;
 	/** sessionIdOrPath: 会话唯一标识(如 sessionPath),用于按 agent/session 隔离折叠状态。

@@ -329,7 +329,7 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 
 自动快照让「焦点归还」成为关闭层的默认行为而不是逐点接线：此前只有发送方式菜单、`Listbox`、`PickerPalette` 显式传 `returnFocusRef`，设备菜单、分支下拉、模型角色选择器、会话操作菜单的 Esc 都把焦点丢给弹框或 `body`，文档却统一宣称「焦点回到触发器」。调用方仍可传 `returnFocusRef` 覆盖（触发器不是当时的 `activeElement`，例如右键菜单）。打开时 `activeElement` 就是 `body`、或触发器已卸载，则不抢焦点。
 
-规则：新增任何弹层都调 `useDismissableLayer`，不自己 `addEventListener`；需要禁用某条关闭路径时传 `dismissOnOutsidePointer: false` / `dismissOnEscape: false`，不要复制一份监听再删掉两行。
+规则：新增任何弹层都调 `useDismissableLayer`，不自己 `addEventListener`；需要禁用某条关闭路径时传 `dismissOnOutsidePointer: false`（整窗覆盖层常这样做，关闭交给自己的 backdrop），不要复制一份监听再删掉两行。
 
 ### Listbox（选项选择原语）
 「触发器 + 弹出选项」的**唯一实现**（`components/ui/Listbox.tsx`）。`SelectField` 是它的表单外壳（标签 + 说明），Git 面板的 `GitCompactFilter` 是它的紧凑外壳（对勾装饰、更小的 chevron），两者共用同一套 ARIA 结构与键盘行为。
@@ -385,6 +385,8 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 缓存住在模块内（`WeakMap` 以消息对象为键，并再核对 text/timestamp 以覆盖原地改写）：流式期间 transcript 每 50ms 更新，但历史消息对象引用不变，未变化的消息必须返回**同一个 item 对象**，宿主才能保持数组引用稳定、不重建大纲。
 
 ### ToolArgs（工具参数推导）
-工具调用参数 → diff / 改动行数 / 会话修改文件清单的**唯一实现**（`utils/toolArgs.ts`）。
+工具调用参数 → diff 目标的**唯一实现**（`utils/toolArgs.ts`）。
 
-它独占 `write|edit|create|patch` 的工具名规则、`oldText`/`old_text` 多写法兼容、「同一路径再次修改移到末尾」的顺序语义。这些共同定义右侧 Files 抽屉与会话结束摘要的数据源，因此不能挂在 App 根 `useMemo` 上（transcript 每 50ms 增量都会唤醒根组件）；改为只在需要时按快照调用一次，进而是可独立单测的深模块。
+它独占 `write|edit|create|patch` 的工具名规则（`isFileMutatingTool` / `isFileWriteTool` / `isFileEditTool`）、`oldText`/`old_text` 多写法兼容、「同一路径再次修改移到末尾」的顺序语义，以及 `content|text|data|body` 的写入内容键兼容面。这些共同定义「这条工具调用展示哪份 diff」，因此不能挂在 App 根 `useMemo` 上（transcript 每 50ms 增量都会唤醒根组件）；改为只在需要时按快照调用一次，进而是可独立单测的深模块。
+
+`getToolDiffTarget` 是「这条工具调用展示哪份 diff」的唯一入口：卡片上的 diff chip 与 diff 打开路径（`App.diffFilePath` 在调用方没带内容时用 `buildDiffTargetIndex` 按 transcript 快照兜底）读同一份结果，否则卡片自己挑内容键时，`data`/`body` 形式的写入会出现「卡片有 chip、点开却没有内容」的落差。

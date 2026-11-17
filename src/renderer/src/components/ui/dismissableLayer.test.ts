@@ -100,27 +100,6 @@ describe("dismissableLayer", () => {
 		el.remove();
 	});
 
-	it("dismissOnEscape:false 的层跳过 Esc，交给下面一层", () => {
-		const keepEl = document.createElement("div");
-		const closableEl = document.createElement("div");
-		document.body.append(keepEl, closableEl);
-		const dismissClosable = vi.fn();
-		unregisters.push(
-			registerDismissableLayer({ getElement: () => closableEl, onDismiss: dismissClosable }),
-			registerDismissableLayer({
-				getElement: () => keepEl,
-				onDismiss: () => undefined,
-				dismissOnEscape: false,
-			}),
-		);
-
-		fireEscape();
-
-		expect(dismissClosable.mock.calls).toEqual([["escape"]]);
-		keepEl.remove();
-		closableEl.remove();
-	});
-
 	it("Esc 时先归还焦点再通知关闭", () => {
 		const layerEl = document.createElement("div");
 		const triggerEl = document.createElement("button");

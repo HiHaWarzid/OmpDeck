@@ -210,7 +210,7 @@ import {
   buildSidebarProjectDisplay,
 } from "./components/app/sidebar/sidebarProjection";
 import { createImportSources } from "./components/app/sessionImportSources";
-import { buildModifiedFiles } from "./utils/toolArgs";
+import { buildDiffTargetIndex } from "./utils/toolArgs";
 import { flattenFiles } from "./utils/fileTree";
 import { matches } from "./utils/keywordMatch";
 import { filterVisibleCommands } from "./components/app/composer/composerSuggestions";
@@ -2563,9 +2563,9 @@ export function App() {
     const messages = activeAgentId
       ? sessionWorkspaceStore.getSlice(activeAgentId, "transcript")?.messages ?? []
       : [];
-    const modified = buildModifiedFiles(messages).find((f) => f.path === path);
-    const resolvedOriginal = originalContent ?? modified?.originalContent ?? "";
-    const resolvedModified = content ?? modified?.content ?? undefined;
+    const target = buildDiffTargetIndex(messages).get(path);
+    const resolvedOriginal = originalContent ?? target?.originalContent ?? "";
+    const resolvedModified = content ?? target?.content ?? undefined;
     // 工具 diff 与 Git diff 共享弹窗层；打开普通 diff 时先关闭 Git 快照，避免两个 backdrop 叠加。
     closeGitDiff();
     setEditorMode("modal");

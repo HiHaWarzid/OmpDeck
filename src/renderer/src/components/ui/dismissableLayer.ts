@@ -10,7 +10,7 @@
  * 现在只有一份 window 捕获监听（用引用计数按需装卸），每条不变式只写一次：
  *
  * - 外部点击：关闭**所有**不包含点击目标的层。点进父层内部时只有内层关闭。
- * - Esc：只有栈顶可关的那一层消费按键，并在捕获阶段 `preventDefault + stopPropagation`。
+ * - Esc：只有栈顶那一层消费按键，并在捕获阶段 `preventDefault + stopPropagation`。
  *   一次 Esc 只关一层（先关内层），外层不会顺带收到 Esc（输入框的历史导航、
  *   Radix Dialog 的关闭都不会被误触发）。
  * - 焦点归还：Esc 关闭前把焦点还给触发元素，且**先还焦再通知关闭**——触发器的 `onFocus`
@@ -35,8 +35,6 @@ export type DismissableLayerSpec = {
 	getReturnFocus?: () => HTMLElement | null;
 	/** 默认 true。 */
 	dismissOnOutsidePointer?: boolean;
-	/** 默认 true。 */
-	dismissOnEscape?: boolean;
 };
 
 /** 打开顺序栈：后注册的在上面。Esc 只作用于栈顶。 */
@@ -60,17 +58,14 @@ function handlePointerDown(event: Event): void {
 
 function handleKeyDown(event: KeyboardEvent): void {
 	if (event.key !== "Escape") return;
-	for (let index = layers.length - 1; index >= 0; index -= 1) {
-		const layer = layers[index];
-		if (layer.dismissOnEscape === false) continue;
-		// 消费掉这次 Esc：否则层内输入框的 Esc 分支与外层弹框会同时响应。
-		event.preventDefault();
-		event.stopPropagation();
-		const returnFocus = layer.getReturnFocus?.();
-		if (returnFocus?.isConnected) returnFocus.focus();
-		layer.onDismiss("escape");
-		return;
-	}
+	const layer = layers[layers.length - 1];
+	if (!layer) return;
+	// 消费掉这次 Esc：否则层内输入框的 Esc 分支与外层弹框会同时响应。
+	event.preventDefault();
+	event.stopPropagation();
+	const returnFocus = layer.getReturnFocus?.();
+	if (returnFocus?.isConnected) returnFocus.focus();
+	layer.onDismiss("escape");
 }
 
 function ensureListening(): void {

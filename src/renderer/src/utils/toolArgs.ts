@@ -1,18 +1,34 @@
 /**
- * 工具参数推导：把工具调用的 meta.args 投影成 diff / 改动行数 / 修改文件清单。
+ * 工具参数推导：把工具调用的 meta.args 投影成 diff 目标。
  *
  * 为什么成模块：`write|edit|patch` 的工具名规则、oldText/newText 的多写法兼容、
- * 「同一路径再次修改要移到末尾」的顺序语义，三者共同定义右侧 Files 抽屉与会话摘要的数据源。
+ * 「同一路径再次修改要移到末尾」的顺序语义，三者共同定义「这条工具调用展示哪份 diff」，
+ * 卡片上的 diff chip 与 `diffFilePath` 的兜底索引都读它。
  * 之前这段推导挂在 App 根 useMemo 上，transcript 每次 50ms 增量都会唤醒根组件；现在只在
  * 真正需要（打开 diff）时按快照算一次，因此必须是一个可独立调用、可独立测试的深模块。
  */
 import type { ChatMessage } from "../../../shared/types";
 import { toolArgPath } from "../../../shared/sessionDisplayContract";
-import type { SessionModifiedFile } from "../components/app/types";
+import type { DiffTarget } from "../components/app/types";
+
+/** 「写整份文件」的工具族：write/create 的 content 就是执行后的完整内容。 */
+function isFileWriteTool(toolName: string): boolean {
+	return /write|create/i.test(toolName);
+}
+
+/** 「改文件片段」的工具族：edit/patch 只带 oldText/newText。 */
+function isFileEditTool(toolName: string): boolean {
+	return /edit|patch/i.test(toolName);
+}
+
+/** 会改动文件的工具族：卡片出 diff、兜底索引收录，两处必须是同一个范围。 */
+function isFileMutatingTool(toolName: string): boolean {
+	return isFileWriteTool(toolName) || isFileEditTool(toolName);
+}
 
 /** 工具参数对象化：唯一实现是 shared 契约的 toolArgSummary/toolArgPath 内部解析，
- *  渲染层只需要对象本身（diff/改动行数），因此保留这一层薄封装。 */
-export function parseToolArgs(value: unknown): Record<string, unknown> | undefined {
+ *  渲染层只需要对象本身（diff 的 oldText/newText），因此保留这一层薄封装。 */
+function parseToolArgs(value: unknown): Record<string, unknown> | undefined {
 	if (!value) return undefined;
 	if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
 	if (typeof value !== "string" || !value.trim()) return undefined;
@@ -27,11 +43,7 @@ export function parseToolArgs(value: unknown): Record<string, unknown> | undefin
 	}
 }
 
-export function countTextLines(value: string): number {
-	return value ? value.split(/\r\n|\r|\n/).length : 0;
-}
-
-export function getToolEditDiff(args: Record<string, unknown>): { oldText: string; newText: string } | undefined {
+function getToolEditDiff(args: Record<string, unknown>): { oldText: string; newText: string } | undefined {
 	const edits = Array.isArray(args.edits) ? args.edits : undefined;
 	if (edits) {
 		const parts = edits.map((edit: unknown) => {
@@ -53,75 +65,78 @@ export function getToolEditDiff(args: Record<string, unknown>): { oldText: strin
 	return { oldText, newText };
 }
 
-export function getToolNewContent(toolName: string, args: any): string | undefined {
+function getToolNewContent(toolName: string, args: any): string | undefined {
 	if (!args) return undefined;
 	if (typeof args === "string" && args.trim()) {
 		try { args = JSON.parse(args); } catch { return undefined; }
 	}
 	if (!toolName) return undefined;
-	if (/write|create/i.test(toolName)) {
+	if (isFileWriteTool(toolName)) {
 		const a = args as Record<string, unknown>;
 		return typeof a.content === "string" ? a.content : typeof a.text === "string" ? a.text : typeof a.data === "string" ? a.data : typeof a.body === "string" ? a.body : undefined;
 	}
-	if (/edit|patch/i.test(toolName)) {
+	if (isFileEditTool(toolName)) {
 		const diff = getToolEditDiff(args);
 		return diff?.newText;
 	}
 	return undefined;
 }
 
-export function getToolChangedLineCount(toolName: string, args: any): number {
-	if (typeof args === "string" && args.trim()) {
-		try { args = JSON.parse(args); } catch { return 0; }
+/**
+ * 一次工具调用的 diff 目标：路径 + 前/后文本。
+ *
+ * 「哪些工具能出 diff、内容取自哪个键」只有这一处规则；卡片上的「查看 diff」与
+ * `diffFilePath` 的兜底索引都读它，否则 `data`/`body` 形式的写入会出现
+ * 「卡片有 chip、点开却没有内容」的落差。
+ * `originalContent` 为空串表示新建：write/create 没有执行前内容。
+ */
+export function getToolDiffTarget(
+	toolName: string,
+	args: unknown,
+): DiffTarget | undefined {
+	if (!toolName || !isFileMutatingTool(toolName)) return undefined;
+	const path = toolArgPath(args);
+	if (!path) return undefined;
+	if (isFileWriteTool(toolName)) {
+		const content = getToolNewContent(toolName, args);
+		if (content === undefined) return undefined;
+		return { path, originalContent: "", content };
 	}
-	if (!toolName) return 0;
-	if (/edit|patch/i.test(toolName)) {
-		const edits = Array.isArray(args?.edits) ? args.edits : undefined;
-		if (edits) {
-			return edits.reduce((total: number, edit: any) => {
-				const oldLines = countTextLines(String(edit?.oldText ?? edit?.old_text ?? ""));
-				const newLines = countTextLines(String(edit?.newText ?? edit?.new_text ?? ""));
-				return total + Math.max(oldLines, newLines);
-			}, 0);
-		}
-		return Math.max(countTextLines(String(args?.oldText ?? args?.old_text ?? "")), countTextLines(String(args?.newText ?? args?.new_text ?? "")));
-	}
-	if (/write|create/i.test(toolName)) {
-		return countTextLines(String(args?.content ?? args?.text ?? args?.data ?? args?.body ?? ""));
-	}
-	return 0;
+	// edit/patch：不存储 full file originalContent，只展示变动区域
+	const parsed = parseToolArgs(args);
+	if (!parsed) return undefined;
+	const diff = getToolEditDiff(parsed);
+	if (!diff) return undefined;
+	return { path, originalContent: diff.oldText, content: diff.newText };
 }
 
 /**
- * 从工具消息里归并出「当前会话修改过的文件」。
+ * 按会话快照归并出「路径 → 该文件当前展示用的前/后文本」。
  *
  * 之前这段推导挂在 App 根 useMemo 上，导致 transcript 每次 50ms 增量都要唤醒根组件；
  * 现在只在真正需要（打开 diff）时按当前 transcript 快照计算一次，点击路径可接受 O(n)。
+ * 同一路径多次修改时后写覆盖先写，并且**保留插入顺序的最后一次**——调用方按路径取值，
+ * 顺序只影响将来若把它渲染成清单时的展示次序。
  */
-export function buildModifiedFiles(messages: ChatMessage[]): SessionModifiedFile[] {
-	const byPath = new Map<string, SessionModifiedFile>();
+export function buildDiffTargetIndex(messages: ChatMessage[]): Map<string, DiffTarget> {
+	const byPath = new Map<string, DiffTarget>();
 	for (const msg of messages) {
 		if (msg.role !== "tool") continue;
 		const toolName: string | undefined = msg.meta?.toolName as string | undefined;
-		const args: unknown = msg.meta?.args;
-		const status: string = String(msg.meta?.status ?? "done");
-		// 只收集文件写入/编辑类的工具调用，作为右侧 Files 与会话结束摘要的统一数据源。
-		if (!toolName || !/write|edit|create|patch/i.test(toolName)) continue;
-		const filePath = toolArgPath(args);
+		if (!toolName || !isFileMutatingTool(toolName)) continue;
+		// 收录条件是「带路径的写/改工具」，与能否解析出内容无关：参数里没有可识别的
+		// 内容键（或工具只带了路径）时，文件仍然被改过，只是没有可展示的内容。
+		const filePath = toolArgPath(msg.meta?.args);
 		if (!filePath) continue;
+		const target = getToolDiffTarget(toolName, msg.meta?.args);
 		const previous = byPath.get(filePath);
-		// 同一路径再次被修改时移动到 Map 末尾，右侧修改清单才能按"最新修改"展示。
+		// 同一路径再次被修改时移到 Map 末尾，维持「最后修改的排在最后」。
 		if (previous) byPath.delete(filePath);
-		// originalContent 不再存储到消息 meta 中（full file 会使会话体积过大）。
-		// diff 展示时使用工具参数（oldText/newText）显示变动区域。
 		byPath.set(filePath, {
 			path: filePath,
-			toolName,
-			status: status === "running" ? "running" : (previous?.status ?? status),
-			changedLines: (previous?.changedLines ?? 0) + getToolChangedLineCount(toolName, args),
-			originalContent: "",
-			content: getToolNewContent(toolName, args) ?? previous?.content,
+			originalContent: target?.originalContent ?? previous?.originalContent ?? "",
+			content: target?.content ?? previous?.content,
 		});
 	}
-	return Array.from(byPath.values());
+	return byPath;
 }

@@ -3,14 +3,17 @@ import type { WidgetLineItem } from "../../../../shared/types";
 
 /** 右侧面板；历史值 "editor" 已并入 files，仅存在于旧版 localStorage 记录里 */
 export type DrawerPanel = "files" | "browser" | "git";
-export type SessionModifiedFile = {
+/**
+ * 一条工具调用的 diff 素材：路径 + 执行前/后的文本。
+ *
+ * 三个字段都活着：`path` 用于索引与匹配，`originalContent`/`content` 用于打开 diff。
+ * 归类时用到的 toolName 与运行状态不保留——没有消费者读它们，留着只会诱使别人去「同步」。
+ */
+export type DiffTarget = {
 	path: string;
-	toolName: string;
-	status: string;
-	changedLines?: number;
-	/** 工具执行前的文件原始内容，用于历史会话恢复时展示差异对比。 */
-	originalContent?: string;
-	/** 工具写入/编辑后的新文件内容，优先于从磁盘实时读取（历史会话恢复时磁盘可能已变化或文件已删除）。 */
+	/** 工具执行前的文件原始内容；空串表示新建（write/create 没有执行前内容）。 */
+	originalContent: string;
+	/** 工具写入/编辑后的新文件内容。 */
 	content?: string;
 };
 export type DiffFileHandler = (path: string, originalContent?: string, content?: string) => void;

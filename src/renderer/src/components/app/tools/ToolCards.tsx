@@ -1,7 +1,7 @@
 /** 工具调用卡片：ToolCard 与按轮聚合的 ToolGroupCard，以及工具名/参数的展示推导。 */
 import { memo, useMemo, useState, type ReactNode } from "react";
 import { type ToolGroupItem } from "../timeline/timelineProjection";
-import { countTextLines, getToolEditDiff, parseToolArgs } from "../../../utils/toolArgs";
+import { getToolDiffTarget } from "../../../utils/toolArgs";
 import {
 	Check,
 	ChevronDown,
@@ -28,7 +28,6 @@ import type { ChatMessage, ImageContent, TodoItem } from "../../../../../shared/
 import { extractTodoItems, isTodoWriteToolName } from "../../../../../shared/todo";
 import {
 	shortText,
-	toolArgPath,
 	toolArgSummary,
 } from "../../../../../shared/sessionDisplayContract";
 import { formatDuration, stripAnsi } from "../format";
@@ -64,31 +63,11 @@ function getToolSubtitle(message: ChatMessage): string {
 	return shortText(toolArgSummary(message.meta?.args, message.meta) ?? "");
 }
 
-function getToolDiffTarget(message: ChatMessage): { path: string; originalContent: string; content: string; changedLines: number } | undefined {
-	const toolName = getToolName(message);
-	if (!/write|edit|create|patch/i.test(toolName)) return undefined;
-	const args = parseToolArgs(message.meta?.args);
-	const path = toolArgPath(args);
-	if (!args || !path) return undefined;
-	if (/write|create/i.test(toolName)) {
-		const content = typeof args.content === "string"
-			? args.content
-			: typeof args.text === "string"
-				? args.text
-				: undefined;
-		if (content === undefined) return undefined;
-		return { path, originalContent: "", content, changedLines: countTextLines(content) };
-	}
-	// edit/patch：不存储 full file originalContent，只展示变动区域
-	const diff = getToolEditDiff(args);
-	if (!diff) return undefined;
-	return {
-		path,
-		originalContent: diff.oldText,
-		content: diff.newText,
-		changedLines: Math.max(countTextLines(diff.oldText), countTextLines(diff.newText)),
-	};
+/** 卡片上的「查看 diff」只决定展示；「哪些工具能出 diff」的规则在 ToolArgs 里。 */
+function getMessageDiffTarget(message: ChatMessage) {
+	return getToolDiffTarget(getToolName(message), message.meta?.args);
 }
+
 /**
  * 识别模型主动触发的 skill：pi 系统提示会指示 LLM 用 read 工具读取 SKILL.md 来加载 skill，
  * 所以 toolName==="read" 且 path 以 SKILL.md 结尾时，视为 skill 调用，返回 skill 名（父目录名）。
@@ -305,7 +284,7 @@ export const ToolCard = memo(function ToolCard(props: {
 	);
 	const tone = getToolTone(props.message);
 	const kindLabel = getToolKindLabel(toolName);
-	const diffTarget = getToolDiffTarget(props.message);
+	const diffTarget = getMessageDiffTarget(props.message);
 	// TodoWrite 特化：从 meta 解析 todos（omp details.phases 快照优先），派生进度摘要并隐藏无意义的耗时
 	const isTodoWrite = isTodoWriteToolName(toolName);
 	const todoItems = isTodoWrite ? extractTodoItems(props.message.meta) : [];

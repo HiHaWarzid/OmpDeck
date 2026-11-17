@@ -23,7 +23,6 @@ export function useDismissableLayer(options: {
 	 */
 	returnFocusRef?: RefObject<HTMLElement | null>;
 	dismissOnOutsidePointer?: boolean;
-	dismissOnEscape?: boolean;
 }): void {
 	const { open, elementRef, returnFocusRef } = options;
 	const dismissRef = useRef(options.onDismiss);
@@ -52,7 +51,6 @@ export function useDismissableLayer(options: {
 						return opener;
 					},
 			dismissOnOutsidePointer: options.dismissOnOutsidePointer,
-			dismissOnEscape: options.dismissOnEscape,
 			onDismiss: (reason) => dismissRef.current(reason),
 		});
 	}, [
@@ -60,6 +58,5 @@ export function useDismissableLayer(options: {
 		elementRef,
 		returnFocusRef,
 		options.dismissOnOutsidePointer,
-		options.dismissOnEscape,
 	]);
 }
