@@ -76,7 +76,7 @@
 | **Remote Access (Tailscale)** | Enable it in Settings to publish the loopback web service to your tailnet through Tailscale Serve. Phones can reach it over HTTPS from anywhere without exposing a public port; the OmpDeck token is still required. |
 | **Session Activity View** | Thinking notes, tool calls, and answer updates are grouped into a compact flow with expandable/copyable details and clear status or exit-code labels. |
 | **Built-in Browser Preview** | Right-drawer browser with tabs, URL bar, fullscreen mode, and PC/mobile/tablet viewport presets for checking web pages alongside the conversation. |
-| **Session File Summary** | Completed agent runs show a compact list of modified file names and changed line counts; more than three files can be expanded. |
+| **Per-Edit Diff** | Each file-writing/editing tool call exposes a diff entry on its card, comparing that call's before/after text directly. |
 | **Context-Aware Input** | `@` file suggestions from project tree, `!` shell execution, `/` slash commands, and command history — all from a single composer. |
 | **Update Prompt** | Periodically checks GitHub Releases and shows release notes plus recommended download links opened in the system browser. |
 | **System Tray** | Close to tray by default, tray context menu, double-click to restore. |
@@ -89,7 +89,7 @@
 
 ![Workspace overview](docs/images/overview.png)
 
-Markdown rendering with streaming text, activity flow, tool-call details, session file-change summary, model/thinking/context/cache status bar, git branch selector, and action controls (New Session · Stop · Restart · Files · History · Terminal).
+Markdown rendering with streaming text, activity flow, tool-call details (each file change has its own diff entry), model/thinking/context/cache status bar, git branch selector, and action controls (New Session · Stop · Restart · Files · History · Terminal).
 
 ### Configuration Management
 
@@ -107,7 +107,7 @@ Built-in slash command suggestions panel with descriptions; past conversations a
 
 ![File tree and session actions](docs/images/files.png)
 
-Project file tree with Git status indicators, `@` file reference suggestions in the composer, current-session modified file list in the Files panel, and session context menu actions (Rename · Copy · Export HTML · Delete · Close Agent).
+Project file tree with Git status indicators, `@` file reference suggestions in the composer, and session context menu actions (Rename · Copy · Export HTML · Delete · Close Agent).
 
 ---
 

@@ -180,6 +180,12 @@ All notable changes to PiDeck are documented here.
 - **Saving a model preset keeps other unsaved edits** — Preset save/delete only writes
   `modelPresets` but rebuilt the drafts of cycle order, fallback chains, provider order
   and roleStorage, discarding unsaved text. Each surface is now refreshed on its own.
+- **Removed the orphaned session file-summary component** — Since tool cards took over
+  the diff entry, `SessionFileSummary` had no render path left yet kept 231 lines of
+  dedicated CSS and 3 strings in the tree. It is now gone together with
+  `drawer.modifiedFiles` / `drawer.modifiedFilesAria` / `drawer.moreFiles`, and the two
+  stale README claims (an answer-level file summary, a session change list in the Files
+  panel) now describe the per-edit diff entry that actually exists.
 
 ## v0.6.7 - 2026-07-29
 

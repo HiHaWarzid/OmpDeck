@@ -131,6 +131,11 @@
 - **保存模型预设不再冲掉其它输入** — 保存/删除预设只写 `modelPresets`，却会整份重建
   循环顺序、回退链、provider 顺序与 roleStorage 的草稿，把尚未提交的编辑清掉。现在按
   写入面分别重读。
+- **移除已无入口的会话修改摘要组件** — 自工具卡片接管 diff 入口后，
+  `SessionFileSummary` 就没有任何渲染入口，却仍带着 231 行专属样式和 3 条文案留在仓库里。
+  现在连同 `drawer.modifiedFiles` / `drawer.modifiedFilesAria` / `drawer.moreFiles`
+  一并删除，README 中「回答级修改文件摘要」「Files 面板本次会话修改列表」两处失效描述
+  也改成了实际存在的逐次修改 diff 入口。
 
 ## v0.6.7 - 2026-07-29
 
