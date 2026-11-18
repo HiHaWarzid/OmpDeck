@@ -72,10 +72,17 @@ if (typeof document !== "undefined" && isBrowserRuntime) {
 	document.documentElement.dataset.runtime = "web";
 }
 
-// 仅 Web 运行时注册 SW；Electron 里不注册，以免 dev server 缓存干扰。
-// HTTPS（Tailscale Serve 等）与 localhost HTTP 是安全上下文，可安装 PWA；
-// 局域网裸 HTTP 注册会被浏览器拒绝，catch 掉即可，不影响页面使用。
+/**
+ * 仅 Web 运行时注册 SW；Electron 里不注册，以免 dev server 缓存干扰。
+ * HTTPS（Tailscale Serve 等）与 localhost HTTP 是安全上下文，可安装 PWA；
+ * 局域网裸 HTTP 注册会被浏览器拒绝，catch 掉即可，不影响页面使用。
+ *
+ * Vite dev 里也必须跳过：`sw.js` / `mobile.*` 在 dev 下由 Vite 直接下发 public 目录的
+ * 原文，`__SHELL_VERSION__` 不会被替换（替换发生在 Main 的 sendFile 里）。缓存键因此
+ * 变成一个永不变化的字面量，改了手机端脚本也照旧命中旧缓存，只能手动清站点数据。
+ */
 if (
+	import.meta.env.DEV === false &&
 	isBrowserRuntime &&
 	typeof navigator !== "undefined" &&
 	"serviceWorker" in navigator &&

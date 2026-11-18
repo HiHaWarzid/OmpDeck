@@ -86,7 +86,21 @@
   气泡六处浮层原本各有一个锚点 state，可以同时打开两个；「再点一次按钮收起」也因此会被
   关闭层的 pointerdown 先关掉、click 又打开，按钮一直亮着（气泡还常压在自己的按钮上）。
   现在是一个判别联合 `OverlayState` + 纯落点函数 `placeEditorsPopover`（不得覆盖触发器），
-  打开任一处都会关掉前一处。
+  打开任一处都会关掉前一处。关闭层同时新增「触发器上的 pointerdown 不算外部」这条不变式，
+  否则任何 toggle 型浮层都会被同一个 click 先关后开。
+- **编辑器 tab 收成账本** — tab 列表、活跃 tab、访问序号原是三个 `useState`，靠
+  `openEditorTab` 在 `setEditorTabs` 的 updater 里顺手 `setActiveTabId` 维持「活跃 ∈ 列表」，
+  而 `closeEditorTab` 又从闭包读 `activeTabId`：连点两次关闭就能留下指向已关节点的活跃 id。
+  现在 `{tabs, activeId, seq}` 是同一个值，LRU 与正文预算的淘汰在 `utils/editorTabLedger.ts`
+  里可直接单测。
+- **手机端纯决策内核抽成 mobile-state.js** — 消息合并窗口、堆叠签名匹配、滚动计划、
+  分组渲染计划此前埋在 2500 行经典脚本里，只能靠人眼验证。现在由
+  `utils/mobileState.test.ts` 覆盖，`mobile.js` 只负责拼 HTML；两文件同批更新，
+  缺函数时直接报「版本不一致」，不再静默降级。
+- **手机外壳版本号收成单一来源** — `mobile.html` 的三个 `?v=` 与 `sw.js` 的 `CACHE_NAME`
+  原本是四个要一起手改的数字，漏改一个就会把「新 `mobile.js` + 旧 `mobile-state.js`」
+  推给手机。现在静态文件里是占位符，由主进程读文件时替换成 `shared/mobileShell` 的常量；
+  Vite dev 下不注册 Service Worker（占位符不会被替换，缓存键会退化成永不变化的字面量）。
 
 ### 🔒 安全
 

@@ -120,7 +120,29 @@ All notable changes to PiDeck are documented here.
   button lit forever (with the bubble often covering the button itself). They
   are now one discriminated union `OverlayState` plus the pure placement
   function `placeEditorsPopover` (which must not cover its trigger); opening any
-  one closes the previous one.
+  one closes the previous one. The dismiss layer also gained a new invariant —
+  a `pointerdown` on the trigger does not count as outside — without which every
+  toggle bubble is closed and reopened by the same click.
+- **Editor tabs collapsed into a ledger** — The tab list, active tab, and access
+  sequence were three `useState`s kept consistent by `openEditorTab` calling
+  `setActiveTabId` from inside the `setEditorTabs` updater, while `closeEditorTab`
+  read `activeTabId` from its closure: clicking close twice could leave an active
+  id pointing at a closed tab. `{tabs, activeId, seq}` is now one value, and the
+  LRU / text-budget eviction lives in `utils/editorTabLedger.ts` where it is
+  tested directly.
+- **The mobile decision core moved into `mobile-state.js`** — Message merge
+  windows, stack signature matching, scroll planning, and the grouped render plan
+  were buried in a 2,500-line classic script that only a human could verify. They
+  are now covered by `utils/mobileState.test.ts`; `mobile.js` only assembles HTML.
+  The two files ship together, and a missing function reports a version mismatch
+  instead of degrading silently.
+- **One source for the mobile shell version** — The three `?v=` in `mobile.html`
+  and `sw.js`'s `CACHE_NAME` were four numbers that had to be bumped together;
+  missing one shipped "new `mobile.js` + old `mobile-state.js`" to phones. The
+  static files now carry a placeholder that the main process replaces from the
+  `shared/mobileShell` constant. Development no longer registers a service
+  worker, since Vite serves the placeholder unreplaced and the cache key would
+  collapse to a never-changing literal.
 
 ### 🔒 Security
 

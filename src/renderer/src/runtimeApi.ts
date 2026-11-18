@@ -52,8 +52,11 @@ const resolved: PiDesktopApi =
 
 /**
  * `missing-preload` 不写入：让 window 保持 undefined，安装损坏仍然可见、可诊断。
- * 其余宿主写入后，`browserApi` 里「preload 不存在才是 Web 运行时」的判定仍成立，
- * 因为它读的是模块求值期的 window，与这里同一次求值、顺序在安装之后。
+ *
+ * 其余宿主写入后，`browserApi` 里「preload 不存在才是 Web 运行时」的判定依然成立：
+ * 它是本模块的静态 import，**先于本文件求值**，因此那次判定读到的 window 一定还是
+ * preload 的原值（不存在），不会被这里安装的 api 反过来当成 Electron。
+ * 两处共用 `detectRuntimeSurface`，规则本身也只有一份。
  */
 if (window.piDesktop === undefined && runtimeSurface !== "missing-preload") {
 	window.piDesktop = resolved;

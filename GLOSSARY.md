@@ -420,3 +420,51 @@ Git 面板 status / branches 的**生命周期 module**（`renderer/src/utils/gi
 它独占 `write|edit|create|patch` 的工具名规则（`isFileMutatingTool` / `isFileWriteTool` / `isFileEditTool`）、`oldText`/`old_text` 多写法兼容、「同一路径再次修改移到末尾」的顺序语义，以及 `content|text|data|body` 的写入内容键兼容面。这些共同定义「这条工具调用展示哪份 diff」，因此不能挂在 App 根 `useMemo` 上（transcript 每 50ms 增量都会唤醒根组件）；改为只在需要时按快照调用一次，进而是可独立单测的深模块。
 
 `getToolDiffTarget` 是「这条工具调用展示哪份 diff」的唯一入口：卡片上的 diff chip 与 diff 打开路径（`App.diffFilePath` 在调用方没带内容时用 `buildDiffTargetIndex` 按 transcript 快照兜底）读同一份结果，否则卡片自己挑内容键时，`data`/`body` 形式的写入会出现「卡片有 chip、点开却没有内容」的落差。
+
+# 浮层锚点、编辑器 tab 与手机纯核心（Renderer 领域术语）
+
+> 第七领域：锚定浮层的位置与互斥、编辑器 tab 的账本、手机端不依赖 DOM 的决策核心。
+> 源自架构评审（宿主判定 / 锚定浮层 / tab 账本 / 手机外壳批次）。维护规则同上。
+
+## 术语
+
+### AnchoredOverlay / OverlayState（锚定浮层与当前浮层）
+锚定浮层是「贴着某个触发器或光标打开的浮层」：文件 / 项目 / Agent / 会话四个右键菜单、会话来源筛选、外部编辑器气泡。它们的当前值**只有一个**（`utils/anchoredOverlay.ts` 的判别联合 `AnchoredOverlay` 与 `OverlayState = AnchoredOverlay | null`，`App.tsx` 里的单个 `useState`）。
+
+互斥必须是类型事实而不是每个打开点的纪律：六个锚点各自一个 `useState` 时，打开 A 只在记得把 B/C/D 置空的代码里才关掉 B/C/D，漏一处就是两个菜单叠在屏幕上。`closeOverlay(kind)` 按 `kind` 精确匹配，异步收尾不会误关用户后来打开的另一个浮层。
+
+`kind: "editors"` 特殊：它是唯一的 toggle 型浮层，**没有独立的 open 标记**——判据就是 `kind === "editors"`。其余浮层都是「打开即替换」。
+
+### placeEditorsPopover（气泡落点）
+外部编辑器气泡落点的**唯一实现**（`utils/anchoredOverlay.ts`）。契约是**不得覆盖自己的触发器**，这不是审美要求而是 toggle 成立的前提：气泡以 `position: fixed` 画在触发器之上时，真实指针点到的是气泡，`pointerdown` 不在气泡外、随后的 `click` 也派发给气泡，按钮的 `onClick` 根本不执行——「再点一次收起」在真机上永远失效。脚本 `.click()` 绕过命中测试，所以这个缺陷不会被自动化测试发现。
+
+依次尝试左侧 / 下方 / 上方 / 右侧，取第一个夹进视口后仍不压住触发器的位置；四个都不行（窗口比气泡还窄）时退回左侧夹好的坐标，宁可压住也不跑到视口外。
+
+估算尺寸 `EDITORS_POPOVER_SIZE` 与 CSS 必须对齐：全局 `* { box-sizing: border-box }` 下 `max-height` 已含内边距，所以高度取 240 而不是「内容上限 + 内边距」；宽度没有写在 CSS 里，由 App 渲染气泡时用同一常量的 `width` 作 `maxWidth`——否则长编辑器名会把气泡撑回触发器上方，toggle 重新失效。
+
+### EditorTabLedger（编辑器 tab 账本）
+编辑器 tab 的**唯一事实源**（`utils/editorTabLedger.ts`）：`{ tabs, activeId, seq }` 是一个值，不存在「id 在、tab 不在」的中间态。
+
+此前那是三个 `useState`：`openEditorTab` 在 `setEditorTabs` 的 updater 里顺手 `setActiveTabId`，而 `closeEditorTab` 又从闭包读 `activeTabId`——连点两次关闭就能留下指向已关节点的活跃 id。把访问序号 `seq` 也放进同一个值，是因为「谁最久没访问」与「谁是活跃」必须同批更新，分居两处时 LRU 会按上一次渲染的顺序淘汰。
+
+两条淘汰规则同住一处：条数上限 `EDITOR_TAB_LIMIT` 与正文预算 `EDITOR_TAB_TEXT_BUDGET`（按 UTF-16 码元 × 2 估算）。本次打开/切换的 tab 受保护，即使自己超预算也保留——否则用户点开的文件会立刻被自己挤掉。
+
+规则：新增 tab 相关行为（重命名、拖拽排序、按项目分组）改本模块，不在 `App.tsx` 里加第三个 `useState`。
+
+### MobileState（手机端纯决策内核）
+手机端**不依赖 DOM 的决策函数集合**（`renderer/public/mobile-state.js`，挂在 `globalThis.OmpMobileState`）。
+
+它独占四类决策：消息合并（`mergeMessageLists` / `mergeTimeline` / `appendTail` / `mergeOlder` / `countNewMessages` / `removeAcknowledgedOptimistic`）、响应接收判定与轮询节奏（`shouldAcceptResponse` / `pollDelay`）、滚动计划（`isNearBottom` / `scrollPlan` / `tailLength` / `lastRealMessageId`）、一条消息到展示项的投影与分组（`displayItem` / `groupDisplayItems`）。
+
+`displayItem` **只产出数据、不含任何 HTML**：转义与拼接留在 `mobile.js`，测试可以直接断言对象。这样「哪些字段来自服务端契约、哪些是手机端兜底」可以被穷举。
+
+`mobile.js` 与 `mobile-state.js` 必须同批更新：启动时一次性核对本文件用到的函数名，缺任何一个都直接显示「版本不一致」并抛错，而不是让时间线中途空白或抛在深层调用里。
+
+### MobileShellVersion（手机外壳版本）
+手机外壳缓存失效契约的**唯一版本来源**（`shared/mobileShell.ts`）。
+
+契约由 `mobile.html` 的三个 `?v=` 与 `sw.js` 的 `CACHE_NAME` 共同构成：改 JS/CSS 却忘了抬版本号，手机会继续用缓存里的旧脚本；只抬 `mobile.js` 而忘了 `mobile-state.js`，就会出现「新渲染代码 + 旧纯核心」的半新半旧组合（历史上踩过一次，当时靠 `mobile.js` 的特性探测兜底）。
+
+静态文件仍然没有构建步骤，所以文件里写的是占位符 `__SHELL_VERSION__`，由主进程读文件时替换（`WebServiceManager.sendFile`）。「四个数字要一起改」因此变成「一个常量」，漏改在结构上不可能发生；`mobileShellVersion.test.ts` 守着「静态文件里不许再出现字面版本数字」与「html 与 sw.js 拿到同一个数字」。
+
+开发态是唯一的例外：Vite dev 直接下发 `public/` 原文，占位符不会被替换，缓存键会退化成永不变化的字面量——所以 `browserApi` 在 `import.meta.env.DEV` 下不注册 Service Worker。
