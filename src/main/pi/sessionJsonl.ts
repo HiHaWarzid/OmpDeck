@@ -1,5 +1,6 @@
 import { readFile, writeFile, readdir, copyFile, unlink } from "node:fs/promises";
 import { readdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, dirname, basename } from "node:path";
 
 import type { Worker } from "node:worker_threads";
@@ -751,6 +752,58 @@ export class SessionJsonl {
 		throw new Error("Message not found in session file");
 	}
 
+	/**
+	 * 在会话文件上挂一个临时 `_reloadMarker` 字段执行 body，然后摘掉它。
+	 *
+	 * pi 以首条记录的变化作为「会话被外部改写」的信号：改完后必须让 pi 重新发现
+	 * 并重载该会话。marker 的写入/摘除是 JSONL 格式知识（只承认第一行是 JSON 对象），
+	 * 因此留在本模块，agent 编排层不再直接读改写第一行。
+	 *
+	 * 失败语义：
+	 *   - body 抛错时仍然尝试摘除 marker 再向上抛，避免残留让 pi 反复重读；
+	 *   - 摘除失败（编码异常/文件被占用）只记日志——marker 残留只会让 pi 多读一次，
+	 *     文件本身仍是合法会话（只改了第一行内部的 JSON 内容，未改行结构）。
+	 *
+	 * body 收到 markerId：它也是「pi 这次为什么重读」的唯一关联键，编排层的
+	 * switch_session 日志要靠它把 pi 侧行为与这次文件改写对上。
+	 */
+	async withReloadMarker<T>(
+		sessionPath: string,
+		body: (markerId: string) => Promise<T>,
+	): Promise<T> {
+		const sessionHostPath = this.resolve(sessionPath);
+		const markerId = randomUUID();
+
+		const raw = await readFile(sessionHostPath, "utf8");
+		const lines = raw.split(/\r?\n/);
+		if (lines.length === 0 || !lines[0].trim()) {
+			throw new Error("Session file is empty");
+		}
+		const firstLine = JSON.parse(lines[0]) as Record<string, unknown>;
+		// 先清除旧值，确保每次 marker 都不同（相同值不会触发 pi 的缓存失效）。
+		delete firstLine._reloadMarker;
+		firstLine._reloadMarker = markerId;
+		lines[0] = JSON.stringify(firstLine);
+		await writeFile(sessionHostPath, lines.join("\n"), "utf8");
+
+		try {
+			return await body(markerId);
+		} finally {
+			try {
+				const afterRaw = await readFile(sessionHostPath, "utf8");
+				const afterLines = afterRaw.split(/\r?\n/);
+				if (afterLines.length > 0 && afterLines[0].includes("_reloadMarker")) {
+					const restored = JSON.parse(afterLines[0]) as Record<string, unknown>;
+					delete restored._reloadMarker;
+					afterLines[0] = JSON.stringify(restored);
+					await writeFile(sessionHostPath, afterLines.join("\n"), "utf8");
+				}
+			} catch {
+				// _reloadMarker 残留只会让 pi 多读一次会话，不影响使用
+			}
+		}
+	}
+
 	// ── 备份 / 恢复 ────────────────────────────────────────
 
 	/**
@@ -810,7 +863,8 @@ export class SessionJsonl {
 	}
 
 	/**
-	 * 从最新备份恢复会话文件。用于 reloadSession 失败后回滚 JSONL。
+	 * 从最新备份恢复会话文件。用于 SessionRewrite 在 reload 失败后回滚 JSONL
+	 * （调用方是 sessionRewrite.ts 的 rollback，不是 AgentManager 的各条消息路径）。
 	 * @returns 是否找到了备份并完成恢复
 	 */
 	async restoreFromBackup(sessionPath: string): Promise<boolean> {
@@ -833,8 +887,8 @@ export class SessionJsonl {
 	 *   - mutator 抛出时（定位失败、角色校验失败等）立即中止，**不会备份也不会写回**，
 	 *     与原 editMessage/deleteMessage 中「先 locate 再 backup 再 mutate 再 write」的失败语义一致
 	 *     （mutate 仅是内存操作，备份前后的 in-memory 变更对磁盘备份内容无影响）。
-	 *   - 不负责 reload：调用方（AgentManager）负责后续 reloadSession 以及 reload 失败时的
-	 *     restoreFromBackup + loadMessages 回滚。
+	 *   - 不负责 reload：调用方（SessionRewrite）负责 reload 以及 reload 失败时的
+	 *     restoreFromBackup + refreshTranscript 回滚。
 	 *
 	 * 文件读取失败或为空时抛出 "Session file is empty"，与原 orchestrator 行为一致。
 	 */

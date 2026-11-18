@@ -648,6 +648,96 @@ test("modifyLines passes through complex mutator return value (object)", async (
 	assert.deepEqual(result, { text: "payload", images: ["img1"] });
 });
 
+// ── withReloadMarker ────────────────────────────────────
+
+/** 读会话文件首行的 `_reloadMarker`（没有该字段时返回 undefined）。 */
+async function readMarker(sessionPath: string): Promise<unknown> {
+	const first: unknown = JSON.parse((await readFileText(sessionPath)).split(/\r?\n/)[0]);
+	return first && typeof first === "object" && "_reloadMarker" in first
+		? first._reloadMarker
+		: undefined;
+}
+
+test("withReloadMarker writes a fresh marker before body and strips it after", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "marker-"));
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([
+			{ id: "u1", type: "message", message: { role: "user", content: "hi" } },
+			{ id: "a1", type: "message", message: { role: "assistant", content: "yo" } },
+		]),
+		"utf8",
+	);
+
+	let markerDuringBody: unknown;
+	let handedMarkerId: string | undefined;
+	await sj.withReloadMarker(sessionPath, async (markerId) => {
+		handedMarkerId = markerId;
+		markerDuringBody = await readMarker(sessionPath);
+	});
+
+	assert.equal(typeof markerDuringBody, "string");
+	// 写在文件里的值就是要交给调用方的值：编排层用它把 pi 侧重读与本次改写对上。
+	assert.equal(handedMarkerId, markerDuringBody);
+	// 摘除后必须干净：残留 marker 会让 pi 反复认为会话被外部改写。
+	assert.equal(await readMarker(sessionPath), undefined);
+	// 只改第一行的 JSON 内容，行结构（行数）保持不变。
+	assert.equal((await readFileText(sessionPath)).split(/\r?\n/).length, 2);
+});
+
+test("withReloadMarker strips the marker even when body throws", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "marker-throw-"));
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([{ id: "u1", type: "message", message: { role: "user", content: "hi" } }]),
+		"utf8",
+	);
+
+	await assert.rejects(
+		() => sj.withReloadMarker(sessionPath, async () => {
+			throw new Error("switch_session failed");
+		}),
+		/switch_session failed/,
+	);
+
+	assert.equal(await readMarker(sessionPath), undefined, "失败的 reload 也不得留下 marker");
+});
+
+test("withReloadMarker replaces a stale marker instead of reusing it", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "marker-stale-"));
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(
+		sessionPath,
+		toJsonl([{ _reloadMarker: "stale", id: "u1", type: "message", message: { role: "user", content: "hi" } }]),
+		"utf8",
+	);
+
+	let markerDuringBody: unknown;
+	await sj.withReloadMarker(sessionPath, async () => {
+		markerDuringBody = await readMarker(sessionPath);
+	});
+
+	// 值必须变化：pi 靠「首条记录变了」判断，相同值不会触发缓存失效。
+	assert.notEqual(markerDuringBody, "stale");
+});
+
+test("withReloadMarker rejects an empty session file", async () => {
+	const sj = makeSessionJsonl();
+	const dir = await mkdtemp(join(tmpRoot, "marker-empty-"));
+	const sessionPath = join(dir, "session.jsonl");
+	await writeFile(sessionPath, "", "utf8");
+
+	await assert.rejects(
+		() => sj.withReloadMarker(sessionPath, async () => "unreachable"),
+		/Session file is empty/,
+	);
+});
+
 // ── readDisplayMessages（Viewer 时间线）───────────────
 
 test("readDisplayMessages walks the active branch from the leaf, not the file order", async () => {

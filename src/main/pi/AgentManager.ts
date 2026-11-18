@@ -1,6 +1,5 @@
 import type { BrowserWindow, NativeImage } from "electron";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
 import type { Worker } from "node:worker_threads";
 import { existsSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -52,7 +51,6 @@ import type { PiRpcClient, RpcResponse } from "./PiRpcClient";
 import { requestPiCommand } from "./piRpcCompat";
 import type { PiProcessDiagnostics } from "./PiProcess";
 import { formatBashToolMessage } from "./bashResult";
-import { extractMessageText } from "./messageContent";
 import { mergeHistoryWithPreservedMessages } from "./historyMessages";
 import {
 	buildActiveBranchEntryIds,
@@ -71,13 +69,14 @@ import {
 	stripAnsi,
 	truncateForDetail,
 } from "./messageTextUtils";
-import {
-	assertResendRootEntry,
-	collectDescendantEntryIds,
-	findLastUserMessageLine,
-	takeActiveEntryId,
-} from "./sessionEntryIds";
+import { takeActiveEntryId } from "./sessionEntryIds";
 import { SessionJsonl } from "./sessionJsonl";
+import { SessionRewrite } from "./sessionRewrite";
+import {
+	deleteEntry,
+	editEntryText,
+	truncateForResend,
+} from "./sessionRewriteMutations";
 import { LatestByKeyEmitter } from "./LatestByKeyEmitter";
 import {
 	classifyPiFailure,
@@ -306,6 +305,11 @@ export class AgentManager {
 	 */
 	private readonly sessionJsonl: SessionJsonl;
 	/**
+	 * 会话改写配方：编辑/删除/重发共用「锁 → 空闲闸 → 读改写 → 重载 → 失败回滚」。
+	 * 行的具体变换在 sessionRewriteMutations（纯函数），本类只提供端口与调用点。
+	 */
+	private readonly sessionRewrite: SessionRewrite;
+	/**
 	 * 运行控制模块：模型 / 思考档 / 服务档 / 自动压缩 / todo 的唯一入口。
 	 * 11 个同级方法收成一个 `apply(change)` + 两个能力查询 + 一次配置刷新探测，
 	 * IPC handler 与本类都不再各自拼「取运行时 → 发请求 → 读状态」。
@@ -358,6 +362,26 @@ export class AgentManager {
 			createArchiveWorker,
 			getBlobsDir: () => this.blobsDir(),
 			logger: this.appLogger,
+		});
+		this.sessionRewrite = new SessionRewrite({
+			runtime: (agentId) => {
+				const runtime = this.requireRuntime(agentId);
+				// messages 用 getter 而不是快照：配方在 provide 给 mutate 时才读它，
+				// 与旧实现（在 mutator 内部取 runtime.transcript.messages）一致——
+				// 否则 modifyLines 读文件期间的转录替换会让改写拿着过期消息去定位。
+				return {
+					sessionPath: runtime.tab.sessionPath,
+					get messages() {
+						return runtime.transcript.messages;
+					},
+				};
+			},
+			jsonl: this.sessionJsonl,
+			withLock: (agentId, fn) => this.withSessionLock(agentId, fn),
+			ensureIdle: (agentId) => this.ensureAgentIdle(agentId),
+			reload: (agentId) => this.reloadSession(agentId),
+			refreshTranscript: (agentId) => this.loadMessages(agentId),
+			log: this.appLogger,
 		});
 		// history 依赖 sessionJsonl 的实例，必须在赋值之后再装配；把它挪到前面会让
 		// host.jsonl 永久停在 undefined（TS 只在严格初始化下才报）。
@@ -2628,80 +2652,51 @@ export class AgentManager {
 
 	/**
 	 * 用 pi 的 switch_session RPC 重载当前会话，而不是新建进程。
-	 * 流程：改写 JSONL 第一行 JSON，写入 _reloadMarker 字段 → switch_session
-	 * → pi 发现首条记录变化 → 缓存失效 → 重新读取 → 摘下 _reloadMarker。
 	 *
-	 * 安全性：只改第一行内部的 JSON 内容，不改文件行结构，因此 marker 若残留，
-	 * 文件仍是合法会话，可被 pi 正常打开。
+	 * pi 以「首条记录变化」作为会话被外部改写的信号，因此重载期间必须在文件上挂
+	 * 一个临时 `_reloadMarker`（写/摘都在 SessionJsonl.withReloadMarker 里，
+	 * 那是 JSONL 格式知识；本方法只编排 agent 状态）。
 	 */
 	private async reloadSession(agentId: string) {
 		const startTime = Date.now();
 		const runtime = this.requireRuntime(agentId);
 		const sessionPath = runtime.tab.sessionPath;
 		if (!sessionPath) throw new Error("Session path not available for reload");
-		const sessionHostPath = this.toSessionHostPath(sessionPath);
 		const sessionProtocolPath = this.toSessionProtocolPath(sessionPath);
 
-		const markerId = randomUUID();
-
 		try {
-			const raw = await readFile(sessionHostPath, "utf8");
-			const lines = raw.split(/\r?\n/);
-			if (lines.length === 0 || !lines[0].trim()) {
-				throw new Error("Session file is empty");
-			}
-			// 改第一行 JSON 对象，加入 _reloadMarker 字段，迫使 pi 重新发现并重载该会话。
-			// 只改第一行的内容，不改文件行结构，使 marker 即便残留，文件仍是合法会话。
-			const firstLine = JSON.parse(lines[0]) as Record<string, unknown>;
-			delete firstLine._reloadMarker; // 先清除旧的，确保值不同
-			firstLine._reloadMarker = markerId;
-			lines[0] = JSON.stringify(firstLine);
-			await writeFile(sessionHostPath, lines.join("\n"), "utf8");
-
-			void this.appLogger?.info("agent", "Session reload: switch_session start", {
-				agentId,
-				markerId,
-				elapsedMs: Date.now() - startTime,
-			});
-
-			const response = await runtime.slot.process.client.request({
-				type: "switch_session",
-				sessionPath: sessionProtocolPath,
-			}, 30_000);
-
-			// reload 也是会话替换：进程内的子代理 registry 随旧会话丢弃，且不会补发
-			// 终态帧。不主动清空的话，编辑/删除消息后卡片会永远停在 Running。
-			if (response.success) this.clearSubagents(runtime);
-
-			void this.appLogger?.info("agent", "Session reload: switch_session done", {
-				agentId,
-				markerId,
-				success: response.success,
-				elapsedMs: Date.now() - startTime,
-			});
-
-			// 恢复第一行：移除 _reloadMarker 字段，把文件还原到原始状态
-			try {
-				const afterRaw = await readFile(sessionHostPath, "utf8");
-				const afterLines = afterRaw.split(/\r?\n/);
-				if (afterLines.length > 0 && afterLines[0].includes("_reloadMarker")) {
-					const restored = JSON.parse(afterLines[0]) as Record<string, unknown>;
-					delete restored._reloadMarker;
-					afterLines[0] = JSON.stringify(restored);
-					await writeFile(sessionHostPath, afterLines.join("\n"), "utf8");
-				}
-			} catch {
-				// _reloadMarker 残留只会让 pi 多读一次会话，不影响使用
-			}
-
-			if (!response.success) {
-				void this.appLogger?.error("agent", "Session reload: switch_session failed", {
+			await this.sessionJsonl.withReloadMarker(sessionPath, async (markerId) => {
+				void this.appLogger?.info("agent", "Session reload: switch_session start", {
 					agentId,
-					error: response.error,
+					markerId,
 					elapsedMs: Date.now() - startTime,
 				});
-				throw new Error(response.error ?? "switch_session failed");
-			}
+
+				const response = await runtime.slot.process.client.request({
+					type: "switch_session",
+					sessionPath: sessionProtocolPath,
+				}, 30_000);
+
+				// reload 也是会话替换：进程内的子代理 registry 随旧会话丢弃，且不会补发
+				// 终态帧。不主动清空的话，编辑/删除消息后卡片会永远停在 Running。
+				if (response.success) this.clearSubagents(runtime);
+
+				void this.appLogger?.info("agent", "Session reload: switch_session done", {
+					agentId,
+					markerId,
+					success: response.success,
+					elapsedMs: Date.now() - startTime,
+				});
+
+				if (!response.success) {
+					void this.appLogger?.error("agent", "Session reload: switch_session failed", {
+						agentId,
+						error: response.error,
+						elapsedMs: Date.now() - startTime,
+					});
+					throw new Error(response.error ?? "switch_session failed");
+				}
+			});
 
 			await this.loadMessages(agentId);
 		} catch (error) {
@@ -2773,85 +2768,30 @@ export class AgentManager {
 
 	/**
 	 * 编辑消息：修改 JSONL 中的 text 后通过 switch_session 重载，不重启进程。
-	 * 前端需在 agent idle 时调用。
 	 *
-	 * 文件读改写、备份、按 entryId 定位均已委托给 SessionJsonl：
-	 *   - sessionJsonl.modifyLines 负责 read→mutate→backup→write 原子封装；
-	 *   - sessionJsonl.locateEntry 负责在 lines 中按 entryId/msg.id/文本三段式定位；
-	 *   - sessionJsonl.restoreFromBackup 负责 reload 失败时回滚 JSONL。
-	 * 本方法只保留 agent 状态相关的编排：空闲检查、锁、reload、内存消息回滚。
+	 * 锁 / 空闲检查 / reload / 失败回滚的编排全在 SessionRewrite；本方法只声明
+	 * 「编辑」这一种改写要做哪些行变换。
 	 *
-	 * messages/msg 查找放在 modifyLines 的 mutator 内部，以保持原顺序：
-	 * 先读文件（空文件校验）再查内存消息，避免双失败时错误信息发生变化。
+	 * messages/msg 查找放在 mutator 内部，以保持原顺序：先读文件（空文件校验）
+	 * 再查内存消息，避免双失败时错误信息发生变化。
 	 */
 	async editMessage(agentId: string, messageId: string, newText: string) {
 		const startTime = Date.now();
 		void this.appLogger?.info("agent", "Edit message requested", { agentId, messageId });
 
-		await this.withSessionLock(agentId, async () => {
-			// 1. 检查 Agent 空闲状态
-			await this.ensureAgentIdle(agentId);
-
-			const runtime = this.requireRuntime(agentId);
-			const sessionPath = runtime.tab.sessionPath;
-			if (!sessionPath) throw new Error("Session not persisted");
-
-			await this.sessionJsonl.modifyLines(sessionPath, (lines) => {
-				const messages = runtime.transcript.messages;
-				const msg = messages.find((m) => m.id === messageId);
-				if (!msg) throw new Error("Message not found");
-
-				// 2. 定位 JSONL 行（优先 entryId，回退 msg.id 提取 / 角色+文本匹配）
-				const { lineIndex, entry } = this.sessionJsonl.locateEntry(lines, messages, msg);
-				const role = (entry as any)?.message?.role;
-
-				if (role !== "user" && role !== "assistant") {
-					throw new Error("Only user and assistant messages can be edited");
-				}
-
-				// 3. 修改 text（modifyLines 会在 mutator 成功后自动 backup + 写回）
-				const wrapped = entry as { message?: Record<string, any> };
-				const content = wrapped.message!.content;
-				if (Array.isArray(content)) {
-					const textBlock = content.find((c: any) => c.type === "text");
-					if (textBlock) {
-						textBlock.text = newText;
-					} else {
-						content.push({ type: "text", text: newText });
-					}
-				} else {
-					wrapped.message!.content = [{ type: "text", text: newText }];
-				}
-				lines[lineIndex] = JSON.stringify(entry);
-			});
-
-			// 4. 使用 _reloadMarker 重载 pi 会话
-			// 注意：不再手动更新桌面端内存——reloadSession 内部调用 loadMessages
-			// 会从 pi 拉取最新消息列表，保持桌面端与 pi 状态一致。
-			try {
-				await this.reloadSession(agentId);
-			} catch (error) {
-				// reload 失败时从备份恢复 JSONL
-				const errMsg = error instanceof Error ? error.message : String(error);
-				void this.appLogger?.error("agent", "Edit message: reload failed, restoring backup", {
-					agentId,
+		// 定位刻意留在 mutate 内部：先读文件（空文件校验）再查内存消息，
+		// 保持「双失败时先报文件空」的原错误优先级。
+		await this.sessionRewrite.apply(agentId, {
+			operation: "Edit message",
+			detail: { messageId },
+			mutate: ({ lines, messages }) =>
+				editEntryText({
+					lines,
+					messages,
 					messageId,
-					error: errMsg,
-					elapsedMs: Date.now() - startTime,
-				});
-				try {
-					const restored = await this.sessionJsonl.restoreFromBackup(sessionPath);
-					if (restored) {
-						await this.loadMessages(agentId).catch(() => {});
-					}
-				} catch (restoreError) {
-					void this.appLogger?.error("agent", "Edit message: failed to restore backup", {
-						agentId,
-						error: restoreError instanceof Error ? restoreError.message : String(restoreError),
-					});
-				}
-				throw error;
-			}
+					newText,
+					locate: (l, m, msg) => this.sessionJsonl.locateEntry(l, m, msg),
+				}),
 		});
 
 		void this.appLogger?.info("agent", "Edit message completed", {
@@ -2864,93 +2804,23 @@ export class AgentManager {
 	/**
 	 * 删除消息：在 JSONL 中用 deleted 标记替换对应行后通过 switch_session 重载。
 	 *
-	 * 相比旧版本（置空行导致 JSONL 行数偏移），本方案：
-	 * - 用 {"type":"deleted","originalEntryId":"...","ts":...} 替换原行
-	 * - 同时将删掉 entry 的子 entry 的 parentId 重定向到被删 entry 的父节点（re-parenting），
-	 *   确保 pi 重载 session tree 时不会因 dangling parentId 丢弃整个子分支
-	 * - 保留行号稳定，不破坏行数对齐
-	 * - entryId 精确定位不受之前删除操作影响
-	 *
-	 * 文件读改写/备份/定位/回滚同 editMessage，委托给 SessionJsonl。
+	 * 行变换规则（tombstone 形状、re-parenting 保住子分支、行号稳定）住在
+	 * sessionRewriteMutations 的 deleteEntry，本方法只接上端口。
 	 */
 	async deleteMessage(agentId: string, messageId: string) {
 		const startTime = Date.now();
 		void this.appLogger?.info("agent", "Delete message requested", { agentId, messageId });
 
-		await this.withSessionLock(agentId, async () => {
-			// 1. 检查 Agent 空闲状态
-			await this.ensureAgentIdle(agentId);
-
-			const runtime = this.requireRuntime(agentId);
-			const sessionPath = runtime.tab.sessionPath;
-			if (!sessionPath) throw new Error("Session not persisted");
-
-			await this.sessionJsonl.modifyLines(sessionPath, (lines) => {
-				const messages = runtime.transcript.messages;
-				const msg = messages.find((m) => m.id === messageId);
-				if (!msg) throw new Error("Message not found");
-
-				// 2. 定位 JSONL 行（优先 entryId）
-				const { lineIndex, entry } = this.sessionJsonl.locateEntry(lines, messages, msg);
-				const deletedEntryId = (entry as any)?.id;
-				const deletedParentId = (entry as any)?.parentId;
-				const foundRole = (entry as any)?.message?.role;
-				console.log(`[deleteMessage] lineIndex=${lineIndex}, entryId=${deletedEntryId?.slice(0, 12) ?? "(none)"}, parentId=${deletedParentId?.slice(0, 12) ?? "(null)"}, entryRole=${foundRole ?? "(none)"}`);
-
-				// 3. Re-parenting：将删掉 entry 的所有直接子节点的 parentId 指向被删 entry 的父节点。
-				// 这样 pi 在 switch_session 重载 session tree 时，子节点不会因为
-				// 父节点消失而变成 dangling orphan，避免 pi 丢弃整个子分支（“删一条丢多条”）。
-				if (deletedEntryId && deletedParentId !== undefined) {
-					for (let i = 0; i < lines.length; i++) {
-						if (i === lineIndex) continue;
-						const childLine = lines[i].trim();
-						if (!childLine) continue;
-						try {
-							const child = JSON.parse(childLine);
-							if (child.parentId === deletedEntryId) {
-								child.parentId = deletedParentId;
-								lines[i] = JSON.stringify(child);
-							}
-						} catch { /* 跳过无法解析的行 */ }
-					}
-				}
-
-				// 4. 用 deleted 标记替换原行（不保留 id 字段，
-				// 避免 pi 的 get_entries 返回已删 entry 导致 activeEntryIds 与 messages 不匹配）
-				lines[lineIndex] = JSON.stringify({
-					type: "deleted",
-					originalEntryId: deletedEntryId ?? `unknown-${messageId}`,
-					ts: Date.now(),
-				});
-			});
-
-			// 5. 使用 _reloadMarker 重载 pi 会话
-			// 不再手动更新 desktop 内存——reloadSession 内部调用 loadMessages
-			// 从 pi 拉取最新消息列表
-			try {
-				await this.reloadSession(agentId);
-			} catch (error) {
-				// reload 失败时从备份恢复 JSONL
-				const errMsg = error instanceof Error ? error.message : String(error);
-				void this.appLogger?.error("agent", "Delete message: reload failed, restoring backup", {
-					agentId,
+		await this.sessionRewrite.apply(agentId, {
+			operation: "Delete message",
+			detail: { messageId },
+			mutate: ({ lines, messages }) =>
+				deleteEntry({
+					lines,
+					messages,
 					messageId,
-					error: errMsg,
-					elapsedMs: Date.now() - startTime,
-				});
-				try {
-					const restored = await this.sessionJsonl.restoreFromBackup(sessionPath);
-					if (restored) {
-						await this.loadMessages(agentId).catch(() => {});
-					}
-				} catch (restoreError) {
-					void this.appLogger?.error("agent", "Delete message: failed to restore backup", {
-						agentId,
-						error: restoreError instanceof Error ? restoreError.message : String(restoreError),
-					});
-				}
-				throw error;
-			}
+					locate: (l, m, msg) => this.sessionJsonl.locateEntry(l, m, msg),
+				}),
 		});
 
 		void this.appLogger?.info("agent", "Delete message completed", {
@@ -2981,8 +2851,8 @@ export class AgentManager {
 	 * 同文件重发：截断该用户消息及其所有后代（assistant/tool 等），再返回可重新 prompt 的原文。
 	 * 不调用 fork，因此不会生成新的会话文件。
 	 *
-	 * 文件读改写/备份/定位/回滚委托给 SessionJsonl；本方法保留重发独有的硬护栏：
-	 * 只允许截断「文件中最后一条 user」，避免误删更早历史。
+	 * 文件读改写/备份/定位/回滚由 SessionRewrite + SessionJsonl 承担；重发独有的
+	 * 硬护栏（只允许截断「文件中最后一条 user」，避免误删更早历史）在 truncateForResend。
 	 */
 	async prepareResendFromMessage(
 		agentId: string,
@@ -2991,197 +2861,66 @@ export class AgentManager {
 		const startTime = Date.now();
 		void this.appLogger?.info("agent", "Prepare resend requested", { agentId, messageId });
 
-		return await this.withSessionLock(agentId, async () => {
-			await this.ensureAgentIdle(agentId);
-
-			const runtime = this.requireRuntime(agentId);
-			const sessionPath = runtime.tab.sessionPath;
-			if (!sessionPath) throw new Error("Session not persisted");
-
-			const messages = runtime.transcript.messages;
-			const msg = messages.find((m) => m.id === messageId);
-			if (!msg) throw new Error("Message not found");
-			if (msg.role !== "user") throw new Error("Only user messages can be resent");
-
-			// modifyLines 返回 mutator 的返回值（截断条数），用于完成日志。
-			const removed = await this.sessionJsonl.modifyLines<number>(sessionPath, (lines) => {
-				let lineIndex = -1;
-				let entry: Record<string, any>;
-				try {
-					const located = this.sessionJsonl.locateEntry(lines, messages, msg);
-					lineIndex = located.lineIndex;
-					entry = located.entry;
-					// entryId 错位时可能定位到 assistant 或更早的 user；
-					// 校验失败则回退到「最后一条同文案 user」，禁止带着错误根继续截断。
-					assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
-				} catch (locateError) {
-					const fallback = findLastUserMessageLine(lines, msg.text, (content) =>
-						extractMessageText(content),
-					);
-					if (!fallback) throw locateError;
-					void this.appLogger?.warn("agent", "Prepare resend: entry locate mismatch, using last text match", {
-						agentId,
-						messageId,
-						error: locateError instanceof Error ? locateError.message : String(locateError),
-					});
-					lineIndex = fallback.lineIndex;
-					entry = fallback.entry;
-					assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
-				}
-
-				// 兜底验证：确保定位到的 entry 是文件中最后一条同文本 user 消息。
-				// entryId 错位时（如 get_entries 与 get_messages 排列不一致）可能匹配到
-				// 更早的重复文案，误删不该删的历史内容。
-				// 纯文本消息用 findLastUserMessageLine 做二次校验；图片消息（text="[图片]"）不走此路径。
-				if (msg.text !== "[图片]") {
-					const lastMatch = findLastUserMessageLine(lines, msg.text, (content) =>
-						extractMessageText(content),
-					);
-					if (lastMatch && lastMatch.lineIndex !== lineIndex) {
+		const { removed, text, images } = await this.sessionRewrite.apply(agentId, {
+			operation: "Prepare resend",
+			detail: { messageId },
+			// 预检刻意放在读文件之前：保持「先报 Message not found / 非 user」的原错误优先级。
+			// 返回的消息实例直接传给 mutate，省掉第二次查找与非空断言。
+			prepare: ({ messages }) => {
+				const msg = messages.find((m) => m.id === messageId);
+				if (!msg) throw new Error("Message not found");
+				if (msg.role !== "user") throw new Error("Only user messages can be resent");
+				return msg;
+			},
+			mutate: ({ lines, messages }, msg) => {
+				const { removed } = truncateForResend({
+					lines,
+					messages,
+					msg,
+					locate: (l, m, target) => this.sessionJsonl.locateEntry(l, m, target),
+					onLocateMismatch: ({ error }) => {
+						void this.appLogger?.warn("agent", "Prepare resend: entry locate mismatch, using last text match", {
+							agentId,
+							messageId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					},
+					onDuplicateCorrected: (detail) => {
 						void this.appLogger?.warn("agent", "Prepare resend: entryId points to non-last duplicate, correcting", {
 							agentId,
 							messageId,
-							originalLine: lineIndex,
-							correctedLine: lastMatch.lineIndex,
-							originalEntryId: (entry as any)?.id?.slice(0, 12),
-							correctedEntryId: (lastMatch.entry as any)?.id?.slice(0, 12),
+							originalLine: detail.originalLine,
+							correctedLine: detail.correctedLine,
+							originalEntryId: detail.originalEntryId?.slice(0, 12),
+							correctedEntryId: detail.correctedEntryId?.slice(0, 12),
 						});
-						lineIndex = lastMatch.lineIndex;
-						entry = lastMatch.entry;
-						assertResendRootEntry(entry, msg.text, (content) => extractMessageText(content));
-					}
-				}
-
-				const rootEntryId = typeof (entry as any)?.id === "string" ? String((entry as any).id) : undefined;
-				if (!rootEntryId) throw new Error("User message entryId missing");
-
-				// 硬护栏：重发只允许截断「文件中最后一条 user」。
-				// 若定位到更早的 user，descendant 截断会把其后整段历史一起删掉——这正是
-				// 「点重发把之前消息全没了」的根因；宁可失败也不误删。
-				const lastUserInFile = findLastUserMessageLine(
-					lines,
-					// 用自身文本做定位；若重复文案，findLast 已取最后一次。
-					// 下面再扫一遍确认 root 确实是全局最后一条 user（不限文本）。
-					msg.text,
-					(content) => extractMessageText(content),
-				);
-				let lastUserLineIndex = lastUserInFile?.lineIndex ?? -1;
-				let lastUserEntryId =
-					typeof lastUserInFile?.entry?.id === "string"
-						? String(lastUserInFile.entry.id)
-						: undefined;
-				// 不依赖文案：扫描文件中最后一条 role=user，防止「最后一条 user 文本不同」时误判。
-				for (let i = 0; i < lines.length; i++) {
-					const line = lines[i]?.trim();
-					if (!line) continue;
-					try {
-						const parsed = JSON.parse(line) as {
-							id?: string;
-							type?: string;
-							message?: { role?: string };
-						};
-						if (parsed.type === "deleted") continue;
-						if (parsed.message?.role === "user" && typeof parsed.id === "string") {
-							lastUserLineIndex = i;
-							lastUserEntryId = parsed.id;
-						}
-					} catch {
-						/* 跳过 */
-					}
-				}
-				if (
-					lastUserEntryId &&
-					(lastUserEntryId !== rootEntryId || lastUserLineIndex !== lineIndex)
-				) {
-					void this.appLogger?.error("agent", "Prepare resend blocked: root is not last user", {
-						agentId,
-						messageId,
-						rootEntryId: rootEntryId.slice(0, 12),
-						lastUserEntryId: lastUserEntryId.slice(0, 12),
-						rootLine: lineIndex,
-						lastUserLine: lastUserLineIndex,
-					});
-					throw new Error(
-						"Resend root is not the last user message; refusing to truncate earlier history",
-					);
-				}
-
-				// 只 tombstone「该 user + 其后代」；root 之前的历史一律保留。
-				// 不用 re-parent：重发语义是丢掉本轮失败回复再重跑，而不是把失败分支挂回父节点。
-				const removeIds = collectDescendantEntryIds(lines, rootEntryId);
-
-				let removed = 0;
-				for (let i = 0; i < lines.length; i++) {
-					const line = lines[i]?.trim();
-					if (!line) continue;
-					try {
-						const parsed = JSON.parse(line) as { id?: string; type?: string };
-						if (!parsed?.id || parsed.type === "deleted") continue;
-						if (!removeIds.has(parsed.id)) continue;
-						lines[i] = JSON.stringify({
-							type: "deleted",
-							originalEntryId: parsed.id,
-							ts: Date.now(),
-							reason: "resend-truncate",
+					},
+					onBlocked: (detail) => {
+						void this.appLogger?.error("agent", "Prepare resend blocked: root is not last user", {
+							agentId,
+							messageId,
+							rootEntryId: detail.rootEntryId.slice(0, 12),
+							lastUserEntryId: detail.lastUserEntryId?.slice(0, 12),
+							rootLine: detail.rootLine,
+							lastUserLine: detail.lastUserLine,
 						});
-						removed += 1;
-					} catch {
-						/* 跳过无法解析的行 */
-					}
-				}
-
-				// 兜底：定位行本身若因 id 异常未进集合，至少 tombstone 该行。
-				if (lineIndex >= 0 && lineIndex < lines.length) {
-					const current = lines[lineIndex]?.trim();
-					if (current && !current.includes('"type":"deleted"')) {
-						lines[lineIndex] = JSON.stringify({
-							type: "deleted",
-							originalEntryId: rootEntryId,
-							ts: Date.now(),
-							reason: "resend-truncate",
-						});
-						removed += 1;
-					}
-				}
-				return removed;
-			});
-
-			try {
-				await this.reloadSession(agentId);
-			} catch (error) {
-				const errMsg = error instanceof Error ? error.message : String(error);
-				void this.appLogger?.error("agent", "Prepare resend: reload failed, restoring backup", {
-					agentId,
-					messageId,
-					error: errMsg,
-					elapsedMs: Date.now() - startTime,
+					},
 				});
-				try {
-					const restored = await this.sessionJsonl.restoreFromBackup(sessionPath);
-					if (restored) {
-						await this.loadMessages(agentId).catch(() => {});
-					}
-				} catch (restoreError) {
-					void this.appLogger?.error("agent", "Prepare resend: failed to restore backup", {
-						agentId,
-						error: restoreError instanceof Error ? restoreError.message : String(restoreError),
-					});
-				}
-				throw error;
-			}
-
-			void this.appLogger?.info("agent", "Prepare resend completed", {
-				agentId,
-				messageId,
-				removed,
-				elapsedMs: Date.now() - startTime,
-			});
-
-			return {
-				text: msg.text,
-				...(msg.images?.length ? { images: msg.images } : {}),
-			};
+				return { removed, text: msg.text, images: msg.images };
+			},
 		});
+
+		void this.appLogger?.info("agent", "Prepare resend completed", {
+			agentId,
+			messageId,
+			removed,
+			elapsedMs: Date.now() - startTime,
+		});
+
+		return {
+			text,
+			...(images?.length ? { images } : {}),
+		};
 	}
 
 	/**

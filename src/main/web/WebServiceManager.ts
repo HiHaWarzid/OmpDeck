@@ -5,31 +5,18 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { gzipSync } from "node:zlib";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
-import type {
-	WebAgentHistoryPage,
-	AgentTab,
-	AgentTodoPhase,
-	AppSettings,
-	ChatMessage,
-	CreateAgentInput,
-	Project,
-	SendPromptInput,
-	SendPromptResult,
-	SessionSummary,
-	WebServiceStatus,
-} from "../../shared/types";
-import type { PiDesktopApi } from "../../shared/api";
-import { matchWebRoute, webRoutes } from "../../shared/ipc";
+import type { AppSettings, ChatMessage, WebServiceStatus } from "../../shared/types";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
+import { attachDisplayMeta } from "../../shared/sessionDisplayContract";
 import {
-	attachDisplayMeta,
-	compactChatMessage,
-	DELIVERY_LABELS,
-	deliveryKind,
-	isTopLevelSessionSummary,
-	SESSION_STATUS_LABELS,
-	sessionStatusKind,
-} from "../../shared/sessionDisplayContract";
+	createWebApiHandlers,
+	dispatchWebApi,
+	flattenWebApiHandlers,
+	toWebAgentView,
+	WebApiError,
+	type WebApiRouteEntry,
+	type WebServiceDependencies,
+} from "./webApiRoutes";
 /**
  * 无 renderer 产物时的降级页：独立静态资源，不再以模板字符串嵌在这里。
  * 原因见该文件头部注释——页面里的路由字面量必须被奇偶守卫扫描，而扫描器
@@ -65,8 +52,10 @@ function hasForwardedHeaders(request: IncomingMessage): boolean {
 	);
 }
 
-/** 展示推导（顶层过滤、compact 截断、工具摘要）统一在 shared SessionDisplayContract，见该模块注释。 */
-
+/**
+ * 展示推导（顶层过滤、compact 截断、工具摘要）统一在 shared SessionDisplayContract；
+ * 本文件只用到 `attachDisplayMeta`（单条消息详情不截断，但仍要补派生字段）。
+ */
 type WebServiceSettings = Pick<
 	AppSettings,
 	| "webServiceEnabled"
@@ -79,108 +68,6 @@ type WebServiceSettings = Pick<
 >;
 
 /**
- * Web 服务对 Agent 运行时操作/读取的依赖面（W6-18）：直接派生自 PiDesktopApi['agents']
- * 的成员类型（Pick），不再手抄签名 —— agents 命名空间（或底层 AgentManager）任何成员
- * 改名/签名变更都会让本文件或下方漂移护栏在编译期失败，而不是让 web 服务带着旧签名
- * 悄悄漂移。
- */
-type WebServiceAgentDeps = Pick<
-	PiDesktopApi["agents"],
-	| "runtimeState"
-	| "cycleModel"
-	| "availableModels"
-	| "setModel"
-	| "refreshModels"
-	| "cycleThinking"
-	| "setThinking"
-	| "availableThinkingLevels"
-	| "setFastMode"
-	| "setSlowMode"
-	| "setAutoCompaction"
-	| "setTodos"
-	| "abortAndRestoreQueue"
-	| "removeQueuedMessage"
-	| "promoteQueuedMessage"
->;
-
-type WebServiceDependencies = {
-	listProjects: () => Project[];
-	listAgents: () => AgentTab[];
-	listSessions: (projectId: string) => Promise<SessionSummary[]>;
-	getMessages: (agentId: string) => ChatMessage[];
-	/**
-	 * 以下成员故意用 web 端点语义命名（create/sendPrompt/stopAgent/abortAgent），
-	 * 对应 agents 命名空间的 create/prompt/stop/abort —— 名称映射是 web 面的刻意
-	 * 选择，签名仍以 agents 命名空间为准。
-	 *
-	 * stopAgent 会退役并结束 pi 进程（关闭会话），abortAgent 只中止当前回合。
-	 * 手机聊天页的「停止」必须走 abort，不能复用 stop，否则会话会被直接关闭。
-	 */
-	createAgent: (input: CreateAgentInput) => Promise<AgentTab>;
-	sendPrompt: (input: SendPromptInput) => Promise<SendPromptResult>;
-	stopAgent: (agentId: string) => Promise<void>;
-	abortAgent: (agentId: string) => Promise<void>;
-	/** 扩展 UI 响应：手机端回答 select/confirm/input/editor。 */
-	sendUiResponse: PiDesktopApi["agents"]["sendUiResponse"];
-	/** 项目信任确认：手机端回传 trust-remember/trust-session/deny。 */
-	respondTrustRequest: PiDesktopApi["agents"]["respondTrustRequest"];
-	/** 历史分页（与桌面 IPC 同一实现）。 */
-	getHistoryPage: (agentId: string, before?: string, limit?: number) => Promise<WebAgentHistoryPage>;
-	/**
-	 * 工具输出超过截断阈值时按需读取全文（与桌面「查看完整输出」同一实现）。
-	 * 老版本主进程没有这个能力时路由返回 404，手机端保留截断结果。
-	 */
-	readMessageFullText?: (
-		agentId: string,
-		messageId: string,
-		entryId?: string,
-	) => Promise<{ text: string }>;
-	/** 手机端轮询待确认的项目信任请求。 */
-	listTrustRequests: () => Array<{ requestId: string; cwd: string; projectName: string; createdAt: number }>;
-	/** 首次启动自动生成的令牌需要落盘，否则每次重启都会让已扫码设备掉线。 */
-	persistWebToken: (patch: WebTokenSettings) => Promise<void>;
-} & WebServiceAgentDeps;
-
-/**
- * 编译期漂移护栏（W6-18）：把 agents 命名空间的真实成员形状（按名取型，改名即
- * 编译失败）与 web 声明的依赖成员做结构性比对。若未来有人把上面 WebServiceAgentDeps
- * 改回手写签名并引入偏差（成员缺失、参型不同），或 agents 命名空间删除了这些成员，
- * 下面这条赋值断言直接编译失败。
- */
-type AgentsNamespace = PiDesktopApi["agents"];
-type _WebAgentDepsDriftGuard = {
-	runtimeState: AgentsNamespace["runtimeState"];
-	cycleModel: AgentsNamespace["cycleModel"];
-	availableModels: AgentsNamespace["availableModels"];
-	setModel: AgentsNamespace["setModel"];
-	refreshModels: AgentsNamespace["refreshModels"];
-	cycleThinking: AgentsNamespace["cycleThinking"];
-	setThinking: AgentsNamespace["setThinking"];
-	availableThinkingLevels: AgentsNamespace["availableThinkingLevels"];
-	setFastMode: AgentsNamespace["setFastMode"];
-	setSlowMode: AgentsNamespace["setSlowMode"];
-	setAutoCompaction: AgentsNamespace["setAutoCompaction"];
-	setTodos: AgentsNamespace["setTodos"];
-	abortAndRestoreQueue: AgentsNamespace["abortAndRestoreQueue"];
-	removeQueuedMessage: AgentsNamespace["removeQueuedMessage"];
-	promoteQueuedMessage: AgentsNamespace["promoteQueuedMessage"];
-} extends Pick<WebServiceDependencies, keyof WebServiceAgentDeps> ? true : never;
-const _assertWebAgentDepsAssignable: _WebAgentDepsDriftGuard = true;
-
-/** 顶层会话规则已收口到 shared/sessionDisplayContract（服务端与手机首页同一实现）。 */
-
-/**
- * /api/state 的 agent 视图：在 AgentTab 上附加手机端直接渲染的状态文案。
- * 手机端（classic script）不 import 契约、也不维护中文状态表，只读 `statusText`。
- */
-type WebAgentView = AgentTab & { statusText: string };
-
-/** 三个状态出口（light 状态、完整状态、创建会话）必须用同一份文案，故统一走这个投影。 */
-function toWebAgentView(agent: AgentTab): WebAgentView {
-	return { ...agent, statusText: SESSION_STATUS_LABELS[sessionStatusKind(agent.status)] };
-}
-
-/**
  * 关闭 server 的有界宽限期（毫秒，构造时可注入小值便于测试）：内嵌页面每 1000ms
  * fetch 轮询走 keep-alive，只要浏览器 tab 开着、或正好有请求在途，server.close()
  * 的回调就要等对应连接结束才触发；连接迟迟不结束则 await applySettings 的 IPC
@@ -191,16 +78,6 @@ const DEFAULT_CLOSE_GRACE_MS = 1000;
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
 /** prompt/停止等写操作按 IP 每分钟上限，避免误触或脚本刷屏。 */
 const MUTATION_RATE_LIMIT_PER_MINUTE = 120;
-
-class HttpError extends Error {
-	constructor(
-		readonly statusCode: number,
-		message: string,
-		readonly code?: string,
-	) {
-		super(message);
-	}
-}
 
 export type WebServiceManagerOptions = {
 	/** 测试注入时钟，验证令牌过期分支 */
@@ -229,6 +106,11 @@ export class WebServiceManager {
 	private readonly rateBuckets = new Map<string, { windowStart: number; count: number }>();
 	private readonly now: () => number;
 	private readonly requireAuth: boolean;
+	/**
+	 * 分发表在构造时扁平化一次：处理器闭包只读 `deps` 的属性，因此测试替换
+	 * `deps.sendPrompt` 之类的成员后仍然生效，不需要重建表。
+	 */
+	private readonly routeEntries: WebApiRouteEntry[];
 
 	constructor(
 		private readonly deps: WebServiceDependencies,
@@ -237,6 +119,7 @@ export class WebServiceManager {
 	) {
 		this.now = options.now ?? Date.now;
 		this.requireAuth = options.requireAuth ?? false;
+		this.routeEntries = flattenWebApiHandlers(createWebApiHandlers(deps));
 	}
 
 	async applySettings(settings: WebServiceSettings) {
@@ -254,7 +137,8 @@ export class WebServiceManager {
 
 		const host = settings.webServiceHost.trim() || "127.0.0.1";
 		const port = this.normalizePort(settings.webServicePort);
-		if (this.server && this.current?.host === host && this.current.port === port) return;
+		const current = this.current;
+		if (this.server && current && current.host === host && current.port === port) return;
 		// 先绑定新端口，成功后才关旧 server：端口被占用/非法时 start 会 reject，
 		// 旧服务原样继续服务，绝不因一次设置笔误把正在工作的服务打下来。
 		const previous = this.server;
@@ -337,7 +221,7 @@ export class WebServiceManager {
 			try {
 				await this.handleRequest(request, response, host, port, server);
 			} catch (error) {
-				if (error instanceof HttpError) {
+				if (error instanceof WebApiError) {
 					this.sendError(response, error.statusCode, error.message, error.code);
 					return;
 				}
@@ -376,548 +260,91 @@ export class WebServiceManager {
 		port: number,
 		server: Server,
 	) {
-			const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-			if (request.method === "OPTIONS") {
-				this.sendNoContent(response);
-				return;
-			}
+		const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+		if (request.method === "OPTIONS") {
+			this.sendNoContent(response);
+			return;
+		}
 
-			// 非 IPC 聚合端点（健康检查 / 服务状态 / 跨命名空间 state）没有对应的
-			// window.piDesktop 成员，故不进 shared/ipc.ts 的 webRoutes，只能在此手写路径。
-			if (url.pathname === "/api/health") {
-				this.sendJson(request, response, {
-					ok: true,
-					service: "OmpDeck",
-					host,
-					port: this.getPort(server, port),
-					authRequired: true,
-				});
-				return;
-			}
-			this.assertRequestAllowed(request, url);
-			// 写操作期间可能有并发轮询把旧快照重新写进缓存；响应结束时再清一次，
-			// 保证下一轮轮询看到 UI 请求已应答、消息已追加等中间字段变化。
-			if (request.method && request.method !== "GET" && request.method !== "HEAD") {
+		// 非 IPC 聚合端点（健康检查 / 服务状态 / 跨命名空间 state）没有对应的
+		// window.piDesktop 成员，故不进 shared/ipc.ts 的 webRoutes，只能在此手写路径。
+		if (url.pathname === "/api/health") {
+			this.sendJson(request, response, {
+				ok: true,
+				service: "OmpDeck",
+				host,
+				port: this.getPort(server, port),
+				authRequired: true,
+			});
+			return;
+		}
+		this.assertRequestAllowed(request, url);
+		// 写操作期间可能有并发轮询把旧快照重新写进缓存；响应结束时再清一次，
+		// 保证下一轮轮询看到 UI 请求已应答、消息已追加等中间字段变化。
+		if (request.method && request.method !== "GET" && request.method !== "HEAD") {
+			this.statePayloadCache = null;
+			response.once("finish", () => {
 				this.statePayloadCache = null;
-				response.once("finish", () => {
-					this.statePayloadCache = null;
-				});
-			}
-			if (url.pathname === "/api/web/status") {
-				const loopback = this.isLoopbackRequest(request);
-				const status = this.getStatus(loopback);
-				this.sendJson(request, response, { ...status, loopback });
-				return;
-			}
-			if (url.pathname === "/api/state") {
-				// 手机端只依赖项目/Agent 列表；不传大会话消息，首屏从 1MB 降到几 KB。
-				if (url.searchParams.get("light") === "1") {
-					this.sendJson(request, response, {
-						projects: this.deps.listProjects(),
-						agents: this.deps.listAgents().map(toWebAgentView),
-						// 手机端在等待新建会话时轮询这里，才能弹出项目信任确认；
-						// 信任请求本身只有 requestId/cwd/projectName，不含会话内容。
-						trustRequests: this.deps.listTrustRequests(),
-					});
-					return;
-				}
-				// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
-				// 的双重序列化（web UI 每 1000ms 轮询，命中缓存时零 stringify 开销）
-				const payload = this.getStatePayload();
-				this.sendJsonText(request, response, payload);
-				return;
-			}
-			// 以下分发条件全部取自 shared/ipc.ts 的 webRoutes（method + 路径模板 + 命名参数）。
-			// 例外：单个消息详情 /api/agents/:id/messages/:mid 没有对应 api 成员
-			// （移动端直连的展开端点），留在原地手写匹配。
-			const sessionsParams = matchWebRoute(
-				webRoutes.sessions.list,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (sessionsParams) {
-				const projectId = sessionsParams.projectId;
-				this.assertProjectExists(projectId);
-				const sessions = await this.deps.listSessions(projectId);
-				// 手机首页只展示顶层会话；子会话占列表的 60%+，在服务端剔除可显著减少
-				// 弱网传输和手机端解析/渲染成本。桌面端不传该参数，保留完整嵌套数据。
-				const onlyTopLevel = url.searchParams.get("topLevel") === "1";
+			});
+		}
+		if (url.pathname === "/api/web/status") {
+			const loopback = this.isLoopbackRequest(request);
+			const status = this.getStatus(loopback);
+			this.sendJson(request, response, { ...status, loopback });
+			return;
+		}
+		if (url.pathname === "/api/state") {
+			// 手机端只依赖项目/Agent 列表；不传大会话消息，首屏从 1MB 降到几 KB。
+			if (url.searchParams.get("light") === "1") {
 				this.sendJson(request, response, {
-					sessions: onlyTopLevel ? sessions.filter(isTopLevelSessionSummary) : sessions,
+					projects: this.deps.listProjects(),
+					agents: this.deps.listAgents().map(toWebAgentView),
+					// 手机端在等待新建会话时轮询这里，才能弹出项目信任确认；
+					// 信任请求本身只有 requestId/cwd/projectName，不含会话内容。
+					trustRequests: this.deps.listTrustRequests(),
 				});
 				return;
 			}
-			const createParams = matchWebRoute(webRoutes.agents.create, url.pathname, request.method ?? "");
-			if (createParams) {
-				// 透传完整 CreateAgentInput：带 sessionPath 即「打开历史会话」，
-				// 不带则新建会话；title/noSession/cwd 与桌面端共用同一语义。
-				const body = await this.readJson<Partial<CreateAgentInput>>(request);
-				if (!body.projectId) {
-					this.sendError(response, 400, "projectId 不能为空");
-					return;
-				}
-				await this.assertResumeTargetAllowed(body);
-				const agent = await this.deps.createAgent({
-					projectId: body.projectId,
-					title: body.title,
-					sessionPath: body.sessionPath,
-					noSession: body.noSession,
-				});
-				this.invalidateStateCache();
-				this.sendJson(request, response, { agent: toWebAgentView(agent) });
+			// 直接写出缓存/新序列化的 JSON 字符串，避免 JSON.parse + 再 stringify
+			// 的双重序列化（web UI 每 1000ms 轮询，命中缓存时零 stringify 开销）
+			const payload = this.getStatePayload();
+			this.sendJsonText(request, response, payload);
+			return;
+		}
+		// 单个消息详情 /api/agents/:id/messages/:mid 没有对应 api 成员（移动端展开时
+		// 直连本端点），因此不进 webRoutes、也不在上面那张分发表里。
+		const messageDetailMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages\/([^/]+)$/);
+		if (messageDetailMatch && request.method === "GET") {
+			const agentId = decodeURIComponent(messageDetailMatch[1]);
+			const messageId = decodeURIComponent(messageDetailMatch[2]);
+			const message = this.deps.getMessages(agentId).find((item) => item.id === messageId);
+			if (!message) {
+				this.sendError(response, 404, "消息不存在", "message_not_found");
 				return;
 			}
-			const messagesParams = matchWebRoute(
-				webRoutes.agents.getMessages,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (messagesParams) {
-				const messages = this.deps.getMessages(messagesParams.agentId);
-				// 手机端只轮询最近窗口，避免大会话每 2s 重传整段消息。
-				const tailParam = url.searchParams.get("tail");
-				const tail = tailParam === null ? null : Math.min(200, Math.max(1, Number(tailParam) || 40));
-				const window = tail === null ? messages : messages.slice(-tail);
-				// 手机要看到 thinking 流式增长，但 messageStreamVersion 只看正文；
-				// 追加末条 thinking 长度，避免“正文没变就不刷新”卡住思考块。
-				const version = `${messageStreamVersion(messages)}:${messages[messages.length - 1]?.thinking?.length ?? 0}`;
-				const compact = url.searchParams.get("compact") === "1";
-				const afterId = url.searchParams.get("afterId") || null;
-				const clientVersion = url.searchParams.get("version");
-				const lengthParam = url.searchParams.get("length");
-				const length = lengthParam === null ? null : Number(lengthParam);
-				const payload = (list: ChatMessage[]) =>
-					compact ? list.map((message) => compactChatMessage(message)) : list;
-				const base = {
-					total: messages.length,
-					...(tail === null ? {} : { tail }),
-					version,
-				};
-				const sendWindow = (reset: boolean) => {
-					this.sendJson(request, response, {
-						...base,
-						messages: payload(window),
-						reset,
-						unchanged: false,
-					});
-				};
+			// 详情端点不截断（展开全文用），但仍要补派生字段：手机端展开后替换掉
+			// compact 消息，不能因此丢掉摘要/状态标签。
+			this.sendJson(request, response, { message: attachDisplayMeta(message) });
+			return;
+		}
+		// 其余全部端点走 webApiRoutes 的处理器表：键与 webRoutes 同构，漏接一条即编译失败。
+		const dispatched = await dispatchWebApi(
+			this.routeEntries,
+			request.method ?? "",
+			url,
+			() => this.readJson(request),
+			() => this.invalidateStateCache(),
+		);
+		if (dispatched) {
+			this.sendJson(request, response, dispatched.body);
+			return;
+		}
+		if (url.pathname.startsWith("/api/")) {
+			this.sendError(response, 404, "API 不存在");
+			return;
+		}
 
-				if (!afterId) {
-					sendWindow(false);
-					return;
-				}
-
-				// length 是客户端当前 tail 窗口的条数。服务端窗口长度变化说明客户端
-				// 的基线已经不可靠（例如新会话只有几条消息），必须整窗重置；只有
-				// 长度一致时才按 afterId 做尾部增量。
-				if (length !== null && Number.isFinite(length) && length !== window.length) {
-					sendWindow(true);
-					return;
-				}
-
-				const afterIndex = messages.findIndex((message) => message.id === afterId);
-				if (afterIndex === -1) {
-					sendWindow(true);
-					return;
-				}
-
-				if (afterIndex === messages.length - 1) {
-					// 最后一条 id 相同：客户端带 version 时用它判断内容是否真的变化
-					// （流式正文/thinking 会就地增长），只回传最后一条替换即可；
-					// 未带 version 的旧客户端保持“不传消息体”的兼容行为。
-					if (clientVersion === null || clientVersion === version) {
-						this.sendJson(request, response, {
-							...base,
-							reset: false,
-							unchanged: true,
-						});
-						return;
-					}
-					this.sendJson(request, response, {
-						...base,
-						messages: payload([messages[afterIndex]]),
-						reset: false,
-						unchanged: false,
-					});
-					return;
-				}
-
-				this.sendJson(request, response, {
-					...base,
-					messages: payload(messages.slice(afterIndex)),
-					reset: false,
-					unchanged: false,
-				});
-				return;
-			}
-			const fullTextParams = matchWebRoute(
-				webRoutes.sessions.readMessageFullText,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (fullTextParams) {
-				if (!this.deps.readMessageFullText) {
-					this.sendError(response, 404, "完整输出不可用", "message_full_text_unavailable");
-					return;
-				}
-				try {
-					const result = await this.deps.readMessageFullText(
-						fullTextParams.agentId,
-						fullTextParams.messageId,
-						url.searchParams.get("entryId") ?? undefined,
-					);
-					this.sendJson(request, response, result);
-				} catch {
-					// 全文缓存被 LRU 淘汰或历史 entry 找不到时，不要回退成截断文本冒充全文。
-					this.sendError(response, 404, "完整输出不可用", "message_full_text_unavailable");
-				}
-				return;
-			}
-			// 单个消息详情没有对应 api 成员（移动端展开时直连本端点），故不进 webRoutes。
-			const messageDetailMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/messages\/([^/]+)$/);
-			if (messageDetailMatch && request.method === "GET") {
-				const agentId = decodeURIComponent(messageDetailMatch[1]);
-				const messageId = decodeURIComponent(messageDetailMatch[2]);
-				const message = this.deps.getMessages(agentId).find((item) => item.id === messageId);
-				if (!message) {
-					this.sendError(response, 404, "消息不存在", "message_not_found");
-					return;
-				}
-				// 详情端点不截断（展开全文用），但仍要补派生字段：手机端展开后替换掉
-				// compact 消息，不能因此丢掉摘要/状态标签。
-				this.sendJson(request, response, { message: attachDisplayMeta(message) });
-				return;
-			}
-			const historyParams = matchWebRoute(
-				webRoutes.agents.historyPage,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (historyParams) {
-				const limit = Number(url.searchParams.get("limit") ?? 40);
-				const page = await this.deps.getHistoryPage(
-					historyParams.agentId,
-					url.searchParams.get("before") ?? undefined,
-					Number.isFinite(limit) ? limit : 40,
-				);
-				// 手机翻页同样只取折叠预览；展开时再按消息 id 拉完整内容。
-				const compact = url.searchParams.get("compact") === "1";
-				this.sendJson(
-					request,
-					response,
-					compact
-						? { ...page, messages: page.messages.map((message) => compactChatMessage(message)) }
-						: page,
-				);
-				return;
-			}
-			const uiResponseParams = matchWebRoute(
-				webRoutes.agents.sendUiResponse,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (uiResponseParams) {
-				const body = await this.readJson<{
-					requestId?: string;
-					value?: string | boolean | null;
-					cancelled?: boolean;
-					confirmed?: boolean;
-				}>(request);
-				if (!body.requestId) {
-					this.sendError(response, 400, "requestId 不能为空");
-					return;
-				}
-				await this.deps.sendUiResponse(uiResponseParams.agentId, body.requestId, {
-					value: body.value,
-					cancelled: body.cancelled,
-					confirmed: body.confirmed,
-				});
-				this.sendJson(request, response, { ok: true });
-				return;
-			}
-			const trustParams = matchWebRoute(
-				webRoutes.agents.respondTrustRequest,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (trustParams) {
-				const body = await this.readJson<{ choice?: "trust-remember" | "trust-session" | "deny" }>(request);
-				if (!body.choice || !["trust-remember", "trust-session", "deny"].includes(body.choice)) {
-					this.sendError(response, 400, "choice 无效");
-					return;
-				}
-				await this.deps.respondTrustRequest(trustParams.requestId, body.choice);
-				this.sendJson(request, response, { ok: true });
-				return;
-			}
-			const promptParams = matchWebRoute(webRoutes.agents.prompt, url.pathname, request.method ?? "");
-			if (promptParams) {
-				const body = await this.readJson<Omit<SendPromptInput, "agentId">>(request);
-				const message = body.message?.trim() ?? "";
-				if (!message && !body.images?.length) {
-					this.sendError(response, 400, "message 或 images 不能为空");
-					return;
-				}
-				const result = await this.deps.sendPrompt({
-					...body,
-					agentId: promptParams.agentId,
-					message,
-				});
-				this.invalidateStateCache();
-				// prompt endpoint is a transport for SendPromptResult. Semantic rejection is still
-				// a successful HTTP exchange so browser clients can distinguish rejected from
-				// post-write unknown instead of collapsing both into a thrown fetch error.
-				// deliveryText：手机端发送后的「已排队/已接管」提示也由服务端派生，
-				// 客户端不再各写一份中文投递文案。
-				const delivery = deliveryKind(body.streamingBehavior);
-				this.sendJson(request, response, {
-					result: delivery ? { ...result, deliveryText: DELIVERY_LABELS[delivery] } : result,
-				});
-				return;
-			}
-			// abort 只停止当前回合，保留 pi 进程和会话；/stop 才会关闭会话。
-			// 手机聊天页的停止按钮走这里，不能复用 /stop。
-			const abortParams = matchWebRoute(webRoutes.agents.abort, url.pathname, request.method ?? "");
-			if (abortParams) {
-				await this.deps.abortAgent(abortParams.agentId);
-				this.sendJson(request, response, { ok: true });
-				return;
-			}
-			const stopParams = matchWebRoute(webRoutes.agents.stop, url.pathname, request.method ?? "");
-			if (stopParams) {
-				await this.deps.stopAgent(stopParams.agentId);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { ok: true });
-				return;
-			}
-			const abortRestoreParams = matchWebRoute(
-				webRoutes.agents.abortAndRestoreQueue,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (abortRestoreParams) {
-				const result = await this.deps.abortAndRestoreQueue(abortRestoreParams.agentId);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { result });
-				return;
-			}
-			const removeQueuedParams = matchWebRoute(
-				webRoutes.agents.removeQueuedMessage,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (removeQueuedParams) {
-				const body = await this.readJson<{ message?: string; queue?: "steering" | "followUp" }>(request);
-				if (typeof body.message !== "string" || !body.message) {
-					this.sendError(response, 400, "message 不能为空");
-					return;
-				}
-				if (body.queue !== "steering" && body.queue !== "followUp") {
-					this.sendError(response, 400, "queue 必须是 steering 或 followUp");
-					return;
-				}
-				const result = await this.deps.removeQueuedMessage(
-					removeQueuedParams.agentId,
-					body.message,
-					body.queue,
-				);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { result });
-				return;
-			}
-			const promoteQueuedParams = matchWebRoute(
-				webRoutes.agents.promoteQueuedMessage,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (promoteQueuedParams) {
-				const body = await this.readJson<{ message?: string }>(request);
-				if (typeof body.message !== "string" || !body.message) {
-					this.sendError(response, 400, "message 不能为空");
-					return;
-				}
-				const result = await this.deps.promoteQueuedMessage(
-					promoteQueuedParams.agentId,
-					body.message,
-				);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { result });
-				return;
-			}
-			const runtimeParams = matchWebRoute(
-				webRoutes.agents.runtimeState,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (runtimeParams) {
-				const agentId = runtimeParams.agentId;
-				const state = await this.deps.runtimeState(agentId);
-				// 手机端头部副标题的状态文案由此派生：isStreaming 优先，其次 runtime 自带
-				// 的 status（老版本主进程），最后回退 /api/state 的 agent 状态。
-				const agentStatus = this.deps.listAgents().find((agent) => agent.id === agentId)?.status;
-				const rawStatus =
-					!state.isStreaming && "status" in state && typeof state.status === "string"
-						? state.status
-						: agentStatus;
-				const status = state.isStreaming ? "running" : rawStatus;
-				this.sendJson(request, response, {
-					state: {
-						...state,
-						statusText: SESSION_STATUS_LABELS[sessionStatusKind(status)],
-					},
-				});
-				return;
-			}
-			const cycleModelParams = matchWebRoute(
-				webRoutes.agents.cycleModel,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (cycleModelParams) {
-				const state = await this.deps.cycleModel(cycleModelParams.agentId);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const modelsParams = matchWebRoute(
-				webRoutes.agents.availableModels,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (modelsParams) {
-				const models = await this.deps.availableModels(modelsParams.agentId);
-				this.sendJson(request, response, { models });
-				return;
-			}
-			const setModelParams = matchWebRoute(
-				webRoutes.agents.setModel,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (setModelParams) {
-				const body = await this.readJson<{ provider?: string; modelId?: string }>(request);
-				const state = await this.deps.setModel(
-					setModelParams.agentId,
-					body.provider ?? "",
-					body.modelId ?? "",
-				);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const refreshModelsParams = matchWebRoute(
-				webRoutes.agents.refreshModels,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (refreshModelsParams) {
-				const state = await this.deps.refreshModels(refreshModelsParams.agentId);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const cycleThinkingParams = matchWebRoute(
-				webRoutes.agents.cycleThinking,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (cycleThinkingParams) {
-				const state = await this.deps.cycleThinking(cycleThinkingParams.agentId);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const setThinkingParams = matchWebRoute(
-				webRoutes.agents.setThinking,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (setThinkingParams) {
-				const body = await this.readJson<{ level?: string }>(request);
-				const state = await this.deps.setThinking(setThinkingParams.agentId, body.level ?? "");
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const thinkingLevelsParams = matchWebRoute(
-				webRoutes.agents.availableThinkingLevels,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (thinkingLevelsParams) {
-				const levels = await this.deps.availableThinkingLevels(thinkingLevelsParams.agentId);
-				this.sendJson(request, response, { levels });
-				return;
-			}
-			const fastModeParams = matchWebRoute(
-				webRoutes.agents.setFastMode,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (fastModeParams) {
-				const body = await this.readJson<{ enabled?: unknown }>(request);
-				if (typeof body.enabled !== "boolean") {
-					this.sendError(response, 400, "enabled 必须是布尔值");
-					return;
-				}
-				const state = await this.deps.setFastMode(fastModeParams.agentId, body.enabled);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const slowModeParams = matchWebRoute(
-				webRoutes.agents.setSlowMode,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (slowModeParams) {
-				const body = await this.readJson<{ enabled?: unknown }>(request);
-				if (typeof body.enabled !== "boolean") {
-					this.sendError(response, 400, "enabled 必须是布尔值");
-					return;
-				}
-				const state = await this.deps.setSlowMode(slowModeParams.agentId, body.enabled);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const autoCompactionParams = matchWebRoute(
-				webRoutes.agents.setAutoCompaction,
-				url.pathname,
-				request.method ?? "",
-			);
-			if (autoCompactionParams) {
-				const body = await this.readJson<{ enabled?: unknown }>(request);
-				if (typeof body.enabled !== "boolean") {
-					this.sendError(response, 400, "enabled 必须是布尔值");
-					return;
-				}
-				const state = await this.deps.setAutoCompaction(autoCompactionParams.agentId, body.enabled);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			const todosParams = matchWebRoute(webRoutes.agents.setTodos, url.pathname, request.method ?? "");
-			if (todosParams) {
-				const body = await this.readJson<{ phases?: unknown }>(request);
-				if (!Array.isArray(body.phases)) {
-					this.sendError(response, 400, "phases 必须是数组");
-					return;
-				}
-				const state = await this.deps.setTodos(
-					todosParams.agentId,
-					body.phases as AgentTodoPhase[],
-				);
-				this.invalidateStateCache();
-				this.sendJson(request, response, { state });
-				return;
-			}
-			if (url.pathname.startsWith("/api/")) {
-				this.sendError(response, 404, "API 不存在");
-				return;
-			}
-
-			await this.serveRenderer(url.pathname, response, request);
+		await this.serveRenderer(url.pathname, response, request);
 	}
 
 	private isLoopbackRequest(request: IncomingMessage): boolean {
@@ -974,46 +401,12 @@ export class WebServiceManager {
 		if (mutating) this.assertRateLimit(request);
 		const failure = verifyWebToken(extractRequestToken(request), this.tokenState, this.now());
 		if (failure) {
-			throw new HttpError(
+			throw new WebApiError(
 				401,
 				failure === "token_missing" ? "缺少访问令牌" : failure === "token_expired" ? "访问令牌已过期" : "访问令牌无效",
 				failure,
 			);
 		}
-	}
-
-	private assertProjectExists(projectId: string): void {
-		if (!this.deps.listProjects().some((project) => project.id === projectId)) {
-			throw new HttpError(404, "项目不存在", "project_not_found");
-		}
-	}
-
-	/**
-	 * Web 端创建 Agent 的边界：
-	 * - 不接受 cwd，进程目录只能由项目/worktree 决定，避免令牌持有者把 pi 起在任意目录；
-	 * - 历史会话必须属于该项目，否则等于用一个项目的工作目录打开另一个项目的会话文件；
-	 * - 路径必须是绝对路径，且与 SessionSummary.filePath 归一化后一致。
-	 */
-	private async assertResumeTargetAllowed(body: Partial<CreateAgentInput>): Promise<void> {
-		const projectId = body.projectId as string;
-		this.assertProjectExists(projectId);
-		if (body.cwd !== undefined) {
-			throw new HttpError(400, "Web 端不接受 cwd", "cwd_not_allowed");
-		}
-		if (!body.sessionPath) return;
-		if (!isAbsolute(body.sessionPath)) {
-			throw new HttpError(400, "sessionPath 必须是绝对路径", "session_path_invalid");
-		}
-		const sessions = await this.deps.listSessions(projectId);
-		const target = this.normalizePathForCompare(body.sessionPath);
-		if (!sessions.some((session) => this.normalizePathForCompare(session.filePath) === target)) {
-			throw new HttpError(400, "sessionPath 不属于该项目", "session_path_not_found");
-		}
-	}
-
-	private normalizePathForCompare(value: string): string {
-		const normalized = normalize(value).replace(/[\\/]+$/, "");
-		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 	}
 
 	private assertSameOrigin(request: IncomingMessage): void {
@@ -1024,11 +417,11 @@ export class WebServiceManager {
 		try {
 			originHost = new URL(origin).host;
 		} catch {
-			throw new HttpError(403, "Origin 无效", "origin_invalid");
+			throw new WebApiError(403, "Origin 无效", "origin_invalid");
 		}
 		const expectedHost = request.headers.host;
 		if (!expectedHost || originHost !== expectedHost) {
-			throw new HttpError(403, "跨站请求已拒绝", "origin_mismatch");
+			throw new WebApiError(403, "跨站请求已拒绝", "origin_mismatch");
 		}
 	}
 
@@ -1049,7 +442,7 @@ export class WebServiceManager {
 		}
 		bucket.count += 1;
 		if (bucket.count > MUTATION_RATE_LIMIT_PER_MINUTE) {
-			throw new HttpError(429, "请求过于频繁，请稍后再试", "rate_limited");
+			throw new WebApiError(429, "请求过于频繁，请稍后再试", "rate_limited");
 		}
 	}
 
@@ -1272,7 +665,7 @@ export class WebServiceManager {
 		// 强制 JSON：text/plain 表单跨站 POST 不触发 CORS 预检，必须在服务端拒绝。
 		const contentType = (request.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase();
 		if (contentType !== "application/json") {
-			throw new HttpError(415, "Content-Type 必须是 application/json", "unsupported_media_type");
+			throw new WebApiError(415, "Content-Type 必须是 application/json", "unsupported_media_type");
 		}
 		const chunks: Buffer[] = [];
 		let total = 0;
@@ -1280,7 +673,7 @@ export class WebServiceManager {
 			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 			total += buffer.length;
 			if (total > MAX_REQUEST_BODY_BYTES) {
-				throw new HttpError(413, "请求体过大", "payload_too_large");
+				throw new WebApiError(413, "请求体过大", "payload_too_large");
 			}
 			chunks.push(buffer);
 		}
@@ -1288,7 +681,7 @@ export class WebServiceManager {
 		try {
 			return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
 		} catch {
-			throw new HttpError(400, "请求体不是合法 JSON", "invalid_json");
+			throw new WebApiError(400, "请求体不是合法 JSON", "invalid_json");
 		}
 	}
 

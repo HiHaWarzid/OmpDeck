@@ -22,7 +22,6 @@ import { matchWebRoute, webRoutePathParams, webRoutes, webRouteUrl, type WebRest
  */
 
 const MOBILE_JS = join(process.cwd(), "src/renderer/public/mobile.js");
-const WEB_SERVICE_MANAGER = join(process.cwd(), "src/main/web/WebServiceManager.ts");
 const FALLBACK_PAGE = join(process.cwd(), "src/main/web/fallbackPage.html");
 
 /** 不属于 webRoutes 聚合/直连端点（改这里等于承认又加了一个手写路由）。 */
@@ -212,80 +211,11 @@ describe.each(CLIENTS)("/api 路由 × webRoutes 奇偶守卫（$name）", ({ so
 });
 
 /**
- * 服务端分发奇偶守卫：表里有、分发里没接 = 运行时静默 404。
- *
- * 上面两组核对的是「客户端写的路径在表里」，反向仍然敞开：往 webRoutes 加一条
- * 端点（或把一条手写 if 改成 matchWebRoute 时改错键）而忘了在 WebServiceManager
- * 里分发，客户端照旧拼得出合法 URL，服务端却一路落到 `/api/` 的 404 分支。
- * 这里静态核对两件事：每条表内端点都有对应的匹配调用，且没有匹配调用指向表外的键。
- */
-describe("服务端分发 × webRoutes 奇偶守卫", () => {
-	const serverSource = readFileSync(WEB_SERVICE_MANAGER, "utf8");
-
-	/**
-	 * 扫源码前剥掉注释。
-	 *
-	 * 守卫是文本匹配：把一条真分发删掉、在注释里留一句
-	 * `// matchWebRoute(webRoutes.agents.runtimeState` 就能骗过它。
-	 * 剥注释后注释不再能"满足"守卫，这条捷径消失。
-	 */
-	function stripComments(source: string): string {
-		return source
-			.replace(/\/\*[\s\S]*?\*\//g, "")
-			// 行注释只认「行首或空白之后的 //」：URL 里的 `http://` 前面是冒号，
-			// 放宽成 `[^:]` 外的任意字符会把 `"http://x"` 之后整行切掉，
-			// 连同行尾的真实分发调用一起吞掉（守卫于是假绿）。
-			.replace(/(^|\s)\/\/[^\n]*/g, "$1");
-	}
-
-	/** 抽出 `matchWebRoute(webRoutes.<ns>.<member>` 的成员键。 */
-	function dispatchedKeys(): string[] {
-		const keys = new Set<string>();
-		for (const match of stripComments(serverSource).matchAll(
-			/matchWebRoute\(\s*webRoutes\.([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)/g,
-		)) {
-			keys.add(`${match[1]}.${match[2]}`);
-		}
-		return [...keys];
-	}
-
-	/** 表内全部成员键（webRoutes 与 ipcTable 由 satisfies 保证成员齐备）。 */
-	function tableKeys(): string[] {
-		const keys: string[] = [];
-		for (const [namespace, members] of Object.entries(
-			webRoutes as unknown as Record<string, Record<string, WebRestRoute>>,
-		)) {
-			for (const member of Object.keys(members)) keys.push(`${namespace}.${member}`);
-		}
-		return keys;
-	}
-
-	it("每条表内端点都有对应的服务端分发", () => {
-		const dispatched = new Set(dispatchedKeys());
-		const missing = tableKeys().filter((key) => !dispatched.has(key));
-		expect(
-			missing,
-			`webRoutes 里有端点没有分发（客户端能拼出 URL，服务端却 404）: ${missing.join(" | ")}`,
-		).toEqual([]);
-	});
-
-	it("没有分发指向表外的键（否则是拼错的成员名）", () => {
-		const known = new Set(tableKeys());
-		const stray = dispatchedKeys().filter((key) => !known.has(key));
-		expect(stray, `分发引用了 webRoutes 之外的成员: ${stray.join(" | ")}`).toEqual([]);
-	});
-
-	it("能抽到分发调用（否则守卫空转）", () => {
-		expect(dispatchedKeys().length).toBe(tableKeys().length);
-	});
-});
-
-/**
  * 表内 method + path 唯一性。
  *
- * 分发是顺序 if 链：两条同形状条目时，前一条分支永远遮蔽后一条，而后一条的客户端
- * 仍能拼出「合法」URL——只会落到前一条的语义上。三处守卫都会自证一致（客户端从表取值、
- * 服务端用同表匹配），所以这条重复必须单独守。
+ * 分发按 webRoutes 声明顺序逐条匹配（webApiRoutes 扁平化后仍是顺序表）：两条同形状条目时，
+ * 前一条永远遮蔽后一条，而后一条的客户端仍能拼出「合法」URL——只会落到前一条的语义上。
+ * 三处守卫都会自证一致（客户端从表取值、服务端用同表匹配），所以这条重复必须单独守。
  */
 describe("webRoutes 表自洽", () => {
 	it("method + path 组合不重复", () => {

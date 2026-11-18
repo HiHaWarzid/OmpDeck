@@ -183,6 +183,13 @@ trust.json = `Record<路径, boolean>`；键归一化显式化（win32 非 `/` �
 
 规则：任何新的客户端门只允许调这 8 个方法，不得直接对 `AgentManager` 的变更方法再拼一遍「校验 → 关终端 → 停进程」。读路径、运行控制（归 `AgentControl`）与 AFK 编排不经过本 module——AFK 创建的 agent 没有桌面终端，且它在域内把 AgentManager 当 spawn 工具用。
 
+### SessionRewrite（会话改写配方）
+编辑 / 删除 / 重发三条「改会话文件再让 pi 重读」的路径共用的**唯一配方**（`main/pi/sessionRewrite.ts` + 行变换 `sessionRewriteMutations.ts`）：`withSessionLock → ensureAgentIdle → sessionPath 守卫 → 读改写 JSONL（modifyLines 自动备份）→ switch_session 重载 → 重载失败则用备份回滚并刷新转录 → 原错误照抛`。
+
+规则：「重载失败必须回滚」是碰用户历史的不变式，此前由三份私有方法各自维护，因此新增第四种改写操作只实现 `mutate`，回滚与重载语义自动继承。行级规则（只改 user/assistant、删除时重挂子节点、重发只允许截断最后一条 user）全在纯函数里，可以对着字符串行数组测边界，不必伪造锁与 RPC；编排层只提供端口。`prepare` 与 `mutate` 的先后是刻意的：`prepare` 在读文件前跑（保持「消息不存在」先于「文件为空」的错误优先级），`mutate` 在文件读入后跑（定位规则需要真实行内容）。因此**身份校验只做一次**：`prepare` 解析出的消息实例直接交给 `mutate`（`truncateForResend` 收 `msg` 而非 `messageId`）。写入路径上再回 `messages` 里查一遍是缺陷而非防御——转录若在读文件期间被替换，二次查找会在文件已改之后抛出 `Message not found`，用户看到失败提示而内容已被截断。
+
+`_reloadMarker` 的写与摘属 JSONL 格式知识，住在 `SessionJsonl.withReloadMarker`，编排层不再直接读改写第一行。
+
 ### PiProtocol（pi 线格式解码器）
 「pi 说了什么」这件事的**唯一属主**（`main/pi/piProtocol.ts`）。RPC 事件帧与 `get_state` / `get_session_stats` 响应体都是未校验的线上数据，读法以前散在三处：`AgentManager.handlePiEvent` 的 30 种帧名 if 阶梯、`getRuntimeState` 的逐字段擦洗、`QuickGenProcess` 对 `message_update`/`agent_end` 的第二份解读。谁都得自己认一遍帧名，于是「pi 的措辞变了」会一次性打穿三处。
 
@@ -206,13 +213,22 @@ RPC 日志的**留痕政策**也在这里：`isRpcLogWorthy` 判定「哪些帧�
 规则：新增任何「等 pi 自己安静下来」的窗口都加进本模块，不在 AgentManager 里新开 `setTimeout`。模块不认识转录内容，需要转录信息的判定必须经由视图字段传入。
 
 ### RouteDescriptor / webRoutes（Web 路由唯一事实源）
-`src/shared/ipc.ts` 里的 `WebRestRoute`（`method` + `path` 模板 + `result` 拆包方式）与 `webRoutes` 表，是 **LAN-web 三端唯一的路径真值**：`WebServiceManager` 用 `matchWebRoute` 分发，`browserApi` 用 `webRouteUrl` 反向拼 URL，`mobile.js` 对齐同一批路径。
+`src/shared/ipc.ts` 里的 `WebRestRoute`（`method` + `path` 模板 + `result` 拆包方式）与 `webRoutes` 表，是 **LAN-web 三端唯一的路径真值**：`WebServiceManager` 把请求交给 `webApiRoutes` 的处理器表分发，`browserApi` 用 `webRouteUrl` 反向拼 URL，`mobile.js` 对齐同一批路径。
 
 规则：新增/修改任何 `/api` 端点只改 `webRoutes` 与 `ipcTable` 的 `route` 列，不在客户端手抄路径字符串。`route`（该成员确实有独立 REST 端点）与 `web`（该成员在 LAN-web 下也必须可用，是给守卫用的能力声明）**互不蕴含**：有 `route` 未必有 `web`（手机端专用端点），有 `web` 未必有 `route`（走 `/api/state` 轮询的能力）。两者的一致性由 `overrideParity.test.ts`（守卫探针）与 `webRouteParity.test.ts`（静态核对三端调用）各自把守。
 
 **模板语法归本 module 独占**：占位符必须独占一整段（`/agents/:agentId/...`，不允许 `/x/full-text:entryId`）。客户端拼 URL 与服务端正则匹配是两条独立实现，段内写法会让客户端拼出字面量路径、服务端却按字面量 `:` 匹配——「拼得出、永远 404」且不报错。`webRoutePathParams` 对段内 `:` 直接抛错，客户端与服务端都经它校验，语法因此只有一处。
 
 **`web` 列是能力声明，不是可选项**：生产代码不读它，漏标就没有守卫探针——`browserApi` 掉一个实现会被 `previewApi` 的 `async () => undefined` 静默接住，全套测试仍然绿。
+
+### WebApiHandlerTable（`/api` 端点分发表）
+`main/web/webApiRoutes.ts` 的 `createWebApiHandlers` 返回的处理器表：键类型**逐层映射自 `webRoutes`**，因此「表里有端点、分发里没接」不再是运行时静默 404，而是 `createWebApiHandlers` 返回对象缺键的编译错误。它是 `WebServiceManager` 里那条 550 行顺序 if 链的替代物。
+
+分工：处理器只做语义（校验、调用 `deps`、组装 JSON 体，失败抛 `WebApiError`），完全不碰 `ServerResponse`；`WebServiceManager` 只剩传输（鉴权闸门、限流、gzip、静态资源）与跨命名空间聚合端点（`/api/health`、`/api/web/status`、`/api/state`、单条消息详情），后者没有对应 `api` 成员，故不进 `webRoutes`。
+
+测试面：处理器可直接以 `WebApiContext` 调用，无需起 socket；接线（处理器确实被分发到）由 `webApiRoutes.test.ts` 对每条 `webRoutes` 发一次真请求、断言「不是 404」来守——它替代了原先用正则扫 `WebServiceManager` 源码找 `matchWebRoute` 调用的文本守卫。
+
+顺序敏感性：分发按 `webRoutes` 声明顺序逐条匹配，两条模板同时命中时前者遮蔽后者，故 `webRouteParity.test.ts` 保留「method + path 组合不重复」的自洽用例。
 
 ### ConfigDraft（配置草稿）
 设置弹框 / 配置弹框 / 模型角色 tab 三处编辑「已落盘配置」的**唯一草稿语义**（`renderer/src/utils/configDraft.ts`，零 React 依赖的纯函数）。`value` 是正在编辑的值，`base` 是它唯一的比较对象；脏不脏一律由**值 diff** 得出，而不是「改过哪些字段」——后者让「改回原值」仍然显示未保存，是此前三处共有的 bug。

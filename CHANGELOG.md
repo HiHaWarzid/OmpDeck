@@ -186,6 +186,19 @@ All notable changes to PiDeck are documented here.
   `drawer.modifiedFiles` / `drawer.modifiedFilesAria` / `drawer.moreFiles`, and the two
   stale README claims (an answer-level file summary, a session change list in the Files
   panel) now describe the per-edit diff entry that actually exists.
+- **The /api dispatch table is checked by the compiler** — WebServiceManager used to
+  match all 25 LAN-web endpoints in one 550-line if-ladder; the server-side guard for
+  "endpoint in the table but never dispatched" was a regex over that source file, which
+  only caught the exact shape it was taught to find. Endpoint handlers now live in
+  `webApiRoutes` behind a table keyed by `webRoutes` itself, so a missing endpoint is a
+  compile error; the regex guard is gone and a real-request wiring test takes its place.
+- **Session edit/delete/resend share one rollback recipe** — All three paths copied
+  "lock → wait for idle → rewrite JSONL → `switch_session` → restore the backup if the
+  reload fails", leaving four identical rollback blocks across ~500 lines whose only
+  differences were transcription slips, and none of it was covered by a test (this is
+  the code path that rewrites a user's history). There is now one recipe
+  (`SessionRewrite`); a fourth rewrite operation only implements its line transform and
+  inherits the reload/rollback semantics.
 
 ## v0.6.7 - 2026-07-29
 
