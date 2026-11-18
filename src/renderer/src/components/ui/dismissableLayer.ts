@@ -33,6 +33,12 @@ export type DismissableLayerSpec = {
 	onDismiss: (reason: DismissReason) => void;
 	/** Esc 关闭后归还焦点的元素（通常是打开它的按钮）。 */
 	getReturnFocus?: () => HTMLElement | null;
+	/**
+	 * 打开它的触发器。指针落在触发器上**不算**外部：否则 toggle 型浮层永远关不掉
+	 * ——pointerdown 先把层关掉，紧接着 click 又把同一个层打开一次，用户看到的是
+	 * 「按钮一直是激活态」。只有触发器的打开动作不是 toggle 时才需要显式传。
+	 */
+	getTriggerElement?: () => HTMLElement | null;
 	/** 默认 true。 */
 	dismissOnOutsidePointer?: boolean;
 };
@@ -50,7 +56,9 @@ function handlePointerDown(event: Event): void {
 		.filter((layer) => {
 			if (layer.dismissOnOutsidePointer === false) return false;
 			const element = layer.getElement();
-			return !element || !element.contains(target);
+			if (element?.contains(target)) return false;
+			// 触发器的点击由调用方自己处理（打开是 toggle 时那次 click 就是收起）。
+			return !layer.getTriggerElement?.()?.contains(target);
 		})
 		.reverse();
 	for (const layer of closing) layer.onDismiss("outside-pointer");

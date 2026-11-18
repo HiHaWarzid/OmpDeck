@@ -72,6 +72,38 @@ describe("dismissableLayer", () => {
 		outside.remove();
 	});
 
+	it("指针落在触发器上不算外部：toggle 型浮层的「再点一次」不会被先关后开", () => {
+		const trigger = document.createElement("button");
+		const popup = document.createElement("div");
+		const option = document.createElement("button");
+		popup.appendChild(option);
+		document.body.append(trigger, popup);
+
+		const dismiss = vi.fn();
+		unregisters.push(
+			registerDismissableLayer({
+				getElement: () => popup,
+				getTriggerElement: () => trigger,
+				onDismiss: dismiss,
+			}),
+		);
+
+		firePointerDown(trigger);
+		expect(dismiss).not.toHaveBeenCalled();
+
+		// 其余外部目标仍照常关闭：触发器只是「不算外部」，不是「免疫关闭」。
+		firePointerDown(option);
+		expect(dismiss).not.toHaveBeenCalled();
+		const outside = document.createElement("button");
+		document.body.append(outside);
+		firePointerDown(outside);
+		expect(dismiss.mock.calls).toEqual([["outside-pointer"]]);
+
+		trigger.remove();
+		popup.remove();
+		outside.remove();
+	});
+
 	it("多个层共用一份 window 监听，全部注销后卸掉", () => {
 		const addSpy = vi.spyOn(window, "addEventListener");
 		const removeSpy = vi.spyOn(window, "removeEventListener");

@@ -31,8 +31,8 @@ export function FileDiffViewer(props: {
 	/** 返回按钮回调（侧栏模式时提供，点击返回上一面板） */
 	onBack?: () => void;
 	onClose: () => void;
-	/** 多 tab 支持：全部 tab 列表 */
-	tabs?: { id: string; filePath: string; label?: string }[];
+	/** 多 tab 支持：全部 tab 列表（账本只读，组件不得改写排序） */
+	tabs?: readonly { id: string; filePath: string; label?: string }[];
 	/** 当前活跃 tab ID */
 	activeTabId?: string | null;
 	/** 切换到指定 tab */

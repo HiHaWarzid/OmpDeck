@@ -27,7 +27,7 @@ export function ConversationOutline(props: {
 	/** 终端入口 */
 	terminalAction?: EntryAction;
 	/** 外部编辑器打开入口 */
-	editorsAction?: EntryAction & { anchorRef?: React.RefObject<HTMLButtonElement | null> };
+	editorsAction?: EntryAction;
 }) {
 	const [expanded, setExpanded] = useState(false);
 	const [dragging, setDragging] = useState(false);

@@ -112,4 +112,47 @@ describe("useDismissableLayer", () => {
 		expect(spy).not.toHaveBeenCalled();
 		spy.mockRestore();
 	});
+
+	it("toggle 型浮层：真实 pointerdown + click 落在触发器上时收起，而不是先关后开", () => {
+		function Toggle(): ReactElement {
+			const [open, setOpen] = useState(false);
+			const layerRef = useRef<HTMLDivElement>(null);
+			const triggerRef = useRef<HTMLElement | null>(null);
+			useDismissableLayer({
+				open,
+				elementRef: layerRef,
+				triggerRef,
+				onDismiss: () => setOpen(false),
+			});
+			return createElement(
+				"div",
+				null,
+				createElement(
+					"button",
+					{
+						id: "toggle",
+						ref: triggerRef,
+						onClick: () => setOpen((current) => !current),
+					},
+					"toggle",
+				),
+				open ? createElement("div", { ref: layerRef, id: "popup" }, "popup") : null,
+			);
+		}
+
+		mount(createElement(Toggle));
+		const trigger = container.querySelector<HTMLButtonElement>("#toggle")!;
+
+		act(() => trigger.click());
+		expect(container.querySelector("#popup")).not.toBeNull();
+
+		// 打开态下再点一次：pointerdown 若把层关掉，随后 click 会重新打开（用户看到的是
+		// 「按钮一直亮着」）。断言最终状态是收起，而不是仍存在。
+		act(() => {
+			trigger.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+			trigger.click();
+		});
+
+		expect(container.querySelector("#popup")).toBeNull();
+	});
 });

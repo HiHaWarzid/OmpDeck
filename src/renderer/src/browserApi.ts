@@ -21,6 +21,7 @@ import { t } from "./i18n";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
 import { webRouteUrl, webRoutes, type WebRestRoute } from "../../shared/ipc";
 import { createPreviewApi } from "./previewApi";
+import { detectRuntimeSurface } from "./utils/runtimeSurface";
 
 type WebState = {
 	projects: Project[];
@@ -53,19 +54,31 @@ function readInitialToken(): string {
 }
 
 let authToken = readInitialToken();
-// 静态 import 在 Electron 里也会执行本模块；只有 preload 不存在时才是真正的 Web 运行时。
-// 无条件标记会让桌面端误判为手机页面，隐藏令牌轮换、远程访问等桌面专属设置。
-if (typeof document !== "undefined" && window.piDesktop === undefined) {
+/**
+ * 宿主判定只经 `detectRuntimeSurface`（见 utils/runtimeSurface）。
+ * 本模块在 `runtimeApi` 安装 api 之前求值，所以这里读到的 `window.piDesktop === undefined`
+ * 恰好就是「preload 不存在」；不要在别处再写第二份 userAgent / protocol 判定。
+ */
+const surface = detectRuntimeSurface({
+	hasPreload: typeof window !== "undefined" && Boolean(window.piDesktop),
+	userAgent: typeof navigator === "undefined" ? "" : navigator.userAgent,
+	protocol: typeof window === "undefined" ? "" : window.location.protocol,
+});
+const isBrowserRuntime = surface === "lan-web" || surface === "preview";
+
+// 静态 import 在 Electron 里也会执行本模块；无条件标记会让桌面端误判为手机页面，
+// 隐藏令牌轮换、远程访问等桌面专属设置。
+if (typeof document !== "undefined" && isBrowserRuntime) {
 	document.documentElement.dataset.runtime = "web";
 }
 
-// 仅 Web 运行时注册 SW；Electron 里 piDesktop 存在，不注册以免 dev server 缓存干扰。
+// 仅 Web 运行时注册 SW；Electron 里不注册，以免 dev server 缓存干扰。
 // HTTPS（Tailscale Serve 等）与 localhost HTTP 是安全上下文，可安装 PWA；
 // 局域网裸 HTTP 注册会被浏览器拒绝，catch 掉即可，不影响页面使用。
 if (
+	isBrowserRuntime &&
 	typeof navigator !== "undefined" &&
 	"serviceWorker" in navigator &&
-	window.piDesktop === undefined &&
 	(window.location.protocol === "http:" || window.location.protocol === "https:")
 ) {
 	void navigator.serviceWorker.register("./sw.js").catch(() => undefined);

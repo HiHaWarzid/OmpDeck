@@ -77,6 +77,16 @@
 - **Web 降级页变成真实文件** — 214 行的「无 renderer 产物」页面从模板字符串搬到
   `main/web/fallbackPage.html`，构建时以 `?raw` 内联。路由奇偶守卫改用已有的
   `mobile.js` 抽取器扫描它，手写的「找反引号 → 逐字符走转义」抽取器随之删除。
+- **运行时 api 收成一个入口** — 渲染层的「我在哪个宿主里、该用哪个 api」此前只在
+  `App.tsx` 里判定一次，约 40 个组件却直接读 `window.piDesktop.*`。在局域网 Web 与
+  浏览器预览里那个值是 undefined，常驻挂载的登录弹框一挂载就崩，桌面 Web 视图整页白屏。
+  现在判定是纯函数 `detectRuntimeSurface`，`runtimeApi` 把选中的 api 装回
+  `window.piDesktop`（Electron 缺 preload 的损坏安装除外，仍保持 undefined 以便诊断）。
+- **锚定浮层收成单值** — 文件 / 项目 / Agent / 会话右键菜单、会话来源筛选、外部编辑器
+  气泡六处浮层原本各有一个锚点 state，可以同时打开两个；「再点一次按钮收起」也因此会被
+  关闭层的 pointerdown 先关掉、click 又打开，按钮一直亮着（气泡还常压在自己的按钮上）。
+  现在是一个判别联合 `OverlayState` + 纯落点函数 `placeEditorsPopover`（不得覆盖触发器），
+  打开任一处都会关掉前一处。
 
 ### 🔒 安全
 

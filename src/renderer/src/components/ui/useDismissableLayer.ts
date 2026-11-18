@@ -22,9 +22,14 @@ export function useDismissableLayer(options: {
 	 * 此时再读 activeElement 只会读到即将卸载的层内节点，焦点归还变成把焦点丢给弹框。
 	 */
 	returnFocusRef?: RefObject<HTMLElement | null>;
+	/**
+	 * toggle 型浮层的触发器。pointerdown 落在它上面不算外部，否则「再点一次收起」
+	 * 会先被关闭、再被同一个 click 打开。
+	 */
+	triggerRef?: RefObject<HTMLElement | null>;
 	dismissOnOutsidePointer?: boolean;
 }): void {
-	const { open, elementRef, returnFocusRef } = options;
+	const { open, elementRef, returnFocusRef, triggerRef } = options;
 	const dismissRef = useRef(options.onDismiss);
 	dismissRef.current = options.onDismiss;
 
@@ -50,6 +55,7 @@ export function useDismissableLayer(options: {
 						if (!opener || opener === document.body || !opener.isConnected) return null;
 						return opener;
 					},
+			getTriggerElement: triggerRef ? () => triggerRef.current : undefined,
 			dismissOnOutsidePointer: options.dismissOnOutsidePointer,
 			onDismiss: (reason) => dismissRef.current(reason),
 		});
@@ -57,6 +63,7 @@ export function useDismissableLayer(options: {
 		open,
 		elementRef,
 		returnFocusRef,
+		triggerRef,
 		options.dismissOnOutsidePointer,
 	]);
 }

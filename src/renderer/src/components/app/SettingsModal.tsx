@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import QRCode from "qrcode";
 import { t } from "../../i18n";
+import { isBrowserRuntime as isWebRuntime } from "../../runtimeApi";
 import { Button } from "../ui/Button";
 import { IconButton } from "../ui/IconButton";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
@@ -713,7 +714,6 @@ function SettingsModalContent(props: SettingsModalProps) {
 	const hasDirtyChanges = hasDraftChanges(settingsDraft) || rolesDraft?.dirty === true;
 	// 代理 tab 仍展示未保存提示；实际保存/取消统一走全局草稿，避免旧 proxyDirty 局部状态残留。
 	const proxyDirty = PROXY_FIELDS.some((field) => isFieldDirty(settingsDraft, field));
-	const isWebRuntime = document.documentElement.dataset.runtime === "web";
 	// 回环地址的二维码手机扫了也连不上，应改为提示用户切换监听地址。
 	const webUrlIsLoopback = (() => {
 		try {

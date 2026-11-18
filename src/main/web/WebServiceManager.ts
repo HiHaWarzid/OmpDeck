@@ -7,6 +7,7 @@ import { gzipSync } from "node:zlib";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import type { AppSettings, ChatMessage, WebServiceStatus } from "../../shared/types";
 import { messageStreamVersion } from "../../shared/messageStreamVersion";
+import { MOBILE_SHELL_VERSION_TOKEN, applyMobileShellVersion } from "../../shared/mobileShell";
 import { attachDisplayMeta } from "../../shared/sessionDisplayContract";
 import {
 	createWebApiHandlers,
@@ -84,6 +85,11 @@ export type WebServiceManagerOptions = {
 	now?: () => number;
 	/** 测试强制非回环请求也校验令牌（默认按 socket 地址判断） */
 	requireAuth?: boolean;
+	/**
+	 * 测试注入静态资源根目录。默认是构建产物旁的 `../renderer`（`__dirname` 相对），
+	 * 在 vitest 里解析不到 `public/`，因此外壳版本测试必须显式指向源码目录。
+	 */
+	rendererRoot?: string;
 };
 
 /**
@@ -96,7 +102,7 @@ const STATE_PAYLOAD_CACHE_MAX_CHARS = 16 * 1024 * 1024;
 export class WebServiceManager {
 	private server: Server | null = null;
 	private current: { host: string; port: number } | null = null;
-	private readonly rendererRoot = join(__dirname, "../renderer");
+	private readonly rendererRoot: string;
 	private tokenState: WebTokenState = {
 		token: "",
 		generatedAt: 0,
@@ -119,6 +125,7 @@ export class WebServiceManager {
 	) {
 		this.now = options.now ?? Date.now;
 		this.requireAuth = options.requireAuth ?? false;
+		this.rendererRoot = options.rendererRoot ?? join(__dirname, "../renderer");
 		this.routeEntries = flattenWebApiHandlers(createWebApiHandlers(deps));
 	}
 
@@ -543,8 +550,21 @@ export class WebServiceManager {
 		await this.sendFile(filePath, response, request);
 	}
 
+	/**
+	 * 手机外壳的版本号只写在 `shared/mobileShell`，静态文件里是占位符。
+	 * 在这里替换而不是构建期生成：手机端刻意没有构建步骤，文件直接从 public 读出。
+	 */
+	private applyShellVersion(filePath: string, body: Buffer): Buffer {
+		// 只有 html/js 可能带占位符；桌面 bundle 与图片直接返回原 Buffer。
+		if (!/\.(?:html|js)$/i.test(filePath)) return body;
+		// 先在字节层查占位符：bundle 分块有几百 KB，没有占位符时不该做一次
+		// UTF-8 解码 + 重编码的往返。
+		if (!body.includes(MOBILE_SHELL_VERSION_TOKEN)) return body;
+		return Buffer.from(applyMobileShellVersion(body.toString("utf8")), "utf8");
+	}
+
 	private async sendFile(filePath: string, response: ServerResponse, request: IncomingMessage) {
-		const body = await readFile(filePath);
+		const body = this.applyShellVersion(filePath, await readFile(filePath));
 		// 只有 Vite 产出的 /assets/ 带内容哈希，可以长缓存；public 下的
 		// mobile.* / boot-diagnostics.js 等文件名固定，必须每次回源。
 		const noStore =

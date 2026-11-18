@@ -221,6 +221,18 @@ RPC 日志的**留痕政策**也在这里：`isRpcLogWorthy` 判定「哪些帧�
 
 **`web` 列是能力声明，不是可选项**：生产代码不读它，漏标就没有守卫探针——`browserApi` 掉一个实现会被 `previewApi` 的 `async () => undefined` 静默接住，全套测试仍然绿。
 
+### RuntimeSurface（渲染层宿主判定）/ runtimeApi（运行时 api 唯一入口）
+`src/renderer/src/runtimeApi.ts` 判定渲染层跑在哪个宿主，并把选中的 api 装回 `window.piDesktop`：
+
+- `electron`：preload 注入，走真实 IPC。
+- `lan-web`：桌面 bundle 经 WebService 下发，api 是 HTTP 路由客户端（`browserApi`）。
+- `preview`：浏览器构建预览，api 是内存假数据（`previewApi`）。
+- `missing-preload`：宿主是 Electron 但 preload 没注入——**唯一不写回 window 的分支**，让安装损坏停在可读错误上。
+
+不变量：**`window.piDesktop` 在除 `missing-preload` 外的所有宿主里都必须有值**。约 40 个组件直接读 `window.piDesktop.*`（`NativeLoginModal` 常驻挂载，`useScratchPad`、`SidebarTree`、文件抽屉、`ModelRolesTab` 等按需挂载），它们不各自兜底。这条阶梯原先私有在 `App.tsx` 里，只有 App 自己拿到正确 api，其余调用方在 LAN-web / 预览宿主读到 undefined，`NativeLoginModal` 一挂载就崩——桌面 Web 视图整页白屏。
+
+规则：新增宿主分支只改 `runtimeSurface` 的判定与 `runtimeApi` 的安装，不在组件里加 `window.piDesktop?.` 兜底；`runtimeSurface` 也取代了组件里零散的 `dataset.runtime === "web"` 与 `navigator.userAgent.includes("Electron/")` 判断。
+
 ### WebApiHandlerTable（`/api` 端点分发表）
 `main/web/webApiRoutes.ts` 的 `createWebApiHandlers` 返回的处理器表：键类型**逐层映射自 `webRoutes`**，因此「表里有端点、分发里没接」不再是运行时静默 404，而是 `createWebApiHandlers` 返回对象缺键的编译错误。它是 `WebServiceManager` 里那条 550 行顺序 if 链的替代物。
 

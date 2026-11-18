@@ -4,6 +4,34 @@
  * /api/agents/:id/messages/:messageId（展开折叠内容）这些已有接口。 */
 (() => {
 	const stateApi = globalThis.OmpMobileState;
+	// mobile-state.js 是本文件的纯决策内核（消息合并、视图流水线、滚动计划），两个文件
+	// 必须同批更新。Service Worker 断网回退会按无查询串路径命中缓存，可能拼成
+	// 「新版 mobile.js + 旧版 mobile-state.js」；这里一次性核对本文件实际用到的函数，
+	// 缺任何一个都直接说明，而不是让时间线中途空白或抛在某个深层调用里。
+	const STATE_API = [
+		"mergeTimeline",
+		"appendTail",
+		"mergeOlder",
+		"countNewMessages",
+		"shouldAcceptResponse",
+		"pollDelay",
+		"isNearBottom",
+		"scrollPlan",
+		"tailLength",
+		"lastRealMessageId",
+		"removeAcknowledgedOptimistic",
+		"displayItem",
+		"groupDisplayItems",
+	];
+	const missing = STATE_API.filter((name) => typeof stateApi?.[name] !== "function");
+	if (missing.length > 0) {
+		const view = document.getElementById("view");
+		if (view) {
+			view.innerHTML =
+				'<div class="card empty">手机端脚本版本不一致，请联网后刷新页面。如仍失败，请清除站点数据。</div>';
+		}
+		throw new Error(`mobile-state.js 版本过旧: 缺少 ${missing.join(", ")}`);
+	}
 	const TAIL_LIMIT = 40;
 	// 首页历史会话先渲染一页，滑到底部再追加；避免一次把几百条 row 全部塞进 DOM。
 	const SESSION_PAGE_SIZE = 40;
@@ -1233,13 +1261,9 @@
 		}
 	}
 
+	/** 合并决策在 mobile-state.mergeTimeline；版本错配由文件头的守卫统一拦下。 */
 	function mergedMessages() {
-		// 旧版 Service Worker/浏览器缓存可能只更新了 mobile.js 而没更新 mobile-state.js；
-		// 缺少 mergeTimeline 时退回按 id 合并，至少不让整个会话白屏。
-		if (typeof stateApi.mergeTimeline === "function") {
-			return stateApi.mergeTimeline(olderMessages, chatMessages);
-		}
-		return stateApi.mergeMessageLists(olderMessages, chatMessages);
+		return stateApi.mergeTimeline(olderMessages, chatMessages);
 	}
 
 	function renderInline(value) {
@@ -1399,96 +1423,6 @@
 		return `<div class="md-body">${renderMarkdown(text)}</div>`;
 	}
 
-	/** 历史消息里 text 可能带 <thinking> 标签，同时另有 thinking 字段；展示时只保留正文。 */
-	function splitThinking(text, thinking) {
-		const raw = String(text || "").trim();
-		let found = typeof thinking === "string" ? thinking.trim() : "";
-		let body = raw;
-		// pi 的思考块包在整条消息最外层；思考内容本身可能包含字面量 <thinking>，
-		// 所以从开头匹配到最后一个 </thinking>，不能使用非贪婪匹配。
-		if (/^<thinking\b/i.test(raw)) {
-			const end = raw.lastIndexOf("</thinking>");
-			if (end !== -1) {
-				if (!found) found = raw.slice(0, end).replace(/^<thinking\b[^>]*>/i, "").trim();
-				body = raw.slice(end + "</thinking>".length).trim();
-			} else {
-				body = raw.replace(/^<thinking\b[^>]*>/i, "").trim();
-			}
-		} else {
-			body = raw
-				.replace(/<thinking\b[^>]*>([\s\S]*?)<\/thinking>/gi, (_, inner) => {
-					if (!found) found = inner.trim();
-					return "";
-				})
-				.trim();
-		}
-		return { body, thinking: found };
-	}
-
-	function toolNameLabel(name) {
-		const names = {
-			read: "读取",
-			read_file: "读取",
-			bash: "命令",
-			eval: "执行",
-			write: "写入",
-			write_file: "写入",
-			edit: "编辑",
-			edit_file: "编辑",
-			apply_patch: "补丁",
-			glob: "查找",
-			grep: "搜索",
-			list_dir: "目录",
-			task: "子任务",
-			wait: "等待",
-			todo: "任务",
-			todo_write: "任务",
-			web_search: "搜索网页",
-			web_fetch: "网页",
-			lsp: "分析",
-			ask: "询问",
-			ask_question: "提问",
-		};
-		return names[name] || name || "工具";
-	}
-
-	function toolLabel(text) {
-		return String(text || "").replace(
-			/^([✓✗▶])\s*([A-Za-z_][\w-]*)/,
-			(_, mark, name) => `${mark} ${toolNameLabel(name)}`,
-		);
-	}
-
-	function durationText(value) {
-		const ms = Number(value);
-		if (!Number.isFinite(ms) || ms <= 0) return "";
-		return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
-	}
-
-	function shortText(value, max = 120) {
-		const text = String(value ?? "").replace(/\s+/g, " ").trim();
-		return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-	}
-
-	/** 工具卡片副标题：服务端 compact / 详情端点已用 shared/sessionDisplayContract 算好
-	 *  meta.summary（参数键优先级唯一实现）；这里只对「旧服务端没有 summary」的响应
-	 *  保留一个 result 兜底，不再复制 detailText 正文行解析。 */
-	function toolSummary(meta) {
-		if (typeof meta.summary === "string" && meta.summary) return meta.summary;
-		return shortText(meta.result);
-	}
-
-	function messageMeta(item, options = {}) {
-		const parts = [];
-		if (options.agent) parts.push('<span class="meta-agent">omp</span>');
-		const time = timeText(item.timestamp);
-		if (time) parts.push(`<time>${escapeHtml(time)}</time>`);
-		if (item.optimistic) parts.push('<span class="meta-pending">发送中…</span>');
-		if (item.delivery) parts.push(`<span class="meta-delivery">${escapeHtml(item.delivery)}</span>`);
-		if (item.duration) parts.push(`<span>${escapeHtml(item.duration)}</span>`);
-		return parts.length ? `<div class="msg-meta">${parts.join("")}</div>` : "";
-	}
-
 	// 轮询会反复拿到同一批消息对象（appendTail 对未变化的消息保留原引用）。
 	// Markdown/思考块解析是手机端最贵的纯计算，按对象缓存 view 与最终 HTML，
 	// 让未变化的消息在每轮轮询里只做一次 Map 查找。
@@ -1503,73 +1437,23 @@
 		return built;
 	}
 
+	/** 视图模型来自 mobile-state.displayItem（纯决策、有测试）；这里只把数据拼成 HTML。 */
 	function buildMessageView(message) {
-		const role = message.role || "assistant";
-		const label = role === "system" ? "系统" : role === "error" ? "错误" : "助手";
-		const images = Array.isArray(message.images)
-			? message.images
+		const item = stateApi.displayItem(message);
+		// 渲染产物叫 imagesHtml：displayItem 给的 images 仍是图片数组，
+		// groupDisplayItems 要靠它判断「这条助手消息是不是空壳」，两者不能共用字段名。
+		const imagesHtml = item.images.length
+			? item.images
 					.map(
 						(image) =>
 							`<img src="data:${escapeHtml(image.mimeType)};base64,${escapeHtml(image.data)}" alt="" loading="lazy" decoding="async" />`,
 					)
 					.join("")
 			: "";
-		const { body, thinking } = splitThinking(message.text, message.thinking);
-		const thinkingOnly = !body && !!thinking;
-		const thinkingPreview = shortText(thinking, 48);
-		const thinkingBlock = thinking
-			? `<details data-detail="thinking"><summary>思考过程${thinkingPreview ? ` · ${escapeHtml(thinkingPreview)}` : ""}</summary><div class="thinking-body">${renderText(thinking)}</div></details>`
+		const thinkingBlock = item.thinking
+			? `<details data-detail="thinking"><summary>思考过程${item.thinkingPreview ? ` · ${escapeHtml(item.thinkingPreview)}` : ""}</summary><div class="thinking-body">${renderText(item.thinking)}</div></details>`
 			: "";
-		const meta = message.meta || {};
-		const toolMatch = /^([✓✗▶])\s*([^\s]+)/.exec(String(body || ""));
-		const toolName = toolNameLabel(String(meta.toolName || toolMatch?.[2] || "工具"));
-		// 状态三件套（glyph/error/文案）与投递文案都由服务端按共享契约写好，
-		// 手机端不再解析 meta.status / streamingBehavior，也不维护中文表。
-		const toolStatus = typeof meta.statusGlyph === "string" ? meta.statusGlyph : "";
-		const toolError = meta.statusKind === "error";
-		const toolState = typeof meta.statusText === "string" ? meta.statusText : "";
-		const duration = durationText(meta.durationMs);
-		const delivery = typeof meta.deliveryText === "string" ? meta.deliveryText : "";
-		const toolDetail = role === "tool" ? toolSummary(meta) : "";
-		const text = role === "tool" ? toolLabel(body) : body;
-		const textRemaining = Number.isFinite(Number(meta.fullLength))
-			? Number(meta.fullLength) - String(body || "").length
-			: 0;
-		const thinkingRemaining = Number.isFinite(Number(meta.fullThinkingLength))
-			? Number(meta.fullThinkingLength) - String(thinking || "").length
-			: 0;
-		const expand = meta.hasMore || meta.thinkingHasMore
-			? {
-					label:
-						meta.hasMore && meta.thinkingHasMore
-							? "展开全文"
-							: meta.hasMore
-								? "展开工具输出"
-								: "展开思考",
-					remaining: Math.max(0, textRemaining, thinkingRemaining),
-				}
-			: null;
-		return {
-			id: message.id,
-			role,
-			label,
-			images,
-			body,
-			thinking,
-			thinkingOnly,
-			text,
-			thinkingBlock,
-			expand,
-			timestamp: message.timestamp,
-			duration,
-			toolName,
-			toolDetail,
-			toolError,
-			toolStatus,
-			toolState,
-			delivery,
-			optimistic: Boolean(message.optimistic),
-		};
+		return { ...item, imagesHtml, thinkingBlock };
 	}
 
 	function renderMessage(item) {
@@ -1586,7 +1470,7 @@
 			: "";
 		const attrs = `data-mid="${escapeHtml(item.id)}"`;
 		if (item.role === "user") {
-			return `<div class="msg user" ${attrs}>${escapeHtml(item.body)}${expand}${item.images}${messageMeta(item)}</div>`;
+			return `<div class="msg user" ${attrs}>${escapeHtml(item.body)}${expand}${item.imagesHtml}${messageMeta(item)}</div>`;
 		}
 		if (item.role === "tool") {
 			const detail = item.toolDetail
@@ -1602,48 +1486,34 @@
 				: "";
 		const meta = item.role === "assistant" ? messageMeta(item, { agent: true }) : "";
 		const body = item.text ? renderText(item.text) : "";
-		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}" ${attrs}>${label}${meta}${item.thinkingBlock}${body}${expand}${item.images}</div>`;
+		return `<div class="msg ${escapeHtml(item.role)}${item.thinkingOnly ? " thinking-only" : ""}" ${attrs}>${label}${meta}${item.thinkingBlock}${body}${expand}${item.imagesHtml}</div>`;
 	}
 
+	/** 消息尾注：时间/发送中/投递/耗时。仍与 HTML 同处，因为只有它用 escapeHtml。 */
+	function messageMeta(item, options = {}) {
+		const parts = [];
+		if (options.agent) parts.push('<span class="meta-agent">omp</span>');
+		const time = timeText(item.timestamp);
+		if (time) parts.push(`<time>${escapeHtml(time)}</time>`);
+		if (item.optimistic) parts.push('<span class="meta-pending">发送中…</span>');
+		if (item.delivery) parts.push(`<span class="meta-delivery">${escapeHtml(item.delivery)}</span>`);
+		if (item.duration) parts.push(`<span>${escapeHtml(item.duration)}</span>`);
+		return parts.length ? `<div class="msg-meta">${parts.join("")}</div>` : "";
+	}
+
+	/** 分组决策来自 mobile-state.groupDisplayItems（纯函数、有测试）；这里只拼 HTML。 */
 	function buildRenderItems() {
-		// 只保留有正文的助手消息；连续工具调用折叠成过程，避免手机端时间线被
-		// 大量英文思考和工具行淹没。纯思考消息仍保留，交给 details 折叠。
-		const messages = mergedMessages()
-			.map(messageView)
-			.filter((item) => !(item.role === "assistant" && !item.body && !item.images && !item.thinking));
-		const items = [];
-		for (let index = 0; index < messages.length; index += 1) {
-			const item = messages[index];
-			if (item.role === "tool") {
-				const group = [item];
-				while (index + 1 < messages.length && messages[index + 1].role === "tool") {
-					index += 1;
-					group.push(messages[index]);
-				}
-				if (group.length > 1) {
-					// 执行过程默认展开：手机端最需要看到 agent 实际跑了哪些命令，
-					// 折叠起来只剩“工具 · N 次”，等于把过程信息全部藏掉。
-					const running = group.some((entry) => entry.toolStatus === "▶");
-					const failed = group.some((entry) => entry.toolError);
-					// 组状态复用每条工具消息的服务端文案，手机端不再拼中文状态词。
-					const state =
-						(group.find((entry) => entry.toolStatus === "▶") ||
-							group.find((entry) => entry.toolError) ||
-							group[group.length - 1])?.toolState || "";
-					items.push({
-						key: `group:${group[0].id}`,
-						html: `<div class="tool-group"><div class="tool-group-title"><span>执行过程 · ${group.length} 步</span><span class="tool-group-state${running ? " running" : failed ? " error" : ""}">${state}</span></div>${group
-							.map(renderMessage)
-							.join("")}</div>`,
-					});
-				} else {
-					items.push({ key: item.id, html: renderMessage(item) });
-				}
-				continue;
-			}
-			items.push({ key: item.id, html: renderMessage(item) });
-		}
-		return items;
+		const plan = stateApi.groupDisplayItems(mergedMessages().map(messageView));
+		return plan.map((entry) => {
+			if (entry.type === "single") return { key: entry.item.id, html: renderMessage(entry.item) };
+			const stateClass = entry.running ? " running" : entry.failed ? " error" : "";
+			return {
+				key: entry.key,
+				html: `<div class="tool-group"><div class="tool-group-title"><span>执行过程 · ${entry.entries.length} 步</span><span class="tool-group-state${stateClass}">${entry.state}</span></div>${entry.entries
+					.map(renderMessage)
+					.join("")}</div>`,
+			};
+		});
 	}
 
 	function createMessageNode(item) {

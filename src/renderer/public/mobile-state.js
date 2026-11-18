@@ -151,6 +151,195 @@
 		return (current || []).filter((message) => !acknowledged.has(message.id));
 	}
 
+	// ── 消息 → 展示项 ─────────────────────────────────────────────
+	// 这段以前埋在 mobile.js 第 106 个函数之后：渲染流水线里唯一的纯决策
+	// （该显示哪条、工具怎么折、展开按钮怎么说）与 DOM 赋值挨着，导致手机端
+	// 零测试。搬到这个文件后，只有转义与 innerHTML 留在 mobile.js。
+
+	/** 工具名 → 中文标签。领域词表留在这里，别的文件不再各存一份。 */
+	function toolNameLabel(name) {
+		const names = {
+			read: "读取",
+			read_file: "读取",
+			bash: "命令",
+			eval: "执行",
+			write: "写入",
+			write_file: "写入",
+			edit: "编辑",
+			edit_file: "编辑",
+			apply_patch: "补丁",
+			glob: "查找",
+			grep: "搜索",
+			list_dir: "目录",
+			task: "子任务",
+			wait: "等待",
+			todo: "任务",
+			todo_write: "任务",
+			web_search: "搜索网页",
+			web_fetch: "网页",
+			lsp: "分析",
+			ask: "询问",
+			ask_question: "提问",
+		};
+		return names[name] || name || "工具";
+	}
+
+	function toolLabel(text) {
+		return String(text || "").replace(
+			/^([✓✗▶])\s*([A-Za-z_][\w-]*)/,
+			(_, mark, name) => `${mark} ${toolNameLabel(name)}`,
+		);
+	}
+
+	function durationText(value) {
+		const ms = Number(value);
+		if (!Number.isFinite(ms) || ms <= 0) return "";
+		return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+	}
+
+	function shortText(value, max = 120) {
+		const text = String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+		return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+	}
+
+	/** 工具卡片副标题：服务端 compact / 详情端点已用 shared/sessionDisplayContract 算好
+	 *  meta.summary（参数键优先级唯一实现）；这里只对「旧服务端没有 summary」的响应
+	 *  保留一个 result 兜底，不再复制 detailText 正文行解析。 */
+	function toolSummary(meta) {
+		if (typeof meta.summary === "string" && meta.summary) return meta.summary;
+		return shortText(meta.result);
+	}
+
+	/** 历史消息里 text 可能带 <thinking> 标签，同时另有 thinking 字段；展示时只保留正文。 */
+	function splitThinking(text, thinking) {
+		const raw = String(text || "").trim();
+		let found = typeof thinking === "string" ? thinking.trim() : "";
+		let body = raw;
+		// pi 的思考块包在整条消息最外层；思考内容本身可能包含字面量 <thinking>，
+		// 所以从开头匹配到最后一个 </thinking>，不能使用非贪婪匹配。
+		if (/^<thinking\b/i.test(raw)) {
+			const end = raw.lastIndexOf("</thinking>");
+			if (end !== -1) {
+				if (!found) found = raw.slice(0, end).replace(/^<thinking\b[^>]*>/i, "").trim();
+				body = raw.slice(end + "</thinking>".length).trim();
+			} else {
+				body = raw.replace(/^<thinking\b[^>]*>/i, "").trim();
+			}
+		} else {
+			body = raw
+				.replace(/<thinking\b[^>]*>([\s\S]*?)<\/thinking>/gi, (_, inner) => {
+					if (!found) found = inner.trim();
+					return "";
+				})
+				.trim();
+		}
+		return { body, thinking: found };
+	}
+
+	/**
+	 * 一条消息 → 一个展示项。只产出数据，不含任何 HTML：
+	 * 转义与拼接留在 mobile.js，测试可以直接断言这个对象。
+	 *
+	 * 状态三件套（glyph/error/文案）与投递文案都由服务端按共享契约写好，
+	 * 手机端不再解析 meta.status / streamingBehavior，也不维护中文表。
+	 */
+	function displayItem(message) {
+		const role = message.role || "assistant";
+		const label = role === "system" ? "系统" : role === "error" ? "错误" : "助手";
+		const images = Array.isArray(message.images) ? message.images : [];
+		const { body, thinking } = splitThinking(message.text, message.thinking);
+		const thinkingOnly = !body && !!thinking;
+		const meta = message.meta || {};
+		const toolMatch = /^([✓✗▶])\s*([^\s]+)/.exec(String(body || ""));
+		const toolName = toolNameLabel(String(meta.toolName || (toolMatch && toolMatch[2]) || "工具"));
+		const toolStatus = typeof meta.statusGlyph === "string" ? meta.statusGlyph : "";
+		const toolError = meta.statusKind === "error";
+		const toolState = typeof meta.statusText === "string" ? meta.statusText : "";
+		const duration = durationText(meta.durationMs);
+		const delivery = typeof meta.deliveryText === "string" ? meta.deliveryText : "";
+		const toolDetail = role === "tool" ? toolSummary(meta) : "";
+		const text = role === "tool" ? toolLabel(body) : body;
+		const textRemaining = Number.isFinite(Number(meta.fullLength))
+			? Number(meta.fullLength) - String(body || "").length
+			: 0;
+		const thinkingRemaining = Number.isFinite(Number(meta.fullThinkingLength))
+			? Number(meta.fullThinkingLength) - String(thinking || "").length
+			: 0;
+		// 只有服务端标了 hasMore/thinkingHasMore 才给展开按钮：截断判定属于服务端契约，
+		// 手机端凭长度猜会让「全文已到但没有标记」的消息永远显示展开。
+		const expand = meta.hasMore || meta.thinkingHasMore
+			? {
+					label:
+						meta.hasMore && meta.thinkingHasMore
+							? "展开全文"
+							: meta.hasMore
+								? "展开工具输出"
+								: "展开思考",
+					remaining: Math.max(0, textRemaining, thinkingRemaining),
+				}
+			: null;
+		return {
+			id: message.id,
+			role,
+			label,
+			images,
+			body,
+			thinking,
+			thinkingOnly,
+			thinkingPreview: shortText(thinking, 48),
+			text,
+			expand,
+			timestamp: message.timestamp,
+			duration,
+			toolName,
+			toolDetail,
+			toolError,
+			toolStatus,
+			toolState,
+			delivery,
+			optimistic: Boolean(message.optimistic),
+		};
+	}
+
+	/**
+	 * 展示项 → 渲染计划。连续工具调用折成一组「执行过程」，其余各占一条。
+	 *
+	 * 组状态复用每条工具消息的服务端文案（运行中 > 失败 > 最后一条），
+	 * 手机端不再拼中文状态词；纯思考消息保留，交给 details 折叠。
+	 */
+	function groupDisplayItems(items) {
+		const visible = (items || []).filter(
+			(item) => !(item.role === "assistant" && !item.body && !item.images.length && !item.thinking),
+		);
+		const plan = [];
+		for (let index = 0; index < visible.length; index += 1) {
+			const item = visible[index];
+			if (item.role !== "tool") {
+				plan.push({ type: "single", item });
+				continue;
+			}
+			const group = [item];
+			while (index + 1 < visible.length && visible[index + 1].role === "tool") {
+				index += 1;
+				group.push(visible[index]);
+			}
+			if (group.length === 1) {
+				plan.push({ type: "single", item });
+				continue;
+			}
+			// 执行过程默认展开：手机端最需要看到 agent 实际跑了哪些命令，
+			// 折叠起来只剩「工具 · N 次」，等于把过程信息全部藏掉。
+			const running = group.some((entry) => entry.toolStatus === "▶");
+			const failed = group.some((entry) => entry.toolError);
+			const state =
+				(group.find((entry) => entry.toolStatus === "▶") ||
+					group.find((entry) => entry.toolError) ||
+					group[group.length - 1]).toolState || "";
+			plan.push({ type: "toolGroup", key: `group:${group[0].id}`, entries: group, running, failed, state });
+		}
+		return plan;
+	}
+
 	return {
 		mergeMessageLists,
 		mergeTimeline,
@@ -164,5 +353,13 @@
 		tailLength,
 		lastRealMessageId,
 		removeAcknowledgedOptimistic,
+		toolNameLabel,
+		toolLabel,
+		durationText,
+		shortText,
+		toolSummary,
+		splitThinking,
+		displayItem,
+		groupDisplayItems,
 	};
 });

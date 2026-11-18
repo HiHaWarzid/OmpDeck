@@ -36,6 +36,7 @@ import {
 import { t } from "../../../i18n";
 import { dispatchToAgent } from "../../../workspace/dispatch";
 import { rpcLogActions } from "../../../workspace/slices/rpcLogSlice";
+import type { AnchoredOverlay } from "../../../utils/anchoredOverlay";
 import { Badge } from "../../ui/Badge";
 import { IconButton } from "../../ui/IconButton";
 import { AgentStatusIndicator, BrandLockup, ProjectAvatar } from "../brand/Brand";
@@ -70,35 +71,6 @@ import {
  *
  * 可见行为不变：展开/折叠、分页、右键菜单、拖拽/隐藏规则、文案与 aria 属性逐字保留。
  */
-
-/** 侧栏右键菜单锚点：项目菜单。 */
-export interface SidebarProjectMenu {
-	x: number;
-	y: number;
-	project: Project;
-}
-
-/** 侧栏右键菜单锚点：历史会话菜单。 */
-export interface SidebarSessionMenu {
-	x: number;
-	y: number;
-	projectId: string;
-	session: SessionSummary;
-}
-
-/** 侧栏右键菜单锚点：Agent 菜单。 */
-export interface SidebarAgentMenu {
-	x: number;
-	y: number;
-	agent: AgentTab;
-}
-
-/** 来源过滤弹窗锚点（带项目归属）。 */
-export interface SidebarSessionFilterAnchor {
-	x: number;
-	y: number;
-	projectId: string;
-}
 
 export interface SidebarTreeProps {
 	/** 主列表项目：已按搜索过滤、已排除 worktree 子项目（子项目在其父项目下展开）。 */
@@ -152,10 +124,11 @@ export interface SidebarTreeProps {
 	handleProjectDragLeave: (projectId: string) => void;
 	handleProjectDrop: (event: DragEvent<HTMLButtonElement>, targetProjectId: string) => void;
 	finishProjectDrag: () => void;
-	setProjectMenu: Dispatch<SetStateAction<SidebarProjectMenu | null>>;
-	setSessionMenu: Dispatch<SetStateAction<SidebarSessionMenu | null>>;
-	setAgentMenu: Dispatch<SetStateAction<SidebarAgentMenu | null>>;
-	setSessionFilterOpen: Dispatch<SetStateAction<SidebarSessionFilterAnchor | null>>;
+	/**
+	 * 打开一个锚定浮层。四个菜单以前各有一个 setter，穿过 props 下发；
+	 * 现在共用一个入口，浮层的互斥由 App 侧的单一值负责，侧栏只描述「要开什么」。
+	 */
+	openOverlay: (overlay: Exclude<AnchoredOverlay, { kind: "editors" }>) => void;
 	setWorktreeCreateDialog: Dispatch<SetStateAction<{ projectId: string } | null>>;
 	/** 「显示更多」：按固定页大小追加该项目可见子项数（分页状态由 useProjectTree 持有）。 */
 	showMoreProjectChildren: (projectId: string) => void;
@@ -231,10 +204,7 @@ function SidebarTreeView({
 	handleProjectDragLeave,
 	handleProjectDrop,
 	finishProjectDrag,
-	setProjectMenu,
-	setSessionMenu,
-	setAgentMenu,
-	setSessionFilterOpen,
+	openOverlay,
 	setWorktreeCreateDialog,
 	showMoreProjectChildren,
 	setCollapsedWorktrees,
@@ -352,7 +322,8 @@ function SidebarTreeView({
 								onDragEnd={finishProjectDrag}
 								onContextMenu={(event) => {
 									event.preventDefault();
-									setProjectMenu({
+									openOverlay({
+										kind: "project",
 										x: event.clientX,
 										y: event.clientY,
 										project,
@@ -427,7 +398,8 @@ function SidebarTreeView({
 												className="filter-indicator"
 												onClick={(e) => {
 													e.stopPropagation();
-													setSessionFilterOpen({
+													openOverlay({
+														kind: "sessionFilter",
 														...adjustMenuPos(e.clientX, e.clientY, 180, 250),
 														projectId: project.id,
 													});
@@ -616,14 +588,16 @@ function SidebarTreeView({
 													if (subagentAgent) {
 														const logging = await window.piDesktop.rpcLogs.getLogging(subagentAgent.id);
 														dispatchToAgent(subagentAgent.id, rpcLogActions.set(logging));
-														setAgentMenu({
+														openOverlay({
+															kind: "agent",
 															x: event.clientX,
 															y: event.clientY,
 															agent: subagentAgent,
 														});
 														return;
 													}
-													setSessionMenu({
+													openOverlay({
+														kind: "session",
 														x: event.clientX,
 														y: event.clientY,
 														projectId: project.id,
@@ -760,7 +734,8 @@ function SidebarTreeView({
 													// 菜单打开时查询 RPC 日志记录状态
 													const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
 													dispatchToAgent(agent.id, rpcLogActions.set(logging));
-													setAgentMenu({
+													openOverlay({
+														kind: "agent",
 														x: event.clientX,
 														y: event.clientY,
 														agent,
@@ -806,7 +781,8 @@ function SidebarTreeView({
 											title={session.filePath}
 											onContextMenu={(event) => {
 												event.preventDefault();
-												setSessionMenu({
+												openOverlay({
+													kind: "session",
 													x: event.clientX,
 													y: event.clientY,
 													projectId: project.id,
@@ -985,7 +961,8 @@ function SidebarTreeView({
 													onContextMenu={(e) => {
 														e.preventDefault();
 														if (childProject) {
-															setProjectMenu({
+															openOverlay({
+																kind: "project",
 																x: e.clientX,
 																y: e.clientY,
 																project: childProject,
@@ -1052,7 +1029,7 @@ function SidebarTreeView({
 																	event.preventDefault();
 																	const logging = await window.piDesktop.rpcLogs.getLogging(agent.id);
 																	dispatchToAgent(agent.id, rpcLogActions.set(logging));
-																	setAgentMenu({ x: event.clientX, y: event.clientY, agent });
+																	openOverlay({ kind: "agent", x: event.clientX, y: event.clientY, agent });
 																}}
 																onClick={() => { setActiveProjectId(agent.projectId); setActiveAgentId(agent.id); ensureAgentMessagesLoaded(agent.id); }}
 															>

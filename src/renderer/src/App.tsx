@@ -54,10 +54,26 @@ import {
   PanelLeft,
   PanelRight,
 } from "lucide-react";
+import {
+  activeTabOf,
+  closeTab,
+  openTab,
+  resetTabs,
+  selectTab,
+  type EditorTabLedger,
+  type OpenTabRequest,
+} from "./utils/editorTabLedger";
+import {
+  clampMenuAnchor,
+  EDITORS_POPOVER_SIZE,
+  placeEditorsPopover,
+  toggleEditors,
+  type AnchoredOverlay,
+  type OverlayState,
+} from "./utils/anchoredOverlay";
 import { showNotice } from "./utils/notice";
 import { lazyWithReload } from "./utils/lazyWithReload";
-import { createPreviewApi } from "./previewApi";
-import { createBrowserApi } from "./browserApi";
+import { api as runtimeApi, isBrowserRuntime, runtimeSurface } from "./runtimeApi";
 const ConfigModal = lazyWithReload(() => import("./ConfigModal").then((m) => ({ default: m.ConfigModal })));
 import { isTextFile } from "./utils/isTextFile";
 import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
@@ -274,10 +290,8 @@ import type {
   WidgetLineItem,
 } from "../../shared/types";
 
-const isLanWeb =
-  !window.piDesktop && window.location.protocol.startsWith("http");
-const isElectronRuntime = navigator.userAgent.includes("Electron/");
-const missingElectronPreload = isElectronRuntime && !window.piDesktop;
+const isLanWeb = runtimeSurface === "lan-web";
+const missingElectronPreload = runtimeSurface === "missing-preload";
 
 /**
  * 模块级调试日志环形缓冲（最多 200 条）。
@@ -309,25 +323,7 @@ function pruneRecordKeys<T>(
   }
   return changed ? next : record;
 }
-function createUnavailableDesktopApi(): typeof window.piDesktop {
-  const fail = () => {
-    throw new Error(t("app.preloadMissing"));
-  };
-  return new Proxy(
-    {},
-    {
-      get: fail,
-      set: fail,
-    },
-  ) as typeof window.piDesktop;
-}
-const api =
-  window.piDesktop ??
-  (missingElectronPreload
-    ? createUnavailableDesktopApi()
-    : isLanWeb
-      ? createBrowserApi()
-      : createPreviewApi());
+const api = runtimeApi;
 // 输入框高度：151px = 4 行正文（--line-height-input 22px）+ 输入框上下 padding 20px
 // + 底部工具条 41px + 边框 2px，刚好放下四行；输入框本身固定高度（不再随内容长高，
 // 超出滚动），用户可向上拖动放大。CSS .composer-box 的 min-height 112px 是最后兜底。
@@ -641,24 +637,42 @@ export function App() {
   const pendingCustomInputRef = useRef("");
   /** 外部编辑器列表 + 弹出气泡状态 */
   const [externalEditors, setExternalEditors] = useState<ExternalEditor[]>([]);
-  const [editorsOpen, setEditorsOpen] = useState(false);
-  const [editorsAnchor, setEditorsAnchor] = useState<{ x: number; y: number } | null>(null);
-  /** 右键项目也能唤起编辑器气泡，所以这里显式记录本次要打开的目录，避免依赖运行中 agent 的 cwd。 */
-  const [editorsTargetPath, setEditorsTargetPath] = useState<string | null>(null);
+  /**
+   * 锚定浮层（右键菜单 / 编辑器气泡 / 来源筛选）的唯一状态。
+   * 六份独立 useState 收成一个带 `kind` 的联合值后，「同时只开一个」不再靠每个打开点
+   * 各自记得把别人置空，而是类型上的事实；打开态也不再需要 `editorsOpen` 这类配套布尔。
+   * 关闭按 `kind` 精确匹配（见 closeOverlay），异步收尾不会误关用户后来打开的浮层。
+   */
+  const [overlay, setOverlay] = useState<OverlayState>(null);
+  /** 只关指定的 kind：异步收尾（重命名弹窗、复制会话）不会误关用户后来打开的浮层。 */
+  const closeOverlay = useCallback((kind: AnchoredOverlay["kind"]) => {
+    setOverlay((current) => (current?.kind === kind ? null : current));
+  }, []);
+  /** 侧栏侧的唯一开入口：只允许打开侧栏能触发的那几个 kind。 */
+  const openOverlay = useCallback(
+    (next: Exclude<AnchoredOverlay, { kind: "editors" }>) => setOverlay(next),
+    [],
+  );
+  /** 按 kind 窄化后的视图：渲染块与处理器继续读局部名，避免满屏 discriminated union 判空。 */
+  const editorsBubble = overlay?.kind === "editors" ? overlay : null;
+  const fileMenu = overlay?.kind === "file" ? overlay : null;
+  const projectMenu = overlay?.kind === "project" ? overlay : null;
+  const agentMenu = overlay?.kind === "agent" ? overlay : null;
+  const sessionMenu = overlay?.kind === "session" ? overlay : null;
+  const sessionFilterOpen = overlay?.kind === "sessionFilter" ? overlay : null;
   /** 浏览器全屏模式：在完整窗口覆盖层中渲染浏览器面板，不受右侧抽屉宽度限制。 */
   const [browserFullscreen, setBrowserFullscreen] = useState(false);
   const browserFullscreenRef = useRef<HTMLDivElement | null>(null);
   const editorsRef = useRef<HTMLDivElement>(null);
+  /** 打开编辑器气泡的按钮。关闭层靠它把「再点一次」留给 toggle 自己处理。 */
+  const editorsTriggerRef = useRef<HTMLElement | null>(null);
 
   // 点击编辑器气泡外部时关闭（Esc 同样可关，见共享关闭层）。
-  const closeEditorsBubble = useCallback(() => {
-    setEditorsOpen(false);
-    setEditorsAnchor(null);
-    setEditorsTargetPath(null);
-  }, []);
+  const closeEditorsBubble = useCallback(() => closeOverlay("editors"), [closeOverlay]);
   useDismissableLayer({
-    open: editorsOpen,
+    open: editorsBubble !== null,
     elementRef: editorsRef,
+    triggerRef: editorsTriggerRef,
     onDismiss: closeEditorsBubble,
   });
 
@@ -712,11 +726,6 @@ export function App() {
   // 侧栏过滤用延迟值：输入框即时响应，O(项目×会话) 的 filter/sort 派生计算
   // 降级为低优先级更新，避免搜索大量项目/会话时按键阻塞。
   const deferredSearch = useDeferredValue(search);
-  const [fileMenu, setFileMenu] = useState<{
-    x: number;
-    y: number;
-    node: FileTreeNode;
-  } | null>(null);
   const [hasClipboardFiles, setHasClipboardFiles] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
@@ -736,19 +745,8 @@ export function App() {
     name: string;
   } | null>(null);
   const [renamingFileInput, setRenamingFileInput] = useState("");
-  const [agentMenu, setAgentMenu] = useState<{
-    x: number;
-    y: number;
-    agent: AgentTab;
-  } | null>(null);
   /** 右键菜单里 RPC 日志开关的当前值（rpcLog 切片；开关菜单时才订阅该条目）。 */
   const menuAgentRpcLogging = useWorkspaceSlice(agentMenu?.agent.id, "rpcLog")?.enabled ?? false;
-  const [sessionMenu, setSessionMenu] = useState<{
-    x: number;
-    y: number;
-    projectId: string;
-    session: SessionSummary;
-  } | null>(null);
   const [agentActionLoading, setAgentActionLoading] = useState<
     "copy" | "export" | null
   >(null);
@@ -764,39 +762,8 @@ export function App() {
   } | null>(null);
   const [agentRenameValue, setAgentRenameValue] = useState("");
   const [agentRenaming, setAgentRenaming] = useState(false);
-  const [projectMenu, setProjectMenu] = useState<{
-    x: number;
-    y: number;
-    project: Project;
-  } | null>(null);
   /** 会话管理弹框 */
   const [sessionManagerProject, setSessionManagerProject] = useState<Project | null>(null);
-  /** 来源过滤弹窗（关联项目ID和位置） */
-  const [sessionFilterOpen, setSessionFilterOpen] = useState<{
-  	x: number;
-  	y: number;
-  	projectId: string;
-  } | null>(null);
-  /** Editor tab：文件中转查看/差异查看。条数与正文估算内存双重受限。 */
-  const EDITOR_TAB_LIMIT = 5;
-  const EDITOR_TAB_TEXT_BUDGET = 24 * 1024 * 1024;
-  interface EditorTab {
-    id: string;
-    filePath: string;
-    mode: "view" | "diff";
-    originalContent: string;
-    modifiedContent?: string;
-    /** 历史提交 Diff 必须只读，不能把旧快照误保存回当前工作区。 */
-    allowSave: boolean;
-    /** 同一文件在不同提交中可以有多个历史 Diff，使用该 key 避免互相覆盖。 */
-    tabKey?: string;
-    /** 历史 Diff 在标签中追加短 hash，便于区分同一路径的不同提交。 */
-    label?: string;
-    /** Git Diff 覆盖在 Git drawer 上，不允许切换成 Editor drawer 破坏原面板状态。 */
-    preserveDrawer?: boolean;
-    /** 仅用于内存淘汰，不改变 tab 的可见排列顺序。 */
-    lastAccess: number;
-  }
   interface GitDrawerDiff {
     projectId: string;
     filePath: string;
@@ -825,14 +792,16 @@ export function App() {
     panelHost.openPanel("git");
     setGitDiffDisplayMode("drawer");
   }, [gitDiffDisplayMode]);
-  const editorTabAccessSequenceRef = useRef(0);
-  const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  /**
+   * 编辑器 tab 账本：tabs / 活跃 id / 访问序号是同一个值，由 editorTabLedger 纯函数
+   * 改写。原先两份 useState 靠「在 updater 里 setActiveTabId」维持「活跃 ∈ 列表」，
+   * 关闭活跃 tab 时又用调用方的闭包快照算邻居，连点两次就可能留下悬空 id。
+   */
+  const [editorTabLedger, setEditorTabLedger] = useState<EditorTabLedger>(resetTabs);
+  const editorTabs = editorTabLedger.tabs;
+  const activeTabId = editorTabLedger.activeId;
   /** 当前活跃 tab 派生数据 */
-  const activeTab = useMemo(
-    () => editorTabs.find((t) => t.id === activeTabId) ?? null,
-    [editorTabs, activeTabId],
-  );
+  const activeTab = useMemo(() => activeTabOf(editorTabLedger), [editorTabLedger]);
   useEffect(() => {
     // Git Diff 属于项目工作区快照；项目切换后必须释放旧快照，避免右侧栏展示错误项目内容。
     gitDiffRequestSequenceRef.current += 1;
@@ -884,24 +853,6 @@ export function App() {
     },
     [activeAgentId],
   );
-  const editorTabTextBytes = (tab: EditorTab) =>
-    (tab.originalContent.length + (tab.modifiedContent?.length ?? 0)) * 2;
-  const trimEditorTabs = (tabs: EditorTab[], protectedId: string) => {
-    const next = [...tabs];
-    let textBytes = next.reduce((sum, tab) => sum + editorTabTextBytes(tab), 0);
-    while (
-      next.length > 1 &&
-      (next.length > EDITOR_TAB_LIMIT || textBytes > EDITOR_TAB_TEXT_BUDGET)
-    ) {
-      const candidates = next.filter((tab) => tab.id !== protectedId);
-      if (candidates.length === 0) break;
-      const oldest = candidates.reduce((left, right) => left.lastAccess <= right.lastAccess ? left : right);
-      const index = next.findIndex((tab) => tab.id === oldest.id);
-      const [removed] = next.splice(index, 1);
-      if (removed) textBytes -= editorTabTextBytes(removed);
-    }
-    return next;
-  };
   /** 打开或切换 tab。命中时更新访问序号；超条数/正文预算时淘汰最久未访问项。 */
   const openEditorTab = useCallback(
     (
@@ -914,69 +865,32 @@ export function App() {
       label?: string,
       preserveDrawer = false,
     ) => {
-      setEditorTabs((prev) => {
-        const existing = prev.find((t) => t.filePath === path && t.tabKey === tabKey);
-        if (existing) {
-          const updated = {
-            ...existing,
-            mode,
-            originalContent: originalContent ?? "",
-            modifiedContent,
-            allowSave,
-            tabKey,
-            label,
-            preserveDrawer,
-            lastAccess: ++editorTabAccessSequenceRef.current,
-          };
-          setActiveTabId(existing.id);
-          return trimEditorTabs(
-            prev.map((tab) => tab.id === existing.id ? updated : tab),
-            existing.id,
-          );
-        }
-        const newTab: EditorTab = {
-          id: crypto.randomUUID(),
-          filePath: path,
-          mode,
-          originalContent: originalContent ?? "",
-          modifiedContent,
-          allowSave,
-          tabKey,
-          label,
-          preserveDrawer,
-          lastAccess: ++editorTabAccessSequenceRef.current,
-        };
-        const next = trimEditorTabs([...prev, newTab], newTab.id);
-        setActiveTabId(newTab.id);
-        return next;
-      });
+      const request: OpenTabRequest = {
+        id: crypto.randomUUID(),
+        filePath: path,
+        mode,
+        originalContent,
+        modifiedContent,
+        allowSave,
+        tabKey,
+        label,
+        preserveDrawer,
+      };
+      setEditorTabLedger((current) => openTab(current, request));
     },
     [],
   );
   /** 关闭指定 tab。关闭活跃 tab 时切到相邻 tab；一个都不剩时关闭编辑器。 */
-  const closeEditorTab = useCallback(
-    (tabId: string) => {
-      setEditorTabs((prev) => {
-        const idx = prev.findIndex((t) => t.id === tabId);
-        if (idx < 0) return prev;
-        const next = prev.filter((t) => t.id !== tabId);
-        if (next.length === 0) {
-          setActiveTabId(null);
-        } else if (tabId === activeTabId) {
-          const neighborIdx = Math.min(idx, next.length - 1);
-          setActiveTabId(next[neighborIdx].id);
-        }
-        return next;
-      });
-    },
-    [activeTabId],
-  );
+  const closeEditorTab = useCallback((tabId: string) => {
+    setEditorTabLedger((current) => closeTab(current, tabId));
+  }, []);
   /** 切换活跃 tab。 */
   const selectEditorTab = useCallback((tabId: string) => {
-    setEditorTabs((current) => current.map((tab) => tab.id === tabId
-      ? { ...tab, lastAccess: ++editorTabAccessSequenceRef.current }
-      : tab));
-    setActiveTabId(tabId);
+    setEditorTabLedger((current) => selectTab(current, tabId));
+  }, []);
+  /** 整块退出编辑器（返回文件列表 / 预览 HTML / 关闭弹窗）。 */
+  const clearEditorTabs = useCallback(() => {
+    setEditorTabLedger(resetTabs());
   }, []);
   // ── 会话导入（Codex / Claude / OpenCode）：一个状态机 + 一张源描述表 ──────────
   // 三源共用同一套类型与交互，差异（api 命名空间/默认勾选/文案前缀/子代理分组）
@@ -1293,7 +1207,7 @@ export function App() {
   useEffect(() => {
     const media = window.matchMedia("(max-width: 820px)");
     const update = () => {
-      const mobile = document.documentElement.dataset.runtime === "web" && media.matches;
+      const mobile = isBrowserRuntime && media.matches;
       setIsMobileWeb(mobile);
       if (mobile) setListCollapsed(true);
     };
@@ -2541,8 +2455,7 @@ export function App() {
 
   /** 关闭侧栏文件编辑器，回到「文件」Tab 的文件列表（保留右侧工具栏 chrome） */
   function backToFilesList() {
-    setActiveTabId(null);
-    setEditorTabs([]);
+    clearEditorTabs();
     setEditorMode("drawer");
     panelHost.openPanel("files");
   }
@@ -2695,19 +2608,19 @@ export function App() {
       showToast(t("app.sessionCopyFailed", { error: translateAgentErrorMessage(msg) }), 5000);
     } finally {
       setAgentActionLoading(null);
-      setAgentMenu(null);
+      closeOverlay("agent");
     }
   }
 
   function openAgentRename(agent: AgentTab) {
-    setAgentMenu(null);
+    closeOverlay("agent");
     setAgentRenameTarget(agent);
     setSessionRenameTarget(null);
     setAgentRenameValue(agent.title);
   }
 
   function openSessionRename(projectId: string, session: SessionSummary) {
-    setSessionMenu(null);
+    closeOverlay("session");
     setAgentRenameTarget(null);
     setSessionRenameTarget({ projectId, session });
     setAgentRenameValue(session.name || t("common.untitled"));
@@ -2780,7 +2693,7 @@ export function App() {
     projectId: string,
     session: SessionSummary,
   ) {
-    setSessionMenu(null);
+    closeOverlay("session");
     const existingAgent = getAgentForSessionPath(
       displayAgents.filter((agent) => agent.projectId === projectId),
       session.filePath,
@@ -2805,7 +2718,7 @@ export function App() {
       await copySession(session.filePath, projectId);
     } finally {
       setSessionActionLoading(null);
-      setSessionMenu(null);
+      closeOverlay("session");
     }
   }
 
@@ -2819,7 +2732,7 @@ export function App() {
       showToast(t("app.exportedPath", { path: result.path }), 3500);
     } finally {
       setSessionActionLoading(null);
-      setSessionMenu(null);
+      closeOverlay("session");
     }
   }
 
@@ -3228,14 +3141,16 @@ export function App() {
   	});
   }
 
-  /** 调整菜单位置避免溢出视口 */
+  /**
+   * 调整菜单位置避免溢出视口。夹紧规则本身在 utils/anchoredOverlay 里（纯函数、可测边界），
+   * 这里只负责读窗口尺寸。
+   */
   function adjustMenuPos(x: number, y: number, width = 200, height = 260) {
-  	const vw = window.innerWidth;
-  	const vh = window.innerHeight;
-  	return {
-  		x: x + width > vw ? Math.max(4, vw - width - 8) : x,
-  		y: y + height > vh ? Math.max(4, vh - height - 8) : y,
-  	};
+  	return clampMenuAnchor(
+  		{ x, y },
+  		{ width, height },
+  		{ width: window.innerWidth, height: window.innerHeight },
+  	);
   }
 
   // 无 agent 时模型列表缓存，避免每次打开模型选择器都 fork pi --list-models
@@ -3624,7 +3539,7 @@ export function App() {
       showToast(t("app.exportedPath", { path: result.path }), 3500);
     } finally {
       setAgentActionLoading(null);
-      setAgentMenu(null);
+      closeOverlay("agent");
     }
   }
 
@@ -4498,8 +4413,7 @@ export function App() {
   const handlePreviewHtml = (filePath: string) => {
     // 如果编辑器是模态模式，先关闭弹框
     if (editorMode === "modal") {
-      setActiveTabId(null);
-      setEditorTabs([]);
+      clearEditorTabs();
     }
     const fileUrl = 'file:///' + filePath.split('\\').join('/');
     navigateTo(fileUrl);
@@ -4662,10 +4576,7 @@ export function App() {
         api={api}
         setSearch={setSearch}
         {...stableSidebarHandlers}
-        setProjectMenu={setProjectMenu}
-        setSessionMenu={setSessionMenu}
-        setAgentMenu={setAgentMenu}
-        setSessionFilterOpen={setSessionFilterOpen}
+        openOverlay={openOverlay}
         setWorktreeCreateDialog={setWorktreeCreateDialog}
         showMoreProjectChildren={showMoreProjectChildren}
         setCollapsedWorktrees={setCollapsedWorktrees}
@@ -5852,7 +5763,7 @@ export function App() {
                 icon: <Terminal size={17} />,
               } : undefined}
               editorsAction={{
-                active: editorsOpen,
+                active: editorsBubble !== null,
                 label: t("app.openWithEditor"),
                 onClick: (e) => {
                   const projectPath =
@@ -5860,13 +5771,23 @@ export function App() {
                     (activeProject && !isChatProject(activeProject)
                       ? activeProject.path
                       : null);
-                  setEditorsTargetPath(projectPath);
-                  setEditorsOpen((open) => !open);
                   const btn = (e?.currentTarget as HTMLElement)?.closest("button");
-                  if (btn) {
-                    const rect = btn.getBoundingClientRect();
-                    setEditorsAnchor(adjustMenuPos(rect.left - 4, rect.top, 220, 280));
-                  }
+                  // 记录触发器：关闭层据此把「pointerdown 在按钮上」当成内部事件，
+                  // 让这次 click 自己完成收起，而不是先关再开。
+                  editorsTriggerRef.current = btn ?? null;
+                  const rect = btn?.getBoundingClientRect();
+                  // 按钮矩形拿不到时不打开：旧实现会留下 `open=true, anchor=null` 的
+                  // 僵持态（按钮显示为激活，气泡永远不出现），这里直接当作无动作。
+                  // 气泡不能压住自己：压住时真实指针点到的是气泡，按钮收不到 click，
+                  // 「再点一次收起」失效。落点选在按钮左侧/上下方，见 placeEditorsPopover。
+                  const anchor = rect
+                    ? placeEditorsPopover(
+                        rect,
+                        EDITORS_POPOVER_SIZE,
+                        { width: window.innerWidth, height: window.innerHeight },
+                      )
+                    : null;
+                  setOverlay((current) => toggleEditors(current, anchor, projectPath));
                 },
                 icon: <Code size={17} />,
               }}
@@ -6044,7 +5965,7 @@ export function App() {
                         onCollapseAllDirectories={collapseAllDirectories}
                         onExpandAllDirectories={expandAllDirectories}
                         onFileContextMenu={(node, x, y) => {
-                          setFileMenu({ node, x, y });
+                          setOverlay({ kind: "file", node, x, y });
                           try {
                             const paths = api.files.getClipboardPaths();
                             setHasClipboardFiles(paths.length > 0);
@@ -6160,16 +6081,16 @@ export function App() {
                 });
               }
             } catch { /* 剪贴板不可用 */ }
-            setFileMenu(null);
+            closeOverlay("file");
           }}
-          onClose={() => setFileMenu(null)}
+          onClose={() => closeOverlay("file")}
           onOpen={() => {
             void api.files.open(fileMenu.node.path);
-            setFileMenu(null);
+            closeOverlay("file");
           }}
           onReveal={() => {
             void api.files.showInFolder(fileMenu.node.path);
-            setFileMenu(null);
+            closeOverlay("file");
           }}
           onAttach={() => {
             // 目录引用必须带尾斜杠，保证渲染为路径 chip 且模型不误判为智能体 mention。
@@ -6181,22 +6102,22 @@ export function App() {
               activeAgentIdRef.current ?? "",
               `${current}${current.endsWith(" ") || current.length === 0 ? "" : " "}${ref} `,
             );
-            setFileMenu(null);
+            closeOverlay("file");
           }}
           onCopyPath={() => {
             void writeClipboard(fileMenu.node.path);
-            setFileMenu(null);
+            closeOverlay("file");
             showToast(t("app.pathCopied"), 1200);
           }}
           onRename={() => {
             const node = fileMenu.node;
             setRenamingFile({ path: node.path, name: node.name });
             setRenamingFileInput(node.name);
-            setFileMenu(null);
+            closeOverlay("file");
           }}
           onDelete={() => {
             const node = fileMenu.node;
-            setFileMenu(null);
+            closeOverlay("file");
             setConfirmDialog({
               title: node.type === "directory" ? t("drawer.deleteFolderTitle") : t("drawer.deleteFileTitle"),
               message: node.type === "directory"
@@ -6225,7 +6146,7 @@ export function App() {
             x={sessionFilterOpen.x}
             y={sessionFilterOpen.y}
             className="filter-menu"
-            onClose={() => setSessionFilterOpen(null)}
+            onClose={() => closeOverlay("sessionFilter")}
           >
               <div className="filter-menu-header">{t("menu.filterSessions")}</div>
               <label className="filter-menu-item">
@@ -6261,36 +6182,43 @@ export function App() {
       {projectMenu && (
         <ProjectContextMenu
           menu={projectMenu}
-          onClose={() => setProjectMenu(null)}
+          onClose={() => closeOverlay("project")}
           onRevealProject={() => {
             void api.files.showInFolder(projectMenu.project.path);
-            setProjectMenu(null);
+            closeOverlay("project");
           }}
           onOpenWithEditor={() => {
-            setEditorsTargetPath(projectMenu.project.path);
-            setEditorsAnchor(adjustMenuPos(projectMenu.x, projectMenu.y, 220, 280));
-            setEditorsOpen(true);
-            setProjectMenu(null);
+            // 这里是「打开」，不是 toggle：气泡已经开着时也要把它移到新位置。
+            setOverlay({
+              kind: "editors",
+              ...adjustMenuPos(
+                projectMenu.x,
+                projectMenu.y,
+                EDITORS_POPOVER_SIZE.width,
+                EDITORS_POPOVER_SIZE.height,
+              ),
+              targetPath: projectMenu.project.path,
+            });
           }}
           onImportCodexSessions={() => {
-            setProjectMenu(null);
+            closeOverlay("project");
             void importFlow.open("codex", projectMenu.project);
           }}
           onImportClaudeSessions={() => {
-            setProjectMenu(null);
+            closeOverlay("project");
             void importFlow.open("claude", projectMenu.project);
           }}
           onImportOpenCodeSessions={() => {
-            setProjectMenu(null);
+            closeOverlay("project");
             void importFlow.open("opencode", projectMenu.project);
           }}
           onManageProjectResources={() => {
             setProjectResourcesProject(projectMenu.project);
-            setProjectMenu(null);
+            closeOverlay("project");
           }}
           onManageSessions={() => {
             setSessionManagerProject(projectMenu.project);
-            setProjectMenu(null);
+            closeOverlay("project");
             // 确保会话列表已加载
             const pid = projectMenu.project.id;
             if (!(sessionsByProject[pid]?.length)) {
@@ -6300,18 +6228,19 @@ export function App() {
           onCopyProjectPath={() => {
             void writeClipboard(projectMenu.project.path);
             showToast(t("common.copied"));
-            setProjectMenu(null);
+            closeOverlay("project");
           }}
           onFilterSessions={() => {
-            setSessionFilterOpen({
+            // 单一值：打开筛选就已经替换掉项目菜单，不需要再单独关它。
+            setOverlay({
+              kind: "sessionFilter",
               ...adjustMenuPos(projectMenu.x, projectMenu.y + 20, 180, 250),
               projectId: projectMenu.project.id,
             });
-            setProjectMenu(null);
           }}
           onToggleWorktree={async () => {
             const project = projectMenu.project;
-            setProjectMenu(null);
+            closeOverlay("project");
             try {
               const projectId = project.id;
               const { result: updated } = await applyProjectMutation(async () => {
@@ -6339,11 +6268,11 @@ export function App() {
           }}
           onRefreshProject={() => {
             void refreshProjectTree(projectMenu.project);
-            setProjectMenu(null);
+            closeOverlay("project");
           }}
           onRemoveProject={async () => {
             const project = projectMenu.project;
-            setProjectMenu(null);
+            closeOverlay("project");
             try {
               // 主进程会保留内置聊天项目（ProjectStore.remove 里 isChatProject 豁免），
               // 所以「调了 remove」不等于「记录真没了」——统一收尾按前后列表差集清理，
@@ -6367,7 +6296,7 @@ export function App() {
           menu={agentMenu}
           actionLoading={agentActionLoading}
           onClose={() => {
-            if (!agentActionLoading) setAgentMenu(null);
+            if (!agentActionLoading) closeOverlay("agent");
           }}
           onRename={() => openAgentRename(agentMenu.agent)}
           onExport={() => {
@@ -6390,12 +6319,12 @@ export function App() {
                 console.info(`[rpc ${id.slice(0, 8)}] logging disabled`);
               }
             });
-            setAgentMenu(null);
+            closeOverlay("agent");
           }}
           isRpcLogging={menuAgentRpcLogging}
           onOpenLogFile={() => {
             void window.piDesktop.rpcLogs.openFile(agentMenu.agent.id);
-            setAgentMenu(null);
+            closeOverlay("agent");
           }}
           onCopySessionFilePath={() => {
             const path = agentMenu.agent.sessionPath;
@@ -6403,16 +6332,16 @@ export function App() {
               void writeClipboard(path);
               showToast(t("common.copied"));
             }
-            setAgentMenu(null);
+            closeOverlay("agent");
           }}
           onOpenSessionFile={() => {
             const path = agentMenu.agent.sessionPath;
             if (path) void api.files.open(path);
-            setAgentMenu(null);
+            closeOverlay("agent");
           }}
           onCloseAgent={() => {
             const agent = agentMenu.agent;
-            setAgentMenu(null);
+            closeOverlay("agent");
             if (agent.noSession) {
               // 匿名聊天关闭会丢失未保存的记录，需要确认
               setConfirmDialog({
@@ -6436,7 +6365,7 @@ export function App() {
           menu={sessionMenu}
           actionLoading={sessionActionLoading}
           onClose={() => {
-            if (!sessionActionLoading) setSessionMenu(null);
+            if (!sessionActionLoading) closeOverlay("session");
           }}
           onRename={() =>
             openSessionRename(sessionMenu.projectId, sessionMenu.session)
@@ -6453,16 +6382,16 @@ export function App() {
           onCopySessionFilePath={() => {
             void writeClipboard(sessionMenu.session.filePath);
             showToast(t("common.copied"));
-            setSessionMenu(null);
+            closeOverlay("session");
           }}
           // 历史会话的 RPC 日志在 agent 启动后再通过右键菜单开启记录
           onOpenSessionFile={() => {
             void api.files.open(sessionMenu.session.filePath);
-            setSessionMenu(null);
+            closeOverlay("session");
           }}
           onDeleteSession={() => {
             const session = sessionMenu.session;
-            setSessionMenu(null);
+            closeOverlay("session");
             // 无论是否有子会话，都弹出确认框
             const projectSessions = sessionsByProject[sessionMenu.projectId] ?? [];
             const childCount = projectSessions.filter(
@@ -6814,7 +6743,7 @@ filePath={activeTab.filePath}
           activeTabId={activeTabId}
           onSelectTab={selectEditorTab}
           onCloseTab={closeEditorTab}
-          onClose={() => { setActiveTabId(null); setEditorTabs([]); }}
+          onClose={clearEditorTabs}
           readContent={readEditorFileContent}
           readOriginalContent={readEditorOriginalContent}
           saveContent={activeTab.allowSave ? saveEditorFileContent : undefined}
@@ -6986,14 +6915,17 @@ filePath={gitDrawerDiff.filePath}
       ) : null}
 
       {/* 外部编辑器选择气泡 */}
-      {editorsOpen && editorsAnchor && (
+      {editorsBubble && (
         <div
           ref={editorsRef}
           className="editors-popover"
           style={{
             position: "fixed",
-            left: editorsAnchor.x,
-            top: editorsAnchor.y,
+            left: editorsBubble.x,
+            top: editorsBubble.y,
+            // 落点按 `EDITORS_POPOVER_SIZE` 估算，实际宽度必须不超过它，否则长编辑器名
+            // 会把气泡撑回触发器上方，「再点一次收起」重新失效（纯函数在那里无从得知）。
+            maxWidth: EDITORS_POPOVER_SIZE.width,
           }}
           onClick={(e) => e.stopPropagation()}
         >
@@ -7005,7 +6937,7 @@ filePath={gitDrawerDiff.filePath}
                 key={editor.id}
                 className="editors-popover-item"
                 onClick={() => {
-                  const projectPath = editorsTargetPath;
+                  const projectPath = editorsBubble.targetPath;
                   if (projectPath) {
                     void api.editors.openProject(editor, projectPath).catch((error) => {
                       showToast(
@@ -7016,9 +6948,7 @@ filePath={gitDrawerDiff.filePath}
                       );
                     });
                   }
-                  setEditorsOpen(false);
-                  setEditorsAnchor(null);
-                  setEditorsTargetPath(null);
+                  closeOverlay("editors");
                 }}
               >
                 <span className={`editor-logo ${editor.id}`}>

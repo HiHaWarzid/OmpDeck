@@ -221,6 +221,13 @@ function loadAgentManager() {
 		"src/main/pi/agentProcessReplacement.ts",
 		"agentProcessReplacement.ts",
 	);
+	// 会话改写配方（锁/重载/回滚编排 + 三套行级变换）；值导入 messageContent 与
+	// sessionEntryIds（均已在上方注入），sessionRewrite 自身只类型导入 shared。
+	registry["./sessionRewriteMutations"] = loadModule(
+		"src/main/pi/sessionRewriteMutations.ts",
+		"sessionRewriteMutations.ts",
+	);
+	registry["./sessionRewrite"] = loadModule("src/main/pi/sessionRewrite.ts", "sessionRewrite.ts");
 
 	const agentManagerExports = loadModule("src/main/pi/AgentManager.ts", "AgentManager.ts");
 	return {

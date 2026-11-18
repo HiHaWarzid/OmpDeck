@@ -104,7 +104,23 @@ All notable changes to PiDeck are documented here.
   inlined at build time. The route parity guard now scans it with the same
   extractor it already runs against `mobile.js`, so the hand-written
   find-the-backtick-and-walk-escapes scraper is gone.
-
+- **The runtime api has one entry point** — "which host am I in, and which api
+  do I use" was decided once in `App.tsx`, while roughly 40 components read
+  `window.piDesktop.*` directly. Under the LAN web build and the browser
+  preview that value was `undefined`, so the always-mounted login modal threw on
+  mount and the desktop web view white-screened. The decision is now the pure
+  function `detectRuntimeSurface`, and `runtimeApi` installs the chosen api onto
+  `window.piDesktop` — except for a broken Electron install with no preload,
+  which stays `undefined` so the damage stays diagnosable.
+- **Anchored overlays collapsed into one value** — The file / project / agent /
+  session context menus, the session-source filter, and the external-editor
+  bubble each had their own anchor state, so two could be open at once, and
+  "click the button again to close" was defeated by the dismiss layer: the
+  `pointerdown` closed it and the following `click` reopened it, leaving the
+  button lit forever (with the bubble often covering the button itself). They
+  are now one discriminated union `OverlayState` plus the pure placement
+  function `placeEditorsPopover` (which must not cover its trigger); opening any
+  one closes the previous one.
 
 ### 🔒 Security
 
