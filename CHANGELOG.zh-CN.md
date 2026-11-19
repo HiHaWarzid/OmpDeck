@@ -101,6 +101,9 @@
   原本是四个要一起手改的数字，漏改一个就会把「新 `mobile.js` + 旧 `mobile-state.js`」
   推给手机。现在静态文件里是占位符，由主进程读文件时替换成 `shared/mobileShell` 的常量；
   Vite dev 下不注册 Service Worker（占位符不会被替换，缓存键会退化成永不变化的字面量）。
+  判定落在两条注册路径上：桌面 renderer 走 `import.meta.env.DEV`，手机外壳走
+  `isUnversionedShell(currentScript.src)`——只看本脚本 URL 里是否还有 `__SHELL` 前缀，
+  正是「Main 没处理过这个响应」的证据。
 
 ### 🔒 安全
 

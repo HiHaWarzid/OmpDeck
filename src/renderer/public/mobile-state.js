@@ -340,7 +340,19 @@
 		return plan;
 	}
 
+	/**
+	 * 本脚本的 URL 是否仍是 Vite dev 下发的原文。
+	 *
+	 * 判据是占位符前缀 `__SHELL` 还在：Main 的 sendFile 会把 `__SHELL_VERSION__` 整体
+	 * 替换成数字，处理后不可能再出现这个前缀。这里只比较前缀、不写完整占位符，因为这
+	 * 个文件自己也会被 sendFile 处理一次——写完整占位符会被替换成数字，生产判断随即反转。
+	 */
+	function isUnversionedShell(src) {
+		return typeof src === "string" && src.includes("__SHELL");
+	}
+
 	return {
+		isUnversionedShell,
 		mergeMessageLists,
 		mergeTimeline,
 		appendTail,

@@ -28,6 +28,7 @@ type MobileState = {
 	durationText: (value: unknown) => string;
 	shortText: (value: unknown, max?: number) => string;
 	splitThinking: (text: string, thinking: string) => { body: string; thinking: string };
+	isUnversionedShell: (src: string) => boolean;
 	displayItem: (message: DisplayMessage) => DisplayItem;
 	groupDisplayItems: (items: DisplayItem[]) => RenderPlanEntry[];
 };
@@ -323,5 +324,16 @@ describe("mobile-state 展示项", () => {
 		const plan = state.groupDisplayItems([user, tool("t1"), user]);
 		expect(plan.map((entry) => entry.type)).toEqual(["single", "single", "single"]);
 		expect(plan.map((entry) => entry.item?.id)).toEqual(["u", "t1", "u"]);
+	});
+
+	test("isUnversionedShell: 只有未替换的外壳脚本 URL 被判为开发态", () => {
+		// Main 的 sendFile 会把整个占位符替换成数字，处理后不可能再出现 __SHELL 前缀。
+		expect(state.isUnversionedShell("http://127.0.0.1:5173/mobile.js?v=__SHELL_VERSION__")).toBe(true);
+		// 生产/预览：已被替换成数字。
+		expect(state.isUnversionedShell("http://192.168.1.5:7788/mobile.js?v=30")).toBe(false);
+		// 没有查询串（断网回退按无查询串路径命中缓存）也不该被误判成开发态。
+		expect(state.isUnversionedShell("http://192.168.1.5:7788/mobile.js")).toBe(false);
+		// 取不到 currentScript（内联/动态注入）时按「已版本化」处理，不悄悄关掉离线能力。
+		expect(state.isUnversionedShell("")).toBe(false);
 	});
 });

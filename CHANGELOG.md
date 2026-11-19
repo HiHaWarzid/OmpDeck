@@ -142,7 +142,11 @@ All notable changes to PiDeck are documented here.
   static files now carry a placeholder that the main process replaces from the
   `shared/mobileShell` constant. Development no longer registers a service
   worker, since Vite serves the placeholder unreplaced and the cache key would
-  collapse to a never-changing literal.
+  collapse to a never-changing literal. The rule is enforced on both
+  registration paths: the desktop renderer via `import.meta.env.DEV`, the mobile
+  shell via `isUnversionedShell(currentScript.src)` - it only checks whether the
+  script's own URL still carries the `__SHELL` prefix, which is the evidence
+  that the main process never rewrote this response.
 
 ### 🔒 Security
 

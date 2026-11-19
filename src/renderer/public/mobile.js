@@ -4,6 +4,9 @@
  * /api/agents/:id/messages/:messageId（展开折叠内容）这些已有接口。 */
 (() => {
 	const stateApi = globalThis.OmpMobileState;
+	// 必须在同步阶段取：异步回调里 document.currentScript 已经是 null。
+	// 这个值用来判定「本文件是不是 Vite dev 下发的未版本化原文」。
+	const selfScriptSrc = document.currentScript?.src ?? "";
 	// mobile-state.js 是本文件的纯决策内核（消息合并、视图流水线、滚动计划），两个文件
 	// 必须同批更新。Service Worker 断网回退会按无查询串路径命中缓存，可能拼成
 	// 「新版 mobile.js + 旧版 mobile-state.js」；这里一次性核对本文件实际用到的函数，
@@ -22,6 +25,7 @@
 		"removeAcknowledgedOptimistic",
 		"displayItem",
 		"groupDisplayItems",
+		"isUnversionedShell",
 	];
 	const missing = STATE_API.filter((name) => typeof stateApi?.[name] !== "function");
 	if (missing.length > 0) {
@@ -2396,9 +2400,15 @@
 	// 手机端装到主屏后离线也能打开外壳；API 请求永不缓存，恢复网络即可继续。
 	// 放到首屏请求完成后的空闲期注册：SW 安装会再拉一遍外壳资源，弱网下与
 	// state/sessions 抢带宽会直接拖慢首屏。
+	//
+	// 但开发态必须跳过：`sw.js` / `mobile.*` 在 Vite dev 下由 Vite 直接下发 public 目录
+	// 的原文，`__SHELL_VERSION__` 不会被替换（替换只发生在 Main 的 sendFile 里）。
+	// 缓存键于是退化成永不变化的字面量，改了手机端脚本也照旧命中旧缓存，只能手动清
+	// 站点数据。判据取「本脚本自己的 URL 是否仍带占位符前缀」——那正是 Main 没处理过的证据。
 	let serviceWorkerRegistered = false;
 	function registerServiceWorker() {
 		if (serviceWorkerRegistered || !("serviceWorker" in navigator)) return;
+		if (stateApi.isUnversionedShell(selfScriptSrc)) return;
 		serviceWorkerRegistered = true;
 		const start = () => void navigator.serviceWorker.register("./sw.js").catch(() => undefined);
 		if (typeof requestIdleCallback === "function") {
